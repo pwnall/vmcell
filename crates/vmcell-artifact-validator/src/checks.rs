@@ -56,7 +56,7 @@ const BANNER_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// way the message names the console it consulted, so the reader can go look at it.
 ///
 /// `kind` is explicit at every call site (no default): the only VM in this module whose console is
-/// empty **by construction** is the restored one in [`snapshot_restore_roundtrip`], and rendering
+/// empty **by construction** is the restored one in [`snapshot_restore_attempt`], and rendering
 /// it as a fresh boot accused a kernel that had provably just booted of not being a kernel.
 async fn explain_boot_failure_at(kind: BootKind, serial_log: &Path, base: &str) -> String {
     let base = format!("{base} (serial log {})", serial_log.display());
@@ -771,42 +771,115 @@ pub async fn concurrency_distinct_ids<V: Vmm>(vmm: &V, a: &ArtifactSet) -> Resul
     Ok(())
 }
 
+/// Where a probe stopped — which is **not** the same question as what it observed.
+///
+/// A candidate that never reached the point where the feature could be exercised has said nothing
+/// about the feature. Reporting that as [`ProbeOutcome::DoesNotWork`] let an artifact that cannot
+/// boot at all earn a *verified absence* (docs/90 M8): [`crate::conformance::judge`] reads a
+/// measured "does not work" against an absence declaration as the one `Pass` an absence can earn.
+/// The positive-control pairing cannot catch it — the control is a **different** artifact, so it
+/// boots fine and the pair looks healthy. Only the candidate's own stop tells the two apart, which
+/// is why the line is drawn here, at the arm that failed, rather than in the judgement.
+///
+/// [`xattr_preserved_probe`] has always drawn this line (its config/boot/handshake arms are all
+/// `NotRun`); this is the same law, applied to the probe that did not.
+enum ProbeStop {
+    /// The probe never got to exercise the feature — the config did not build, the VM did not
+    /// start, the guest never handed shakes, the host had no scratch space. →
+    /// [`ProbeOutcome::NotRun`], which §10.6 renders as `Unverified`, never a pass.
+    Setup(String),
+    /// The feature **was** exercised and it did not work. → [`ProbeOutcome::DoesNotWork`], the
+    /// measurement an absence declaration can be verified against.
+    Exercised(String),
+}
+
+impl ProbeStop {
+    /// The failure text, whichever side of the line it fell on.
+    ///
+    /// A *level* check (`snapshot.restore_roundtrip`) judges a declared-**present** property, where
+    /// both sides are the same verdict — the artifact pair did not survive the round trip — so the
+    /// split changes nothing there and the recorded message is byte-identical.
+    fn into_why(self) -> String {
+        match self {
+            ProbeStop::Setup(why) | ProbeStop::Exercised(why) => why,
+        }
+    }
+}
+
+/// The one mapping from a stopped probe onto a §10.6 outcome.
+///
+/// Pure, so both directions are unit-gated
+/// (`a_setup_stop_is_notrun_and_an_exercised_stop_is_doesnotwork`) on a machine with no KVM. Which
+/// *probe arm* produces which stop is a second question: a fake reaches the setup arms, and only a
+/// KVM host reaches the measuring ones, so those are pinned by a source scan.
+fn stopped_probe_outcome(stop: ProbeStop) -> ProbeOutcome {
+    match stop {
+        ProbeStop::Setup(why) => ProbeOutcome::NotRun(why),
+        ProbeStop::Exercised(why) => ProbeOutcome::DoesNotWork(why),
+    }
+}
+
 /// Snapshot a running VM and restore it, confirming the **restored** VM boots back to
 /// steward-ready and execs (← `snapshot_restore.rs`, §8, Snapshot, restore, and cloning/§8.2, Restore correctness: a restored VM is not a fresh VM). Proves the artifact survives the
 /// PVH snapshot/restore path. The VM must be a snapshot-eligible config (no vhost-user device).
 ///
+/// The level-check form of the crate-private `snapshot_restore_probe` (deliberately unlinked: a
+/// public doc must not link a private item): one body, two callers, because a level check asks "does
+/// this declared-present property hold" — both stop kinds are the same `Err` — while the §10.6
+/// battery asks "what did we observe", where they are not the same answer.
+///
 /// # Errors
 /// Returns `Err` if snapshot or restore fails, or the restored VM does not return to steward-ready and exec.
 pub async fn snapshot_restore_roundtrip<V: Vmm>(vmm: &V, a: &ArtifactSet) -> Result<(), String> {
+    snapshot_restore_attempt(vmm, a)
+        .await
+        .map_err(ProbeStop::into_why)
+}
+
+/// The §10.6 data-plane probe for [`vmcell::feature::Feature::SnapshotRestore`]: the same round trip
+/// [`snapshot_restore_roundtrip`] runs, reported as a [`ProbeOutcome`] so a candidate that never
+/// booted is `NotRun` (undecided) rather than a measured absence — see [`ProbeStop`].
+pub(crate) async fn snapshot_restore_probe<V: Vmm>(vmm: &V, a: &ArtifactSet) -> ProbeOutcome {
+    match snapshot_restore_attempt(vmm, a).await {
+        Ok(()) => ProbeOutcome::Works,
+        Err(stop) => stopped_probe_outcome(stop),
+    }
+}
+
+/// The round trip proper. Every arm states which side of the [`ProbeStop`] line it is on, and the
+/// boundary is [`MicroVm::snapshot`] — the first call that actually exercises the feature.
+async fn snapshot_restore_attempt<V: Vmm>(vmm: &V, a: &ArtifactSet) -> Result<(), ProbeStop> {
     let mut cfg = base_cfg(a)
         .network_disabled()
         .build()
-        .map_err(|e| format!("snapshot-eligible config build failed: {e}"))?;
+        .map_err(|e| ProbeStop::Setup(format!("snapshot-eligible config build failed: {e}")))?;
     // Snapshot-eligible: net=None → no vhost-user device (§13, Cross-cutting invariants); set the flag on the built
     // config (the pair is already vhost-user-free, so this stays valid).
     cfg.snapshotting = true;
     let env = vmcell::HostEnv::hermetic();
     let mut vm = MicroVm::start(vmm, cfg.clone(), &env)
         .await
-        .map_err(|e| format!("snapshot-source: {}", failed_start(&e)))?;
+        .map_err(|e| ProbeStop::Setup(format!("snapshot-source: {}", failed_start(&e))))?;
     // Boot to steward-ready before snapshotting.
     if let Err(e) = vm.steward(Some(STEWARD_READY_BUDGET)).await {
         let base = format!(
             "snapshot-source: {}",
             steward_handshake_base(&e, STEWARD_READY_BUDGET)
         );
-        return Err(explain_boot_failure_for(&vm, &base).await);
+        // THE M8 arm: a guest that never handed shakes was never asked to snapshot, so this says
+        // nothing about the artifact's snapshot support.
+        return Err(ProbeStop::Setup(explain_boot_failure_for(&vm, &base).await));
     }
 
-    let snap_dir = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
+    let snap_dir = tempfile::tempdir().map_err(|e| ProbeStop::Setup(format!("tempdir: {e}")))?;
     vm.snapshot(snap_dir.path())
         .await
-        .map_err(|e| format!("snapshot() failed: {e}"))?;
+        .map_err(|e| ProbeStop::Exercised(format!("snapshot() failed: {e}")))?;
     let _ = vm.shutdown().await;
 
     let mut restored = MicroVm::restore(vmm, snap_dir.path(), cfg, &env)
         .await
-        .map_err(|e| format!("restore() failed: {e}"))?;
+        .map_err(|e| ProbeStop::Exercised(format!("restore() failed: {e}")))?;
     // Captured before the `&mut` steward borrow (see `guest_core_checks`).
     let restored_serial = restored.instance().serial_log().to_path_buf();
     let steward = match restored.steward(Some(STEWARD_READY_BUDGET)).await {
@@ -821,12 +894,23 @@ pub async fn snapshot_restore_roundtrip<V: Vmm>(vmm: &V, a: &ArtifactSet) -> Res
             // told this check that a kernel which had just booted, snapshotted and resumed "is not
             // a direct-boot PVH-ELF vmlinux". `checks_render_a_restored_console_as_restored` pins
             // this argument.
-            return Err(explain_boot_failure_at(BootKind::Restored, &restored_serial, &base).await);
+            //
+            // `Exercised`, not `Setup`: the snapshot and the restore both succeeded and the guest
+            // did not come back — that IS the feature failing, and calling it undecidable would
+            // hide a broken restore behind an `Unverified` (M8's inverse).
+            return Err(ProbeStop::Exercised(
+                explain_boot_failure_at(BootKind::Restored, &restored_serial, &base).await,
+            ));
         }
     };
-    let out = exec(steward, &["true"]).await?;
+    let out = exec(steward, &["true"])
+        .await
+        .map_err(ProbeStop::Exercised)?;
     if out.code != 0 {
-        return Err(format!("restored VM exec `true` exited {}", out.code));
+        return Err(ProbeStop::Exercised(format!(
+            "restored VM exec `true` exited {}",
+            out.code
+        )));
     }
     let _ = restored.shutdown().await;
     Ok(())
@@ -2266,25 +2350,131 @@ mod tests {
         assert!(fresh.contains("CONFIG_PVH"), "{fresh}");
     }
 
+    /// `snapshot_restore_attempt`'s body, read out of this file with its comments stripped — the two
+    /// source scans below both need it, and both would otherwise trip on a comment that merely
+    /// *names* the token they are looking for.
+    ///
+    /// The first column-0 `}` closes the function, so this is its body alone — not the needles in
+    /// the scans further down the file.
+    fn snapshot_attempt_code() -> String {
+        const SRC: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/checks.rs"));
+        let after = SRC
+            .split("async fn snapshot_restore_attempt")
+            .nth(1)
+            .expect("the function must exist");
+        let end = after
+            .find("\n}\n")
+            .expect("the function has a closing brace");
+        after
+            .get(..end)
+            .expect("a char boundary at a newline")
+            .lines()
+            .filter_map(|l| l.split("//").next())
+            .collect::<Vec<&str>>()
+            .join("\n")
+    }
+
+    // The mapping M8 turned on, purely: a probe that stopped in SETUP decides nothing (`NotRun` →
+    // `Unverified`), and only a probe that got to exercise the feature can report a measured absence
+    // (`DoesNotWork` → the one `Pass` an absence declaration can earn). RED on the inverse: collapse
+    // either arm onto the other — which is exactly the shape the defect had, every `Err` mapped to
+    // `DoesNotWork` — and the corresponding leg fails.
+    #[test]
+    fn a_setup_stop_is_notrun_and_an_exercised_stop_is_doesnotwork() {
+        assert_eq!(
+            stopped_probe_outcome(ProbeStop::Setup("the VM never started".into())),
+            ProbeOutcome::NotRun("the VM never started".into())
+        );
+        assert_eq!(
+            stopped_probe_outcome(ProbeStop::Exercised("restore() failed".into())),
+            ProbeOutcome::DoesNotWork("restore() failed".into())
+        );
+        // The level check keeps both as one `Err` with the same text: it judges a declared-present
+        // property, where "never got there" and "got there and it broke" are the same verdict.
+        assert_eq!(
+            ProbeStop::Setup("the VM never started".into()).into_why(),
+            "the VM never started"
+        );
+        assert_eq!(
+            ProbeStop::Exercised("restore() failed".into()).into_why(),
+            "restore() failed"
+        );
+    }
+
+    // M8, at the arm that shipped it: an artifact that cannot boot at all must come back `NotRun`,
+    // never `DoesNotWork` — the latter is what let it earn a *verified absence* from `judge`, with
+    // the healthy control keeping the run green. `fail_create` is a candidate that never reaches the
+    // point where a snapshot could be attempted, which is the whole class.
+    //
+    // RED on the inverse: map the attempt's `Err` back to `DoesNotWork` (or move any arm before
+    // `vm.snapshot(` to `ProbeStop::Exercised`) and this fails. The end-to-end verdict is gated one
+    // module over (`an_unbootable_candidate_is_unverified_never_a_verified_absence`).
+    #[tokio::test]
+    async fn the_snapshot_probe_reports_an_unbootable_candidate_as_notrun() {
+        let vmm = FakeVmm::with_faults(FaultMenu {
+            fail_create: true,
+            ..FaultMenu::default()
+        });
+        let artifacts = ArtifactSet::new("/nonexistent/vmlinux", "/nonexistent/rootfs.erofs");
+        let outcome = snapshot_restore_probe(&vmm, &artifacts).await;
+        let ProbeOutcome::NotRun(why) = &outcome else {
+            panic!(
+                "a candidate that never booted decides nothing about snapshot support: {outcome:?}"
+            );
+        };
+        assert!(
+            !why.is_empty(),
+            "the undecided verdict must carry why it could not be decided"
+        );
+        // The level check's verdict on the same artifact is unchanged — a declared-present property
+        // that does not hold is still a failure, with the same text.
+        let level = snapshot_restore_roundtrip(&vmm, &artifacts).await;
+        assert_eq!(level.as_ref().err(), Some(why), "{level:?}");
+    }
+
+    // M8's BOUNDARY, in the shape of the m9 scan below: which side of the setup/measurement line
+    // each arm falls on is only observable on a KVM host with a snapshot-capable backend, so it is
+    // pinned on the source. Everything before `vm.snapshot(` is setup (the feature was never
+    // exercised → undecided); everything from there on is the measurement. An arm on the wrong side
+    // is either M8 itself (an unbootable candidate certified as a verified absence) or its inverse
+    // (a broken restore excused as undecidable).
+    #[test]
+    fn the_snapshot_probe_classifies_setup_before_the_attempt_and_measurement_after() {
+        let code = snapshot_attempt_code();
+        let attempt = code
+            .find("vm.snapshot(")
+            .expect("the probe must attempt a snapshot");
+        let (before, after) = code.split_at(attempt);
+        assert!(
+            before.contains("ProbeStop::Setup"),
+            "non-vacuity: the arms before the attempt are the setup ones"
+        );
+        assert!(
+            !before.contains("ProbeStop::Exercised"),
+            "an arm that runs BEFORE the snapshot attempt cannot have measured the feature — \
+             reporting it as a measured absence is docs/90 M8: {before}"
+        );
+        assert!(
+            after.contains("ProbeStop::Exercised"),
+            "non-vacuity: the arms from the attempt on are the measuring ones"
+        );
+        assert!(
+            !after.contains("ProbeStop::Setup"),
+            "an arm that runs AFTER the snapshot attempt has exercised the feature; calling it a \
+             setup failure would excuse a broken snapshot/restore as undecidable: {after}"
+        );
+    }
+
     // m9, the WIRING half. The classifier and the fs read are both gated above, but which kind
-    // `snapshot_restore_roundtrip` passes is only observable on a KVM host with a snapshot-capable
+    // `snapshot_restore_attempt` passes is only observable on a KVM host with a snapshot-capable
     // backend — the one thing the KVM-free suite structurally cannot reach (AGENTS.md rule 4). This
     // reads the source instead: inside that function, the console rendered AFTER `MicroVm::restore`
     // must be the restored one, and the snapshot-source arm before it must not be. Guards the
     // argument being swapped back (either direction) by a later edit.
     #[test]
     fn snapshot_restore_roundtrip_renders_the_restored_console_as_restored() {
-        const SRC: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/checks.rs"));
-        let after = SRC
-            .split("pub async fn snapshot_restore_roundtrip")
-            .nth(1)
-            .expect("the function must exist");
-        // The first column-0 `}` closes the function, so the slice below is its body alone — not
-        // this test's own needles further down the file.
-        let end = after
-            .find("\n}\n")
-            .expect("the function has a closing brace");
-        let body = after.get(..end).expect("a char boundary at a newline");
+        let code = snapshot_attempt_code();
+        let body = code.as_str();
 
         let restore_call = body
             .find("MicroVm::restore(")

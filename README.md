@@ -19,10 +19,62 @@ go stale here), `vmcell-privilege`, the two in-VM artifact builders, the
 control-plane tier (`vmcell-daemon`, `vmcelld`, `vmcell-daemon-client`, `vmcelld-ctl`,
 `vmcell-broker`).
 
+## The library API is the product surface
+
+Here is a whole cell as library code — boot, exec, assert on what the guest actually printed, tear
+down. It needs a KVM host, a `cloud-hypervisor` binary and built artifacts (§8), so it is a `no_run`
+doctest: `just test-doc` **compiles** it on every run and never executes it, which is what stops it
+from describing an API that has since moved.
+
+```rust,no_run
+use vmcell::artifact::{ch_binary_path, kernel_path, rootfs_path};
+use vmcell::{CloudHypervisor, ExecRequest, HostEnv, MicroVm, RootfsSource, VmConfig};
+
+#[tokio::main]
+async fn main() -> vmcell::Result<()> {
+    // One seam bundle, threaded by reference into every VM-spawning entry point. A test builds
+    // `hermetic()`; a long-lived composition root builds `HostEnv::shared()` once, whose id
+    // allocators are unique across processes.
+    let env = HostEnv::hermetic();
+    // `$VMCELL_CH_BIN`, else `cloud-hypervisor` on `PATH` — the one resolver every harness reads.
+    let vmm = CloudHypervisor::new(ch_binary_path());
+    // `kernel_path()` / `rootfs_path()` honor `$VMCELL_KERNEL` / `$VMCELL_ROOTFS` (the env contract
+    // below). The kernel must be absolute: `build()` refuses a relative path here rather than
+    // resolving it against whatever working directory the VMM child inherits.
+    let cfg = VmConfig::builder(kernel_path(), RootfsSource::Erofs { image: rootfs_path() })
+        .vcpus(2)
+        .mem_mib(512)
+        .build()?;
+
+    let mut vm = MicroVm::start(&vmm, cfg, &env).await?;
+    // The steward connects on first use; the argument is that call's connect budget, not a seam.
+    let out = vm
+        .steward(None)
+        .await?
+        .exec(ExecRequest::new(vec!["/bin/echo".into(), "isolated".into()]))
+        .await?;
+    assert_eq!(out.code, 0);
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "isolated");
+    // The graceful path; `Drop` is the panic path, and both run the one ordered teardown helper.
+    vm.shutdown().await?;
+    Ok(())
+}
+```
+
+The other worked examples live in the rustdoc, on the items they document, under the same doctest
+gate — `cargo doc --workspace --open`:
+
+| Example | Where |
+|---|---|
+| Suspend a zygote, fan out copy-on-write clones | `vmcell`'s crate docs |
+| Assemble a `Pipeline`; repack through the one inject-and-pack tail | `vmcell::artifact`'s module docs |
+| A `DaemonClient` upload + `run`/`exec`/`destroy` round trip | `vmcell-daemon-client`'s crate docs |
+| The artifact-conformance battery, both directions | `vmcell-artifact-validator`'s crate docs |
+
 ## CLI (`vmcell`)
 
-The library API is the product surface; the `vmcell` binary is a thin `clap` wrapper for trying it
-out. The binary lives in the `vmcell-cli` crate (`vmcell` itself declares no binary). Build it with
+The `vmcell` binary is a thin `clap` wrapper for trying the library out. It lives in the
+`vmcell-cli` crate (`vmcell` itself declares no binary). Build it with
 `cargo build` (the default feature set) and run subcommands with
 `cargo run -p vmcell-cli --bin vmcell -- <subcommand>`:
 

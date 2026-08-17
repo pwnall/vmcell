@@ -6,9 +6,12 @@
 //! (§8.1, Workspace layout). It defines the messages exchanged over the vsock connection and
 //! the framing bound both ends must agree on.
 //!
-//! It carries one non-wire item for the same reason: [`GUEST_TOOLS_APPLETS`], the
-//! host↔guest **agreement** on the multicall applet roster. `vmcell-guest-tools` links
-//! this crate for that const alone; it speaks no protocol.
+//! It also carries the host↔guest **agreements that are not wire vocabulary**, for the same reason:
+//! this is the one crate both sides link, so an agreement kept here cannot be two literals that
+//! drift. [`GUEST_TOOLS_APPLETS`] is the multicall applet roster (`vmcell-guest-tools` links this
+//! crate for that const alone; it speaks no protocol), [`STEWARD_VSOCK_PORT`] is the control-plane
+//! port, and [`STEWARD_ACCEPT_POLL`] / [`STEWARD_REBIND_IDLE`] are the two kernel-cmdline cadence
+//! tokens — each of which had already shipped as a pair of mirrored copies.
 #![forbid(unsafe_code)]
 #![deny(missing_docs, unsafe_op_in_unsafe_fn, rustdoc::broken_intra_doc_links)]
 #![deny(unreachable_pub)] // pub-in-private-module API-surface honesty
@@ -176,6 +179,115 @@ pub const GUEST_TOOLS_APPLETS: &[&str] =
 /// token, already reserved against caller spoofing by F3's prefix rule). This constant is the
 /// default the token is omitted for, so a `Pid1` cell's cmdline stays byte-identical to v32's.
 pub const STEWARD_VSOCK_PORT: u32 = 5000;
+
+/// One host→guest cadence knob carried on the kernel command line: the token's spelling, the value
+/// **both** sides fall back to, and the window the guest clamps an arriving value into (§5.3, The
+/// kernel command line).
+///
+/// It lives here, beside [`STEWARD_VSOCK_PORT`], for the same reason and after the same class of
+/// defect. The two tuning tokens used to be hand-spelled on both sides of the process boundary —
+/// one literal in `vmcell`'s cmdline builder, a second copy in `vmcell-steward`'s parser, with no
+/// shared const because `vmcell` does not depend on `vmcell-steward`. Re-spell either and nothing
+/// goes red: the guest simply falls back to its compiled cadence, which was *coincidentally* the
+/// number the host meant to send (finding G7). The three facts the two ends must agree on are one
+/// agreement, so they travel as one value.
+///
+/// **The default is deliberately the same number on both sides**, and that is not the defect. The
+/// host emits both tokens unconditionally, so the fallback is reached only when the command line
+/// came from somewhere else — an older host, a hand-written boot line, another harness — and the
+/// honest cadence there is *the* documented default, not a deliberately different number that
+/// would make an omitted token a silent behavior change. Deriving it makes the guest's fallback the
+/// host's default **by construction** instead of by coincidence; the falsifiability the finding
+/// asks for is bought by observing a guest honor a NON-default profile
+/// (`vmcell/tests/guest_tuning.rs`), never by making the two sides disagree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TuningToken {
+    /// The `key=` prefix as it appears on the kernel command line, `=` included.
+    ///
+    /// A **compatibility surface**, not a name: the parser is baked into `rootfs.erofs`, so a host
+    /// that re-spells this string silently loses the channel against every already-packed image
+    /// (the guest falls back, quietly). Changing the string is therefore a deliberate,
+    /// re-bake-forcing change — pinned as a literal by `the_tuning_tokens_are_the_wire_spelling` —
+    /// whereas renaming the *const* is a compile-time move on both sides at once.
+    pub token: &'static str,
+    /// The cadence used when the command line carries no such token, on both sides.
+    pub default: std::time::Duration,
+    /// Correctness floor. The command line is UNTRUSTED (§5.3), and the guest clamps up to this:
+    /// a hostile or fat-fingered `…_ms=0` must not turn a bind→poll→fail loop into a busy-spin in
+    /// PID 1. The host clamps its own config to the same floor (`Timeouts::clamped`), so the two
+    /// sides' validity domains are equal by derivation.
+    pub floor: std::time::Duration,
+    /// Ceiling the guest clamps down to, so an absurd value cannot stall the control plane past
+    /// any host budget. A host profile above it would be honored as the ceiling instead of as
+    /// written — a silent divergence, forbidden for the shipped profiles by
+    /// `every_shipped_timeouts_profile_is_honored_by_the_guest_verbatim`.
+    pub ceiling: std::time::Duration,
+}
+
+impl TuningToken {
+    /// The token as the host emits it for `value`: `<token><whole ms>`, one whitespace-free
+    /// cmdline token.
+    ///
+    /// The **one** place the wire form is composed. Sub-millisecond precision is truncated, exactly
+    /// as the pre-const emitter's `as_millis()` did; a value below [`Self::floor`] is the caller's
+    /// to clamp (the host does, at `build()` and again at `start()`).
+    #[must_use]
+    pub fn render(self, value: std::time::Duration) -> String {
+        format!("{}{}", self.token, ms_of(value))
+    }
+
+    /// [`Self::default`] in whole milliseconds — the fallback the guest's parse is handed.
+    #[must_use]
+    pub fn default_ms(self) -> u64 {
+        ms_of(self.default)
+    }
+
+    /// [`Self::floor`] in whole milliseconds — the lower clamp the guest's parse is handed.
+    #[must_use]
+    pub fn floor_ms(self) -> u64 {
+        ms_of(self.floor)
+    }
+
+    /// [`Self::ceiling`] in whole milliseconds — the upper clamp the guest's parse is handed.
+    #[must_use]
+    pub fn ceiling_ms(self) -> u64 {
+        ms_of(self.ceiling)
+    }
+}
+
+/// Whole milliseconds of `d`, saturating — the one narrowing on this channel, `try_from` rather
+/// than `as` (B10) because a `u128` truncation would render a *smaller* cadence than the caller
+/// asked for.
+fn ms_of(d: std::time::Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// The steward's failure-recovery cadence: the `bind` retry, and every reason
+/// `recovery_backoff` rate-limits (§5.3, §8.2).
+///
+/// **Not** the connect latency: the accept path blocks in `poll(2)` and wakes sub-millisecond on
+/// arrival (OPP-2). The floor is load-bearing on the failure paths — see [`TuningToken::floor`].
+pub const STEWARD_ACCEPT_POLL: TuningToken = TuningToken {
+    token: "vmcell_accept_poll_ms=",
+    default: std::time::Duration::from_millis(20),
+    floor: std::time::Duration::from_millis(1),
+    ceiling: std::time::Duration::from_millis(10_000),
+};
+
+/// The steward's re-bind idle window — the post-restore **deaf listener** bound (§8.2, Restore
+/// correctness: a restored VM is not a fresh VM).
+///
+/// On a CH/FC `--restore` the vhost-vsock device is re-created and the pre-snapshot listener stops
+/// yielding accepts; the guest re-attaches only by re-binding, which it does after this much idle
+/// time. So this is the number that bounds how long a restored guest stays unreachable, and the
+/// user-visible cost of the channel being unfalsifiable was a caller asking for a tighter window
+/// and silently getting this one.
+pub const STEWARD_REBIND_IDLE: TuningToken = TuningToken {
+    token: "vmcell_rebind_idle_ms=",
+    default: std::time::Duration::from_millis(250),
+    floor: std::time::Duration::from_millis(20),
+    ceiling: std::time::Duration::from_millis(60_000),
+};
 
 /// IPv4 reconfiguration the guest applies to `eth0` during a post-restore resync
 /// (H-VMM-1 — "rotate everything").
@@ -532,6 +644,105 @@ mod tests {
                 "duplicate applet name {name:?}: the second copy is unreachable"
             );
             seen.push(name);
+        }
+    }
+
+    // The two tuning tokens' SPELLING is a wire format, not a name: `vmcell-steward`'s parser is
+    // baked into `rootfs.erofs`, so a host that re-spells one keeps booting — the guest just falls
+    // back to its compiled cadence and nothing says the request was dropped (finding G7). Renaming
+    // the const is free (a compile-time move on both sides); changing these strings is not, and
+    // this is the literal that makes the difference visible in review.
+    //
+    // RED on the inverse: edit either `token` field (say `vmcell_accept_poll=`) and the matching
+    // assertion fires naming both spellings.
+    #[test]
+    fn the_tuning_tokens_are_the_wire_spelling() {
+        assert_eq!(
+            STEWARD_ACCEPT_POLL.token, "vmcell_accept_poll_ms=",
+            "re-spelling this token silently loses the channel against every already-packed rootfs"
+        );
+        assert_eq!(
+            STEWARD_REBIND_IDLE.token, "vmcell_rebind_idle_ms=",
+            "re-spelling this token silently loses the channel against every already-packed rootfs"
+        );
+    }
+
+    // What `render` composes must be ONE kernel-cmdline token, for every value a caller can hand
+    // it. `lib/cmdline.c`'s `next_arg` splits on whitespace and treats `"` as a quoting
+    // metacharacter, so a rendered value carrying either would forge (or swallow) neighbouring boot
+    // parameters — the same hazard `vmcell::config::is_cmdline_unsafe_char` guards on the host's
+    // caller-supplied inputs, asserted here on the one composer of these two tokens.
+    //
+    // RED on the inverse: render `format!("{} {}", ...)` (a space between key and value) and the
+    // whitespace assert fires; drop the `token` prefix and the prefix assert fires.
+    #[test]
+    fn a_rendered_tuning_token_is_a_single_cmdline_token() {
+        for token in [STEWARD_ACCEPT_POLL, STEWARD_REBIND_IDLE] {
+            for value in [
+                std::time::Duration::ZERO,
+                std::time::Duration::from_micros(500),
+                token.floor,
+                token.default,
+                token.ceiling,
+                std::time::Duration::from_secs(u64::from(u32::MAX)),
+            ] {
+                let rendered = token.render(value);
+                assert!(
+                    rendered.starts_with(token.token),
+                    "{rendered:?} must carry the shared token prefix {:?}",
+                    token.token
+                );
+                assert!(
+                    !rendered
+                        .chars()
+                        .any(|c| c.is_whitespace() || c.is_control() || c == '"'),
+                    "{rendered:?} must be a single kernel-cmdline token"
+                );
+                // The value half is what the guest parses back: whole milliseconds, decimal,
+                // saturating rather than wrapping (a `u128 as u64` truncation would render a
+                // *smaller* cadence than the caller asked for).
+                assert_eq!(
+                    rendered
+                        .strip_prefix(token.token)
+                        .and_then(|v| v.parse::<u64>().ok()),
+                    Some(ms_of(value)),
+                    "{rendered:?} must carry the value in whole ms"
+                );
+            }
+        }
+    }
+
+    // A default outside its own clamp window is the silent-divergence shape this type exists to
+    // prevent: the host would emit the number it documents as the default and the guest would honor
+    // the clamped one instead, with nothing red anywhere. `floor <= default <= ceiling` is what
+    // makes "the guest's fallback IS the host's default" a fact rather than a hope.
+    //
+    // RED on the inverse: set `STEWARD_ACCEPT_POLL.default` to 20 s (past its 10 s ceiling) and the
+    // ceiling assert fires; set it to `ZERO` and the floor assert fires.
+    #[test]
+    fn every_tuning_token_default_lies_inside_its_own_window() {
+        for token in [STEWARD_ACCEPT_POLL, STEWARD_REBIND_IDLE] {
+            assert!(
+                token.floor <= token.ceiling,
+                "{:?}: an inverted window clamps every value to the ceiling",
+                token.token
+            );
+            assert!(
+                token.default >= token.floor,
+                "{:?}: the default is below its own floor, so the guest would clamp UP and quietly \
+                 run a cadence the host never asked for",
+                token.token
+            );
+            assert!(
+                token.default <= token.ceiling,
+                "{:?}: the default is above its own ceiling, so the guest would clamp DOWN",
+                token.token
+            );
+            // The ms accessors are what the guest's parse is handed; a lossy narrowing here would
+            // hand it a different window than the `Duration` fields document.
+            assert_eq!(token.default_ms(), ms_of(token.default));
+            assert_eq!(token.floor_ms(), ms_of(token.floor));
+            assert_eq!(token.ceiling_ms(), ms_of(token.ceiling));
         }
     }
 

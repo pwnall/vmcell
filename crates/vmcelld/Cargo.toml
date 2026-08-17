@@ -4,20 +4,20 @@ version = "0.1.0"
 edition = "2024"
 rust-version.workspace = true
 license = "MIT OR Apache-2.0"
-description = "vmcelld: the blessed vmcell control-plane daemon binary (thin wrapper over vmcell-daemon; design §D)"
+description = "vmcelld: the blessed vmcell control-plane daemon binary (thin wrapper over vmcell-daemon; design §11)"
 publish = false
 
 # Thin binary wrapper (AGENTS.md "functionality in the library, binary is the wrapper"): it blesses
-# (refuse-to-start without the three caps, RETAINING them — no uid drop/exec, §18.2), parses the
+# (refuse-to-start without the three caps, RETAINING them — no uid drop/exec, §11.2), parses the
 # server config, and runs `vmcell-daemon`'s server. All logic lives in the library.
 [[bin]]
 name = "vmcelld"
 path = "src/main.rs"
 
 [dependencies]
-vmcell-daemon = { path = "../vmcell-daemon", version = "0.3.0" }
+vmcell-daemon = { path = "../vmcell-daemon", version = "0.4.0" }
 vmcell-privilege = { path = "../vmcell-privilege", version = "0.2.0" }
-# The setup-broker cutover (§20.5): `fork_privileged_child` splits vmcelld into the capped broker
+# The setup-broker cutover (§12.4): `fork_privileged_child` splits vmcelld into the capped broker
 # child (owns the registry) and the cap-dropped HTTP parent; `libc` for the child's `_exit`.
 vmcell-broker = { path = "../vmcell-broker", version = "0.2.0" }
 libc = "0.2"

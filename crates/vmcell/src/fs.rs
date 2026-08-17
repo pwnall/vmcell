@@ -373,14 +373,6 @@ impl Drop for VirtioFsDaemon {
     }
 }
 
-/// The ceiling on the `virtiofsd` socket-readiness wait, in milliseconds.
-///
-/// A failure ceiling, not a knob: §9.4 keeps the correctness ceilings as constants and puts only
-/// the *cadence* in `Timeouts` (`api_socket_poll`). Same 1 s ceiling `spawn_ch` passes to
-/// `register_and_await_ready` for the VMM control socket.
-#[cfg(not(feature = "experiment-fuse"))]
-const SOCKET_READY_TIMEOUT_MS: u64 = 1000;
-
 /// The `(timeout_ms, interval_ms)` pair the `virtiofsd` readiness wait passes to
 /// [`crate::vmm::wait_for_socket`].
 ///
@@ -388,10 +380,20 @@ const SOCKET_READY_TIMEOUT_MS: u64 = 1000;
 /// wait") is unit-testable without spawning a daemon: the cadence must come from the caller's
 /// profile, never from a hard-coded grid. `wait_for_socket` clamps the interval to ≥1 ms itself,
 /// so a zero-valued profile cannot busy-spin here either.
+///
+/// The **ceiling** is a failure ceiling, not a knob (§9.4 keeps the correctness ceilings as
+/// constants and puts only the cadence in `Timeouts`) — and it is the ONE
+/// [`crate::vmm::VMM_SOCKET_READY_TIMEOUT_MS`], not a copy of its value. A local `1000` sat here
+/// with a doc claiming it was "the same 1 s ceiling `spawn_ch` passes to
+/// `register_and_await_ready`", which was doubly untrue: that entry point takes no ceiling
+/// argument at all, and nothing tied the two numbers together (docs/90 `fs.rs:380`). Both waits
+/// answer the same question — has a locally spawned helper created its listening socket yet — so
+/// they ride one const, and `socket_wait_ceiling_is_the_one_shared_readiness_ceiling` reddens if
+/// they ever diverge.
 #[cfg(not(feature = "experiment-fuse"))]
 fn socket_wait_budget(timeouts: &crate::config::Timeouts) -> (u64, u64) {
     (
-        SOCKET_READY_TIMEOUT_MS,
+        crate::vmm::VMM_SOCKET_READY_TIMEOUT_MS,
         u64::try_from(timeouts.api_socket_poll.as_millis()).unwrap_or(u64::MAX),
     )
 }
@@ -535,8 +537,9 @@ mod uid_tests {
 
 #[cfg(all(test, not(feature = "experiment-fuse")))]
 mod readiness_pacing_tests {
-    use super::{SOCKET_READY_TIMEOUT_MS, readiness_failure_message, socket_wait_budget};
+    use super::{readiness_failure_message, socket_wait_budget};
     use crate::config::Timeouts;
+    use crate::vmm::VMM_SOCKET_READY_TIMEOUT_MS;
     use std::time::Duration;
 
     // §9.4: `api_socket_poll` paces EVERY daemon readiness wait. This goes RED on the pre-fix
@@ -550,7 +553,7 @@ mod readiness_pacing_tests {
         };
         assert_eq!(
             socket_wait_budget(&fast),
-            (SOCKET_READY_TIMEOUT_MS, 2),
+            (VMM_SOCKET_READY_TIMEOUT_MS, 2),
             "the readiness cadence must be the caller's api_socket_poll"
         );
 
@@ -558,14 +561,24 @@ mod readiness_pacing_tests {
             api_socket_poll: Duration::from_millis(37),
             ..Timeouts::default()
         };
-        assert_eq!(socket_wait_budget(&slow), (SOCKET_READY_TIMEOUT_MS, 37));
+        assert_eq!(socket_wait_budget(&slow), (VMM_SOCKET_READY_TIMEOUT_MS, 37));
     }
 
-    // The ceiling is a correctness constant (§9.4), and it must match what the pre-fix loop
-    // budgeted (50 × 20 ms) so this fix does not silently shorten or lengthen the wait.
+    // The ceiling is a correctness constant (§9.4) — and it is not a SECOND copy of one. virtiofsd's
+    // socket wait rides the same `vmm::VMM_SOCKET_READY_TIMEOUT_MS` the VMM control socket does, so
+    // the pair cannot drift the way the former local `1000` could (docs/90 `fs.rs:380`). RED on the
+    // inverse: re-introduce a local ceiling here and retune it (the only defect this class has —
+    // one of the two numbers moving) and the first assert fails naming both values.
     #[test]
-    fn socket_wait_ceiling_matches_the_previous_total_budget() {
-        assert_eq!(socket_wait_budget(&Timeouts::default()).0, 1000);
+    fn socket_wait_ceiling_is_the_one_shared_readiness_ceiling() {
+        assert_eq!(
+            socket_wait_budget(&Timeouts::default()).0,
+            VMM_SOCKET_READY_TIMEOUT_MS,
+            "virtiofsd's readiness ceiling must BE the shared one, not equal a copy of it"
+        );
+        // …and that shared ceiling is still the 1 s the pre-consolidation 50 × 20 ms loop
+        // budgeted, so neither consolidation silently shortened or lengthened this wait.
+        assert_eq!(VMM_SOCKET_READY_TIMEOUT_MS, 1000);
     }
 
     // The shared `wait_for_socket` reports a generic Timeout / "process exited early"; the two

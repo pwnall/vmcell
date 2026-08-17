@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# ONE predicate for the lean-member invariant (AGENTS.md "One law, one predicate"; design §12.8 #4
-# and §18.1). A governed member must not link the packages its row of the LEAN MATRIX below bans.
+# ONE predicate for the lean-member invariant (AGENTS.md "One law, one predicate"; design v15 §12.8 #4
+# and §15.2). A governed member must not link the packages its row of the LEAN MATRIX below bans.
 #
 # `--color never` is LOAD-BEARING, not tidiness. `.github/workflows/ci.yml` sets
 # `CARGO_TERM_COLOR: always` at WORKFLOW level, so it applies to every job and every `run:` block.
@@ -39,7 +39,7 @@ set -euo pipefail
 #   axum|vmcell           — the daemon's SERVER stack. `vmcell-daemon-client` depends on
 #                           `vmcell-daemon` with `default-features = false` so the wire DTOs are
 #                           single-sourced without dragging the axum router and the `vmcell` host
-#                           lib into every consumer (design §18.1; AGENTS.md "DTOs are
+#                           lib into every consumer (design §11.1; AGENTS.md "DTOs are
 #                           single-sourced (client links `default-features = false`)"). That
 #                           boundary had no gate at all — dropping the flag would have gone
 #                           unnoticed (docs/81 m28).

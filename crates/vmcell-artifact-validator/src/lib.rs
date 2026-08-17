@@ -56,6 +56,112 @@
 //! [`kconfig::KconfigValues`] is the matching mechanism for the other half of §5.6: asserting
 //! against a *resolved* `.config`, since `make olddefconfig` silently drops symbols whose
 //! dependencies are unmet.
+//!
+//! ## Example: validating an artifact pair
+//!
+//! Both examples below are `no_run` doctests: they boot real micro-VMs, and [`validate`] refuses to
+//! run at all without `/dev/kvm` rather than emit a green all-skipped report. `just test-doc`
+//! compiles them, so this is the battery's API as it ships.
+//!
+//! ```no_run
+//! use std::time::Duration;
+//! use vmcell_artifact_validator::{ArtifactSet, Level, ValidationOptions, harness, validate};
+//!
+//! # #[tokio::main]
+//! # async fn main() -> vmcell::Result<()> {
+//! // A custom kernel paired with a known-good rootfs. The caller supplies BOTH, because
+//! // "known-good" is the management system's judgement and not this crate's. The `harness` getters
+//! // are the documented downstream route — `$VMCELL_KERNEL` / `$VMCELL_ROOTFS` after an existence
+//! // check — and they panic naming that route rather than guessing when it is not set.
+//! let artifacts = ArtifactSet::new("/artifacts/vmlinux-custom", harness::get_rootfs());
+//! let opts = ValidationOptions {
+//!     level: Level::Full,
+//!     // Bounds the WHOLE run — every level, every boot, end to end — on top of the per-check
+//!     // deadlines. `None` opts out explicitly for a caller that bounds the run itself (a nextest
+//!     // timeout, a CI job budget); either way it is honored, and exceeding it is a typed
+//!     // `vmcell::Error::Timeout` naming the level that outran it, never a hang.
+//!     run_budget: Some(Duration::from_secs(15 * 60)),
+//! };
+//! // `ValidationOptions::level(Level::Core)` is the same choice on the default budget.
+//!
+//! let report = validate(&artifacts, &opts).await?;
+//! // A skip is never a pass, so coverage is judged separately from success.
+//! for skipped in report.skipped() {
+//!     eprintln!("skipped {}: {:?}", skipped.id, skipped.status);
+//! }
+//! if let Err(failures) = report.into_result() {
+//!     for f in &failures {
+//!         eprintln!("FAIL {}: {:?}", f.id, f.status);
+//!     }
+//! }
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ## Example: the two-directional battery
+//!
+//! [`conformance::run_battery`] judges an artifact's **declaration** against the data plane in both
+//! directions, and pairs every absence probe with a positive control on a second artifact (§10.6).
+//!
+//! ```no_run
+//! use vmcell::feature::{Feature, FeatureDeclaration, Source};
+//! use vmcell::vmm::cloud_hypervisor::CloudHypervisor;
+//! use vmcell_artifact_validator::conformance::{
+//!     ArtifactId, ConformanceOptions, ConformanceSubject, LiveProbe, Substrate, run_battery,
+//! };
+//! use vmcell_artifact_validator::{ArtifactSet, harness};
+//!
+//! # #[tokio::main]
+//! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let vmm = CloudHypervisor::new(harness::ch_bin());
+//! // What this backend on this host can exercise at all, from `vmcell`'s one intersection site.
+//! // Where the substrate itself removes a feature, a declared-PRESENT claim is a `Fail` (it cannot
+//! // hold here, and the provenance names who says so) and a declared-ABSENT one is a `Skip` — never
+//! // a measured absence, because the control would fail for the substrate's reason, not the
+//! // artifact's.
+//! let substrate = Substrate::of(&vmm);
+//!
+//! // The candidate. Its declaration is read from the sidecar beside its image — the travel form of
+//! // its registry entry — and an absent sidecar is the stated baseline, not "everything absent".
+//! let candidate_artifacts = ArtifactSet::new(harness::get_vmlinux(), "/artifacts/rootfs-acme.erofs");
+//! let candidate = ConformanceSubject {
+//!     id: ArtifactId::new("acme"),
+//!     declaration: FeatureDeclaration::load_beside(
+//!         &candidate_artifacts.rootfs,
+//!         Source::Rootfs("acme".into()),
+//!     )?,
+//!     artifacts: candidate_artifacts,
+//! };
+//!
+//! // The positive control: a DIFFERENT artifact that declares what the candidate denies. Both
+//! // mistakes — the control being the candidate, and a control that declares nothing — are refused
+//! // before anything boots, because a battery with no usable control cannot verify an absence.
+//! let mut declaration = FeatureDeclaration::baseline(Source::Rootfs("default".into()));
+//! declaration.stances.insert(Feature::SnapshotRestore, true);
+//! let control = ConformanceSubject {
+//!     id: ArtifactId::new("default"),
+//!     artifacts: ArtifactSet::new(harness::get_vmlinux(), harness::get_rootfs()),
+//!     declaration,
+//! };
+//!
+//! let report = run_battery(
+//!     &LiveProbe::new(&vmm),
+//!     &substrate,
+//!     &candidate,
+//!     &control,
+//!     &ConformanceOptions::default(),
+//! )
+//! .await?;
+//!
+//! // `Warn` is an under-claim — declared absent, demonstrably working. It is a documentation defect,
+//! // so it never fails the run; an UN-triaged one has already become a `Fail` by the time it lands
+//! // here, via `ConformanceOptions::expected_warnings`.
+//! for w in report.warnings() {
+//!     eprintln!("under-claim {}: {:?}", w.id, w.status);
+//! }
+//! # Ok(())
+//! # }
+//! ```
 #![deny(missing_docs, unsafe_op_in_unsafe_fn, rustdoc::broken_intra_doc_links)]
 #![deny(unreachable_pub)] // pub-in-private-module API-surface honesty
 #![deny(
@@ -89,6 +195,8 @@ pub mod harness;
 pub mod kconfig;
 
 use std::path::PathBuf;
+use std::time::Duration;
+use vmcell::vmm::Vmm;
 use vmcell::vmm::cloud_hypervisor::CloudHypervisor;
 
 /// The artifact pair under validation. The caller always supplies **both** — the custom
@@ -162,24 +270,57 @@ impl Level {
     }
 }
 
+/// The default overall budget for a [`validate`] run: generous enough for a `Level::Full` roster of
+/// real, sequential boots, finite so a wedged one is a typed error instead of a hung CI job.
+///
+/// Deliberately its own constant rather than a reuse of
+/// [`conformance::DEFAULT_BATTERY_BUDGET`]: the two bound different rosters (the three levels here,
+/// a declared feature roster there), and one const for both would silently re-budget one when the
+/// other's roster grew.
+pub const DEFAULT_RUN_BUDGET: Duration = Duration::from_secs(20 * 60);
+
 /// Knobs for a validation run.
 #[derive(Clone, Debug)]
 pub struct ValidationOptions {
     /// The deepest level of checks to run (default [`Level::Core`]).
     pub level: Level,
+    /// The wall-clock budget for the **whole** run — every level, every boot, end to end
+    /// (default `Some(`[`DEFAULT_RUN_BUDGET`]`)`).
+    ///
+    /// Per-check deadlines are unchanged and each one still fails loud; this bounds their **sum**.
+    /// A `Level::Full` run boots several VMs sequentially, so without it the only ceiling was
+    /// whatever those deadlines happened to add up to — the gap
+    /// [`conformance::ConformanceOptions::battery_budget`] closed for the battery and not for this,
+    /// older, entry point (design §17; the scoping is recorded in `docs/implementation-notes.md`).
+    ///
+    /// `None` opts out **explicitly**, for a caller that bounds the run itself (a nextest timeout, a
+    /// CI job budget). Either way it is honored, never silently ignored: exceeded is
+    /// [`vmcell::Error::Timeout`] naming the budget, the level that outran it and the checks that
+    /// completed first — never a hang, and never a green report with its tail missing.
+    pub run_budget: Option<Duration>,
 }
 
 impl Default for ValidationOptions {
     fn default() -> Self {
-        Self { level: Level::Core }
+        Self {
+            level: Level::Core,
+            run_budget: Some(DEFAULT_RUN_BUDGET),
+        }
     }
 }
 
 impl ValidationOptions {
-    /// Options running up to `level`.
+    /// Options running up to `level`, on the default budget.
     #[must_use]
     pub fn level(level: Level) -> Self {
-        Self { level }
+        // Functional update, not a fresh literal: a constructor that re-spells the other fields is
+        // how the budget would silently become `None` for every `level()` caller when a later field
+        // is added. `the_default_and_the_level_constructor_both_carry_the_default_budget` reddens
+        // on one.
+        Self {
+            level,
+            ..Self::default()
+        }
     }
 }
 
@@ -349,6 +490,8 @@ impl ValidationReport {
 /// # Errors
 /// - [`vmcell::Error::Artifact`] if `artifacts.kernel` or `artifacts.rootfs` does not exist.
 /// - [`vmcell::Error::CapabilityUnavailable`] if `/dev/kvm` is absent (cannot validate).
+/// - [`vmcell::Error::Timeout`] if the run outran [`ValidationOptions::run_budget`], naming the
+///   level that outran it and the checks that completed first.
 pub async fn validate(
     artifacts: &ArtifactSet,
     opts: &ValidationOptions,
@@ -375,15 +518,31 @@ pub async fn validate(
     }
 
     let vmm = CloudHypervisor::new(harness::ch_bin());
-    let mut outcomes: Vec<CheckOutcome> = Vec::new();
+    validate_on(&vmm, artifacts, opts).await
+}
 
-    checks::run_core(&vmm, artifacts, &mut outcomes).await;
-    if opts.level >= Level::Extended {
-        checks::run_extended(&vmm, artifacts, &mut outcomes).await;
-    }
-    if opts.level >= Level::Full {
-        checks::run_full(&vmm, artifacts, &mut outcomes).await;
-    }
+/// [`validate`]'s body, generic over the backend so the run budget is drivable without KVM.
+///
+/// Private: the shipped entry point hardcodes cloud-hypervisor by design (a backend knob on
+/// [`ValidationOptions`] is design §17's *other* recorded gap, and closing it is not this
+/// function's business).
+async fn validate_on<V: Vmm>(
+    vmm: &V,
+    artifacts: &ArtifactSet,
+    opts: &ValidationOptions,
+) -> vmcell::Result<ValidationReport> {
+    let outcomes = match run_levels_bounded(opts.level, opts.run_budget, |level| async move {
+        let mut level_outcomes: Vec<CheckOutcome> = Vec::new();
+        run_level(level, vmm, artifacts, &mut level_outcomes).await;
+        level_outcomes
+    })
+    .await
+    {
+        Ok(outcomes) => outcomes,
+        Err((budget, level, completed)) => {
+            return Err(run_budget_exceeded(budget, level, &completed));
+        }
+    };
 
     tracing::info!(
         level = opts.level.as_str(),
@@ -395,6 +554,90 @@ pub async fn validate(
         "artifact validation complete"
     );
     Ok(ValidationReport { outcomes })
+}
+
+/// Runs one level's checks — **the one place** a [`Level`] is turned into its runner, so a level
+/// cannot acquire a second, unbudgeted call site
+/// (`every_level_runner_is_called_only_through_run_level` scans for one).
+async fn run_level<V: Vmm>(
+    level: Level,
+    vmm: &V,
+    artifacts: &ArtifactSet,
+    outcomes: &mut Vec<CheckOutcome>,
+) {
+    match level {
+        Level::Core => checks::run_core(vmm, artifacts, outcomes).await,
+        Level::Extended => checks::run_extended(vmm, artifacts, outcomes).await,
+        Level::Full => checks::run_full(vmm, artifacts, outcomes).await,
+    }
+}
+
+/// Runs every level up to `deepest` under **one absolute deadline**, accumulating their outcomes.
+///
+/// `Err((budget, level, completed))` is "this level outran the budget", carrying every check that
+/// had completed — the shape [`conformance::ConformanceError::BatteryBudgetExceeded`] uses, because
+/// a bare timeout that says only "too slow" never says where it hung.
+///
+/// Generic over the runner so the budget is gated against a future the test controls: a boot is not
+/// a deterministic wedge (`harness::try_start_vm` wires the real cgroup seam, which fails *fast* on
+/// a host with no delegated subtree), and a gate whose wedge depends on the machine is not a gate.
+async fn run_levels_bounded<F, Fut>(
+    deepest: Level,
+    budget: Option<Duration>,
+    mut run: F,
+) -> Result<Vec<CheckOutcome>, (Duration, Level, Vec<CheckOutcome>)>
+where
+    F: FnMut(Level) -> Fut,
+    Fut: Future<Output = Vec<CheckOutcome>>,
+{
+    // ONE `Instant`, computed once, bounding the whole run — a per-level `Duration` would hand each
+    // level a fresh copy of the budget and bound nothing overall (§9.4: outer-bounds-inner). Kept
+    // beside the budget it came from so the refusal can name it without an `unwrap`.
+    let bound = budget.map(|budget| (budget, tokio::time::Instant::now() + budget));
+    let mut completed: Vec<CheckOutcome> = Vec::new();
+    for level in [Level::Core, Level::Extended, Level::Full] {
+        if level > deepest {
+            break;
+        }
+        let run_one = run(level);
+        // `timeout_at`, not `timeout`: one deadline for every level is what makes the bound the
+        // run's, and a level that starts already past it is refused immediately instead of being
+        // handed the rest of a budget that is gone.
+        let level_outcomes = match bound {
+            Some((budget, deadline)) => match tokio::time::timeout_at(deadline, run_one).await {
+                Ok(level_outcomes) => level_outcomes,
+                // The wedged level's own partial outcomes go down with the cancelled future (it
+                // owns its buffer); what the error carries is every check that COMPLETED, which is
+                // the half a reader acts on.
+                Err(_) => return Err((budget, level, completed)),
+            },
+            None => run_one.await,
+        };
+        completed.extend(level_outcomes);
+    }
+    Ok(completed)
+}
+
+/// The typed refusal a run that outran its budget returns.
+///
+/// [`vmcell::Error::Timeout`] rather than a `Fail` outcome in the report: the artifact violated
+/// nothing — the *run* did not finish — and a `Skip` would make an unfinished run green (the
+/// skip==pass hazard this crate's rustdoc opens with).
+fn run_budget_exceeded(
+    budget: Duration,
+    level: Level,
+    completed: &[CheckOutcome],
+) -> vmcell::Error {
+    let ids: Vec<&str> = completed.iter().map(|o| o.id).collect();
+    vmcell::Error::Timeout(format!(
+        "artifact validation exceeded its {}s run_budget while running the {} checks; {} check(s) \
+         completed first: [{}]. The budget bounds the whole run (per-check deadlines are \
+         unchanged), so this is a wedged boot or an under-budgeted run, never a hang.",
+        budget.as_secs(),
+        level.as_str(),
+        ids.len(),
+        ids.join(", ")
+    ))
 }
 
 #[cfg(test)]
@@ -533,11 +776,9 @@ mod tests {
         });
         let artifacts = ArtifactSet::new("/nonexistent/vmlinux", "/nonexistent/rootfs.erofs");
         let mut outcomes = Vec::new();
-        match level {
-            Level::Core => checks::run_core(&vmm, &artifacts, &mut outcomes).await,
-            Level::Extended => checks::run_extended(&vmm, &artifacts, &mut outcomes).await,
-            Level::Full => checks::run_full(&vmm, &artifacts, &mut outcomes).await,
-        }
+        // Through the shipped `run_level`, not a second `match` over the levels: a copy here would
+        // be the roster gates measuring a dispatch table `validate` does not use.
+        run_level(level, &vmm, &artifacts, &mut outcomes).await;
         assert!(
             outcomes.iter().all(|o| o.level == level),
             "a level's runner must record only its own level: {:?}",
@@ -589,5 +830,190 @@ mod tests {
         assert!(Level::Core < Level::Extended);
         assert!(Level::Extended < Level::Full);
         assert!(Level::Full >= Level::Core);
+    }
+
+    // ── The run budget (design §17's gap for `validate`, closed) ──────────────────────────────
+
+    /// One outcome, so a stub level runner returns something identifiable.
+    fn stub_outcome(level: Level) -> CheckOutcome {
+        CheckOutcome::pass(
+            match level {
+                Level::Core => "stub.core",
+                Level::Extended => "stub.extended",
+                Level::Full => "stub.full",
+            },
+            level,
+        )
+    }
+
+    // A wedged level trips the WHOLE-RUN budget as a typed error naming it — the property per-check
+    // deadlines cannot provide, since a `Level::Full` run boots several VMs sequentially and their
+    // sum was the only ceiling. The outer `timeout` is this test's own harness bound: if the budget
+    // ever stops binding, this fails in five seconds instead of wedging the suite forever.
+    //
+    // Real time, deliberately (the battery-budget test's argument): `start_paused` would auto-advance
+    // the clock past the budget and prove nothing about wall-clock behavior. A STUB runner, also
+    // deliberately: a real boot is not a deterministic wedge — `try_start_vm` wires the real cgroup
+    // seam, which fails fast on a host with no delegated subtree, so a boot-driven version of this
+    // gate would pass here and pass vacuously on CI.
+    //
+    // RED on the inverse (verified): drop the `timeout_at` in `run_levels_bounded` and this fails on
+    // the harness timeout instead of returning.
+    #[tokio::test]
+    async fn the_run_budget_bounds_the_whole_run_typed_and_never_hangs() {
+        let budget = Duration::from_millis(50);
+        let run = run_levels_bounded(Level::Full, Some(budget), |level| async move {
+            if level == Level::Extended {
+                // A level that never answers — not one that answers slowly. Only the run-wide
+                // budget can end this.
+                let () = std::future::pending().await;
+            }
+            vec![stub_outcome(level)]
+        });
+        let outcome = tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .expect("the run must return on its own budget, not on this harness timeout");
+
+        let Err((reported, level, completed)) = outcome else {
+            panic!("a wedged level must trip the run budget, got {outcome:?}");
+        };
+        assert_eq!(reported, budget);
+        assert_eq!(level, Level::Extended, "the error names WHERE it hung");
+        assert_eq!(
+            completed.iter().map(|o| o.id).collect::<Vec<&str>>(),
+            vec!["stub.core"],
+            "the checks that completed before the wedge are what the reader acts on"
+        );
+
+        let rendered = run_budget_exceeded(reported, level, &completed).to_string();
+        assert!(
+            rendered.contains("run_budget") && rendered.contains("extended"),
+            "the typed error names the budget and the level that outran it: {rendered}"
+        );
+        assert!(
+            rendered.contains("stub.core"),
+            "…and the checks that completed first: {rendered}"
+        );
+        assert!(
+            matches!(
+                run_budget_exceeded(reported, level, &completed),
+                vmcell::Error::Timeout(_)
+            ),
+            "an unfinished run is a timeout, never a report whose missing tail reads as green"
+        );
+    }
+
+    // The positive control for the gate above, in both directions: a run that fits its budget
+    // returns every level's outcomes, and `None` (the explicit opt-out) runs unbounded. Without this
+    // the budget could be bounding everything to zero and the test above would still pass.
+    #[tokio::test]
+    async fn a_run_that_fits_its_budget_reports_every_level_it_was_asked_for() {
+        for budget in [Some(Duration::from_secs(30)), None] {
+            let outcomes = run_levels_bounded(Level::Extended, budget, |level| async move {
+                vec![stub_outcome(level)]
+            })
+            .await
+            .expect("a run that fits its budget reports");
+            assert_eq!(
+                outcomes.iter().map(|o| o.id).collect::<Vec<&str>>(),
+                vec!["stub.core", "stub.extended"],
+                "budget {budget:?}: every level up to the deepest asked for, and no deeper"
+            );
+        }
+    }
+
+    // The default arm gets the strictest scrutiny (AGENTS.md): the budget must be ON by default, and
+    // the `level()` constructor must not silently drop it — a caller that never names the budget is
+    // the caller this gap was open for.
+    #[test]
+    fn the_default_and_the_level_constructor_both_carry_the_default_budget() {
+        assert_eq!(
+            ValidationOptions::default().run_budget,
+            Some(DEFAULT_RUN_BUDGET)
+        );
+        assert_eq!(
+            ValidationOptions::level(Level::Full).run_budget,
+            Some(DEFAULT_RUN_BUDGET)
+        );
+        assert_eq!(ValidationOptions::level(Level::Full).level, Level::Full);
+    }
+
+    // The wiring, behaviorally: `validate_on` runs exactly the levels its options ask for, through
+    // the bounded sequencer, and returns a report. `fail_create` keeps it KVM-free — every check
+    // records or skips its id on every path, so the rosters are enumerable against a backend that
+    // cannot create a VM.
+    #[tokio::test]
+    async fn validate_on_runs_exactly_the_levels_its_options_ask_for() {
+        let vmm = vmcell::vmm::FakeVmm::with_faults(vmcell::vmm::FaultMenu {
+            fail_create: true,
+            ..vmcell::vmm::FaultMenu::default()
+        });
+        let artifacts = ArtifactSet::new("/nonexistent/vmlinux", "/nonexistent/rootfs.erofs");
+        for (deepest, expected) in [
+            (Level::Core, vec![Level::Core]),
+            (Level::Extended, vec![Level::Core, Level::Extended]),
+            (Level::Full, vec![Level::Core, Level::Extended, Level::Full]),
+        ] {
+            let report = validate_on(&vmm, &artifacts, &ValidationOptions::level(deepest))
+                .await
+                .expect("a run inside its budget reports");
+            let mut levels: Vec<Level> = report.outcomes.iter().map(|o| o.level).collect();
+            levels.dedup();
+            assert_eq!(levels, expected, "deepest = {deepest:?}");
+            assert!(
+                report
+                    .outcomes
+                    .iter()
+                    .any(|o| o.id == "boot.config" && matches!(o.status, CheckStatus::Pass)),
+                "the run really reached the shipped checks: {:?}",
+                report.outcomes
+            );
+        }
+    }
+
+    /// This file's production text — everything before the test module.
+    fn production_code() -> &'static str {
+        const SRC: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
+        SRC.split_once("\n#[cfg(test)]\nmod tests {")
+            .expect("this file has a test module")
+            .0
+    }
+
+    // The budget binds the whole run only if EVERY level goes through the one bounded sequencer. A
+    // later edit adding a direct `checks::run_*` call beside it restores the unbounded path
+    // silently: the levels that kept using the helper stay bounded, so no behavioral test reddens
+    // and the run's ceiling quietly becomes "whatever the per-check deadlines add up to" again. The
+    // gate binds the call sites, not just the extracted predicate (AGENTS.md), so it is source-
+    // scanned in the shape `checks::every_roster_id_has_a_recording_site` uses.
+    #[test]
+    fn every_level_runner_is_called_only_through_run_level() {
+        let code = production_code();
+        let dispatch = code
+            .split_once("async fn run_level")
+            .expect("`run_level` is the one dispatch")
+            .1;
+        let dispatch_end = dispatch
+            .find("\n}\n")
+            .expect("the function has a closing brace");
+        let dispatch = dispatch
+            .get(..dispatch_end)
+            .expect("a char boundary at a newline");
+        for runner in [
+            "checks::run_core(",
+            "checks::run_extended(",
+            "checks::run_full(",
+        ] {
+            assert_eq!(
+                code.matches(runner).count(),
+                1,
+                "`{runner}` must be called from exactly one production site — a second one is a \
+                 level run the run budget does not bound"
+            );
+            assert!(
+                dispatch.contains(runner),
+                "`{runner}`'s one call site must be `run_level`, which `run_levels_bounded` is the \
+                 only caller of: {dispatch}"
+            );
+        }
     }
 }

@@ -54,7 +54,6 @@ use std::time::Duration;
 use vmcell::feature::{Feature, FeatureDeclaration, FeatureSet, HostDeclaration, Removal};
 use vmcell::vmm::{Vmm, VmmCapabilities};
 
-use crate::checks::fill_unrecorded;
 use crate::classify::{explain_broken_claim, explain_undecidable, explain_underclaim};
 use crate::{ArtifactSet, CheckOutcome, CheckStatus, Level, ValidationReport};
 
@@ -251,8 +250,10 @@ pub const EXPECTED_WARNINGS_CHECK_ID: &str = "conformance.expected_warnings";
 
 /// The battery's roster: one paired id per [`Feature`], plus [`EXPECTED_WARNINGS_CHECK_ID`].
 ///
-/// Built at call time from `Feature::ALL` so it cannot drift from the vocabulary, and filled to the
-/// end on every path exactly like the [`Level`] rosters (`crate::checks::CORE_CHECK_IDS`).
+/// Built at call time from `Feature::ALL` so it cannot drift from the vocabulary. The battery reports
+/// it whole on every path that produces a report — by construction rather than by a fill tail, unlike
+/// the [`Level`] rosters (`crate::checks::CORE_CHECK_IDS`), because it judges every variant of the
+/// same `Feature::ALL` it is composed from (see [`run_battery`]'s tail).
 #[must_use]
 pub fn battery_check_ids() -> Vec<&'static str> {
     let mut ids: Vec<&'static str> = Feature::ALL.into_iter().map(conformance_check_id).collect();
@@ -530,12 +531,21 @@ pub fn judge(obs: &PairedObservation<'_>) -> CheckStatus {
 
 /// The shipped probe: boots real VMs through [`crate::checks`].
 ///
+/// Each decidable arm answers in all three [`ProbeOutcome`] states, and the state that matters most
+/// is `NotRun`: a candidate that could not be configured, could not start, or never handed shakes was
+/// never asked about the feature, so it must not be reported as a measured absence (docs/90 M8 —
+/// `judge` reads a measured absence against an absence declaration as the one `Pass` an absence can
+/// earn, and the positive control cannot catch it because the control is a *different* artifact and
+/// boots fine). `crate::checks::ProbeStop` is where the two are split.
+///
 /// FAKE-BLIND AXIS (AGENTS.md rule 4): this type is the one piece of the battery a fake cannot
-/// exercise — `crate::checks::snapshot_restore_roundtrip` needs a real guest to hand shake, so a
-/// fake-driven run of it would take the full handshake budget and always answer `DoesNotWork`. Its
-/// *dispatch* is unit-gated ([`probe_plan`]); its *execution* is covered only by the live
-/// `#[ignore]`d conformance legs in `tests/smoke.rs`, which `just test-validator` selects — one per
-/// decidable plan ([`ProbePlan::SnapshotRoundTrip`] and [`ProbePlan::XattrReadback`]).
+/// fully exercise — `crate::checks::snapshot_restore_probe` needs a real guest to hand shake, so a
+/// fake-driven run reaches only its setup arms (`NotRun`), never `Works` or the measured
+/// `DoesNotWork`. Its *dispatch* is unit-gated ([`probe_plan`]), its setup/measurement split by
+/// `the_snapshot_probe_classifies_setup_before_the_attempt_and_measurement_after` (a source scan,
+/// like the m9 one beside it); its *execution* is covered only by the live `#[ignore]`d conformance
+/// legs in `tests/smoke.rs`, which `just test-validator` selects — one per decidable plan
+/// ([`ProbePlan::SnapshotRoundTrip`] and [`ProbePlan::XattrReadback`]).
 ///
 /// What the xattr leg does **not** cover, stated rather than implied: the artifacts the validator
 /// suite has on hand are packed under [`vmcell::artifact::XattrPolicy::Strip`] (that is what
@@ -559,12 +569,10 @@ impl<'a, V: Vmm> LiveProbe<'a, V> {
 impl<V: Vmm> FeatureProbe for LiveProbe<'_, V> {
     async fn probe(&self, feature: Feature, subject: &ConformanceSubject) -> ProbeOutcome {
         match probe_plan(feature) {
+            // Not `snapshot_restore_roundtrip().map_err(DoesNotWork)`: that mapping is what made an
+            // unbootable artifact a verified absence (M8). The probe form draws the setup line.
             ProbePlan::SnapshotRoundTrip => {
-                match crate::checks::snapshot_restore_roundtrip(self.vmm, &subject.artifacts).await
-                {
-                    Ok(()) => ProbeOutcome::Works,
-                    Err(e) => ProbeOutcome::DoesNotWork(e),
-                }
+                crate::checks::snapshot_restore_probe(self.vmm, &subject.artifacts).await
             }
             ProbePlan::XattrReadback => {
                 crate::checks::xattr_preserved_probe(self.vmm, &subject.artifacts).await
@@ -628,14 +636,14 @@ pub async fn run_battery<P: FeatureProbe>(
     let mut outcomes = outcomes.into_inner();
     let warned = warned.into_inner();
     apply_warning_lifecycle(&mut outcomes, &warned, candidate, &opts.expected_warnings);
-    // Records-or-skips on every path, exactly as the level runners do: the roster is filled to the
-    // end so a report never shrinks (the same mechanism that makes it enumerable KVM-free).
-    fill_unrecorded(
-        &mut outcomes,
-        &battery_check_ids(),
-        Level::Full,
-        "not attempted: the battery did not reach this check",
-    );
+    // The roster is complete BY CONSTRUCTION here, not by a fill tail: `battery_inner` judges every
+    // `Feature::ALL` variant and `apply_warning_lifecycle` always pushes its own id, and
+    // `battery_check_ids` is composed from that same `Feature::ALL` — so no path returns `Ok` with a
+    // short roster. A `fill_unrecorded` tail stood here claiming a red-on-inverse it could not have
+    // (docs/90): deleting it changed nothing, because nothing ever reached it. The property is real
+    // and is gated where it actually lives —
+    // `the_battery_reports_its_whole_roster_whatever_is_declared`, red on a `battery_inner` arm that
+    // skips a feature instead of judging it.
     Ok(ValidationReport { outcomes })
 }
 
@@ -821,6 +829,30 @@ mod tests {
             self.answers.get(&key).cloned().unwrap_or_else(|| {
                 ProbeOutcome::DoesNotWork(format!("scripted: no answer for {key:?}"))
             })
+        }
+    }
+
+    /// The M8 gate's probe: the **real** [`LiveProbe`] for the candidate, a scripted `Works` for the
+    /// positive control.
+    ///
+    /// Half-and-half on purpose. The candidate side must be the shipped probe, because the thing
+    /// under test is how it classifies its own setup failure — the one thing [`ScriptedProbe`]
+    /// cannot express, since it hands out outcomes directly. The control side must be `Works`, which
+    /// no fake backend can produce (it needs a guest that hands shakes), and scripting it is
+    /// faithful to the case that matters: a healthy control beside a candidate that cannot boot is
+    /// exactly the run M8 turned green.
+    struct RealCandidateWorkingControl<'a, V: Vmm> {
+        live: LiveProbe<'a, V>,
+        candidate: String,
+    }
+
+    impl<V: Vmm> FeatureProbe for RealCandidateWorkingControl<'_, V> {
+        async fn probe(&self, feature: Feature, subject: &ConformanceSubject) -> ProbeOutcome {
+            if subject.id.as_str() == self.candidate {
+                self.live.probe(feature, subject).await
+            } else {
+                ProbeOutcome::Works
+            }
         }
     }
 
@@ -1125,32 +1157,51 @@ mod tests {
 
     // ── The roster ────────────────────────────────────────────────────────────────────────────
 
-    // Records-or-skips on every path, battery edition: whatever the artifacts declare, the report
-    // carries the whole roster — so a consumer diffing against a baseline sees states change, never
-    // checks appear and vanish. RED on the inverse: drop the `fill_unrecorded` tail and the
-    // no-declaration run reports 1 id instead of 13.
+    // The whole roster on every path that produces a report: whatever the artifacts declare, and
+    // whatever the substrate can do, a consumer diffing against a baseline sees states change, never
+    // checks appear and vanish.
+    //
+    // The battery gets this BY CONSTRUCTION — `battery_inner` judges every `Feature::ALL` variant,
+    // and `battery_check_ids` is composed from the same array — so the property lives in the loop,
+    // not in a fill tail. (A `fill_unrecorded` tail used to sit at the end of `run_battery` with a
+    // red-on-inverse claim it could not have: nothing ever reached it, so deleting it changed
+    // nothing. docs/90.) RED on the inverse, verified here: make `battery_inner` `continue` on the
+    // arm it does not probe — the shape a "skip the cheap ones" edit takes — and the ids it stops
+    // judging vanish from the report.
     #[tokio::test]
     async fn the_battery_reports_its_whole_roster_whatever_is_declared() {
-        let probe = ScriptedProbe::with(&[]);
-        let candidate = subject("under-test", &[]);
+        // Two paths, because they are the two ways an arm reaches no probe at all: nothing declared,
+        // and declared on a substrate that cannot exercise it (the `Skip` arm).
+        let no_stance = subject("under-test", &[]);
+        let declared = subject("under-test", &[(Feature::SnapshotRestore, true)]);
         let control = subject("known-good", &[(Feature::SnapshotRestore, true)]);
-        let report = run_battery(
-            &probe,
-            &capable_substrate(),
-            &candidate,
-            &control,
-            &ConformanceOptions::default(),
-        )
-        .await
-        .expect("the battery runs");
+        for (candidate, substrate, path) in [
+            (&no_stance, capable_substrate(), "nothing declared"),
+            (
+                &declared,
+                substrate_without(Feature::SnapshotRestore),
+                "declared on an incapable substrate",
+            ),
+        ] {
+            let probe = ScriptedProbe::with(&[]);
+            let report = run_battery(
+                &probe,
+                &substrate,
+                candidate,
+                &control,
+                &ConformanceOptions::default(),
+            )
+            .await
+            .expect("the battery runs");
 
-        let ids: Vec<&str> = report.outcomes.iter().map(|o| o.id).collect();
-        assert_eq!(ids, battery_check_ids(), "{ids:?}");
-        assert!(
-            probe.calls().is_empty(),
-            "an artifact that declares nothing costs no boots: {:?}",
-            probe.calls()
-        );
+            let ids: Vec<&str> = report.outcomes.iter().map(|o| o.id).collect();
+            assert_eq!(ids, battery_check_ids(), "{path}: {ids:?}");
+            assert!(
+                probe.calls().is_empty(),
+                "{path} costs no boots: {:?}",
+                probe.calls()
+            );
+        }
     }
 
     // ── The battery budget (design §17's gap, closed) ─────────────────────────────────────────
@@ -1467,16 +1518,20 @@ mod tests {
     }
 
     // `LiveProbe`'s own wiring, as far as a fake can reach it: an `Undecidable` plan must produce
-    // `NotRun` (never a `DoesNotWork`, which would read as a measured absence), and a decidable one
-    // must actually CALL the shipped check and map its `Err` to `DoesNotWork`.
+    // `NotRun` carrying its stated reason, and a decidable plan must actually CALL the shipped
+    // check — reporting what that check answered, not a blanket verdict.
     //
-    // `fail_create` is what keeps this fast: `snapshot_restore_roundtrip` fails at `MicroVm::start`
-    // in milliseconds, before the 60-second steward handshake it would otherwise wait out. That is
-    // also the boundary of what a fake proves here — the `Works` side needs a guest that hands
-    // shakes, which is the live `conformance_live_underclaim_warns_with_its_positive_control` leg in
-    // `tests/smoke.rs` (FAKE-BLIND AXIS, AGENTS.md rule 4).
+    // `fail_create` is what keeps this fast: the snapshot probe fails at `MicroVm::start` in
+    // milliseconds, before the 60-second steward handshake it would otherwise wait out. It is also
+    // why the two answers here are both `NotRun`: a candidate that never started never exercised the
+    // feature (docs/90 M8), and this arm used to report it as `DoesNotWork` — a *measured* absence,
+    // which `judge` turns into a Pass for an absence declaration. The measured `DoesNotWork` and the
+    // `Works` side both need a guest that hands shakes, which is the live
+    // `conformance_live_underclaim_warns_with_its_positive_control` leg in `tests/smoke.rs`
+    // (FAKE-BLIND AXIS, AGENTS.md rule 4); the setup/measurement split itself is source-scanned in
+    // `crate::checks`.
     #[tokio::test]
-    async fn the_live_probe_maps_an_undecidable_plan_to_notrun_and_a_failure_to_doesnotwork() {
+    async fn the_live_probe_maps_an_undecidable_plan_and_a_setup_failure_to_notrun() {
         let vmm = vmcell::vmm::FakeVmm::with_faults(vmcell::vmm::FaultMenu {
             fail_create: true,
             ..vmcell::vmm::FaultMenu::default()
@@ -1491,12 +1546,70 @@ mod tests {
         assert_eq!(why, NESTED_VIRT_UNDECIDABLE);
 
         let decidable = probe.probe(Feature::SnapshotRestore, &subject).await;
-        let ProbeOutcome::DoesNotWork(why) = &decidable else {
-            panic!("a backend that cannot even create a VM cannot snapshot: {decidable:?}");
+        let ProbeOutcome::NotRun(why) = &decidable else {
+            panic!(
+                "a backend that cannot even create a VM never exercised snapshot support, so it \
+                 measured nothing: {decidable:?}"
+            );
         };
         assert!(
             !why.is_empty(),
-            "the failure text is what the report's evidence line quotes"
+            "the undecided verdict is what the report's evidence line quotes"
+        );
+        assert_ne!(
+            why, NESTED_VIRT_UNDECIDABLE,
+            "the decidable plan must report the shipped check's own reason, not the undecidable \
+             plan's — otherwise this leg would pass with the two arms swapped"
+        );
+    }
+
+    // M8, END TO END, through the REAL probe: an artifact that declares an absence and cannot boot
+    // at all must be `Unverified`, never the `Pass` a *verified* absence earns. The kit's own
+    // four-leg matrix structurally cannot see this — `ScriptedProbe` supplies outcomes directly, so
+    // the setup failure the shipped probe has to classify never happens — which is why this leg
+    // drives `LiveProbe` on the candidate side, against a backend that cannot create a VM.
+    //
+    // RED on the inverse (verified): restore the mapping `LiveProbe` shipped with
+    // (`snapshot_restore_roundtrip(...).map_err(ProbeOutcome::DoesNotWork)`) and the verdict becomes
+    // `Pass` — an unbootable artifact certified as a verified absence, with the healthy control
+    // keeping the run green.
+    #[tokio::test]
+    async fn an_unbootable_candidate_is_unverified_never_a_verified_absence() {
+        let vmm = vmcell::vmm::FakeVmm::with_faults(vmcell::vmm::FaultMenu {
+            fail_create: true,
+            ..vmcell::vmm::FaultMenu::default()
+        });
+        let probe = RealCandidateWorkingControl {
+            live: LiveProbe::new(&vmm),
+            candidate: "under-test".to_string(),
+        };
+        let candidate = subject("under-test", &[(Feature::SnapshotRestore, false)]);
+        let control = subject("known-good", &[(Feature::SnapshotRestore, true)]);
+        let report = run_battery(
+            &probe,
+            &capable_substrate(),
+            &candidate,
+            &control,
+            &ConformanceOptions::default(),
+        )
+        .await
+        .expect("the battery runs");
+
+        let status = status_of(&report, "conformance.snapshot_restore");
+        let CheckStatus::Unverified(why) = status else {
+            panic!(
+                "an absence declared by an artifact that never booted is undecided, got {status:?}"
+            );
+        };
+        assert!(
+            why.contains(Feature::SnapshotRestore.name()),
+            "the undecided verdict names the feature it could not decide: {why}"
+        );
+        assert_eq!(report.unverified().count(), 1, "{:?}", report.outcomes);
+        assert!(
+            report.is_ok(),
+            "an undecidable absence is not a failed run — but it is not a pass either: {:?}",
+            report.failures().collect::<Vec<_>>()
         );
     }
 

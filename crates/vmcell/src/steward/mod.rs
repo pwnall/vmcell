@@ -348,6 +348,61 @@ fn endpoint_on_port(endpoint: &VsockEndpoint, port: u32) -> VsockEndpoint {
     }
 }
 
+/// The endpoint a [`StewardClient`] recovery must re-dial: the one recorded at connect time, or the
+/// caller-supplied AF_UNIX coordinates when the recorded transport is the one they can address.
+///
+/// **One predicate** for both recovery entry points — [`StewardClient::reconnect`] (the AF_UNIX
+/// coordinate form) and [`StewardClient::reconnect_endpoint`] (the transport-generic one) — because
+/// the pre-fix `reconnect` composed `VsockEndpoint::Unix { path, port }` unconditionally. An
+/// AF_VSOCK client (a snapshot-eligible QEMU on the in-kernel transport, §2.4, QEMU q35 — the fallback and most-proven nester,
+/// and every crosvm cell) therefore had **no** working recovery at all: its reconnect dialed an
+/// AF_UNIX path belonging to a different transport, while [`StewardClient::ensure_synced`] kept
+/// pointing every later request at that recovery.
+///
+/// Coordinates may **re-address** an AF_UNIX client but never **re-family** it: a restore on a
+/// rotating backend legitimately hands the same VM a fresh bridge path
+/// ([`VmmCapabilities::restore_rotates_host_paths`](crate::vmm::VmmCapabilities::restore_rotates_host_paths)),
+/// so a supplied path is honored on that transport, while a supplied path against an AF_VSOCK client
+/// names a transport it does not speak and is refused rather than dialed.
+///
+/// # Errors
+/// [`Error::Steward`] when AF_UNIX coordinates are supplied for a client connected over AF_VSOCK
+/// (which has no bridge path), or when neither a recorded endpoint nor supplied coordinates say
+/// where to re-dial.
+#[cfg(feature = "host-common")]
+fn recovery_endpoint(
+    recorded: Option<&VsockEndpoint>,
+    supplied: Option<(&Path, u32)>,
+) -> Result<VsockEndpoint> {
+    match (recorded, supplied) {
+        // No coordinates: re-dial exactly what this client is connected over — the transport-generic
+        // recovery, and the only recovery an AF_VSOCK client has.
+        (Some(recorded), None) => Ok(recorded.clone()),
+        (None, None) => Err(Error::Steward(
+            "this steward client records no endpoint (it was built over an injected stream), so \
+             there is nothing to re-dial"
+                .into(),
+        )),
+        (
+            Some(VsockEndpoint::Vsock {
+                cid,
+                port: vsock_port,
+            }),
+            Some(_),
+        ) => Err(Error::Steward(format!(
+            "this steward client is connected over AF_VSOCK (cid {cid}, port {vsock_port}), which \
+             has no AF_UNIX bridge path: recover it with StewardClient::reconnect_endpoint, which \
+             re-dials the recorded endpoint"
+        ))),
+        // An AF_UNIX client (or an injected-stream client, which records nothing to contradict):
+        // the supplied bridge path is honored, rotated or not.
+        (Some(VsockEndpoint::Unix { .. }) | None, Some((path, port))) => Ok(VsockEndpoint::Unix {
+            path: path.to_path_buf(),
+            port,
+        }),
+    }
+}
+
 /// A raw byte stream to a guest AF_VSOCK listener (§3.2, The host side: StewardClient and SessionMux — the raw vsock
 /// dial): the guest process on the other end owns its own protocol, so there is no
 /// framing, no `Ready` handshake, and no steward involvement.
@@ -528,11 +583,17 @@ pub struct ResyncOutcome {
 #[derive(Debug)]
 pub struct StewardClient {
     stream: Framed<ControlStream, LengthDelimitedCodec>,
+    /// The endpoint this client was connected over, so the recovery path re-dials the
+    /// **same transport family** ([`recovery_endpoint`]). `None` only for the
+    /// `#[cfg(test)]` injected-stream constructors, which were handed a socket rather
+    /// than an endpoint and therefore have nothing to re-dial.
+    endpoint: Option<VsockEndpoint>,
     /// Set when a request times out or the framed stream desynchronizes
     /// mid-exchange. A desynced stream may still hold a late frame from the
     /// abandoned request, so reusing it would read stale data and silently
     /// return a wrong result. Further requests fail loud until
-    /// [`StewardClient::reconnect`] re-establishes the stream.
+    /// [`StewardClient::reconnect`] — or, on the AF_VSOCK transport,
+    /// [`StewardClient::reconnect_endpoint`] — re-establishes the stream.
     desynced: bool,
 }
 
@@ -642,6 +703,9 @@ impl StewardClient {
         let stream = Self::connect_framed(endpoint, timeout, timeouts, serial_log).await?;
         Ok(Self {
             stream,
+            // Recorded here so a later recovery re-dials THIS transport family, not a hardcoded
+            // AF_UNIX path (`recovery_endpoint`).
+            endpoint: Some(endpoint.clone()),
             desynced: false,
         })
     }
@@ -819,22 +883,49 @@ impl StewardClient {
     /// dropping its cached client). Uses the same codec configuration as
     /// [`StewardClient::connect`] and starts in-sync (`desynced: false`).
     /// `#[cfg(test)]` + `pub(crate)` so no test-only constructor ships in the
-    /// public surface.
+    /// public surface. Records **no** endpoint: it was handed a socket, not an
+    /// address, so a recovery on it has nothing of its own to re-dial.
     #[cfg(test)]
     pub(crate) fn from_stream_for_tests(stream: UnixStream) -> Self {
+        Self::from_stream_and_endpoint_for_tests(stream, None)
+    }
+
+    /// As [`StewardClient::from_stream_for_tests`], but recording `endpoint` as the endpoint the
+    /// recovery path must re-dial.
+    ///
+    /// Lets a unit test present the shape of a live AF_VSOCK client — a recorded
+    /// [`VsockEndpoint::Vsock`] — without an AF_VSOCK socket, because what
+    /// [`recovery_endpoint`] must get right is *which endpoint the recovery dials*, not the kernel's
+    /// vsock. KVM-free by construction, which is the point: the AF_VSOCK transport is only reachable
+    /// live on a snapshot-eligible QEMU or crosvm cell.
+    #[cfg(test)]
+    pub(crate) fn from_stream_and_endpoint_for_tests(
+        stream: UnixStream,
+        endpoint: Option<VsockEndpoint>,
+    ) -> Self {
         let mut codec = LengthDelimitedCodec::new();
         // Mirror `connect`: align the host frame cap with the guest's.
         codec.set_max_frame_length(MAX_FRAME_BYTES);
         Self {
             stream: Framed::new(ControlStream::Unix(stream), codec),
+            endpoint,
             desynced: false,
         }
     }
 
-    /// Reconnects to the steward.
+    /// Reconnects to the steward over an AF_UNIX bridge — the coordinate form, mirroring
+    /// [`StewardClient::connect`].
+    ///
+    /// The coordinates are checked against the transport this client was **connected over**
+    /// (`recovery_endpoint`, the one law both recoveries share) instead of being dialed
+    /// unconditionally: a client on the in-kernel
+    /// AF_VSOCK transport has no bridge path at all, and dialing one anyway is how its recovery used
+    /// to fail silently. Such a client recovers through [`StewardClient::reconnect_endpoint`], which
+    /// is also the form to prefer for an AF_UNIX client that still has its original path.
     ///
     /// # Errors
-    /// Returns an error if the connection fails or times out.
+    /// Returns an error if the connection fails or times out, or [`Error::Steward`] if this client is
+    /// connected over AF_VSOCK, which `vsock_path`/`port` cannot address.
     ///
     /// Parameter order mirrors [`StewardClient::connect`]
     /// (`vsock_path, port, timeout, timeouts, serial_log`) so the two cannot be
@@ -847,10 +938,47 @@ impl StewardClient {
         timeouts: &crate::config::Timeouts,
         serial_log: &dyn crate::vmm::SerialLog,
     ) -> Result<()> {
-        let new_client = Self::connect(vsock_path, port, timeout, timeouts, serial_log).await?;
-        self.stream = new_client.stream;
-        // A fresh stream is back in sync, so clear any prior desync state.
+        let endpoint = recovery_endpoint(self.endpoint.as_ref(), Some((vsock_path, port)))?;
+        self.redial(endpoint, timeout, timeouts, serial_log).await
+    }
+
+    /// Reconnects over the [`VsockEndpoint`] this client recorded at connect time — the
+    /// transport-generic recovery, of which [`StewardClient::reconnect`] is the AF_UNIX
+    /// coordinate wrapper.
+    ///
+    /// This is the recovery for an AF_VSOCK control plane (a snapshot-eligible QEMU, §2.4, QEMU q35 — the fallback and most-proven nester,
+    /// or any crosvm cell): it re-dials the recorded `(cid, port)` through the same
+    /// `connect_framed` the first connect used, so the per-transport prologue —
+    /// hybrid `CONNECT`/`OK` on AF_UNIX, none on AF_VSOCK — comes from the one implementation.
+    ///
+    /// # Errors
+    /// Returns an error if the connection fails or times out, or [`Error::Steward`] if this client
+    /// records no endpoint (only an injected-stream test client does).
+    pub async fn reconnect_endpoint(
+        &mut self,
+        timeout: std::time::Duration,
+        timeouts: &crate::config::Timeouts,
+        serial_log: &dyn crate::vmm::SerialLog,
+    ) -> Result<()> {
+        let endpoint = recovery_endpoint(self.endpoint.as_ref(), None)?;
+        self.redial(endpoint, timeout, timeouts, serial_log).await
+    }
+
+    /// Re-establishes the framed stream over `endpoint` — the one body both recovery entry points
+    /// share, so neither can diverge on what a successful recovery resets.
+    async fn redial(
+        &mut self,
+        endpoint: VsockEndpoint,
+        timeout: std::time::Duration,
+        timeouts: &crate::config::Timeouts,
+        serial_log: &dyn crate::vmm::SerialLog,
+    ) -> Result<()> {
+        let stream = Self::connect_framed(&endpoint, timeout, timeouts, serial_log).await?;
+        self.stream = stream;
+        // A fresh stream is back in sync, so clear any prior desync state — and only now that the
+        // connect has succeeded, so a failed recovery leaves the next attempt able to retry.
         self.desynced = false;
+        self.endpoint = Some(endpoint);
         Ok(())
     }
 
@@ -870,8 +998,9 @@ impl StewardClient {
     ///
     /// Every request method calls this first so a stale in-flight frame from an
     /// abandoned (timed-out or errored) exchange can never be read as the next
-    /// request's response. Recovery is via [`StewardClient::reconnect`], or — for the
-    /// orchestrator's cached client — the eviction [`StewardClient::is_desynced`] drives.
+    /// request's response. Recovery is via [`StewardClient::reconnect`] /
+    /// [`StewardClient::reconnect_endpoint`], or — for the orchestrator's cached client — the
+    /// eviction [`StewardClient::is_desynced`] drives.
     fn ensure_synced(&self) -> Result<()> {
         if self.desynced {
             return Err(Error::Steward(
@@ -1134,7 +1263,7 @@ mod tests {
         ControlStream, Error, ExecRequest, LengthDelimitedCodec, MAX_FRAME_BYTES,
         MAX_PROLOGUE_LINE_BYTES, Message, PrologueError, RequestFailure, SessionId, StewardClient,
         VsockDial, VsockEndpoint, dial_prologue_error, endpoint_on_port, hybrid_connect_prologue,
-        hybrid_prologue_port, protocol,
+        hybrid_prologue_port, protocol, recovery_endpoint,
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -1171,6 +1300,182 @@ mod tests {
                 tokio::spawn(answer(stream));
             }
         });
+    }
+
+    /// Serves one mock-bridge connection the way a booting steward does: answer the hybrid
+    /// prologue, send the `Ready` frame, then hold the connection open (the client keeps the stream
+    /// after the handshake, so returning here would look like an immediate EOF).
+    async fn serve_ready(mut stream: tokio::net::UnixStream) {
+        use futures::SinkExt as _;
+
+        let _line = read_line(&mut stream).await;
+        if stream.write_all(b"OK 5000\n").await.is_err() {
+            return;
+        }
+        let mut codec = LengthDelimitedCodec::new();
+        codec.set_max_frame_length(MAX_FRAME_BYTES);
+        let mut framed = tokio_util::codec::Framed::new(stream, codec);
+        let ready =
+            ::bytes::Bytes::from(postcard::to_stdvec(&Message::Ready).expect("encode Ready"));
+        if framed.send(ready).await.is_err() {
+            return;
+        }
+        std::future::pending::<()>().await;
+    }
+
+    // The recovery-endpoint law: a reconnect re-dials the transport the client is CONNECTED over.
+    // AF_UNIX coordinates may re-address an AF_UNIX client (a restore on a rotating backend hands
+    // the same VM a fresh bridge path), but they cannot address an AF_VSOCK client at all.
+    //
+    // RED on the inverse (the shipped pre-fix `reconnect`, which composed
+    // `VsockEndpoint::Unix { path, port }` unconditionally): the AF_VSOCK legs return an AF_UNIX
+    // endpoint instead of the recorded one, and the refusal leg returns `Ok`.
+    #[test]
+    fn recovery_endpoint_redials_the_recorded_transport() {
+        let path = std::path::PathBuf::from("/run/vmcell/vsock.sock");
+        let vsock = VsockEndpoint::Vsock {
+            cid: 42,
+            port: 5000,
+        };
+        let unix = VsockEndpoint::Unix {
+            path: path.clone(),
+            port: 5000,
+        };
+
+        assert_eq!(
+            recovery_endpoint(Some(&vsock), None).expect("an AF_VSOCK client must be recoverable"),
+            vsock,
+            "the recovery must re-dial the recorded AF_VSOCK endpoint, not an AF_UNIX path"
+        );
+        assert_eq!(
+            recovery_endpoint(Some(&unix), None).expect("an AF_UNIX client must be recoverable"),
+            unix
+        );
+
+        // The AF_UNIX coordinate form cannot express an AF_VSOCK client, so it must fail loud and
+        // name the entry point that can — never dial the path it was handed.
+        let err = recovery_endpoint(Some(&vsock), Some((&path, 5000)))
+            .expect_err("AF_UNIX coordinates must not recover an AF_VSOCK client");
+        assert!(
+            matches!(&err, Error::Steward(m)
+                if m.contains("AF_VSOCK") && m.contains("reconnect_endpoint")),
+            "the refusal must name the transport and the recovery that works: {err:?}"
+        );
+
+        assert_eq!(
+            recovery_endpoint(Some(&unix), Some((&path, 5000)))
+                .expect("matching coordinates must be accepted"),
+            unix
+        );
+
+        // Same family, rotated path: honored, because that is exactly what a restore on a
+        // `restore_rotates_host_paths` backend hands the same VM.
+        let rotated = std::path::PathBuf::from("/run/vmcell/vsock-2.sock");
+        assert_eq!(
+            recovery_endpoint(Some(&unix), Some((&rotated, 5000)))
+                .expect("an AF_UNIX client may be re-addressed on its own transport"),
+            VsockEndpoint::Unix {
+                path: rotated,
+                port: 5000
+            }
+        );
+
+        // An injected-stream client records no endpoint, so the caller's coordinates are all there
+        // is — and with neither, the recovery fails loud instead of dialing something invented.
+        assert_eq!(
+            recovery_endpoint(None, Some((&path, 5000))).expect("coordinates are all there is"),
+            unix
+        );
+        assert!(matches!(
+            recovery_endpoint(None, None),
+            Err(Error::Steward(_))
+        ));
+    }
+
+    // The call-site half of the law above, which the pure test structurally cannot see: that the
+    // two recovery entry points on the client actually route through it. The AF_VSOCK client is
+    // presented by its RECORDED endpoint over an injected stream, so this runs KVM-free — the live
+    // AF_VSOCK transport exists only on a snapshot-eligible QEMU or a crosvm cell.
+    //
+    // RED on the inverse (restore `Self::connect(vsock_path, port, …)` in `reconnect`): the
+    // AF_VSOCK client's reconnect returns `Ok` after dialing the AF_UNIX bridge, so both the typed
+    // refusal and the `seen == 0` assertion fail.
+    #[tokio::test]
+    async fn an_af_vsock_client_is_never_recovered_over_the_af_unix_bridge() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("vsock.sock");
+        let seen = std::sync::Arc::new(AtomicUsize::new(0));
+        let bridge_seen = std::sync::Arc::clone(&seen);
+        spawn_mock_bridge(&sock, move |stream| {
+            let seen = std::sync::Arc::clone(&bridge_seen);
+            async move {
+                seen.fetch_add(1, Ordering::SeqCst);
+                serve_ready(stream).await;
+            }
+        });
+        let budget = std::time::Duration::from_millis(300);
+        let timeouts = crate::config::Timeouts::default();
+        let serial = crate::vmm::FakeSerialLog { panicked: false };
+
+        // A client whose control plane is the in-kernel AF_VSOCK transport.
+        let (client_io, _guest_io) = tokio::net::UnixStream::pair().expect("socketpair");
+        let mut vsock_client = StewardClient::from_stream_and_endpoint_for_tests(
+            client_io,
+            Some(VsockEndpoint::Vsock {
+                cid: 42,
+                port: 5000,
+            }),
+        );
+        let err = vsock_client
+            .reconnect(&sock, 5000, budget, &timeouts, &serial)
+            .await
+            .expect_err("AF_UNIX coordinates must not recover an AF_VSOCK client");
+        assert!(
+            matches!(&err, Error::Steward(m)
+                if m.contains("AF_VSOCK") && m.contains("reconnect_endpoint")),
+            "the refusal must be typed and name the recovery that works: {err:?}"
+        );
+
+        // The transport-generic recovery dials the recorded `(cid, port)`: it cannot succeed here
+        // (no VM with cid 42), but it must fail on the AF_VSOCK dial — never by reaching the
+        // AF_UNIX bridge, which is live and answering throughout.
+        vsock_client
+            .reconnect_endpoint(budget, &timeouts, &serial)
+            .await
+            .expect_err("there is no guest at cid 42");
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            0,
+            "an AF_VSOCK client's recovery must never dial the AF_UNIX bridge"
+        );
+
+        // Positive control: the very same bridge recovers an AF_UNIX client, so the negative above
+        // is a refusal to dial and not an unreachable mock. The injected-stream client records no
+        // endpoint, so its first recovery takes the coordinate form...
+        let (client_io, _guest_io) = tokio::net::UnixStream::pair().expect("socketpair");
+        let mut unix_client = StewardClient::from_stream_for_tests(client_io);
+        unix_client
+            .reconnect(&sock, 5000, budget, &timeouts, &serial)
+            .await
+            .expect("the AF_UNIX bridge must recover an AF_UNIX client");
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            1,
+            "the positive control must have reached the bridge"
+        );
+        // ...and having recovered, the client now records that endpoint, so the generic recovery
+        // works on it too (a recovery that did not record would fail loud here).
+        unix_client
+            .reconnect_endpoint(budget, &timeouts, &serial)
+            .await
+            .expect("a recovered client must record the endpoint it re-dialed");
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            2,
+            "the generic recovery must re-dial the recorded AF_UNIX endpoint"
+        );
     }
 
     // Guards m8: an over-cap one-shot request fails loud with the typed cap error

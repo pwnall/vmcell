@@ -802,6 +802,8 @@ dependencies = [
 name = "downstream-kernel"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "blake3",
  "tempfile",
  "tokio 1.53.1",
  "vmcell",
@@ -3730,7 +3732,7 @@ dependencies = [
 
 [[package]]
 name = "vmcell"
-version = "0.20.0"
+version = "0.21.0"
 dependencies = [
  "am-fs-erofs",
  "async-trait",
@@ -3784,7 +3786,7 @@ dependencies = [
 
 [[package]]
 name = "vmcell-artifact-validator"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "futures 0.3.34",
  "tempfile",
@@ -3796,7 +3798,7 @@ dependencies = [
 
 [[package]]
 name = "vmcell-protocol"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "serde",
 ]

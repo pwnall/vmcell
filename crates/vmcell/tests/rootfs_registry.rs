@@ -1,10 +1,16 @@
 //! The `rootfs` artifact registry (design §10.5; §18 delta 6), exercised from **outside** the crate
 //! — the position a git-dep consumer registers a userland from.
 //!
-//! Every test here is KVM-free, network-free and toolchain-free. What they cover is the half of
+//! Every test here is KVM-free and network-free. What they cover is the half of
 //! §10.5 that has no other proof: that the reshape from a `{image, digest}` singleton to a map of
 //! labels **changed nothing** for a cell that names no label, and that the legacy shape fails loud
 //! naming the migration instead of being silently reinterpreted.
+//!
+//! One leg — `a_registered_ext4_label_packs_an_ext4_image` — is not toolchain-free: it runs the real
+//! inject+pack tail into §4.7's external ext4 producer, because "the declared format reaches the
+//! emitter" was asserted as far as `PackOptions` and no further, and the seam in between refused
+//! every format but erofs. It asks the product's own probe and records a reviewable capability skip
+//! when e2fsprogs is genuinely absent (§7.2), exactly as the delta-8 battery does.
 //!
 //! The mirror of `kernel_toolkit.rs`, one kind over — deliberately a separate file rather than more
 //! tests in that one, because the registry law is now shared and two batteries against one core is
@@ -25,6 +31,8 @@ use vmcell::artifact::{
 };
 use vmcell::error::Error;
 use vmcell::feature::{Feature, FeatureDeclaration, Source, feature_manifest_path};
+
+mod common;
 
 /// The committed baseline's **second** `rootfs` label — §18 delta 9's systemd proof cell.
 ///
@@ -1726,4 +1734,109 @@ async fn an_unpinned_rootfs_publishes_the_pointed_at_bytes_and_tracks_their_cont
             .registration,
         RootfsRegistration::Digest { .. }
     ));
+}
+
+// §4.7 / §18 delta 8, END TO END from the registry: an entry declaring `format: ext4` must actually
+// produce an ext4 image, at the filename the entry's format names, registered under the entry's own
+// artifact key.
+//
+// Delta 8's battery packs ext4 by calling the producer directly, and the sibling leg above
+// (`a_declared_format_parses_and_reaches_the_tail_the_filename_and_the_key`) follows the declaration
+// as far as `PackOptions` — so the two ends were pinned and the middle was not. The middle refused:
+// the OCI stage packed through `pack_erofs_with_injection`, the erofs-only door, which rejects any
+// other format BY NAME. Every registry-driven ext4 build therefore resolved its entry, missed the
+// cache, pulled its layers and then died naming that door, which made `format` an accepted input no
+// registry-driven build could honor (the F1 shape) and left delta 8's producer reachable only
+// through the `unpinned_path` dev registration that `bundle` refuses by design.
+//
+// What runs here: overlay → `resolve_rootfs_entry` → `RootfsStage::with_format` → `pack_options()`
+// → the one inject+pack tail → the external producer → the bytes on disk. The layer pull is the one
+// link this leg does not run (it needs a registry); `oci::tests`'s
+// `the_oci_stage_packs_through_the_general_tail_so_an_ext4_label_builds` drives the seam itself
+// through the fake puller, KVM-free and network-free, so both halves of the middle are covered.
+//
+// e2fsprogs is PROBED, never presumed: the product's own refusal is the classifier. An **absent**
+// facility records a reviewable capability skip (§7.2, the `ext4_cell` precedent); anything else —
+// including the erofs door's `Error::Artifact`, which is what the defect produced — is a hard
+// failure, because a probe that swallows the wrong error is the `println!("SKIP") + return`
+// green-PASS wearing the probe's clothes.
+//
+// RED on the inverse (call `pack_erofs_with_injection` from `oci::build_rootfs_with` again — or from
+// this leg's own call site): the `other` arm panics quoting the door.
+#[cfg(all(feature = "pipeline", feature = "am-fs-erofs"))]
+#[tokio::test]
+async fn a_registered_ext4_label_packs_an_ext4_image() {
+    use vmcell::artifact::rootfs::pack_rootfs_with_injection;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let digest = format!("sha256:{}", "e".repeat(64));
+    let overlay = write_overlay(
+        tmp.path(),
+        &format!(
+            r#"{{ "rootfs": {{ "acme": {{ "image": "example.invalid/acme",
+                 "digest": "{digest}", "format": "ext4" }} }} }}"#
+        ),
+    );
+    let entry = resolve_rootfs_entry(Some("acme"), Some(&overlay))
+        .expect("the overlay resolves")
+        .expect("the acme entry");
+    assert_eq!(entry.format, RootfsFormat::Ext4);
+
+    // The stage the CLI would compose for that entry, and the pack options IT hands the tail — so
+    // this leg cannot pass with the format dropped anywhere between the entry and the emitter.
+    let musl = tmp.path().join("steward-musl");
+    std::fs::write(&musl, b"#!static-steward").expect("write the steward stand-in");
+    let stage = RootfsStage::labelled(Some("acme"))
+        .with_format(entry.format)
+        .with_xattrs(entry.xattrs)
+        .with_steward_musl(Some(musl));
+    let out = stage.out_path(tmp.path());
+    assert_eq!(
+        out,
+        tmp.path().join(rootfs_filename(Some("acme"), entry.format)),
+        "the declared format must name the file the pack writes"
+    );
+
+    match pack_rootfs_with_injection(vec![], &StageInputs::default(), &out, &stage.pack_options())
+        .await
+    {
+        Ok(outputs) => {
+            // The ext4 superblock magic `0xEF53`, little-endian, at byte 0x438 (offset 56 of the
+            // superblock, which starts at 1024). Asserted on the BYTES, because an erofs image
+            // written to a `.ext4` name satisfies every filename assertion above.
+            let image = std::fs::read(&out).expect("read the packed image");
+            assert!(
+                image.len() > 0x43a,
+                "the image is too small to hold a superblock: {} bytes",
+                image.len()
+            );
+            assert_eq!(
+                &image[0x438..0x43a],
+                &[0x53, 0xef],
+                "a `format: ext4` entry must produce an ext4 filesystem, not an erofs one under an \
+                 `.ext4` name"
+            );
+            assert_eq!(
+                outputs
+                    .artifacts
+                    .get(&rootfs_artifact_key(Some("acme")))
+                    .map(PathBuf::as_path),
+                Some(out.as_path()),
+                "the ext4 image must be registered under its label's artifact key: {outputs:?}"
+            );
+        }
+        // The facility is genuinely absent (no `mkfs.ext4`, too old for `-d <tarball>`, no
+        // libarchive, or the `ext4-producer` feature compiled out). Reviewable, not invisible.
+        Err(Error::CapabilityUnavailable { op, needed }) => {
+            common::record_capability_skip("cloud-hypervisor", "ext4_producer");
+            println!(
+                "SKIP: this host cannot produce ext4 rootfs images ({op}: {needed}). The registry's \
+                 `format: ext4` leg needs e2fsprogs with libarchive support"
+            );
+        }
+        other => panic!(
+            "a `format: ext4` registry entry must pack (or be typed-refused by §4.7's probe), never \
+             die on the erofs-only door or on a broken tool: {other:?}"
+        ),
+    }
 }

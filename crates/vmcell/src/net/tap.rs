@@ -22,12 +22,34 @@ fn panic_payload_str(payload: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
+/// The directory `iproute2`/`netns_rs` bind named network namespaces into.
+///
+/// The **only** spelling of that layout in this crate's production code, from which [`netns_path`]
+/// and every enumerating sweep compose. Four call sites outside this module used to spell the
+/// literal themselves (the proxy's namespace entry, `build_vmm_cmd`'s pre-allocated NUL-terminated
+/// path, and the orphan scanner's two `read_dir`s); all four now go through [`netns_path`] /
+/// [`netns_dir`], and this module's `netns_layout_gate` scans the tree so a new one is a red gate
+/// rather than a claim that quietly ages into fiction — which is exactly how the "spelled in one
+/// place" wording came to be false the first time.
+const NETNS_DIR: &str = "/var/run/netns";
+
+/// The directory named network namespaces live in, for callers that **enumerate** it rather than
+/// name one member ([`cleanup_orphan_netns`] and the orphan scanner's per-VM and per-segment
+/// `read_dir`s in [`HostOrphanScanner`](crate::orchestrator::HostOrphanScanner)).
+pub(crate) fn netns_dir() -> &'static std::path::Path {
+    std::path::Path::new(NETNS_DIR)
+}
+
 /// The bind-mount path of the named network namespace (`/var/run/netns/<name>`).
 ///
-/// One law, one predicate: [`in_netns`] and [`crate::net::NetSegment::netns_path`] both compose the
-/// path here, so the directory `iproute2`/`netns_rs` use is spelled in exactly one place.
+/// One law, one predicate, and now actually one: [`in_netns`], [`cleanup_orphan_netns`],
+/// [`crate::net::NetSegment::netns_path`], the §6.4 proxy's namespace entry, `build_vmm_cmd`'s
+/// pre-fork C string and the orphan scanner's two sweeps all reach the layout through this function
+/// or its [`netns_dir`] sibling, both of which read [`NETNS_DIR`]. The shape a caller needs differs
+/// (a `PathBuf` to open, a `read_dir` root, a NUL-terminated `String`); the fact does not, so none
+/// of them may re-spell it — `netns_layout_gate` is the scan that enforces that.
 pub(crate) fn netns_path(name: &str) -> std::path::PathBuf {
-    std::path::Path::new("/var/run/netns").join(name)
+    netns_dir().join(name)
 }
 
 /// Runs `f` **inside** the network namespace `netns`, on a thread that exists only for this call.
@@ -148,7 +170,7 @@ where
 /// the names of the namespaces it successfully removed.
 pub fn cleanup_orphan_netns(prefix: &str) -> Vec<String> {
     let mut removed = Vec::new();
-    let Ok(dir) = std::fs::read_dir("/var/run/netns") else {
+    let Ok(dir) = std::fs::read_dir(netns_dir()) else {
         return removed; // no netns dir → nothing to sweep
     };
     for entry in dir.flatten() {
@@ -1321,5 +1343,137 @@ mod tests {
                 "vmid {vmid} must be rejected by the /30 host-IP math"
             );
         }
+    }
+}
+
+/// Call-site gate for the netns-layout law ([`NETNS_DIR`]): **no** production site outside this
+/// module spells the `/var/run/netns` layout, pinned in both directions.
+///
+/// [`netns_path`]'s rustdoc claimed the layout was spelled "in exactly one place" while four other
+/// production sites composed it — the claim aged into fiction because nothing could see it age. The
+/// four are closed (the §6.4 proxy's namespace entry, `build_vmm_cmd`'s pre-fork C string, and the
+/// orphan scanner's two `read_dir`s all compose from [`netns_path`]/[`netns_dir`] now), so this gate
+/// states the law rather than a to-do list: a **new** occurrence anywhere under `src` reddens it, and
+/// so does the law's own literal moving, vanishing or gaining a twin.
+///
+/// A source scan, not a type: the closed holdouts each needed a different *shape* of the same fact
+/// (a `read_dir` root, a NUL-terminated C string for the post-fork `open`), so no signature can force
+/// a future call site through the composer — only a scan can see it.
+#[cfg(test)]
+mod netns_layout_gate {
+    use std::collections::BTreeMap;
+
+    /// `(file relative to `crates/vmcell/src`, production occurrences of the layout literal)`.
+    ///
+    /// One row, because there is one law: `net/tap.rs` — 1, [`super::NETNS_DIR`] itself. Any second
+    /// row this gate reports is a call site that must compose from [`super::netns_path`] /
+    /// [`super::netns_dir`] instead.
+    const ROSTER: &[(&str, usize)] = &[("net/tap.rs", 1)];
+
+    /// Files the scan must have read for its verdict to mean anything.
+    ///
+    /// The law's own file, the three that held the four closed holdouts, and `net/segment.rs` — the
+    /// law's other consumer. Non-vacuity cannot ride on the roster any more: with one row the
+    /// both-directions `assert_eq!` agrees with a walk that reached almost nothing, where it could
+    /// not while the roster still listed every violating file. These are the files a re-spelling is
+    /// most likely to land in, so they are the ones the scan must prove it opened.
+    const MUST_SCAN: &[&str] = &[
+        "net/tap.rs",
+        "net/segment.rs",
+        "orchestrator.rs",
+        "proxy/mod.rs",
+        "vmm/mod.rs",
+    ];
+
+    /// Every `.rs` file under this crate's `src`, as `(relative path, production text)`.
+    ///
+    /// "Production" is everything before a file's unit-test module: a test that recomputes the
+    /// layout independently is the *judge* of the law (`in_netns_reports_an_absent_namespace…`,
+    /// `segment_names_and_gateway_come_from_the_shared_laws`), not a violation of it.
+    fn production_sources() -> Vec<(String, String)> {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut out = Vec::new();
+        let mut stack = vec![src.clone()];
+        while let Some(dir) = stack.pop() {
+            let entries = std::fs::read_dir(&dir)
+                .unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()));
+            for entry in entries {
+                let path = entry.unwrap_or_else(|e| panic!("src entry: {e}")).path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path)
+                    .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+                let production = match text.split_once("mod tests {") {
+                    Some((before, _)) => before.to_string(),
+                    None => text,
+                };
+                let rel = path
+                    .strip_prefix(&src)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .into_owned();
+                out.push((rel, production));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn the_netns_layout_is_spelled_only_by_the_law() {
+        // Composed from the law itself, so this gate's own text is never what it counts and a change
+        // to the layout cannot leave the needle behind.
+        let needle = format!("\"{}", super::NETNS_DIR);
+        let sources = production_sources();
+        // Non-vacuity: the scan must have actually reached this crate's tree. With a one-row roster
+        // the comparison below agrees with an almost-empty walk, so the guard is the named
+        // `MUST_SCAN` set rather than the roster — a walk over the wrong directory reddens here.
+        for must_be_scanned in MUST_SCAN {
+            assert!(
+                sources.iter().any(|(rel, _)| rel == must_be_scanned),
+                "the scan never read {must_be_scanned}; it is walking the wrong tree and would \
+                 pass vacuously"
+            );
+        }
+
+        let found: BTreeMap<String, usize> = sources
+            .iter()
+            .map(|(rel, text)| (rel.clone(), text.matches(&needle).count()))
+            .filter(|(_, count)| *count > 0)
+            .collect();
+        let expected: BTreeMap<String, usize> = ROSTER
+            .iter()
+            .map(|(rel, count)| ((*rel).to_string(), *count))
+            .collect();
+
+        assert_eq!(
+            found, expected,
+            "the netns layout must be spelled ONLY by `NETNS_DIR`. An extra entry is a production \
+             call site that has to compose from `netns_path`/`netns_dir` instead — whatever shape it \
+             needs (a `PathBuf`, a `read_dir` root, a NUL-terminated string) it composes from the law. \
+             A missing or moved entry means the law itself was renamed or relocated; move the row with \
+             it in the same change"
+        );
+    }
+
+    #[test]
+    fn the_gate_reddens_on_a_re_planted_inline_layout() {
+        // The scan's own predicate, driven against text the roster does not record: a re-planted
+        // occurrence must be visible as a difference, or the law above is decoration.
+        let needle = format!("\"{}", super::NETNS_DIR);
+        let smuggled = format!("let p = std::fs::read_dir({needle}\").unwrap();");
+        assert_eq!(
+            smuggled.matches(&needle).count(),
+            1,
+            "an inline layout literal must be countable — this is the comparison the roster rests on"
+        );
+        // …and a comment or a prose diagnostic mentioning the path is NOT a call site: the needle
+        // includes the opening quote, so only a literal that *starts* with the layout counts.
+        let prose = "// no /var/run/netns → the privileged datapath has nowhere to keep namespaces";
+        assert_eq!(prose.matches(&needle).count(), 0);
     }
 }

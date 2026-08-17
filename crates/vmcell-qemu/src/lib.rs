@@ -518,8 +518,10 @@ struct SpawnedQemu {
     fs_daemons: Vec<vmcell::fs::VirtioFsDaemon>,
     pgid: Option<u32>,
     vsock_pgid: Option<u32>,
-    /// The effective guest CID the vsock device was bound to (the baked CID on a
-    /// restore, `res.guest_cid` on create).
+    /// The guest CID the vsock device was bound to — **always** the fresh `res.guest_cid`, on
+    /// restore as on create: `guest-cid` is a QEMU device property and not part of the migration
+    /// stream, so the destination programs a new allocator-unique CID
+    /// (`restore_rotates_host_paths: true`, §2.4).
     cid: u32,
     /// How the host reaches this VM's steward — AF_VSOCK (in-kernel vsock) or
     /// AF_UNIX (external daemon).
@@ -717,6 +719,44 @@ struct SpawnParams {
     /// `true` on the restore path: launch with `-incoming defer` so the caller drives
     /// `migrate-incoming` over QMP, then `resume`. `false` on cold create.
     incoming: bool,
+}
+
+/// How the host reaches this VM's steward: the **transport** (in-kernel vsock is dialed by CID over
+/// AF_VSOCK; the external daemon bridges to the AF_UNIX `vsock.sock`) and — law C8's FIRST question
+/// — the **port**.
+///
+/// The port is the DECLARED one ([`StewardPlacement::steward_port`](vmcell::config::StewardPlacement::steward_port)),
+/// never the protocol default, because [`QemuInstance::verify_control_plane`] probes this endpoint
+/// *verbatim*: QEMU on the external-daemon transport is the only backend that probes at all, so
+/// baking 5000 in dialed a dead port on a `Service { port: 5100 }` cell. The daemon accepts the
+/// `CONNECT` and never answers a port with no guest listener, so the probe spent its whole budget,
+/// the VM was destroyed and re-spawned, and after `MAX_CONTROL_PLANE_RESPAWNS` a healthy cell was
+/// refused (M1). `MicroVm::steward`/`connect_sessions` re-key the port per call (`with_port`), which
+/// is exactly why the defect was invisible everywhere except the probe.
+///
+/// [`StewardPlacement::None`](vmcell::config::StewardPlacement::None) has no steward and never
+/// reaches the health gate (the orchestrator keys it on `steward_port().is_some()`), so the protocol
+/// default stands in as an unused placeholder there — not as a silent fallback for a declared port,
+/// of which there is none.
+fn steward_endpoint(
+    params: &SpawnParams,
+    vsock_path: &Path,
+    placement: vmcell::config::StewardPlacement,
+) -> VsockEndpoint {
+    let port = placement
+        .steward_port()
+        .unwrap_or(vmcell::vmm::STEWARD_VSOCK_PORT);
+    if params.in_kernel_vsock {
+        VsockEndpoint::Vsock {
+            cid: params.guest_cid,
+            port,
+        }
+    } else {
+        VsockEndpoint::Unix {
+            path: vsock_path.to_path_buf(),
+            port,
+        }
+    }
 }
 
 /// The per-VM host paths the QEMU argv references, computed by [`Qemu::spawn_qemu`] and
@@ -1013,9 +1053,11 @@ fn qemu_launch_plan(
     // (snapshot-eligible, §2.4, QEMU q35 — the fallback and most-proven nester) is realized by QEMU against `/dev/vhost-vsock` — a
     // root:kvm device, so a jailed QEMU needs the runner's `CAP_DAC_OVERRIDE` to
     // open it; a permission failure surfaces loud at device realize, never a silent
-    // downgrade (M-VMM-2). Its `guest-cid` is a device *property* (not migrated),
-    // so restore reuses the baked CID here (§8.2). The default external daemon path
-    // stays the `vhost-user-vsock-pci` chardev pair.
+    // downgrade (M-VMM-2). Its `guest-cid` is a device *property* and NOT part of the migration
+    // stream, which is why restore programs the FRESH `res.guest_cid` here rather than the source's
+    // — QEMU is on the rotating side (`restore_rotates_host_paths: true`, §2.4), and each concurrent
+    // clone therefore holds its own CID on the host-global vhost-vsock namespace. The default
+    // external daemon path stays the `vhost-user-vsock-pci` chardev pair.
     if params.in_kernel_vsock {
         cmd.arg("-device")
             .arg(format!("vhost-vsock-pci,guest-cid={}", params.guest_cid));
@@ -1214,19 +1256,7 @@ async fn finish_qemu_spawn(
         None => (None, None),
     };
 
-    // How the host reaches this VM's steward: in-kernel vsock is dialed by CID
-    // over AF_VSOCK; the external daemon bridges to the AF_UNIX `vsock.sock`.
-    let endpoint = if params.in_kernel_vsock {
-        VsockEndpoint::Vsock {
-            cid: params.guest_cid,
-            port: vmcell::vmm::STEWARD_VSOCK_PORT,
-        }
-    } else {
-        VsockEndpoint::Unix {
-            path: paths.vsock_path.to_path_buf(),
-            port: vmcell::vmm::STEWARD_VSOCK_PORT,
-        }
-    };
+    let endpoint = steward_endpoint(params, paths.vsock_path, cfg.steward_placement);
 
     Ok(SpawnedQemu {
         qmp_socket: paths.qmp_socket.to_path_buf(),
@@ -2429,6 +2459,76 @@ mod tests {
         )));
     }
 
+    // M1, and the KVM-free half of its gate (the live half is the `Service{5100}` QEMU leg in
+    // `vmcell/tests/service_steward.rs`): the endpoint this backend bakes at spawn carries the
+    // DECLARED steward port. `verify_control_plane` probes that endpoint verbatim — it is the only
+    // backend that probes at all — so a hardcoded default dialed 5000 at a guest listening on 5100,
+    // and the health gate re-spawned a healthy cell to exhaustion and refused it.
+    //
+    // RED on the inverse: put `vmcell::vmm::STEWARD_VSOCK_PORT` back in either arm of
+    // `steward_endpoint` and the `Service { port: 5100 }` assertions fail on both transports.
+    #[test]
+    fn the_spawned_endpoint_carries_the_declared_steward_port() {
+        use vmcell::config::StewardPlacement;
+
+        let vsock_path = PathBuf::from("/tmp/vmcell-m1/vsock.sock");
+        let params = |in_kernel_vsock| SpawnParams {
+            in_kernel_vsock,
+            guest_cid: 42,
+            incoming: false,
+        };
+        let port_of = |e: &VsockEndpoint| match e {
+            VsockEndpoint::Unix { port, .. } | VsockEndpoint::Vsock { port, .. } => *port,
+        };
+
+        // A NON-default declared port, on BOTH transports: the external daemon is where the probe
+        // actually runs, and the in-kernel arm is where a restored cell's endpoint comes from.
+        for in_kernel in [false, true] {
+            let endpoint = steward_endpoint(
+                &params(in_kernel),
+                &vsock_path,
+                StewardPlacement::Service { port: 5100 },
+            );
+            assert_eq!(
+                port_of(&endpoint),
+                5100,
+                "the probe dials THIS endpoint, so it must carry the declared port \
+                 (in_kernel_vsock={in_kernel})"
+            );
+        }
+
+        // The default placement is byte-identical to every release before v33 — the pay-for-what-
+        // you-use floor — so a `Pid1` cell's endpoint must be unchanged.
+        assert_eq!(
+            port_of(&steward_endpoint(
+                &params(false),
+                &vsock_path,
+                StewardPlacement::Pid1
+            )),
+            vmcell::vmm::STEWARD_VSOCK_PORT,
+        );
+        // …and the transport half still follows `in_kernel_vsock`, which the port change must not
+        // have disturbed.
+        assert!(matches!(
+            steward_endpoint(&params(true), &vsock_path, StewardPlacement::Pid1),
+            VsockEndpoint::Vsock { cid: 42, .. }
+        ));
+        assert!(matches!(
+            steward_endpoint(&params(false), &vsock_path, StewardPlacement::Pid1),
+            VsockEndpoint::Unix { ref path, .. } if path == &vsock_path
+        ));
+        // `None` never reaches the health gate, so its port is an unused placeholder — pinned so a
+        // future reader does not mistake it for a dialable answer.
+        assert_eq!(
+            port_of(&steward_endpoint(
+                &params(false),
+                &vsock_path,
+                StewardPlacement::None
+            )),
+            vmcell::vmm::STEWARD_VSOCK_PORT,
+        );
+    }
+
     // The authoritative snapshot-eligibility guard (S1). Task B decoupled the in-kernel
     // Vsock transport from `snapshotting`, so a `Vsock` endpoint alone no longer proves
     // eligibility — a non-snapshot `InKernel` VM can carry a virtio-fs share. The guard
@@ -2898,28 +2998,27 @@ mod tests {
     }
 }
 
-/// Source-level gate for M6's "the migration budget is the instance's, never a call site's" — the
-/// backstop behind the structural fix.
+/// What this file's four source-scanning gates read, and the one normalizer they read it through.
 ///
-/// [`QemuInstance::drive_migration`] takes no budget argument, so a call site that reached for the
-/// flat [`MIGRATION_BUDGET`] floor is a compile error. What a compiler cannot catch is a shipped
-/// call site reaching for the private `drive_migration_within` seam that the M7 gate uses — same
-/// file, same crate, one extra word. This scans for exactly that, in the same shape as
-/// [`virtiofs_pacing_gate`] (whose doc carries the full rationale for scanning source).
+/// Scanning source is how a law whose drift is not a compile error gets a gate here (each gate
+/// module's own doc carries its rationale; [`virtiofs_pacing_gate`]'s is the fullest). Every such
+/// gate needs the same two things, so they live here once: three copies of `production_code` and
+/// four of the `include_str!` had accumulated, one per gate, and a scanner that exists to notice
+/// drift is the last helper that should be able to drift from its siblings — a fix applied to one
+/// copy (the `//!` inner-doc lines the filter drops, say) silently leaves the others reading
+/// different text.
 #[cfg(test)]
-mod migration_budget_gate {
-    const SOURCE: &str = include_str!("lib.rs");
-
-    /// The number of migrations this backend drives: two — `snapshot()`'s `migrate` and
-    /// `restore()`'s `migrate-incoming`.
-    ///
-    /// Asserted exactly, so a scan that silently matched nothing — the way every source-scanning
-    /// gate fails vacuously — reddens instead of passing over an empty set.
-    const EXPECTED_MIGRATIONS: usize = 2;
+mod gate_source {
+    /// This file's own text, `include_str!`-ed once for every gate below.
+    pub(super) const SOURCE: &str = include_str!("lib.rs");
 
     /// This file's production text: everything before the first `#[cfg(test)]`, comment lines
     /// dropped and whitespace collapsed.
-    fn production_code(source: &str) -> String {
+    ///
+    /// Dropping comments is what lets a gate's own prose name the very spelling it forbids, and
+    /// collapsing whitespace is what makes a rustfmt-wrapped call site match as one string. Both are
+    /// controlled by each gate's own `the_scanner_ignores_comments…` leg.
+    pub(super) fn production_code(source: &str) -> String {
         let production = source
             .split_once("#[cfg(test)]")
             .map_or(source, |(before, _)| before);
@@ -2930,6 +3029,26 @@ mod migration_budget_gate {
             .collect::<Vec<_>>()
             .join(" ")
     }
+}
+
+/// Source-level gate for M6's "the migration budget is the instance's, never a call site's" — the
+/// backstop behind the structural fix.
+///
+/// [`QemuInstance::drive_migration`] takes no budget argument, so a call site that reached for the
+/// flat [`MIGRATION_BUDGET`] floor is a compile error. What a compiler cannot catch is a shipped
+/// call site reaching for the private `drive_migration_within` seam that the M7 gate uses — same
+/// file, same crate, one extra word. This scans for exactly that, in the same shape as
+/// [`virtiofs_pacing_gate`] (whose doc carries the full rationale for scanning source).
+#[cfg(test)]
+mod migration_budget_gate {
+    use super::gate_source::{SOURCE, production_code};
+
+    /// The number of migrations this backend drives: two — `snapshot()`'s `migrate` and
+    /// `restore()`'s `migrate-incoming`.
+    ///
+    /// Asserted exactly, so a scan that silently matched nothing — the way every source-scanning
+    /// gate fails vacuously — reddens instead of passing over an empty set.
+    const EXPECTED_MIGRATIONS: usize = 2;
 
     /// Method-call occurrences of `name` — the leading `.` is what separates a call from the
     /// `async fn name(` definition, which would otherwise inflate every count by one.
@@ -3019,30 +3138,13 @@ mod migration_budget_gate {
 /// are two readers of it.
 #[cfg(test)]
 mod virtiofs_pacing_gate {
-    const SOURCE: &str = include_str!("lib.rs");
+    use super::gate_source::{SOURCE, production_code};
 
     /// The number of virtio-fs daemon starts this backend ships: one, in `create`.
     ///
     /// Asserted exactly, so a scan that silently matched nothing — the way every source-scanning
     /// gate fails vacuously — reddens instead of passing over an empty set.
     const EXPECTED_CALL_SITES: usize = 1;
-
-    /// This file's production text: everything before the first `#[cfg(test)]`, comment lines
-    /// dropped and whitespace collapsed.
-    ///
-    /// `pub(super)` so the sibling [`jail_composition_gate`](super::jail_composition_gate) reuses
-    /// this normalizer instead of carrying a third copy of it.
-    pub(super) fn production_code(source: &str) -> String {
-        let production = source
-            .split_once("#[cfg(test)]")
-            .map_or(source, |(before, _)| before);
-        production
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.starts_with("//"))
-            .collect::<Vec<_>>()
-            .join(" ")
-    }
 
     /// Every `VirtioFsDaemon::…` call expression in `code`, each truncated at its statement's `;`.
     fn virtiofs_start_calls(code: &str) -> Vec<&str> {
@@ -3120,16 +3222,14 @@ mod virtiofs_pacing_gate {
 /// or `spawn_qemu`, which re-opens the window between deciding the posture and applying it and
 /// leaves the plan's record describing a command nobody spawns. That is a property of this
 /// file's *text*, so it is scanned — the same shape as the sibling [`virtiofs_pacing_gate`],
-/// whose `production_code` normalizer this reuses rather than copies.
+/// through the one [`gate_source`] normalizer every gate here shares.
 ///
 /// It catches: a raw `jail_spec_from_config` call in this backend, a second launch-plan
 /// construction, and a deleted one. It cannot catch: the wrong `JailConfig` handed to the plan —
 /// that is behavioral, and the KVM-free plan gate asserts it directly.
 #[cfg(test)]
 mod jail_composition_gate {
-    use super::virtiofs_pacing_gate::production_code;
-
-    const SOURCE: &str = include_str!("lib.rs");
+    use super::gate_source::{SOURCE, production_code};
 
     /// The number of launch-plan constructions this backend ships: one, in
     /// [`super::qemu_launch_plan`].
@@ -3197,5 +3297,76 @@ mod jail_composition_gate {
         let code = production_code(composed);
         assert!(calls(&code, "jail_spec_from_config(").is_empty());
         assert_eq!(calls(&code, "LaunchPlan::build(").len(), 1);
+    }
+}
+
+/// Source-level gate for M1's "the host dials the DECLARED steward port": the endpoint composition
+/// lives in exactly one place, and the protocol default is spelled only as the placement-`None`
+/// placeholder inside it.
+///
+/// The composer has its own unit test (`the_spawned_endpoint_carries_the_declared_steward_port`), and
+/// that test cannot see the defect this gate is about: a second, inlined `VsockEndpoint` carrying
+/// `STEWARD_VSOCK_PORT` — which is exactly the shape the defect shipped as, two of them, in
+/// `finish_qemu_spawn`. Nor can a KVM-free behavioral test see it: reaching
+/// `verify_control_plane`'s dial needs a booted guest, which is why the live half of this gate is
+/// the `Service{5100}` QEMU leg in `vmcell/tests/service_steward.rs`.
+///
+/// Same shape and same honest limit as [`migration_budget_gate`]: a scan sees spellings, not values.
+#[cfg(test)]
+mod steward_port_gate {
+    use super::gate_source::{SOURCE, production_code};
+
+    /// Production mentions of the protocol default: one, the placement-`None` placeholder in
+    /// `steward_endpoint`. Asserted exactly, so the scan cannot pass over an empty set.
+    const EXPECTED_DEFAULT_PORT_MENTIONS: usize = 1;
+
+    // M1 GATE (KVM-free): the composer is the one place that decides the dialed port, and the one
+    // place allowed to name the protocol default.
+    //
+    // RED on the inverse: re-inline either `VsockEndpoint` arm with
+    // `port: vmcell::vmm::STEWARD_VSOCK_PORT` in `finish_qemu_spawn` and the mention count goes to
+    // 2 or 3; drop the composer and the `steward_port()` assertion fires.
+    #[test]
+    fn the_dialed_port_is_composed_once_from_the_declared_placement() {
+        let code = production_code(SOURCE);
+        let mentions = code.matches("STEWARD_VSOCK_PORT").count();
+        assert_eq!(
+            mentions, EXPECTED_DEFAULT_PORT_MENTIONS,
+            "the protocol default may be spelled only as `steward_endpoint`'s placement-`None` \
+             placeholder; every other mention is a dial site hardcoding a port the caller may have \
+             re-declared (M1). Found {mentions}."
+        );
+        assert!(
+            code.contains("placement .steward_port()") || code.contains("placement.steward_port()"),
+            "the composed port must come from `StewardPlacement::steward_port()` — C8's first \
+             question — not from a constant"
+        );
+        // Non-vacuity: the composer is actually the spawn path's endpoint, not dead code.
+        assert!(
+            code.contains("steward_endpoint(params,"),
+            "`finish_qemu_spawn` must compose its endpoint through `steward_endpoint`"
+        );
+    }
+
+    /// The scanner's own controls: prose is not code, and the regression shape is genuinely
+    /// detected — so the gate above is not a test that can only ever pass (AGENTS.md rule 2).
+    #[test]
+    fn the_scanner_ignores_comments_and_sees_a_re_inlined_port() {
+        let clean = "// port: vmcell::vmm::STEWARD_VSOCK_PORT in a comment is not a dial site\n\
+             let port = placement.steward_port().unwrap_or(vmcell::vmm::STEWARD_VSOCK_PORT);\n\
+             #[cfg(test)]\nmod tests { STEWARD_VSOCK_PORT }";
+        assert_eq!(
+            production_code(clean).matches("STEWARD_VSOCK_PORT").count(),
+            EXPECTED_DEFAULT_PORT_MENTIONS,
+        );
+        let regressed = "let port = placement.steward_port().unwrap_or(vmcell::vmm::STEWARD_VSOCK_PORT); \
+             let e = VsockEndpoint::Unix { path: p, port: vmcell::vmm::STEWARD_VSOCK_PORT };";
+        assert!(
+            production_code(regressed)
+                .matches("STEWARD_VSOCK_PORT")
+                .count()
+                > EXPECTED_DEFAULT_PORT_MENTIONS,
+            "a re-inlined default port must be visible to the scan"
+        );
     }
 }

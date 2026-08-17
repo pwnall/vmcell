@@ -5,6 +5,11 @@
 //! `test-integration` job runs after the artifacts are built and the runner blessed. Before that
 //! recipe existed, both tests were compiled and skipped by every invocation in the tree (`m24`):
 //! an `#[ignore]`d test that no `--run-ignored all` filter selects is a suite that cannot go red.
+//!
+//! One test here is **not** `#[ignore]`d, and it boots nothing: the fake-blind axis each live leg
+//! claims is stated in that leg's own rustdoc, and prose is the one part of a live test that no host
+//! ever executes. [`the_fake_blind_axis_claims_state_what_the_shipped_probe_answers`] scans those
+//! claims, so this file cannot go on describing a probe the crate stopped shipping.
 
 use vmcell_artifact_validator::harness::{get_rootfs, get_vmlinux};
 use vmcell_artifact_validator::{ArtifactSet, CheckStatus, Level, ValidationOptions, validate};
@@ -82,11 +87,15 @@ async fn validate_broken_kernel_reports_failure() {
 /// Everything else about the battery — the four-leg matrix, the control pairing, the warning
 /// lifecycle, the budget — is unit-gated against a scripted probe, because the judgement is what
 /// delta 3 specifies and it must run on every machine. What a scripted probe structurally cannot
-/// see is the probe's own wiring: `snapshot_restore_roundtrip` needs a real guest to hand shake, so
-/// a fake-driven run of it answers `DoesNotWork` after the full handshake budget, always. This leg
-/// is that evidence, and it is deliberately the **under-claim** direction, because it is the one
-/// only a live run can produce: the canonical artifacts genuinely snapshot, so an artifact record
-/// that declares `snapshot_restore = false` for them is an under-claim by construction.
+/// see is the probe's own wiring: the snapshot probe needs a real guest to hand shake, so a
+/// fake-driven run of it answers `NotRun` — it stops in one of its **setup** arms (the config, the
+/// start, the handshake), in milliseconds, and reports nothing measured. Since docs/90's M8 split,
+/// neither answer that *decides* the feature is reachable without a guest: not `Works`, and not the
+/// measured `DoesNotWork` either, which is now produced only past `MicroVm::snapshot` — the first
+/// call that actually exercises the feature. This leg is that evidence, and it is deliberately the
+/// **under-claim** direction, because it is the one only a live run can produce: the canonical
+/// artifacts genuinely snapshot, so an artifact record that declares `snapshot_restore = false` for
+/// them is an under-claim by construction.
 ///
 /// The known-good pair plays both roles — under two different labels, which is the point: the
 /// battery refuses a control that IS the candidate, so the labels are what the pairing is keyed on
@@ -256,5 +265,88 @@ async fn conformance_live_xattr_probe_walks_the_image_and_refuses_an_uncontrolle
     assert!(
         !msg.contains("no data-plane probe"),
         "the kit must not still be reporting `NO_PROBE_YET` for a feature it now probes: {msg}"
+    );
+}
+
+/// The KVM-free gate on this file's own prose: a live leg's rustdoc says what a *fake-driven* run of
+/// its probe answers, and that sentence is the one thing in a `#[ignore]`d test that never runs.
+///
+/// It went stale exactly once and predictably: docs/90's M8 split `snapshot_restore_roundtrip`'s
+/// single `Err` into a setup stop (`NotRun` → `Unverified`) and an exercised one (`DoesNotWork`, the
+/// measurement an absence can be verified against), and the doc here kept promising the blanket
+/// `DoesNotWork` the probe had stopped producing — which is the *pass* an absence declaration used to
+/// earn from an artifact that could not boot. A reader trusting it would take this leg to be
+/// redundant with the unit tests.
+///
+/// It scans, rather than re-testing the behavior: the behavior is unit-gated in the crate itself
+/// (`conformance`'s `the_live_probe_maps_an_undecidable_plan_and_a_setup_failure_to_notrun` and
+/// `an_unbootable_candidate_is_unverified_never_a_verified_absence`), and a second copy of that leg
+/// here would be a second copy of a law rather than a gate on the claim.
+#[test]
+fn the_fake_blind_axis_claims_state_what_the_shipped_probe_answers() {
+    const SOURCE: &str = include_str!("smoke.rs");
+
+    /// The rustdoc block immediately above `anchor`, with the `///` markers stripped and whitespace
+    /// collapsed so a sentence split across lines still matches. Panics if the anchor is missing or
+    /// carries no doc — an extraction that silently returned nothing would make the assertions
+    /// vacuous.
+    fn doc_block_before(source: &str, anchor: &str) -> String {
+        let before = source
+            .split_once(anchor)
+            .unwrap_or_else(|| panic!("`{anchor}` must exist in this file"))
+            .0;
+        let mut doc: Vec<&str> = Vec::new();
+        for line in before.lines().rev() {
+            let trimmed = line.trim_start();
+            if let Some(rest) = trimmed.strip_prefix("///") {
+                doc.push(rest);
+                continue;
+            }
+            // Attributes (`#[tokio::test]`, `#[ignore]`) and blank lines sit between the doc and its
+            // item; anything else ends the block.
+            if doc.is_empty() && (trimmed.is_empty() || trimmed.starts_with("#[")) {
+                continue;
+            }
+            break;
+        }
+        assert!(!doc.is_empty(), "`{anchor}` must carry a rustdoc block");
+        doc.reverse();
+        doc.join(" ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    let doc = doc_block_before(
+        SOURCE,
+        "async fn conformance_live_underclaim_warns_with_its_positive_control()",
+    );
+    // The claim is about what the probe ANSWERS, so that is the phrase under test — not the bare
+    // variant names, which the corrected sentence legitimately mentions in order to rule them out.
+    assert!(
+        doc.contains("answers `NotRun`"),
+        "the snapshot leg's fake-blind claim must state the answer the shipped probe gives a \
+         fake-driven run — a setup stop, `NotRun` (M8):\n{doc}"
+    );
+    assert!(
+        !doc.contains("answers `DoesNotWork`"),
+        "M8 made the measured `DoesNotWork` reachable only past `MicroVm::snapshot`, so no \
+         fake-driven run answers it; this doc still promises it:\n{doc}"
+    );
+    // Non-vacuity for the extraction: the block really is the one that documents the snapshot probe.
+    assert!(
+        doc.contains("snapshot"),
+        "the extracted block is not the snapshot leg's doc — the anchor must have moved:\n{doc}"
+    );
+
+    // The sibling leg's own claim, checked for the mirror-image staleness: its evidence sentence
+    // rests on `NotRun` being what a probe that could not run reports, which is the same M8 line.
+    let xattr = doc_block_before(
+        SOURCE,
+        "async fn conformance_live_xattr_probe_walks_the_image_and_refuses_an_uncontrolled_absence()",
+    );
+    assert!(
+        xattr.contains("Unverified") && xattr.contains("control"),
+        "the xattr leg's claim must still be about the pairing's honesty:\n{xattr}"
     );
 }

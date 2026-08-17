@@ -622,6 +622,38 @@ mod tests {
         assert_eq!(ErrorKind::from_wire("bogus"), None);
     }
 
+    // The snapshot-eligibility predicate itself (finding T5: a repo-wide grep found the definition
+    // and one call site, and no test anywhere). `Unprivileged` is the one mode that attaches a
+    // vhost-user device, which is what the eligibility law is about (§8.1) — the wire spelling is
+    // asserted beside it, because that string is what a client actually types.
+    //
+    // Roster completeness is not this test's job (see the `ErrorKind::ALL` note above — an array
+    // literal cannot force a new variant into itself); what it holds is that every mode in the
+    // roster has a STATED expectation, so flipping the predicate reddens. RED on the inverse: drop
+    // the `!` in `snapshot_eligible`, or widen it to `Privileged`.
+    #[test]
+    fn snapshot_eligible_is_exactly_the_net_modes_with_no_vhost_user_device() {
+        for (net, wire) in [
+            (NetMode::None, "none"),
+            (NetMode::Privileged, "privileged"),
+            (NetMode::Unprivileged, "unprivileged"),
+        ] {
+            let want = match net {
+                // No device at all / a tap the VMM owns: nothing vhost-user in the config.
+                NetMode::None | NetMode::Privileged => true,
+                // The in-process smoltcp NAT IS a vhost-user-net device.
+                NetMode::Unprivileged => false,
+            };
+            assert_eq!(net.snapshot_eligible(), want, "{net:?}");
+            assert_eq!(
+                serde_json::to_value(net).expect("encode"),
+                serde_json::Value::String(wire.to_string()),
+                "the wire spelling a client types"
+            );
+        }
+        assert_eq!(NetMode::default(), NetMode::None, "the default is eligible");
+    }
+
     // Additive compatibility: an older client that omits the new fields still deserializes, and
     // defaults apply (a JSON with only kernel+rootfs boots a default create).
     #[test]

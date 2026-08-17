@@ -1,15 +1,28 @@
 #!/usr/bin/env bash
-# The KVM-free half of the downstream toolkit contract gate (design v30 §5.6 / §10.4; §18 delta 5).
+# The KVM-free half of the downstream toolkit contract gate (design §5.6 / §10.4; v30 §18 delta 5,
+# extended by the v33 register's §10.5 registry, §7.4 declarations and §10.6 conformance kit).
 #
 # Four groups of legs, all runnable on a plain ubuntu runner:
 #
-#   1. the contract test binary          — overlay resolution, the sidecar naming rule + parser,
-#                                          and this example's survival predicates with their inverses
-#   2. the harness getters, both ways    — §10.4: the full `VMCELL_*` override set returns the named
-#                                          paths; WITHOUT it the getters fail loud naming the
-#                                          two-step route (separate processes: `ensure_test_artifacts`
-#                                          memoizes its outcome per process)
-#   3. the DOCUMENTED CLI invocations    — `vmcell build-kernels <label>…|--all --pins …` and
+#   1. fmt + clippy + the test binary    — the two lints because this workspace is `exclude`d from
+#                                          vmcell's, so the root job's `cargo fmt --all` / `clippy
+#                                          --workspace` never reach a line of it; then the contract
+#                                          battery — overlay + registry resolution (all three kinds),
+#                                          the declaration sidecar through the shipped pipeline, a
+#                                          consumer's own `Stage` behind Stage 0, the pack-surface
+#                                          composition, the conformance kit's five-state verdict law,
+#                                          and this example's survival predicates — each with its
+#                                          inverse
+#   2. the `VMCELL_*` env contract       — §10.4, in separate processes because the contract is about
+#                                          what the ENVIRONMENT does (and `ensure_test_artifacts`
+#                                          memoizes its outcome per process): the full override set
+#                                          returns the named paths; WITHOUT it the getters fail loud
+#                                          naming the two-step route; and the four backend-binary
+#                                          resolvers return the named binary when set and the
+#                                          documented default name when not.
+#   3. the DOCUMENTED CLI invocations    — `vmcell build-kernels <label>…|--all --pins …`,
+#                                          `vmcell build --rootfs-label/--handler-label …` (the v33
+#                                          labelled selectors, §10.5) and
 #                                          `vmcell oci2-erofs … --inject/--tools/--work-dir …`, the
 #                                          half of the contract `cargo semver-checks` cannot see.
 #                                          Mostly exercised on their fail-fast contract boundaries so
@@ -109,14 +122,25 @@ expect_absent() {
     echo "ok   [$name]"
 }
 
-group "1. the consumer builds and its contract tests pass"
+group "1. the consumer builds, lints, and its contract tests pass"
 cd "$here"
+# `fmt` and `clippy` HERE, not in the repo-root job, and that is a hole this script had to close:
+# `cargo fmt --all --check` and `cargo clippy --locked --workspace` at the repo root operate on the
+# vmcell WORKSPACE, and this directory is `exclude`d from it — so every line under
+# `examples/downstream-kernel/` was unformatted and unlinted by construction, however green the root
+# job was. `-D warnings` mirrors `just ci`'s `RUSTFLAGS`, so the two workspaces hold one standard.
+cargo fmt --check
 cargo build --locked
+cargo clippy --locked --all-targets -- -D warnings
+# The whole KVM-free contract battery: the pins overlay's three registry namespaces (§10.5), the
+# feature-manifest sidecar through the shipped pipeline (§7.4), a consumer's own `Stage` behind
+# Stage 0 (§10.2), the pack-surface composition (§4.2/§4.7) and the two-directional conformance
+# battery's five-state verdict law (§10.6).
 cargo test --locked
 bin="$here/target/debug/downstream-kernel"
 [ -x "$bin" ] || { echo "FAIL: $bin was not built"; exit 1; }
 
-group "2. the harness getters under the VMCELL_* env contract (§10.4)"
+group "2. the VMCELL_* env contract (§10.4): the getters, and the backend resolvers"
 # The documented downstream configuration: an externally managed artifact pair. The getters only
 # assert existence, so two touched files pin the identity contract with no VM and no build.
 touch "$work/vmlinux" "$work/rootfs.erofs"
@@ -132,6 +156,23 @@ expect "getters return the named rootfs path" 0 "^rootfs=$work/rootfs.erofs\$" \
 expect "getters fail loud without the override set" nonzero \
     "VMCELL_KERNEL.*VMCELL_ROOTFS|VMCELL_ROOTFS.*VMCELL_KERNEL" \
     env VMCELL_ARTIFACTS_DIR="$work/empty" VMCELL_PINS="$overlay" "$bin" getters
+
+# The other half of the same table: `VMCELL_CH_BIN` / `_FC_BIN` / `_QEMU_BIN` / `_CROSVM_BIN` are
+# THE documented way any harness finds a VMM binary. Both behaviors are the contract, so both are
+# asserted — the named path verbatim when set, the documented default name when not. A resolver that
+# ignored its variable prints the default in the first leg and reddens there; one that invented a
+# different default reddens in the second.
+touch "$work/ch-stub"
+expect "the CH resolver returns the named binary" 0 "^ch=$work/ch-stub\$" \
+    env VMCELL_CH_BIN="$work/ch-stub" "$bin" bins
+# `env -u` on all four: a developer box may have any of them exported, which would make the
+# defaults leg assert against the ambient environment instead of the contract.
+expect "the backend resolvers fall back to the documented names" 0 \
+    "^ch=cloud-hypervisor\$" \
+    env -u VMCELL_CH_BIN -u VMCELL_FC_BIN -u VMCELL_QEMU_BIN -u VMCELL_CROSVM_BIN "$bin" bins
+expect "…and the other three names with them" 0 \
+    "^qemu=qemu-system-x86_64\$" \
+    env -u VMCELL_CH_BIN -u VMCELL_FC_BIN -u VMCELL_QEMU_BIN -u VMCELL_CROSVM_BIN "$bin" bins
 
 group "3. the documented CLI invocations (§10.4), on their fail-fast boundaries"
 cd "$repo"
@@ -155,6 +196,26 @@ expect "build-kernels --pins --kernel-source prebuilt is a typed error" nonzero 
 expect "build-kernels with no selection refuses naming both forms" nonzero \
     "pass one or more labels.*--all" \
     "${cli[@]}" build-kernels --pins "$overlay"
+# THE v33 LABELLED SELECTORS (§10.5, delta 6) — the CLI half of the two namespaces this consumer's
+# overlay adds. An unknown label is refused NAMING the labels that are registered, and this
+# consumer's own label has to be among them: that is what proves the CLI resolved the overlay's
+# `rootfs`/`handlers` namespaces and not just the baseline's. If `--pins` were ignored here, or the
+# namespace merge replaced instead of merged, `acme` is absent from the roster and these redden.
+#
+# On the fail-fast boundary like the rest of this group: `build_stages` honors or refuses every flag
+# before any pull, so an unknown label costs a message rather than a base image. Completing a
+# labelled rootfs build needs an OCI pull (and a labelled handler its digest-pinned fetch), which is
+# why the pack itself is out of this job's scope — see the header.
+expect "build --rootfs-label names the registered rootfs labels" nonzero "rootfs.*acme" \
+    "${cli[@]}" build --pins "$overlay" --rootfs-label nosuch
+expect "build --handler-label names the registered handler labels" nonzero "handlers.*acme" \
+    "${cli[@]}" build --pins "$overlay" --handler-label nosuch
+# …and the flag-vs-source table on the same selector (F1): a source that cannot honor a registry
+# label refuses the flag by name instead of ignoring it.
+expect "build --rootfs-label is refused by name against a source that cannot honor it" nonzero \
+    "--rootfs-label" \
+    "${cli[@]}" build --pins "$overlay" --rootfs-source mmdebstrap --rootfs-label acme
+
 # `--inject`'s value parser: the positive control is that a well-formed triple PARSES (the command
 # then stops on the un-pinned image digest, which is why this leg needs no network at all).
 expect "oci2-erofs --inject accepts a well-formed triple" nonzero "digest-pinned" \
@@ -287,4 +348,4 @@ if [ "$fail" -ne 0 ]; then
     printf '\ndownstream-kernel contract check FAILED\n'
     exit 1
 fi
-printf '\nok: downstream-kernel contract check passed (contract tests, getters both ways, documented CLI, vendor trio)\n'
+printf '\nok: downstream-kernel contract check passed (contract tests, env contract both ways, documented CLI incl. the v33 labelled selectors, vendor trio)\n'

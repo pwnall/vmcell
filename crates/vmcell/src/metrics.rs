@@ -141,6 +141,43 @@ pub fn vm_slice_name(prefix: &str, vmid: u32) -> String {
     }
 }
 
+/// How deep under the cgroup-v2 root a slice named by [`vm_slice_name`] sits: the components of the
+/// composed name, i.e. this process's own placement plus the leaf. `1` for a bare leaf (no `0::`
+/// entry in `/proc/self/cgroup`).
+///
+/// The orphan sweep's bounded walk needs exactly this and carried a literal `4`, which **no**
+/// systemd user session can reach: a slice there is
+/// `/user.slice/user-1000.slice/user@1000.service/<scope>/<prefix>-vm-<vmid>` — component 5 — so the
+/// walk returned before reading it, the crash-recovery sweep reported zero cgroup slices reclaimed,
+/// and the leak survived until reboot while the netns and scratch arms of the same sweep worked
+/// (M4). Derived from the composed name so the walk and the placement cannot drift apart again.
+///
+/// The bound is honest rather than exhaustive: it reaches every slice at or above this process's own
+/// nesting, which covers the leak shape that matters — a hard-killed `vmcelld` or blessed-runner
+/// process launched the same way, whose scope is a *sibling* component and not a deeper one. A
+/// leaker nested strictly deeper stays out of reach, deliberately: the walk is bounded rather than a
+/// full descent of the host's cgroup tree.
+///
+/// Reaching *another live* process's slice is not a new hazard the extra depth introduces: the sweep
+/// deletes through `rmdir`, and a live slice holds its VMM, so the delete fails `EBUSY` and is warned
+/// — the kernel interlock the netns arm (which has always walked its whole directory) does not have.
+///
+/// Pure on the composed name, so the derivation is gate-able without a systemd session.
+///
+/// Crate-private on purpose, unlike its `pub` sibling [`vm_slice_name`]: the no-hand-formatting law
+/// is about the *name* — a downstream reader composes one and never walks the host's cgroup tree, so
+/// exporting this would widen a ledgered contract surface for a sweep-internal derivation. The cost
+/// is that only crate-private docs may link it: a `pub` item's rustdoc that does earns
+/// `rustdoc::private_intra_doc_links`, which the `-D warnings` rustdoc gate turns into a hard error
+/// (the public [`crate::orchestrator::HostOrphanScanner`] therefore points at [`vm_slice_name`], the
+/// composer this reads, and says "its own component count").
+pub(crate) fn vm_slice_scan_depth(slice_name: &str) -> u8 {
+    let components = slice_name.split('/').filter(|c| !c.is_empty()).count();
+    // Saturating, and never 0: a `depth == 0` walk returns before reading anything, which is the
+    // silent no-op this function exists to prevent.
+    u8::try_from(components).unwrap_or(u8::MAX).max(1)
+}
+
 /// Computes the cgroup-v2 `cpu.max` `(quota, period)` pair for a CPU cap expressed
 /// as a percentage of one core. The period is fixed at 100000us and the quota is the
 /// matching slice of that period (e.g. 50% -> `(50000, 100000)`, 200% -> `(200000, 100000)`).
@@ -196,7 +233,9 @@ fn controller_listed(listing: &str, controller: &str) -> bool {
 /// Classifies a failed limit-write into a typed error, distinguishing a rejected
 /// limit *value* from a missing host capability. `EINVAL` means the kernel refused
 /// the value itself (e.g. a `cpu.max` quota below the kernel's µs floor, or a
-/// malformed `io.max` device) — a caller bug that must surface as
+/// malformed `io.max` device) and `ENODEV` means it refused the **device** in that value
+/// (`io.max`'s `major:minor` names no block device, or names a partition — the kernel's
+/// `blkg_conf_open_bdev` rejects both with `ENODEV`); both are a caller bug that must surface as
 /// [`crate::error::Error::Cgroup`] so its remediation is "fix the limit", not
 /// "enable delegation". `ENOENT`/`EOPNOTSUPP` mean the control file is *absent* or
 /// the facility is unsupported (e.g. `memory.swap.max` on a kernel without swap
@@ -215,7 +254,11 @@ fn classify_limit_write_err(
     e: &std::io::Error,
 ) -> crate::error::Error {
     use crate::error::Error;
-    if e.raw_os_error() == Some(libc::EINVAL) {
+    // A rejected VALUE, not a missing capability. `ENODEV` joins `EINVAL` because the only way an
+    // `io.max` write earns it is a `<major>:<minor>` naming no whole block device, which is the
+    // caller's `IoMax::device` being wrong — sending that down the "enable delegation" path pointed
+    // the operator at a cgroup mount that is delegated and fine.
+    if matches!(e.raw_os_error(), Some(libc::EINVAL) | Some(libc::ENODEV)) {
         Error::Cgroup(format!(
             "invalid limit value {value:?} for {path} ('{controller}' controller): {e}"
         ))
@@ -867,6 +910,39 @@ mod tests {
         }
     }
 
+    // M4: the orphan sweep's walk depth is DERIVED from where a per-VM slice actually goes, so a
+    // systemd user session's placement is in reach. The shipped literal was `4`; a session slice
+    // sits at component 5, so the cgroup arm of the crash-recovery sweep could never match.
+    //
+    // RED on the inverse: return a constant (any constant) and the session case or the bare-leaf
+    // case fails — they demand different answers, which is the point of deriving it.
+    #[test]
+    fn vm_slice_scan_depth_reaches_a_systemd_user_session_placement() {
+        // The shape a `systemd-run --user --scope` (or a plain user session) puts this process in,
+        // spelled out so the assertion holds on a host whose own placement is shallower.
+        let session = "user.slice/user-1000.slice/user@1000.service/run-r0.scope";
+        assert_eq!(
+            vm_slice_scan_depth(&format!("{session}/vmcell-vm-7")),
+            5,
+            "a session slice is path component 5; the shipped literal 4 stopped one short"
+        );
+        // A bare leaf (no `0::` line, so no base) is component 1 — and never 0, which would make
+        // the walk return before reading anything.
+        assert_eq!(vm_slice_scan_depth("vmcell-vm-7"), 1);
+        assert_eq!(vm_slice_scan_depth(""), 1);
+        // A leading slash is punctuation, not a component: `vm_slice_name` emits a relative name,
+        // and counting the empty head would silently buy a spare level of depth.
+        assert_eq!(vm_slice_scan_depth("/a/vmcell-vm-7"), 2);
+        // The real composition on THIS host must be reachable by the depth derived from it — the
+        // property the sweep actually depends on.
+        let name = vm_slice_name(crate::naming::DEFAULT_RESOURCE_PREFIX, 7);
+        assert_eq!(
+            usize::from(vm_slice_scan_depth(&name)),
+            name.split('/').filter(|c| !c.is_empty()).count(),
+            "the derived depth must equal the composed name's own component count: {name}"
+        );
+    }
+
     #[test]
     fn test_fake_cgroup_fs() {
         let fs = FakeCgroupFs::new();
@@ -1364,6 +1440,23 @@ mod tests {
                 Error::Cgroup(_)
             ),
             "EINVAL (bad limit value) must be Error::Cgroup, not CapabilityUnavailable"
+        );
+        // ENODEV is the same class one field over: `io.max`'s `<major>:<minor>` naming no whole
+        // block device (a typo, or a partition) is a rejected VALUE, so its remediation is "fix the
+        // device", never "enable delegation" on a mount that is already delegated. RED on the
+        // pre-fix classifier, where ENODEV fell into the else arm.
+        let enodev = std::io::Error::from_raw_os_error(libc::ENODEV);
+        let classified =
+            classify_limit_write_err("io.max", "/p/io.max", "io", "259:9 wbps=1048576", &enodev);
+        assert!(
+            matches!(classified, Error::Cgroup(_)),
+            "ENODEV (no such block device in the io.max value) must be Error::Cgroup, got \
+             {classified:?}"
+        );
+        assert!(
+            classified.to_string().contains("259:9"),
+            "the refusal must name the rejected value so the operator can fix the device: \
+             {classified}"
         );
         // The capability/permission errnos must remain CapabilityUnavailable so the
         // "enable delegation" remediation still fires.

@@ -6,14 +6,15 @@
 //! unless the op is explicitly best-effort (law F1). To make "what does this host support?" have
 //! **one** answer and **one** probe, [`HostCapabilities`] records the effective capability set,
 //! KVM-group access, `/var/run/netns` reachability, which cgroup controllers the current scope
-//! delegates, and whether the scope is a non-threaded `domain` leaf. As built (§18 delta 8, Delta
+//! delegates, whether the scope is a non-threaded `domain` leaf, and — since docs/90 D5 — whether
+//! nested virtualization is enabled. As built (§18 delta 8, Delta
 //! register: changes from the validated v27 build), the descriptor is **probed once at start-up and
 //! logged** as a visible boot-time capability signal; per-op enforcement keeps its own authoritative
 //! fail-loud per-write check (`metrics::try_apply_limit_at` / `classify_limit_write_err`), so the
 //! descriptor is the queryable single source, not a replacement for that per-write typed error (see
 //! docs/implementation-notes.md, Delta 8).
 //!
-//! The as-built production consumers are exactly three (`hostcaps-consumer-roster-overstated`; the
+//! The as-built production consumers are exactly four (`hostcaps-consumer-roster-overstated`; the
 //! §7.2 sentence "mode selection, the daemon's main, and the test harness" overstates them — there
 //! is no mode-selection and no test-harness caller):
 //!
@@ -21,6 +22,11 @@
 //!    [`HostCapabilities::privileged_net_available`] gate for vm-to-vm segments (§6.5).
 //! 2. `vmcell_daemon::launcher::MicroVmLauncher::new` — the boot-time capability log (§11.2).
 //! 3. `vmcell-bench`'s `bench-vm` net-egress leg — the privileged-variant self-skip (M-BIN-1).
+//! 4. [`crate::feature::HostDeclaration::from_host_capabilities`] — the §7.4 intersection's host
+//!    axis, which reads [`HostCapabilities::nested_virt`] and nothing else (docs/90 D5). The
+//!    orchestrator still reaches it through `HostDeclaration::probe`, so a cell start probes the
+//!    descriptor rather than being handed the boot-time one; threading it is recorded as the
+//!    remaining half.
 
 use std::collections::BTreeSet;
 
@@ -56,13 +62,31 @@ pub struct HostCapabilities {
     /// The current cgroup scope is a non-threaded `domain` leaf. A threaded scope rejects
     /// `cgroup.procs` regardless of `CAP_SYS_ADMIN`, so no per-VM slice can hold the VMM (§7.3, cgroup delegation mechanics).
     pub domain_leaf: bool,
+    /// Nested virtualization is enabled on the host (`kvm_intel.nested` / `kvm_amd.nested`) — the
+    /// **host axis of the §7.4 feature intersection** (The feature intersection).
+    ///
+    /// §7.4 states the host contributes `HostCapabilities` ("nested-virt readiness, privileged-net
+    /// facilities"), and until this field existed it did not:
+    /// [`crate::feature::HostDeclaration`] ran a **second** probe of its own, so the one-probe law
+    /// (§7.2 rule 1) held for everything except the one axis the design named. The declaration is
+    /// now derived from this descriptor by
+    /// [`HostDeclaration::from_host_capabilities`](crate::feature::HostDeclaration::from_host_capabilities).
+    ///
+    /// An unreadable module parameter resolves to `true`, **against** this descriptor's usual
+    /// conservative direction, and deliberately: the host axis removes a feature only when it can
+    /// positively say the facility is off (F1's distinction between an absent facility and an
+    /// unasked question). Reading `false` here on a non-KVM box or a locked-down sysfs would remove
+    /// `Feature::NestedVirt` from every cell with host provenance it cannot support.
+    pub nested_virt: bool,
 }
 
 impl HostCapabilities {
-    /// Probes the host **once**, reading `/proc/self/status`, `/dev/kvm`, `/var/run/netns`, and the
-    /// current cgroup scope's `cgroup.subtree_control` / `cgroup.type`. Every field is a best-effort
-    /// read that resolves to the conservative value (`false` / empty) when the source is unreadable,
-    /// so an unknown host is treated as *un*-provisioned rather than optimistically capable.
+    /// Probes the host **once**, reading `/proc/self/status`, `/dev/kvm`, `/var/run/netns`, the
+    /// current cgroup scope's `cgroup.subtree_control` / `cgroup.type`, and the KVM modules' `nested`
+    /// parameter. Every field is a best-effort read that resolves to the conservative value
+    /// (`false` / empty) when the source is unreadable, so an unknown host is treated as
+    /// *un*-provisioned rather than optimistically capable — [`Self::nested_virt`] documents the one
+    /// field whose conservative direction is the other way, and why.
     #[must_use]
     pub fn probe() -> Self {
         let cgroups = CgroupSysfs::system();
@@ -73,6 +97,7 @@ impl HostCapabilities {
             netns_reachable: netns_reachable(),
             delegated_controllers: cgroups.delegated_controllers(),
             domain_leaf: cgroups.domain_leaf(),
+            nested_virt: nested_virt_enabled(),
         }
     }
 
@@ -150,6 +175,34 @@ fn kvm_accessible() -> bool {
         .write(true)
         .open("/dev/kvm")
         .is_ok()
+}
+
+/// The KVM modules whose `nested` parameter answers "is nested virtualization enabled", in probe
+/// order: the first one that reads decides (a host runs at most one of them).
+const NESTED_PARAM_MODULES: [&str; 2] = ["kvm_intel", "kvm_amd"];
+
+/// Whether nested virtualization is enabled, reading `/sys/module/<kvm module>/parameters/nested`.
+///
+/// **The one site that reads this parameter** (§7.4's host axis, The feature intersection). It lived
+/// in `feature::HostDeclaration::probe` — a second host probe beside this descriptor, which is what
+/// made §7.4's "the host contributes `HostCapabilities`" false;
+/// `the_host_axis_reads_the_nested_parameter_in_exactly_one_place` is the call-site scan that keeps
+/// it here.
+fn nested_virt_enabled() -> bool {
+    let raw = NESTED_PARAM_MODULES
+        .iter()
+        .find_map(|m| std::fs::read_to_string(format!("/sys/module/{m}/parameters/nested")).ok());
+    nested_virt_from_param(raw.as_deref())
+}
+
+/// Decodes the module parameter: `Y`/`y`/`1` is enabled, anything else is not, and `None` — the
+/// parameter could not be read at all — is **enabled**.
+///
+/// Split from the read so the unreadable arm is unit-testable without a `/sys` seam: it is the arm
+/// with the surprising direction ([`HostCapabilities::nested_virt`] carries the rationale), and it is
+/// the arm every non-KVM host takes.
+fn nested_virt_from_param(value: Option<&str>) -> bool {
+    value.is_none_or(|v| matches!(v.trim(), "Y" | "y" | "1"))
 }
 
 /// Whether the `/var/run/netns` bind-mount directory is reachable (the privileged datapath keeps
@@ -264,6 +317,7 @@ mod tests {
             netns_reachable: true,
             delegated_controllers: controllers(&["memory", "cpu", "io", "pids"]),
             domain_leaf: true,
+            nested_virt: true,
         };
         assert!(
             full.privileged_net_available(),
@@ -344,6 +398,42 @@ mod tests {
             ..full
         };
         assert!(!no_kvm.can_boot_vm(), "no /dev/kvm → static-only");
+    }
+
+    // docs/90 D5: the §7.4 host axis is this descriptor's `nested_virt` field, and the parameter
+    // decode is the one arm no live suite reaches — every KVM host reads `Y` or `N`, so the
+    // "unreadable ⇒ enabled" direction (the one that keeps an unprobed axis from removing
+    // `NestedVirt` everywhere) is untestable through `probe()` alone. RED on the inverse: a decoder
+    // returning `false` for `None`, or accepting an arbitrary string as enabled.
+    #[test]
+    fn the_nested_parameter_decodes_and_an_unreadable_one_means_enabled() {
+        for enabled in ["Y", "y", "1", "Y\n", " 1 "] {
+            assert!(
+                nested_virt_from_param(Some(enabled)),
+                "{enabled:?} is the kernel's spelling of an ENABLED module parameter"
+            );
+        }
+        for disabled in ["N", "n", "0", "", "maybe"] {
+            assert!(
+                !nested_virt_from_param(Some(disabled)),
+                "{disabled:?} is not `Y`/`y`/`1`, so nested virt is off — only a positive value \
+                 counts, never any non-empty string"
+            );
+        }
+        assert!(
+            nested_virt_from_param(None),
+            "an UNREADABLE parameter is an unasked question, not an absent facility (F1): reading \
+             it as disabled would remove Feature::NestedVirt with host provenance on every non-KVM \
+             box and every locked-down sysfs"
+        );
+
+        // And the descriptor is wired to that one reader on this host — a `probe()` that forgot the
+        // field (or filled it from somewhere else) goes red here rather than at a cell's feature set.
+        assert_eq!(
+            HostCapabilities::probe().nested_virt,
+            nested_virt_enabled(),
+            "the descriptor's nested_virt must be what the one reader reports"
+        );
     }
 
     /// Writes `contents` to `dir/name`, creating the parent scope directory.

@@ -8,6 +8,7 @@
 //! [`resolve_builder_base`](crate::artifact::rootfs::resolve_builder_base) here so every rootfs
 //! source shares one inject/CA/erofs tail.
 
+use crate::artifact::handler::handler_artifact_key;
 use crate::artifact::{CacheKey, Stage, StageInputs, StageOutputs};
 use crate::error::{Error, Result};
 use async_trait::async_trait;
@@ -217,6 +218,25 @@ pub struct PackOptions {
     /// const the guest binary's dispatch table is compile-time asserted against. A registered
     /// consumer handler supplies its own, strict-parsed from its registry entry (§10.5).
     pub applets: Vec<String>,
+    /// The `handlers` registry label whose binary this pack bakes — `None` is the default handler
+    /// (§10.5).
+    ///
+    /// **Not** the same label as [`PackOptions::label`]: that one names the rootfs this pack
+    /// produces, this one names the handler it consumes, and `vmcell build` takes the two as
+    /// separate flags. The tail reads the binary from
+    /// `inputs.artifacts[handler_artifact_key(this)]`, which is the only reason the tail is told:
+    /// it bakes the bytes the same way either way.
+    ///
+    /// It hardcoded the DEFAULT key (`inputs.artifacts["guest_tools"]`) until this field existed,
+    /// so a labelled handler — which `GuestToolsStage` publishes under `guest_tools-<label>`, per
+    /// its own one key law — reached the tail as `None`: the manifest emitted **neither** the
+    /// multicall binary nor a single applet symlink, and the build reported success. Every applet
+    /// path in the image was absent, `mini-init` among them, which is an `init=` target, so a cell
+    /// pointed at one panicked the guest kernel.
+    ///
+    /// Set through [`PackOptions::with_handler_label`], which normalizes the reserved `default`
+    /// spelling away — see there.
+    pub handler_label: Option<String>,
     /// The registry label whose image this pack produces — `None` is the default rootfs (§10.5).
     ///
     /// The tail registers its output under [`rootfs_artifact_key`] of this label, which is the only
@@ -281,6 +301,24 @@ impl PackOptions {
         self
     }
 
+    /// Sets the `handlers` registry label whose binary this pack bakes (§10.5); `None` is the
+    /// default handler.
+    ///
+    /// **The reserved `default` spelling normalizes to `None`** — through
+    /// [`crate::artifact::registry::registry_label`], the one predicate that says so — because
+    /// §10.5's "canonical artifacts stay byte-identical for a cell that names no label" is a claim
+    /// about the *artifact*, and `Some("default")` would compose `guest_tools-default`: a different
+    /// key, a different file and a different cache key than the omitted spelling, for the same
+    /// registry entry. Normalized HERE, at the one intake, rather than at each of the two sites
+    /// that compose the key from it, so the two cannot disagree about which handler the pack meant.
+    #[must_use]
+    pub fn with_handler_label(mut self, handler_label: Option<&str>) -> Self {
+        self.handler_label = handler_label
+            .and_then(crate::artifact::registry::registry_label)
+            .map(str::to_string);
+        self
+    }
+
     /// Sets the artifact's extended-attribute policy (§4.7); the default is
     /// [`XattrPolicy::Strip`].
     #[must_use]
@@ -295,6 +333,18 @@ impl PackOptions {
     pub fn with_format(mut self, format: RootfsFormat) -> Self {
         self.format = format;
         self
+    }
+
+    /// The artifact-map key this pack reads its handler binary from — [`handler_artifact_key`] of
+    /// [`PackOptions::handler_label`].
+    ///
+    /// The **one** place the rootfs side composes a handler key, called by the pack tail (which
+    /// reads the binary) and by [`RootfsStage::cache_key`] (which folds the artifact it consumes).
+    /// Two spellings of "which handler is this?" is exactly how the identity and the bytes come to
+    /// disagree: the fold would key off the default binary while the tail baked a labelled one.
+    #[must_use]
+    pub fn handler_key(&self) -> String {
+        handler_artifact_key(self.handler_label.as_deref())
     }
 
     /// The roster to inject: this options' own, or the default handler's.
@@ -514,6 +564,15 @@ pub struct RootfsStage {
     /// entry, folded into the cache key, handed to the one pack tail, **and** appended to this
     /// stage's `out_path`. Default [`RootfsFormat::Erofs`].
     pub format: RootfsFormat,
+    /// The `handlers` registry label whose binary this rootfs bakes (§10.5, v33 delta 6b) — `None`
+    /// is the default handler.
+    ///
+    /// Private, and set only through [`RootfsStage::with_handler_label`], because it is not this
+    /// stage's own label: it names an artifact this stage CONSUMES, and both readers — the pack
+    /// tail and the consumed-artifact fold in [`Stage::cache_key`] — have to compose the same key
+    /// from it. Both read it through [`RootfsStage::pack_options`], which is where the reserved
+    /// `default` spelling is normalized away.
+    handler_label: Option<String>,
     /// The `rootfs` registry label this stage builds (§10.5, v33 delta 6) — `None` is
     /// `rootfs.default`, which resolves to today's inputs and today's filename.
     ///
@@ -552,6 +611,7 @@ impl RootfsStage {
             applets: Vec::new(),
             xattrs: XattrPolicy::default(),
             format: RootfsFormat::default(),
+            handler_label: None,
             label: label.map(str::to_string),
             // The artifact key IS the stage name for this kind, so a labelled stage cannot collide
             // with the default one on the pipeline's cache sidecar — the §5.1 hazard recorded for
@@ -591,6 +651,20 @@ impl RootfsStage {
     #[must_use]
     pub fn with_applets(mut self, applets: Vec<String>) -> Self {
         self.applets = applets;
+        self
+    }
+
+    /// Sets the `handlers` registry label whose binary this rootfs bakes (§10.5) — `None` is the
+    /// default handler.
+    ///
+    /// The companion of [`RootfsStage::with_applets`]: the roster says which symlinks to emit, this
+    /// says which binary they point at, and both come from the **same** resolved `handlers` entry.
+    /// A caller that sets one without the other gets a rootfs whose symlinks and binary were
+    /// declared by two different handlers, which is why `vmcell build` passes them from one entry
+    /// and why they sit next to each other here.
+    #[must_use]
+    pub fn with_handler_label(mut self, handler_label: Option<&str>) -> Self {
+        self.handler_label = handler_label.map(str::to_string);
         self
     }
 
@@ -635,12 +709,22 @@ impl RootfsStage {
     }
 
     /// What this stage tells the one inject+pack tail.
+    ///
+    /// Built through the `with_*` setter for the handler label rather than as one struct literal,
+    /// because that setter is where the reserved-`default` normalization lives (§10.5): every
+    /// reader of "which handler does this rootfs bake?" — the tail, and `cache_key`'s consumed fold
+    /// — goes through this one value, so the explicit and the omitted spelling of the default
+    /// handler cannot compose two artifacts.
     #[must_use]
     pub fn pack_options(&self) -> PackOptions {
         PackOptions {
             steward_musl: self.steward_musl.clone(),
             extra: self.extra.clone(),
             applets: self.applets.clone(),
+            // Replaced immediately below by the normalizing setter; the literal has to name every
+            // field because `fold_rootfs_injection_identity` destructures this type exhaustively
+            // and a new field must be a compile error here too.
+            handler_label: None,
             // The SAME policy `cache_key` folds, so the identity and the packed bytes can never
             // disagree about which attributes the image is supposed to carry.
             xattrs: self.xattrs,
@@ -652,6 +736,7 @@ impl RootfsStage {
             // are one law rather than two that agree only for the default label.
             label: self.label.clone(),
         }
+        .with_handler_label(self.handler_label.as_deref())
     }
 }
 
@@ -683,9 +768,16 @@ impl RootfsStage {
 /// wrong bytes here — the bump is the identity-fold discipline applied anyway, and one re-pack is
 /// harmless.
 ///
+/// v33 (§18 delta 6b, the docs/90 H1 fix): bumped to 8 — the consumed-artifact set is now
+/// `["steward", options.handler_key()]` instead of the hardcoded `["steward", "guest_tools"]`, so a
+/// labelled handler's binary is what the fold hashes. Every key that can exist today is bit-for-bit
+/// unmoved (the default handler's key IS `guest_tools`), because until this fix a labelled handler
+/// never reached the tail at all — the bump is the identity-fold discipline applied anyway, exactly
+/// as delta 6c's conditional arm was, and one re-pack is harmless.
+///
 /// Module-level (rather than a `fn`-local `const`) so the bump itself is assertable KVM-free:
 /// `rootfs_stage_version_pins_the_identity_fold_bumps`.
-const OCI_ROOTFS_STAGE_VERSION: u32 = 7;
+const OCI_ROOTFS_STAGE_VERSION: u32 = 8;
 
 #[async_trait]
 impl Stage for RootfsStage {
@@ -708,8 +800,10 @@ impl Stage for RootfsStage {
         //
         // Through `pack_options()` — the SAME struct `run` packs with — so what this key claims
         // and what the tail bakes cannot drift. Handing the fold individual fields is what let the
-        // delta-6b applet roster go unfolded for a whole release.
-        fold_rootfs_injection_identity(&mut hasher, inputs, &self.pack_options());
+        // delta-6b applet roster go unfolded for a whole release. Bound to a local because the
+        // consumed-artifact set below reads the handler key off the very same value.
+        let options = self.pack_options();
+        fold_rootfs_injection_identity(&mut hasher, inputs, &options);
         hasher.update(b"oci");
         // oci2erofs: the CLI-provided digest-pinned base is an INPUT (not a pin) and
         // must be content-addressed directly; otherwise a stale erofs is reused for a
@@ -761,10 +855,17 @@ impl Stage for RootfsStage {
         // deterministic key-sorted order over their on-disk content. Folding *every*
         // upstream artifact meant a `kernel` rebuild invalidated the OCI rootfs, which does
         // not depend on the kernel (the OCI source boots no VM). Scope the fold to the
-        // injected `steward` + `guest_tools` binaries (the base image is a pin/override,
+        // injected `steward` + handler binaries (the base image is a pin/override,
         // not an artifact). The in-VM `mmdebstrap` source, which additionally consumes the
         // seed `kernel`, lives in `vmcell-rootfs-builder` and folds it in its own key.
-        let consumed: &[&str] = &["steward", "guest_tools"];
+        //
+        // The handler entry is the key the TAIL reads — `options.handler_key()`, off the same
+        // options — never the `"guest_tools"` literal it used to be. With the literal, a build
+        // baking a labelled handler folded the DEFAULT handler's binary (or, since the labelled one
+        // is the only handler in that pipeline, nothing at all) into the identity of an image the
+        // tail was meanwhile packing from a different binary and a different applet roster.
+        let handler_key = options.handler_key();
+        let consumed: [&str; 2] = ["steward", handler_key.as_str()];
         let filtered: std::collections::HashMap<String, std::path::PathBuf> = inputs
             .artifacts
             .iter()
@@ -1101,6 +1202,13 @@ pub fn fold_rootfs_injection_identity(
         // two labels resolving to the same base pack byte-identical images — the same-digest,
         // two-labels byte-identity gate delta 6c landed.
         label: _,
+        // Not folded HERE, and not unfolded: the handler label names an artifact this pack
+        // CONSUMES, so its identity travels as the consumed binary's content under
+        // `PackOptions::handler_key()` — which each caller folds through
+        // `hash_artifacts_sorted` (the key name AND the content), because only the caller knows its
+        // own artifact map. Folding the label string here as well would make two labels registered
+        // to byte-identical binaries two images.
+        handler_label: _,
         xattrs,
         format,
     } = options;
@@ -1312,6 +1420,77 @@ pub async fn pack_rootfs_with_injection(
     // `VmConfig` (design §4.2, invariant F5).
     let extra_validated = validate_extra_files(extra)?;
 
+    // The guest test-helper (ip/curl/kvm-ok) is baked into the rootfs rather than
+    // mounted as a virtio-fs share: virtiofsd cannot enter its sandbox
+    // unprivileged, so a share fails in the unprivileged suite, whereas the erofs
+    // rootfs is served over virtio-blk in both modes.
+    //
+    // Read through the ONE handler key law (§10.5), never the `"guest_tools"` literal: a labelled
+    // handler is published by `GuestToolsStage` under `guest_tools-<label>`, so the literal
+    // resolved to `None` and the manifest below emitted neither the binary nor one applet symlink
+    // — a *successful* build of an image whose every applet path, `mini-init` included, was absent.
+    //
+    // Absent is legal for exactly one shape: a pipeline that ran NO handler stage at all
+    // (`oci2erofs` without `--tools`, an in-VM builder pack), where an image with no
+    // `/vmcell-tools` is what the caller asked for. Every other absence is a wiring error and is
+    // refused, because the alternative is the *successful* build of an image whose every applet
+    // path is missing — `mini-init` included, and that one is an `init=` target, so its absence is a
+    // guest kernel panic and not a missing test helper:
+    //
+    //   * a LABELLED handler with nothing under its key: the pack was told which handler to bake
+    //     and the pipeline never published it;
+    //   * the DEFAULT key absent while some `guest_tools-<label>` artifact IS in the map: the
+    //     pipeline built a handler this pack was not told about. That is the mmdebstrap-source shape
+    //     of the same defect — its stage takes no handler label, so `vmcell build --handler-label
+    //     acme --rootfs-source mmdebstrap` publishes `guest_tools-acme` and packs a tools-less image
+    //     — and it is the shape a downstream mis-wiring takes.
+    //
+    // Beside the extras check, ahead of the probe and the CA, for the same reason they are: these
+    // are pure map lookups, and a wiring error must not first spawn `mkfs.ext4` and mint a CA.
+    let handler_key = options.handler_key();
+    let tools_path = match inputs.artifacts.get(&handler_key) {
+        Some(path) => Some(path.clone()),
+        None => {
+            // The handler artifacts the pipeline DID publish, recognized through the key law and its
+            // own inverse — never a `starts_with("guest_tools")` of our own — so a dotted label
+            // (`guest_tools-12.4`, which the FILENAME law would have sanitized) is seen too.
+            let default_key = handler_artifact_key(None);
+            let mut published: Vec<&str> = inputs
+                .artifacts
+                .keys()
+                .filter(|k| {
+                    *k == &default_key
+                        || crate::artifact::handler::handler_label_from_artifact_key(k).is_some()
+                })
+                .map(String::as_str)
+                .collect();
+            published.sort_unstable();
+            match (options.handler_label.as_deref(), published.as_slice()) {
+                (None, []) => None,
+                (Some(label), _) => {
+                    return Err(Error::Artifact(format!(
+                        "handler `{label}` was declared for this rootfs but no `{handler_key}` \
+                         artifact reached the pack tail (§10.5); this pipeline published \
+                         {published:?}. Run the `GuestToolsStage` for that label in the same \
+                         pipeline. Refusing rather than packing an image with no applets in it — \
+                         `mini-init` is one of them and is an `init=` target, so its absence is a \
+                         guest kernel panic."
+                    )));
+                }
+                (None, orphans) => {
+                    return Err(Error::Artifact(format!(
+                        "this pack declares no `handlers` label, so it bakes `{handler_key}` — but \
+                         the only handler artifacts in this pipeline are {orphans:?} (§10.5). \
+                         Either tell the pack which one to bake (`PackOptions::with_handler_label`, \
+                         which is what `--handler-label` reaches on the OCI source), or stop \
+                         building a handler this image will not carry. Refusing rather than packing \
+                         an image with no applets in it."
+                    )));
+                }
+            }
+        }
+    };
+
     // The ext4 route's version gate runs HERE — after the pure validation above, and before the CA
     // is materialized, before a layer is read, before a byte is packed — so an absent or too-old
     // e2fsprogs refuses in milliseconds rather than after a multi-minute merge (§4.7: "probed
@@ -1351,13 +1530,6 @@ pub async fn pack_rootfs_with_injection(
     // naming the path instead of baking a stale or foreign CA.
     #[cfg(feature = "proxy")]
     let ca_path = crate::proxy::tls::CaManager::new()?.ca_cert_path();
-
-    // The guest test-helper (ip/curl/kvm-ok) is baked into the rootfs rather than
-    // mounted as a virtio-fs share: virtiofsd cannot enter its sandbox
-    // unprivileged, so a share fails in the unprivileged suite, whereas the erofs
-    // rootfs is served over virtio-blk in both modes. Optional — builds that do
-    // not run the GuestToolsStage simply omit it.
-    let tools_path = inputs.artifacts.get("guest_tools").cloned();
 
     tokio::task::spawn_blocking(move || -> Result<StageOutputs> {
         // The CA is baked only under the `proxy` feature (it produced `ca_path` above).
@@ -1627,6 +1799,49 @@ pub async fn pack_rootfs_with_injection(
     ))
 }
 
+/// Materialize the shared proxy CA ONCE, before a test packs an image or folds a cache key.
+///
+/// Every rootfs cache key folds the deployment CA's PEM ([`fold_rootfs_injection_identity`]) and
+/// every pack materializes it, and `CaManager::new()` reads it from the process-GLOBAL artifacts
+/// dir, minting it when absent. Its cache and lock are process-global — but nextest gives every test
+/// its own PROCESS, so on a cold artifacts dir (any CI runner) hundreds of test processes race to
+/// materialize the same `ca.pem` / `ca.key`.
+///
+/// The pair is published as TWO renames. A process that looks between them sees
+/// `cert_exists != key_exists` and gets the deliberate `partial CA in …` refusal, which the fold
+/// turns into `ca-read-error:…` — and errors are NOT cached, so the very next call in the same
+/// process folds the real PEM. Two keys computed either side of that window differ for a reason that
+/// has nothing to do with what the test asserts. Seen exactly once in CI, as
+/// `test_rootfs_cache_key_order_independent` reporting two unequal hashes on a cold runner.
+///
+/// One SUCCESSFUL call closes the window for the rest of the process: `CaManager::new_in`'s fast
+/// path then returns the cached PEM without touching the filesystem. The retry exists because this
+/// call can itself land in another process's publish window; the transient is bounded by two
+/// renames, so a few short waits cover it, and a CA that is genuinely half-committed still fails
+/// loudly here — naming the real problem instead of a mystified key mismatch.
+///
+/// Module-level `pub(crate)` rather than a helper inside `mod tests`, because `oci.rs`'s own pack
+/// tests need the same window closed: a second copy of a retry loop is a second place for the
+/// bound to drift.
+#[cfg(all(test, feature = "proxy"))]
+pub(crate) fn stabilize_ca() {
+    let mut last = String::new();
+    for _ in 0..50 {
+        match crate::proxy::tls::CaManager::new() {
+            Ok(_) => return,
+            Err(e) => {
+                last = e.to_string();
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+    }
+    panic!("the shared proxy CA never materialized; last error: {last}");
+}
+
+/// Without the `proxy` feature no CA is folded, so there is nothing to stabilize.
+#[cfg(all(test, not(feature = "proxy")))]
+pub(crate) fn stabilize_ca() {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1693,45 +1908,6 @@ mod tests {
             other => panic!("the ext4 emitter must be probed or typed-refused: {other:?}"),
         }
     }
-
-    /// Materialize the shared proxy CA ONCE, before any test below folds it into a cache key.
-    ///
-    /// Every rootfs cache key folds the deployment CA's PEM (`fold_rootfs_injection_identity`), and
-    /// `CaManager::new()` reads it from the process-GLOBAL artifacts dir, minting it when absent.
-    /// Its cache and lock are process-global — but nextest gives every test its own PROCESS, so on a
-    /// cold artifacts dir (any CI runner) hundreds of test processes race to materialize the same
-    /// `ca.pem` / `ca.key`.
-    ///
-    /// The pair is published as TWO renames. A process that looks between them sees
-    /// `cert_exists != key_exists` and gets the deliberate `partial CA in …` refusal, which the fold
-    /// turns into `ca-read-error:…` — and errors are NOT cached, so the very next call in the same
-    /// process folds the real PEM. Two keys computed either side of that window differ for a reason
-    /// that has nothing to do with what the test asserts. Seen exactly once in CI, as
-    /// `test_rootfs_cache_key_order_independent` reporting two unequal hashes on a cold runner.
-    ///
-    /// One SUCCESSFUL call closes the window for the rest of the process: `CaManager::new_in`'s fast
-    /// path then returns the cached PEM without touching the filesystem. The retry exists because
-    /// this call can itself land in another process's publish window; the transient is bounded by
-    /// two renames, so a few short waits cover it, and a CA that is genuinely half-committed still
-    /// fails loudly here — naming the real problem instead of a mystified key mismatch.
-    #[cfg(feature = "proxy")]
-    fn stabilize_ca() {
-        let mut last = String::new();
-        for _ in 0..50 {
-            match crate::proxy::tls::CaManager::new() {
-                Ok(_) => return,
-                Err(e) => {
-                    last = e.to_string();
-                    std::thread::sleep(std::time::Duration::from_millis(20));
-                }
-            }
-        }
-        panic!("the shared proxy CA never materialized; last error: {last}");
-    }
-
-    /// Without the `proxy` feature no CA is folded, so there is nothing to stabilize.
-    #[cfg(not(feature = "proxy"))]
-    fn stabilize_ca() {}
 
     fn stage() -> RootfsStage {
         RootfsStage::new()
@@ -2007,14 +2183,71 @@ mod tests {
     //
     // A literal-value assertion on purpose: it is a TRIPWIRE, not a derivation, so it goes red on
     // the next fold change and forces the author to state which bump they are making. RED on the
-    // inverse: reverting the const to 5.
+    // inverse: reverting the const to 7 (the docs/90 H1 fix is the fourth bump: the consumed set
+    // now names the DECLARED handler's artifact key instead of the `guest_tools` literal).
     #[test]
     fn rootfs_stage_version_pins_the_identity_fold_bumps() {
         assert_eq!(
-            OCI_ROOTFS_STAGE_VERSION, 7,
+            OCI_ROOTFS_STAGE_VERSION, 8,
             "an identity-fold change requires this stage-version bump; without it a stale rootfs \
              is served from the warm cache. If you changed what `cache_key` folds, bump the const \
              and this literal together and record the reason in the const's doc comment"
+        );
+    }
+
+    // §10.5 / §18 delta 6b, the identity half of the handler fix: the consumed-artifact fold must
+    // hash the handler this rootfs actually BAKES. It folded the `"guest_tools"` literal, so a build
+    // declaring a labelled handler keyed off the default handler's binary (or, in the pipeline the
+    // CLI composes, off nothing at all — the labelled handler is the only one there) while the tail
+    // packed a different binary and a different symlink set. Two consumer handlers over one
+    // pipeline then shared one warm rootfs.
+    //
+    // Both directions, because either alone passes on a fold that hashes the whole artifact map:
+    // editing the DECLARED handler's binary must move the key, and editing an undeclared one's must
+    // not. The last leg is the pre-existing law, restated here so a "just fold everything" fix
+    // cannot pass: the default stage keys off `guest_tools` exactly as it always did.
+    //
+    // RED on the inverse (restore `let consumed: &[&str] = &["steward", "guest_tools"]`): the first
+    // assertion fails (the declared handler's content stops moving the key) and the second fails
+    // (the undeclared default handler's content starts moving it).
+    #[test]
+    fn rootfs_key_tracks_the_declared_handlers_binary() {
+        stabilize_ca();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let default_bin = write_tmp(dir.path(), "guest_tools", b"default-v1");
+        let acme_bin = write_tmp(dir.path(), "guest_tools-acme", b"acme-v1");
+        let mut inputs = StageInputs::default();
+        inputs
+            .artifacts
+            .insert(handler_artifact_key(None), default_bin.clone());
+        inputs
+            .artifacts
+            .insert(handler_artifact_key(Some("acme")), acme_bin.clone());
+
+        let acme_stage = RootfsStage::new().with_handler_label(Some("acme"));
+        let before = acme_stage.cache_key(&inputs);
+        std::fs::write(&acme_bin, b"acme-v2").expect("rebuild the declared handler");
+        assert_ne!(
+            before,
+            acme_stage.cache_key(&inputs),
+            "rebuilding the DECLARED handler's binary must re-pack the rootfs that bakes it"
+        );
+        let after = acme_stage.cache_key(&inputs);
+        std::fs::write(&default_bin, b"default-v2").expect("rebuild the other handler");
+        assert_eq!(
+            after,
+            acme_stage.cache_key(&inputs),
+            "a handler this rootfs does not bake must not move its key"
+        );
+
+        // The default stage's own law, unmoved: it consumes `guest_tools` and re-keys on it.
+        let default_stage = RootfsStage::new();
+        let before = default_stage.cache_key(&inputs);
+        std::fs::write(&default_bin, b"default-v3").expect("rebuild the default handler");
+        assert_ne!(
+            before,
+            default_stage.cache_key(&inputs),
+            "the default handler's binary must still re-key the default rootfs"
         );
     }
 
@@ -2522,6 +2755,173 @@ mod tests {
                 "`RootfsStage::labelled({label:?})` must tell the pack tail which label it packs"
             );
         }
+    }
+
+    // §10.5 / §18 delta 6b: the inject+pack TAIL reads its handler binary through the one handler
+    // key law, `handler_artifact_key(handler_label)` — not the bare `"guest_tools"` literal it
+    // hardcoded. With the literal, `vmcell build --handler-label acme` fetched and digest-verified
+    // acme's binary, published it as `guest_tools-acme` (which is `GuestToolsStage`'s own one key
+    // law), and the tail's lookup returned `None`: the manifest emitted the steward and the CA and
+    // **neither the multicall binary nor a single applet symlink**, and the build reported success.
+    // In the guest every applet path was absent — `mini-init` among them, which is an `init=`
+    // target, so a cell pointed at it panicked the guest kernel.
+    //
+    // Nothing else could have caught it: an artifact-map key is a `String`, so reading a name no
+    // producer registered is not a compile error; the two keys are IDENTICAL for the default
+    // handler, which is the only one the suite ever packed; and the rootfs cache key MOVED (the
+    // consumed fold lost its `guest_tools` entry), so the build was not even a no-op — it was a
+    // *successful* build of a broken image.
+    //
+    // Four claims, because the first alone would pass on an image that baked the WRONG binary:
+    //   1. the labelled leg bakes the labelled handler's bytes and NOT the default handler's —
+    //      both are in the artifact map at once, which is what makes it discriminating;
+    //   2. the default leg bakes the default handler's bytes and not the labelled one's (the
+    //      pre-v33 behavior, unmoved);
+    //   3. the applet symlinks reach the image: one multicall target per roster entry, counted, so
+    //      a tail that baked the binary with no links reddens here rather than in a guest;
+    //   4. a labelled handler with no artifact in the map is a LOUD refusal, never a silent
+    //      no-applet pack — the shape the defect actually shipped.
+    // Plus the call site (5): `RootfsStage::with_handler_label` reaches `pack_options()`, the
+    // "green predicate beside an unchanged call site" half kept visible on purpose.
+    //
+    // RED on the inverse: restore `inputs.artifacts.get("guest_tools")` and claim 1 fails naming
+    // the default marker (and claim 4's refusal never happens); drop `with_handler_label` from
+    // `pack_options()` and claim 5 fails while 1–4 still pass.
+    #[cfg(all(feature = "am-fs-erofs", feature = "proxy"))]
+    #[tokio::test]
+    async fn the_pack_tail_bakes_the_handler_the_label_names() {
+        stabilize_ca();
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A static-musl steward stand-in: `require_libc6` is then false, so the tail packs with no
+        // layers and the image holds nothing but vmcell's own injections.
+        let musl = write_tmp(dir.path(), "steward-musl", b"#!static-steward");
+
+        // Two handler binaries, distinguishable by content, published under the DEFAULT key and
+        // under a LABELLED one — both in the map at once.
+        const DEFAULT_BYTES: &[u8] = b"#!the-default-handler-binary\n";
+        const ACME_BYTES: &[u8] = b"#!the-acme-handler-binary\n";
+        let mut inputs = StageInputs::default();
+        inputs.artifacts.insert(
+            handler_artifact_key(None),
+            write_tmp(dir.path(), "guest_tools", DEFAULT_BYTES),
+        );
+        inputs.artifacts.insert(
+            handler_artifact_key(Some("acme")),
+            write_tmp(dir.path(), "guest_tools-acme", ACME_BYTES),
+        );
+
+        let count_of = |image: &[u8], needle: &[u8]| -> usize {
+            image.windows(needle.len()).filter(|w| *w == needle).count()
+        };
+        let pack = async |handler_label: Option<&str>| -> Vec<u8> {
+            // A scratch name, deliberately NOT spelled `rootfs-<x>.erofs`: these are two packs of
+            // the same artifact under different handlers, not two rootfs labels, and
+            // `ban-rootfs-key-composers.sh` rightly counts any `rootfs-{…}` literal as a second
+            // copy of the artifact-name law.
+            let out = dir
+                .path()
+                .join(format!("packed-{}.erofs", handler_label.unwrap_or("none")));
+            pack_erofs_with_injection(
+                vec![],
+                &inputs,
+                &out,
+                &PackOptions::new()
+                    .with_steward_musl(Some(musl.clone()))
+                    .with_handler_label(handler_label),
+            )
+            .await
+            .expect("the pack must succeed");
+            std::fs::read(&out).expect("read the packed image")
+        };
+
+        // 1. The labelled leg.
+        let acme_image = pack(Some("acme")).await;
+        assert_eq!(
+            count_of(&acme_image, ACME_BYTES),
+            1,
+            "the labelled handler's binary must be baked into the image"
+        );
+        assert_eq!(
+            count_of(&acme_image, DEFAULT_BYTES),
+            0,
+            "a labelled handler's rootfs must not carry the DEFAULT handler's binary — reading the \
+             `guest_tools` literal is how it came to carry neither"
+        );
+
+        // 2. The default leg, unmoved.
+        let default_image = pack(None).await;
+        assert_eq!(count_of(&default_image, DEFAULT_BYTES), 1);
+        assert_eq!(count_of(&default_image, ACME_BYTES), 0);
+
+        // 3. The applet symlinks. Every roster entry's link points at the multicall binary by its
+        // relative name, so that name occurs once per link PLUS once as the binary's own directory
+        // entry — a tail that baked the binary and emitted no links counts 1. The roster here is
+        // the DEFAULT one (`applets` unset means `GUEST_TOOLS_APPLETS`), so this also pins that a
+        // labelled handler which declares no roster still gets vmcell's full one.
+        for image in [&acme_image, &default_image] {
+            assert_eq!(
+                count_of(image, GUEST_TOOLS_MULTICALL_BIN.as_bytes()),
+                vmcell_protocol::GUEST_TOOLS_APPLETS.len() + 1,
+                "the image must carry one `{GUEST_TOOLS_MULTICALL_BIN}` symlink target per applet \
+                 ({}) plus the binary's own directory entry",
+                vmcell_protocol::GUEST_TOOLS_APPLETS.len()
+            );
+            for applet in vmcell_protocol::GUEST_TOOLS_APPLETS {
+                assert!(
+                    count_of(image, applet.as_bytes()) >= 1,
+                    "the image must carry a `{VMCELL_TOOLS_DIR}/{applet}` entry"
+                );
+            }
+        }
+
+        // 4. A named handler with nothing published under its key is a refusal, naming the label
+        // and the key a `GuestToolsStage` would have registered.
+        let mut orphaned = StageInputs::default();
+        orphaned
+            .artifacts
+            .insert(handler_artifact_key(None), dir.path().join("guest_tools"));
+        let err = pack_erofs_with_injection(
+            vec![],
+            &orphaned,
+            &dir.path().join("rootfs-orphan.erofs"),
+            &PackOptions::new()
+                .with_steward_musl(Some(musl.clone()))
+                .with_handler_label(Some("acme")),
+        )
+        .await
+        .expect_err("a declared handler with no artifact must be refused");
+        let Error::Artifact(msg) = &err else {
+            panic!("expected Error::Artifact, got {err:?}");
+        };
+        for named in ["acme", &handler_artifact_key(Some("acme"))] {
+            assert!(msg.contains(named), "the refusal must name {named}: {msg}");
+        }
+
+        // 5. The call site: the stage tells the tail which handler it bakes, and the reserved
+        // default spelling is the omitted one (§10.5's byte-identity rule).
+        for label in [None, Some("acme")] {
+            assert_eq!(
+                RootfsStage::new()
+                    .with_handler_label(label)
+                    .pack_options()
+                    .handler_label
+                    .as_deref(),
+                label,
+                "`RootfsStage::with_handler_label({label:?})` must reach the pack tail"
+            );
+        }
+        let explicit_default = RootfsStage::new()
+            .with_handler_label(Some(crate::artifact::registry::DEFAULT_LABEL))
+            .pack_options();
+        assert_eq!(
+            explicit_default.handler_label, None,
+            "`--handler-label default` and no flag are one request (§10.5)"
+        );
+        assert_eq!(
+            explicit_default.handler_key(),
+            handler_artifact_key(None),
+            "…so both read the DEFAULT handler's artifact key"
+        );
     }
 
     // §18 delta 7's CALL-SITE SCAN, the half a `PackOptions` unit test cannot see: the stage's

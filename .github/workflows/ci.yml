@@ -208,6 +208,13 @@ jobs:
   # ---- Fast tests: unit, codec, property. No KVM. DEFAULT (non-ignored) set only. ----
   test-unit:
     runs-on: ubuntu-latest
+    env:
+      # H-TEST-3, in the job that needs it now: this suite carries the KVM-free half of the §4.7
+      # ext4 battery, whose answer to an absent `mkfs.ext4` is a RECORDED capability skip. Without a
+      # run-scoped path that record lands in a per-PID temp file nobody surfaces — the invisible-pass
+      # shape already fixed in `test-integration` — so the manifest is pointed, reset, and printed
+      # here too. `just skip-manifest-*` and `record_capability_skip` both read this variable.
+      VMCELL_SKIP_MANIFEST: ${{ github.workspace }}/target/vmcell-skip-manifest.txt
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with: { persist-credentials: false }   # do not leave the token in .git/config (zizmor: artipacked)
@@ -219,6 +226,91 @@ jobs:
         # for the reason given at the lint job's install step — an unsupported tool name must fail at
         # the name, not detour through cargo-binstall and take the job down with it.
         with: { tool: "cargo-nextest,just", fallback: none }
+      # ---- The §4.7 ext4 battery's facility, OBTAINED rather than skipped (§18 delta 8). ----
+      # `mkfs.ext4 -d <tarball>` — the form the ext4 producer is built on — landed in e2fsprogs
+      # 1.47.1, and ubuntu-24.04 packages 1.47.0, so apt cannot supply it at any pin. This builds the
+      # pinned release from source. libarchive is what makes the tarball form work at all (mke2fs
+      # *dlopen*s libarchive.so.13, so `-V` reports the same banner either way and the only honest
+      # probe is a trial build), which is why libarchive-dev goes in first.
+      #
+      # NON-GATING on purpose. Two of the three possible outcomes are honest: with the facility the
+      # battery RUNS, and without it `common::probe_ext4_or_record_skip` records
+      # `SKIP cloud-hypervisor ext4_producer` to the manifest this job surfaces. The third — a red
+      # job — is what the `panic!` this replaced produced on `test-unit` AND `test-integration` for
+      # four commits, and a permanently-red job is a job nobody reads.
+      #
+      # 1.47.2 rather than the newest release: every measured constant in `vmcell::artifact::ext4`
+      # (`EXT4_TARBALL_XATTRS`, the determinism triple) was measured against 1.47.2, so CI agrees
+      # with the constants by construction instead of by luck. The digest is upstream's own published
+      # `sha256sums.asc` entry for that tarball; bump the two together.
+      #
+      # `ci_obtains_the_ext4_facility_rather_than_living_with_the_skip` (in
+      # crates/vmcell/tests/ext4_producer.rs) is this step's gate: every job that runs the ext4 legs
+      # carries these steps BEFORE them, the pin is >= the producer's own `MIN_E2FSPROGS_VERSION`,
+      # the download is checksum-verified, the steps stay non-gating, and the copies in the two jobs
+      # are byte-identical (this block is duplicated because a `run:` step cannot be shared between
+      # jobs; the identity assertion is what keeps a fix to one copy from missing the other).
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+        continue-on-error: true   # a cache failure must cost a rebuild, never the job
+        with:
+          path: ~/.local/e2fsprogs
+          # The DIGEST is in the key, not only the version, so a re-pin can never be served the tree
+          # built from the bytes it replaced.
+          key: e2fsprogs-1.47.2-7a959221c1b1cc6e-${{ runner.os }}-${{ runner.arch }}
+      - name: e2fsprogs for the ext4 battery (pinned, checksum-verified, non-gating)
+        continue-on-error: true
+        env:
+          E2FSPROGS_VERSION: "1.47.2"
+          E2FSPROGS_SHA256: "7a959221c1b1cc6e28b7d7a4e204a2ffd8ec6d8a2de4461c482b64c5f4463cca"
+        run: |
+          set -uo pipefail
+          prefix="$HOME/.local/e2fsprogs"
+          # Every command carries an explicit `|| return 1` and nothing here relies on `set -e`:
+          # measured, `set -e` inside a function (or a subshell) invoked as an `if` condition is
+          # suppressed, so a `set -e` helper called from `if build; then` runs on past a failed
+          # `sha256sum -c` and returns the status of whatever it did last. Falling through the
+          # CHECKSUM is the one failure that must be impossible — it would build an unverified
+          # tarball, which is the supply-chain shape the pin exists to prevent.
+          obtain_e2fsprogs() {
+            sudo apt-get update -qq || return 1
+            sudo apt-get install -y -qq build-essential pkg-config libarchive-dev || return 1
+            url="https://cdn.kernel.org/pub/linux/kernel/people/tytso/e2fsprogs/v${E2FSPROGS_VERSION}/e2fsprogs-${E2FSPROGS_VERSION}.tar.gz"
+            curl --proto '=https' --tlsv1.2 -fsSL --retry 3 -o /tmp/e2fsprogs.tar.gz "$url" || return 1
+            echo "${E2FSPROGS_SHA256}  /tmp/e2fsprogs.tar.gz" | sha256sum -c - || return 1
+            rm -rf /tmp/e2fsprogs-src || return 1
+            mkdir -p /tmp/e2fsprogs-src || return 1
+            tar -xzf /tmp/e2fsprogs.tar.gz -C /tmp/e2fsprogs-src --strip-components=1 || return 1
+            cd /tmp/e2fsprogs-src || return 1
+            # The three `--without-*-dir` flags: those files install OUTSIDE --prefix (/etc/cron.d,
+            # /lib/udev, the systemd unit dir), so an unprivileged `make install` dies on them —
+            # measured: `install: Failed to remove existing file '/etc/cron.d/e2scrub_all'`.
+            ./configure --prefix="$prefix" --disable-fuse2fs --disable-defrag --disable-nls \
+              --without-crond-dir --without-udev-rules-dir --without-systemd-unit-dir || return 1
+            make -j"$(nproc)" || return 1
+            make install || return 1
+          }
+          if [ -x "$prefix/sbin/mkfs.ext4" ]; then
+            echo "e2fsprogs $E2FSPROGS_VERSION restored from the cache at $prefix"
+          elif obtain_e2fsprogs; then
+            echo "built e2fsprogs $E2FSPROGS_VERSION into $prefix"
+          else
+            echo "::warning::could not obtain e2fsprogs; the ext4 battery will RECORD a capability skip (see the skip-manifest step) instead of running, which is the honest outcome and not a failure"
+          fi
+          # $GITHUB_PATH only affects LATER steps, so the prepend and the report below are two acts.
+          # The prepend is what makes this build win over the image's own /usr/sbin/mkfs.ext4 (1.47.0).
+          if [ -x "$prefix/sbin/mkfs.ext4" ]; then
+            echo "$prefix/sbin" >> "$GITHUB_PATH"
+          fi
+          # THE LINE THAT SAYS WHICH ARM HAPPENED — read this before believing the ext4 legs ran.
+          echo "--- the mkfs.ext4 the §4.7 producer's probe will find ---"
+          if [ -x "$prefix/sbin/mkfs.ext4" ]; then
+            "$prefix/sbin/mkfs.ext4" -V || true
+          else
+            mkfs.ext4 -V || echo "no mkfs.ext4 on PATH at all"
+          fi
+      - name: reset the run-scoped skip manifest
+        run: just skip-manifest-reset   # so the surfaced skips belong to THIS run, not an accumulated history
+
       # AGENTS rule 3: a CI step that hand-copies a `just` recipe drifts from it. This one was a
       # verbatim copy of `test-unit` — harmless so far, and exactly the shape that let the
       # test-integration job's copy drop `--features qemu` and silently stop compiling a whole
@@ -234,6 +326,14 @@ jobs:
       # invoked, not copied: `just ci` runs the same one (AGENTS rule 3).
       - name: doctests (nextest cannot run them)
         run: just test-doc
+
+      # `always()`, for the same reason as the identical step in `test-integration`: the capability
+      # skips of a FAILING run are exactly the ones worth reading. Never gates — a skip is a recorded
+      # fact to review, and for the ext4 battery it is the honest outcome when the step above could
+      # not obtain e2fsprogs.
+      - name: surface the capability-skip manifest (count + contents)
+        if: always()
+        run: just skip-manifest-show
 
   # ---- Integration matrix: boots real VMs. Runs the #[ignore]'d suite so it is NOT CI-invisible. ----
   #
@@ -335,6 +435,88 @@ jobs:
             pkg-config libseccomp-dev libcap-ng-dev libcap2-bin \
             nftables qemu-system-x86
 
+      # ---- The §4.7 ext4 battery's facility, OBTAINED rather than skipped (§18 delta 8). ----
+      # `mkfs.ext4 -d <tarball>` — the form the ext4 producer is built on — landed in e2fsprogs
+      # 1.47.1, and ubuntu-24.04 packages 1.47.0, so apt cannot supply it at any pin. This builds the
+      # pinned release from source. libarchive is what makes the tarball form work at all (mke2fs
+      # *dlopen*s libarchive.so.13, so `-V` reports the same banner either way and the only honest
+      # probe is a trial build), which is why libarchive-dev goes in first.
+      #
+      # NON-GATING on purpose. Two of the three possible outcomes are honest: with the facility the
+      # battery RUNS, and without it `common::probe_ext4_or_record_skip` records
+      # `SKIP cloud-hypervisor ext4_producer` to the manifest this job surfaces. The third — a red
+      # job — is what the `panic!` this replaced produced on `test-unit` AND `test-integration` for
+      # four commits, and a permanently-red job is a job nobody reads.
+      #
+      # 1.47.2 rather than the newest release: every measured constant in `vmcell::artifact::ext4`
+      # (`EXT4_TARBALL_XATTRS`, the determinism triple) was measured against 1.47.2, so CI agrees
+      # with the constants by construction instead of by luck. The digest is upstream's own published
+      # `sha256sums.asc` entry for that tarball; bump the two together.
+      #
+      # `ci_obtains_the_ext4_facility_rather_than_living_with_the_skip` (in
+      # crates/vmcell/tests/ext4_producer.rs) is this step's gate: every job that runs the ext4 legs
+      # carries these steps BEFORE them, the pin is >= the producer's own `MIN_E2FSPROGS_VERSION`,
+      # the download is checksum-verified, the steps stay non-gating, and the copies in the two jobs
+      # are byte-identical (this block is duplicated because a `run:` step cannot be shared between
+      # jobs; the identity assertion is what keeps a fix to one copy from missing the other).
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+        continue-on-error: true   # a cache failure must cost a rebuild, never the job
+        with:
+          path: ~/.local/e2fsprogs
+          # The DIGEST is in the key, not only the version, so a re-pin can never be served the tree
+          # built from the bytes it replaced.
+          key: e2fsprogs-1.47.2-7a959221c1b1cc6e-${{ runner.os }}-${{ runner.arch }}
+      - name: e2fsprogs for the ext4 battery (pinned, checksum-verified, non-gating)
+        continue-on-error: true
+        env:
+          E2FSPROGS_VERSION: "1.47.2"
+          E2FSPROGS_SHA256: "7a959221c1b1cc6e28b7d7a4e204a2ffd8ec6d8a2de4461c482b64c5f4463cca"
+        run: |
+          set -uo pipefail
+          prefix="$HOME/.local/e2fsprogs"
+          # Every command carries an explicit `|| return 1` and nothing here relies on `set -e`:
+          # measured, `set -e` inside a function (or a subshell) invoked as an `if` condition is
+          # suppressed, so a `set -e` helper called from `if build; then` runs on past a failed
+          # `sha256sum -c` and returns the status of whatever it did last. Falling through the
+          # CHECKSUM is the one failure that must be impossible — it would build an unverified
+          # tarball, which is the supply-chain shape the pin exists to prevent.
+          obtain_e2fsprogs() {
+            sudo apt-get update -qq || return 1
+            sudo apt-get install -y -qq build-essential pkg-config libarchive-dev || return 1
+            url="https://cdn.kernel.org/pub/linux/kernel/people/tytso/e2fsprogs/v${E2FSPROGS_VERSION}/e2fsprogs-${E2FSPROGS_VERSION}.tar.gz"
+            curl --proto '=https' --tlsv1.2 -fsSL --retry 3 -o /tmp/e2fsprogs.tar.gz "$url" || return 1
+            echo "${E2FSPROGS_SHA256}  /tmp/e2fsprogs.tar.gz" | sha256sum -c - || return 1
+            rm -rf /tmp/e2fsprogs-src || return 1
+            mkdir -p /tmp/e2fsprogs-src || return 1
+            tar -xzf /tmp/e2fsprogs.tar.gz -C /tmp/e2fsprogs-src --strip-components=1 || return 1
+            cd /tmp/e2fsprogs-src || return 1
+            # The three `--without-*-dir` flags: those files install OUTSIDE --prefix (/etc/cron.d,
+            # /lib/udev, the systemd unit dir), so an unprivileged `make install` dies on them —
+            # measured: `install: Failed to remove existing file '/etc/cron.d/e2scrub_all'`.
+            ./configure --prefix="$prefix" --disable-fuse2fs --disable-defrag --disable-nls \
+              --without-crond-dir --without-udev-rules-dir --without-systemd-unit-dir || return 1
+            make -j"$(nproc)" || return 1
+            make install || return 1
+          }
+          if [ -x "$prefix/sbin/mkfs.ext4" ]; then
+            echo "e2fsprogs $E2FSPROGS_VERSION restored from the cache at $prefix"
+          elif obtain_e2fsprogs; then
+            echo "built e2fsprogs $E2FSPROGS_VERSION into $prefix"
+          else
+            echo "::warning::could not obtain e2fsprogs; the ext4 battery will RECORD a capability skip (see the skip-manifest step) instead of running, which is the honest outcome and not a failure"
+          fi
+          # $GITHUB_PATH only affects LATER steps, so the prepend and the report below are two acts.
+          # The prepend is what makes this build win over the image's own /usr/sbin/mkfs.ext4 (1.47.0).
+          if [ -x "$prefix/sbin/mkfs.ext4" ]; then
+            echo "$prefix/sbin" >> "$GITHUB_PATH"
+          fi
+          # THE LINE THAT SAYS WHICH ARM HAPPENED — read this before believing the ext4 legs ran.
+          echo "--- the mkfs.ext4 the §4.7 producer's probe will find ---"
+          if [ -x "$prefix/sbin/mkfs.ext4" ]; then
+            "$prefix/sbin/mkfs.ext4" -V || true
+          else
+            mkfs.ext4 -V || echo "no mkfs.ext4 on PATH at all"
+          fi
       - name: install VMM backends (pinned, checksum-verified)
         env:
           CH_VERSION: "v53.0"

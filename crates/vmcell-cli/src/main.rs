@@ -55,6 +55,15 @@ enum KernelSource {
     InVm,
 }
 
+/// The Debian release suite the `mmdebstrap` rootfs source bootstraps when `--release` is omitted.
+///
+/// A const rather than a clap `default_value` because the flag has to stay **distinguishable from
+/// its default**: the `oci` source cannot honor a release suite, and refusing a flag the operator
+/// typed (F1) is impossible once clap has filled the same value in for everyone. Applied at the one
+/// arm that consumes it ([`rootfs_stage`]), so the omitted spelling and `--release trixie` build the
+/// identical stage.
+const DEFAULT_RELEASE: &str = "trixie";
+
 /// Which rootfs builder produces the erofs for `build` (design §4.3, The rootfs-construction contract).
 #[derive(Copy, Clone, PartialEq, Eq, Debug, clap::ValueEnum)]
 enum RootfsSourceKind {
@@ -77,9 +86,16 @@ enum Commands {
         /// Which rootfs builder to use for the erofs (§4.3, The rootfs-construction contract).
         #[arg(long, value_enum, default_value_t = RootfsSourceKind::Oci)]
         rootfs_source: RootfsSourceKind,
-        /// Debian release suite for the `mmdebstrap` rootfs source (ignored for `oci`).
-        #[arg(long, default_value = "trixie")]
-        release: String,
+        /// Debian release suite for the `mmdebstrap` rootfs source; omitted uses vmcell's pinned
+        /// default suite. Naming it against the `oci` source — which pulls a digest-pinned image and
+        /// bootstraps no suite of its own — is a typed refusal, not an ignored flag (F1).
+        //
+        // `Option` with no clap `default_value`, and the default applied at `rootfs_stage` (the one
+        // arm that consumes it), so that refusal can tell a value the operator typed from one clap
+        // filled in for everybody. `DEFAULT_RELEASE`'s rustdoc carries the rest — kept out of the
+        // doc comment because clap prints it as `--help` text.
+        #[arg(long)]
+        release: Option<String>,
         /// Which `rootfs` registry label to build (§10.5, v33 delta 6). Omitted builds `default`,
         /// which resolves to today's pinned base and lands at `rootfs.erofs`; a label lands at
         /// `rootfs-<label>.erofs`. Selection lives here, at the artifact layer, rather than on
@@ -443,25 +459,200 @@ fn reject_seed_needing_source_for_build(source: KernelSource) -> vmcell::Result<
     })
 }
 
+/// Refuses a `vmcell build` input the **selected rootfs source** cannot honor (F1): a `rootfs`
+/// registry selector against the `mmdebstrap` source, or a release suite against the `oci` one.
+///
+/// One table rather than a check per flag, because the two halves are one law read from both sides —
+/// each source honors exactly one of these inputs, and every accepted input is honored or rejected
+/// at construction:
+///
+/// * `--rootfs-label` selects a `rootfs` registry entry (§10.5), which the `mmdebstrap` source does
+///   not read at all: it builds from `--release`. Keyed on the RAW flag, deliberately —
+///   [`build_stages`] normalizes the reserved `default` label to `None`, but that normalization is
+///   about which pins keys a REGISTRY request flattens to, and letting the normalized form through
+///   would make `--rootfs-label default --rootfs-source mmdebstrap` the one spelling that is
+///   silently ignored instead of refused.
+/// * `--release` names a Debian suite for `mmdebstrap` to bootstrap, which the `oci` source does not
+///   read: it pulls the digest-pinned image its registry entry names. It was accepted and dropped,
+///   with "(ignored for `oci`)" written in the flag's own help — the accept-then-ignore shape
+///   documented instead of fixed.
+///
+/// Both refusals name the route that works, so the operator's next command is runnable.
+///
+/// # Errors
+/// [`vmcell::Error::Artifact`] naming the flag, the source that cannot honor it, and the fix.
+fn reject_unhonorable_rootfs_source_inputs(
+    source: RootfsSourceKind,
+    rootfs_label: Option<&str>,
+    release: Option<&str>,
+) -> vmcell::Result<()> {
+    match source {
+        RootfsSourceKind::Mmdebstrap => {
+            if rootfs_label.is_some() {
+                return Err(vmcell::Error::Artifact(
+                    "--rootfs-label selects a `rootfs` registry entry (§10.5), which the \
+                     `mmdebstrap` source does not read: it builds from --release. Use \
+                     --rootfs-source oci, or drop --rootfs-label."
+                        .into(),
+                ));
+            }
+        }
+        RootfsSourceKind::Oci => {
+            if let Some(release) = release {
+                return Err(vmcell::Error::Artifact(format!(
+                    "--release {release} names a Debian suite for the `mmdebstrap` source to \
+                     bootstrap (§4.3), which the `oci` source does not read: it pulls the \
+                     digest-pinned image its `rootfs` registry entry names, userland already \
+                     built. Use --rootfs-source mmdebstrap, or drop --release."
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Refuses a `handlers` registration the `mmdebstrap` source cannot bake (F1, §10.5).
+///
+/// That source's stage carries no handler field at all: its pack tail is handed
+/// `PackOptions::new()`, which bakes the binary under the **default** artifact key with the
+/// **default** applet roster. So a labelled handler — published as `guest_tools-<label>`, a key that
+/// tail never looks up — and an entry declaring its own `applets` are both selections it would
+/// accept and drop: silently for the roster (the image gets the default symlinks), and as a
+/// missing-artifact failure stages later for the label, which is remedial advice the operator cannot
+/// act on (M3's shape, one flag over).
+///
+/// Keyed on the RESOLVED entry rather than on the flag, and that is the difference from the
+/// `--rootfs-label` half of [`reject_unhonorable_rootfs_source_inputs`]: `--handler-label default`
+/// IS honorable — it names the very handler this source bakes — so refusing the flag's presence
+/// would refuse the default request spelled out. `applets` is read off the entry rather than
+/// compared against a roster spelled here: an entry that declares none MEANS the default handler's
+/// roster ([`vmcell::artifact::handler::HandlerRegistryEntry::applet_roster`]), which is exactly
+/// what the tail bakes.
+///
+/// The `applets` clause is **unreachable by construction today**, and written as a refusal for the
+/// reason the handler parser's own two-shape arm is: the overlay merge is leaf-wise, so the
+/// baseline's `build: workspace:…` leaf on the default label survives every overlay, and the parser
+/// refuses `applets` beside a workspace build. The day the baseline registers a digest-shaped default
+/// handler that clause becomes live, and it must fail loud then rather than drop the roster —
+/// `the_baseline_default_handler_declares_no_roster_of_its_own` is what says so from the other side.
+///
+/// # Errors
+/// [`vmcell::Error::Artifact`] naming the entry, what about it cannot be baked, and the fix.
+fn reject_unbakeable_handler_for_mmdebstrap(
+    source: RootfsSourceKind,
+    handler: Option<&vmcell::artifact::handler::HandlerRegistryEntry>,
+) -> vmcell::Result<()> {
+    if !matches!(source, RootfsSourceKind::Mmdebstrap) {
+        return Ok(());
+    }
+    let Some(entry) = handler else {
+        // No `handlers` namespace at all is the pre-v33 workspace build, which this source has
+        // always produced.
+        return Ok(());
+    };
+    let (unbakeable, fix) = if entry.label != vmcell::artifact::registry::DEFAULT_LABEL {
+        (
+            "is not the `default` handler",
+            "use --rootfs-source oci, or drop --handler-label",
+        )
+    } else if !entry.applets.is_empty() {
+        (
+            "declares its own `applets` roster",
+            "use --rootfs-source oci, or drop the entry's `applets` key",
+        )
+    } else {
+        return Ok(());
+    };
+    Err(vmcell::Error::Artifact(format!(
+        "the `handlers.{}` entry {unbakeable}, and the `mmdebstrap` source bakes the default \
+         handler with the default applet roster — it carries no field for either, so the selection \
+         would be accepted and dropped (§10.5): {fix}.",
+        entry.label
+    )))
+}
+
+/// Refuses a `rootfs` registration whose **packing** declarations the `mmdebstrap` source cannot
+/// honor (F1, §4.7, §10.5).
+///
+/// The same shape as [`reject_unbakeable_handler_for_mmdebstrap`], on the other registry: that
+/// source's stage packs through the erofs door with a hardcoded [`vmcell::artifact::XattrPolicy`]
+/// `Strip` and carries no format field at all, so a declared `xattrs: preserve` would be dropped
+/// silently — the packer strips, the image ships, and the entry's own derived
+/// `xattr_preserved: true` declaration (§4.7's one derivation) then travels beside bytes that
+/// contradict it — and a declared `format: ext4` would produce a `rootfs.erofs` under an entry that
+/// says otherwise.
+///
+/// Keyed on the RESOLVED entry, and that is what makes it reachable at all: `--rootfs-label` is
+/// refused against this source, so the label is always `None` — but `None` resolves the **default**
+/// entry, and the default entry is precisely the one describing the artifact this source writes
+/// (`rootfs.erofs`). Both clauses are inert against the committed baseline, whose default entry
+/// declares neither key; an overlay that declares either is what they exist for.
+///
+/// The comparison is against each type's own `default()` rather than a named variant, so the
+/// refusal tracks the packer's actual behavior: the day this source honors a policy, the honoring —
+/// not this predicate — is what changes.
+///
+/// # Errors
+/// [`vmcell::Error::Artifact`] naming the entry, the declaration that cannot be produced, and the
+/// source that can.
+fn reject_unproducible_rootfs_entry_for_mmdebstrap(
+    source: RootfsSourceKind,
+    entry: Option<&vmcell::artifact::RootfsRegistryEntry>,
+) -> vmcell::Result<()> {
+    if !matches!(source, RootfsSourceKind::Mmdebstrap) {
+        return Ok(());
+    }
+    let Some(entry) = entry else {
+        // No `rootfs` namespace at all: nothing declared, nothing to honor.
+        return Ok(());
+    };
+    let unproducible = if entry.xattrs != vmcell::artifact::XattrPolicy::default() {
+        format!(
+            "declares `xattrs: {}`, and this source packs with `{}`",
+            entry.xattrs.name(),
+            vmcell::artifact::XattrPolicy::default().name()
+        )
+    } else if entry.format != vmcell::artifact::RootfsFormat::default() {
+        format!(
+            "declares `format: {}`, and this source packs `{}`",
+            entry.format.name(),
+            vmcell::artifact::RootfsFormat::default().name()
+        )
+    } else {
+        return Ok(());
+    };
+    Err(vmcell::Error::Artifact(format!(
+        "the `rootfs.{}` entry {unproducible} — it carries no field for that declaration, so it \
+         would be accepted and dropped (§4.7): use --rootfs-source oci, which honors it, or drop \
+         the key.",
+        entry.label
+    )))
+}
+
 /// Assembles the `vmcell build` pipeline's stages in run order: resolved pins, the selected kernel
 /// producer, the steward and tools, and the selected rootfs producer (§5.4, The guest-kernel contract and the bootstrap seed; §4.3, The rootfs-construction contract).
 ///
-/// Separate from [`dispatch`] so the wiring — including the refusal above — is assertable without
+/// Separate from [`dispatch`] so the wiring — including the refusals above — is assertable without
 /// running a build that downloads and compiles for hours.
 ///
 /// # Errors
-/// As [`reject_seed_needing_source_for_build`] (a producer `build` cannot seed) and
-/// [`kernel_stage`].
+/// As [`reject_seed_needing_source_for_build`] (a producer `build` cannot seed),
+/// [`reject_unhonorable_rootfs_source_inputs`], [`reject_unbakeable_handler_for_mmdebstrap`],
+/// [`reject_unproducible_rootfs_entry_for_mmdebstrap`] and [`kernel_stage`].
 fn build_stages(
     kernel_source: KernelSource,
     rootfs_source: RootfsSourceKind,
-    release: String,
+    release: Option<&str>,
     rootfs_label: Option<&str>,
     handler_label: Option<&str>,
     pins: Option<&std::path::Path>,
     cid_alloc: std::sync::Arc<vmcell::vmm::CidAllocator>,
 ) -> vmcell::Result<Vec<Box<dyn vmcell::artifact::Stage>>> {
     reject_seed_needing_source_for_build(kernel_source)?;
+    // The flag-vs-source table, on the RAW labels — before the normalization below, and before any
+    // registry is resolved, so a flag this source cannot honor costs an error message rather than a
+    // pins read that reports a different problem.
+    reject_unhonorable_rootfs_source_inputs(rootfs_source, rootfs_label, release)?;
     // `--rootfs-label default` and no `--rootfs-label` are the SAME request, and the one law that
     // says so is `registry_label` (§10.5): the reserved default label contributes no suffix, so the
     // pins flatten to the un-suffixed `rootfs_image`/`rootfs_digest` keys and the image lands on
@@ -474,8 +665,21 @@ fn build_stages(
     // `Option<&str>`, or the sidecar lands beside a differently-spelled image (the two filename
     // composers treat `Some("default")` and `None` as different files).
     let rootfs_label = rootfs_label.and_then(vmcell::artifact::registry::registry_label);
+    // The same law on `--handler-label`, for the same reason and with the same defect behind it:
+    // `--handler-label default` composed `guest_tools-default` — a stage name, artifact key, output
+    // file and cache key the omitted spelling does not use — so the rootfs stage looked for the
+    // handler the operator named and the handler stage had published a differently-keyed one. The
+    // two stages below and the entry resolution above must be handed ONE spelling; the two stage
+    // constructors normalize as well, so no other caller can compose the split artifact either.
+    let handler_label = handler_label.and_then(vmcell::artifact::registry::registry_label);
     let rootfs_entry = resolve_rootfs_entry(rootfs_label, pins)?;
     let handler = resolve_handler_entry(handler_label, pins)?;
+    // The entry half of the same law, from the ONE resolution above rather than a second one: what
+    // the `mmdebstrap` arm below cannot bake is a property of the registration, not of the flag.
+    reject_unbakeable_handler_for_mmdebstrap(rootfs_source, handler.as_ref())?;
+    // …and the same reading on the `rootfs` entry's own packing declarations (§4.7): that arm has no
+    // field for `xattrs` or `format`, and the DEFAULT entry describes the very artifact it writes.
+    reject_unproducible_rootfs_entry_for_mmdebstrap(rootfs_source, rootfs_entry.as_ref())?;
     let mut stages: Vec<Box<dyn vmcell::artifact::Stage>> = vec![
         Box::new(vmcell::artifact::ResolvePinsStage {
             overlay_file: pins_overlay(pins),
@@ -491,6 +695,7 @@ fn build_stages(
             release,
             rootfs_label,
             rootfs_entry.as_ref(),
+            handler_label,
             handler
                 .as_ref()
                 .map(vmcell::artifact::handler::HandlerRegistryEntry::applet_roster),
@@ -660,8 +865,188 @@ fn build_kernels_stages(
     Ok(stages)
 }
 
+/// The `resolved_pins.json` an artifacts dir carries — the document the pipeline published **into
+/// that dir**, and therefore the record of what the artifacts beside it were built from.
+///
+/// Composed through the stage that writes it rather than spelled a second time here, so the reader
+/// and the writer of that filename cannot drift.
+fn recorded_pins_path(dir: &std::path::Path) -> PathBuf {
+    use vmcell::artifact::Stage as _;
+    vmcell::artifact::ResolvePinsStage::default().out_path(dir)
+}
+
+/// The registrations an artifacts dir recorded — what `vmcell bundle` reads to learn how a label is
+/// **spelled** and, for a rootfs, **which format is the current one**.
+///
+/// The dir's own [`recorded_pins_path`] is the source, for the same reason `bundle` deliberately
+/// gains no `--pins`: a dir judged against today's overlay is the wrong fact, while the document
+/// stage 0 of the build that filled it published is exactly right. Read back through the library's
+/// own registry resolvers with that document as the overlay — the merge is leaf-wise over the
+/// committed baseline, and the recorded document is that baseline plus whatever the build's overlay
+/// added, so re-resolving it yields the build's own registry rather than a second parser's idea of
+/// it.
+///
+/// An absent record is not an error: a dir no pipeline has filled has nothing to record, and both
+/// rosters stay empty so every candidate falls back to what the filenames say.
+#[derive(Default)]
+struct RecordedRegistrations {
+    /// The `kernels` registry the recorded pins resolve to.
+    kernels: Vec<vmcell::artifact::KernelRegistryEntry>,
+    /// The `rootfs` registry the recorded pins resolve to.
+    rootfs: Vec<vmcell::artifact::RootfsRegistryEntry>,
+}
+
+impl RecordedRegistrations {
+    /// Reads what `dir`'s own resolved pins recorded.
+    ///
+    /// # Errors
+    /// [`vmcell::Error::Artifact`] when the recorded document is malformed, holds a retired pins
+    /// shape, or registers two labels that collide on one artifact — the same refusals every other
+    /// reader of those registries raises. A manifest composed against a document vmcell cannot parse
+    /// would name artifacts by keys nobody can resolve, which is the one thing this walk's names
+    /// exist to prevent.
+    fn read_from(dir: &std::path::Path) -> vmcell::Result<Self> {
+        let recorded = recorded_pins_path(dir);
+        if !recorded.exists() {
+            return Ok(Self::default());
+        }
+        Ok(Self {
+            kernels: vmcell::artifact::resolve_kernel_registry(Some(&recorded))?,
+            rootfs: vmcell::artifact::resolve_rootfs_registry(Some(&recorded))?,
+        })
+    }
+
+    /// The **registered** spelling of a kernel label read off a `vmlinux-<label>` filename.
+    ///
+    /// The filename law sanitizes `.`→`-` while the artifact key keeps the dots, so
+    /// `kernels.6.12.94` builds `vmlinux-6-12-94` and the filename alone cannot say which of
+    /// `6.12.94` and `6-12-94` was registered. `bundle` composed the on-disk spelling, so the
+    /// manifest recorded `kernel-6-12-94` — a name no producer registers, and therefore one no
+    /// consumer can look up, which is exactly what [`bundle_candidates`]'s own rules forbid.
+    ///
+    /// Matched by composing each registered label THROUGH the producers' filename law and its
+    /// inverse, never by re-spelling the sanitization here. An unregistered label (a kernel built
+    /// from pins that no longer name it) keeps its on-disk spelling: that is all that is known about
+    /// it, and dropping it from the manifest would be the N-BIN-4 omission.
+    fn kernel_label<'a>(&'a self, on_disk: &'a str) -> &'a str {
+        self.kernels
+            .iter()
+            .find(|e| {
+                vmcell::artifact::kernel::kernel_label_from_filename(
+                    &vmcell::artifact::kernel::kernel_filename(Some(&e.label)),
+                ) == Some(on_disk)
+            })
+            .map_or(on_disk, |e| e.label.as_str())
+    }
+
+    /// The `rootfs` registration whose on-disk artifact **stem** is `stem`.
+    ///
+    /// The stem rather than the filename because that is the registry's own collision key (§18
+    /// delta 8): both formats of one label share it, which is precisely why a registration — and not
+    /// a directory listing — is what says which of the two images is current.
+    fn rootfs_by_stem(&self, stem: &str) -> Option<&vmcell::artifact::RootfsRegistryEntry> {
+        self.rootfs.iter().find(|e| {
+            vmcell::artifact::rootfs::rootfs_artifact_stem(
+                vmcell::artifact::registry::registry_label(&e.label),
+            ) == stem
+        })
+    }
+}
+
+/// The rootfs image present in `dir` for `label` — `bundle`'s fallback for an artifact whose
+/// registration the dir does not record.
+///
+/// In `RootfsFormat::ALL` order rather than `read_dir` order, so an unrecorded label whose two
+/// formats are both on disk pins the same one on every run. Erofs when neither is present, so an
+/// empty dir still names the artifact it is missing rather than naming nothing.
+fn present_rootfs_image(dir: &std::path::Path, label: Option<&str>) -> PathBuf {
+    use vmcell::artifact::RootfsFormat;
+    use vmcell::artifact::rootfs::rootfs_filename;
+    RootfsFormat::ALL
+        .into_iter()
+        .map(|f| dir.join(rootfs_filename(label, f)))
+        .find(|p| p.exists())
+        .unwrap_or_else(|| dir.join(rootfs_filename(label, RootfsFormat::Erofs)))
+}
+
+/// Every `(artifact key, image path)` the **rootfs** half of `vmcell bundle` pins for `dir`: the
+/// default artifact, plus one candidate per labelled image the dir holds, each resolved against the
+/// registrations that dir recorded.
+///
+/// Two questions only the registrations can answer, and both were answered wrong from the filenames
+/// alone:
+///
+/// * **Which format is current.** A label's two formats share one stem (§18 delta 8), so an entry
+///   re-registered from `erofs` to `ext4` leaves the old image sitting beside the new one. The
+///   `RootfsFormat::ALL`-first scan then pinned the STALE erofs for the default artifact, and — worse
+///   — named BOTH files for a labelled one, so the manifest carried two digests under `rootfs-<label>`
+///   and a consumer resolved whichever `read_dir` happened to yield first. The declaration wins:
+///   `resolved_pins.json` is written by stage 0 of the very build that packed these images, so the
+///   format it names is the format that build wrote.
+/// * **How the label is spelled** — see [`RecordedRegistrations::kernel_label`], one kind over.
+///
+/// Discovery still comes from the DIRECTORY rather than from the roster: naming every registered
+/// label would report a skipped artifact for every label the operator has not built, and a skip
+/// notice that always fires is one nobody reads. A registered label whose declared format is absent
+/// while its other format is present IS named, and so reported skipped — that artifact is stale, and
+/// saying so is the point.
+fn rootfs_bundle_candidates(
+    dir: &std::path::Path,
+    recorded: &RecordedRegistrations,
+) -> Vec<(String, PathBuf)> {
+    use vmcell::artifact::registry::registry_label;
+    use vmcell::artifact::rootfs::{
+        rootfs_artifact_from_filename, rootfs_artifact_key, rootfs_artifact_stem, rootfs_filename,
+    };
+
+    // One candidate per artifact, composed through the key/filename laws from the recorded
+    // registration when there is one. The DEFAULT artifact is always a candidate: the walk below
+    // keys on a `-<label>` filename and so cannot see it at all, which is the N-BIN-4 hole one
+    // format over.
+    let declared = |label: Option<&str>| -> Option<(String, PathBuf)> {
+        let entry = recorded.rootfs_by_stem(&rootfs_artifact_stem(label))?;
+        let label = registry_label(&entry.label);
+        Some((
+            rootfs_artifact_key(label),
+            dir.join(rootfs_filename(label, entry.format)),
+        ))
+    };
+    let mut candidates: Vec<(String, PathBuf)> = vec![
+        declared(None)
+            .unwrap_or_else(|| (rootfs_artifact_key(None), present_rootfs_image(dir, None))),
+    ];
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let fname = e.file_name();
+            let name = fname.to_string_lossy();
+            // The library's one label law (the inverse of the producers' filename composer), which
+            // answers for `.ext4` as well as `.erofs` (§18 delta 8) and returns `None` for a
+            // `.features` or `.cache_key` sidecar — the property that keeps a sidecar from being
+            // bundled as a rootfs in its own right.
+            let Some((on_disk, _format)) = rootfs_artifact_from_filename(&name) else {
+                continue;
+            };
+            let candidate = declared(Some(on_disk)).unwrap_or_else(|| {
+                // Unrecorded: the manifest can only say what the filename says. Composed through
+                // `present_rootfs_image` rather than from this entry's own path so that both
+                // formats of an unrecorded label resolve to the SAME candidate below.
+                (
+                    rootfs_artifact_key(Some(on_disk)),
+                    present_rootfs_image(dir, Some(on_disk)),
+                )
+            });
+            // Both of a label's formats resolve to that one candidate, so the second file must not
+            // push a duplicate: two entries under one artifact key is the defect above.
+            if !candidates.iter().any(|(key, _)| *key == candidate.0) {
+                candidates.push(candidate);
+            }
+        }
+    }
+    candidates
+}
+
 /// Every `(manifest name, path)` `vmcell bundle` considers in `dir`, present or not — the whole
-/// candidate walk, as a pure function of the directory's contents.
+/// candidate roster, as a function of the directory's contents and the registrations it recorded.
 ///
 /// Extracted from [`bundle_artifacts`] so the roster is assertable **directly**, against a fixture
 /// tree, without hashing files or writing a manifest. It was inline, and that is why the sidecar
@@ -673,34 +1058,24 @@ fn build_kernels_stages(
 /// and skipped, and prints the skipped ones, so an absent artifact is reported rather than silently
 /// dropped.
 ///
-/// Every name is composed through the library's own key laws, never spelled here: a manifest entry
-/// under a name the producers do not register is a name no consumer can look up.
-fn bundle_candidates(dir: &std::path::Path) -> Vec<(String, PathBuf)> {
-    use vmcell::artifact::RootfsFormat;
-    use vmcell::artifact::rootfs::{features_artifact_key, rootfs_artifact_key, rootfs_filename};
+/// Every name is composed through the library's own key laws, never spelled here, and a label's
+/// spelling comes from its **registration** rather than from its sanitized filename: a manifest
+/// entry under a name the producers do not register is a name no consumer can look up.
+fn bundle_candidates(
+    dir: &std::path::Path,
+    recorded: &RecordedRegistrations,
+) -> Vec<(String, PathBuf)> {
+    use vmcell::artifact::rootfs::features_artifact_key;
     use vmcell::feature::feature_manifest_path;
 
-    // The DEFAULT rootfs, whichever format it was built in (§18 delta 8). The labelled walk below
-    // keys on a `-<label>` filename and so cannot see the default one at all, which means a default
-    // entry registered `"format": "ext4"` would be bundled by nobody — the N-BIN-4 hole, re-armed
-    // by the second format. Resolved from the directory rather than pushed twice: two candidates
-    // under one artifact key would report `rootfs` as a skipped artifact on every ordinary erofs
-    // build, and a skip notice that always fires is one nobody reads. Erofs when neither exists, so
-    // an empty dir still names the artifact it is missing.
-    let default_rootfs = RootfsFormat::ALL
-        .into_iter()
-        .map(|f| dir.join(rootfs_filename(None, f)))
-        .find(|p| p.exists())
-        .unwrap_or_else(|| dir.join(rootfs_filename(None, RootfsFormat::Erofs)));
     let mut candidates: Vec<(String, PathBuf)> = vec![
         ("kernel".to_string(), dir.join("vmlinux")),
-        (rootfs_artifact_key(None), default_rootfs.clone()),
         ("ca".to_string(), dir.join("ca.pem")),
         // The RESOLVED pins (baseline + any overlay), not the committed baseline: with an
         // overlay in play the repo file is not what the artifacts were built from, and the
         // baseline is embedded in the binary now anyway (§10.2). Absent until a pipeline
         // has run, which the skipped-artifact notice below reports.
-        ("pins".to_string(), dir.join("resolved_pins.json")),
+        ("pins".to_string(), recorded_pins_path(dir)),
     ];
     // The default kernel's resolved-config sidecar (§5.6): present for a compiling
     // producer, absent for the prebuilt seed — which clears any config an earlier
@@ -712,17 +1087,18 @@ fn bundle_candidates(dir: &std::path::Path) -> Vec<(String, PathBuf)> {
         "kernel-config".to_string(),
         vmcell::artifact::kernel::resolved_config_path(&dir.join("vmlinux")),
     ));
-    // The default rootfs's §7.4 feature-declaration sidecar (§18 delta 6c) — the rootfs's
-    // counterpart of the kernel-config candidate above, and it closes the same N-BIN-4 hole for a
-    // strictly worse consequence: a bundled rootfs that arrives WITHOUT its declaration reads to
-    // `FeatureDeclaration::load_beside` exactly like an un-annotated artifact, so the consumer's
+    // Every rootfs artifact, each with its §7.4 feature-declaration sidecar (§18 delta 6c) — the
+    // rootfs's counterpart of the kernel-config candidate above, and it closes the same N-BIN-4 hole
+    // for a strictly worse consequence: a bundled rootfs that arrives WITHOUT its declaration reads
+    // to `FeatureDeclaration::load_beside` exactly like an un-annotated artifact, so the consumer's
     // cell silently re-claims every capability the declaration existed to withdraw (today, that
     // vmcell's packer strips xattrs). A missing kernel config is a gap; a missing declaration is a
-    // lie the consumer cannot detect.
-    candidates.push((
-        features_artifact_key(&rootfs_artifact_key(None)),
-        feature_manifest_path(&default_rootfs),
-    ));
+    // lie the consumer cannot detect. The sidecar is derived from the image's own path, so it
+    // travels with whichever format the registration declared.
+    for (key, image) in rootfs_bundle_candidates(dir, recorded) {
+        candidates.push((features_artifact_key(&key), feature_manifest_path(&image)));
+        candidates.push((key, image));
+    }
     // Cover every labelled kernel built by `build-kernels` (`vmlinux-<label>`),
     // not just the default `vmlinux` — otherwise the manifest silently omits
     // the cross-kernel sweep's artifacts (N-BIN-4) — and each one's resolved-config
@@ -738,32 +1114,14 @@ fn bundle_candidates(dir: &std::path::Path) -> Vec<(String, PathBuf)> {
                 // The manifest names a labelled kernel by the library's artifact-key law
                 // (and its sidecar by the derived config key) rather than re-spelling
                 // `kernel-<label>` here — a manifest entry the producers do not register
-                // under is a name no consumer can look up.
-                let key = vmcell::artifact::kernel::kernel_artifact_key(Some(label));
+                // under is a name no consumer can look up. The label is the REGISTERED
+                // spelling, which the sanitized filename cannot supply.
+                let key = vmcell::artifact::kernel::kernel_artifact_key(Some(
+                    recorded.kernel_label(label),
+                ));
                 candidates.push((
                     vmcell::artifact::kernel::config_artifact_key(&key),
                     vmcell::artifact::kernel::resolved_config_path(&e.path()),
-                ));
-                candidates.push((key, e.path()));
-            }
-            // The same law, one kind over (§10.5, v33 delta 6): every labelled rootfs
-            // built through `--rootfs-label` (`rootfs-<label>.erofs`). Without this the
-            // registry would re-arm the exact N-BIN-4 defect the kernel walk above exists
-            // to close — a registered artifact silently absent from the manifest.
-            //
-            // The walk keys on the IMAGE filename, so each labelled rootfs contributes its
-            // declaration sidecar here rather than in a second pass: `rootfs_artifact_from_filename`
-            // returns `None` for a `.features` file (it demands a known FORMAT extension), which is
-            // the property that keeps a sidecar from being bundled as a rootfs in its own right.
-            // It answers for `.ext4` as well as `.erofs` (§18 delta 8) — an ext4 artifact invisible
-            // to `bundle` would be this exact N-BIN-4 hole, re-armed by the second format.
-            if let Some((label, _format)) =
-                vmcell::artifact::rootfs::rootfs_artifact_from_filename(&name)
-            {
-                let key = rootfs_artifact_key(Some(label));
-                candidates.push((
-                    features_artifact_key(&key),
-                    feature_manifest_path(&e.path()),
                 ));
                 candidates.push((key, e.path()));
             }
@@ -782,9 +1140,21 @@ fn bundle_candidates(dir: &std::path::Path) -> Vec<(String, PathBuf)> {
 ///
 /// # Errors
 /// [`vmcell::Error::Artifact`] when `dir` holds no artifacts at all, when its resolved pins name an
-/// unpinned registration (§10.5, F7), or when an artifact cannot be hashed or the manifest written.
+/// unpinned registration (§10.5, F7) or cannot be resolved into their registries, or when an
+/// artifact cannot be hashed or the manifest written.
 fn bundle_artifacts(dir: &std::path::Path, out: Option<&std::path::Path>) -> vmcell::Result<()> {
-    let candidates = bundle_candidates(dir);
+    // F7 (§10.5): an unpinned registration is REFUSED before a byte of manifest is written — a
+    // manifest naming an artifact whose registration meant "whatever was at that path that day" is
+    // a provenance claim vmcell cannot back, and writing it first and complaining afterwards would
+    // leave that claim on disk. Read from the artifacts dir's own `resolved_pins.json`, so `bundle`
+    // still needs no `--pins` (see `reject_unpinned_registrations`).
+    //
+    // FIRST, ahead of the roster below, because the roster is now composed from that same recorded
+    // document: the refusal and the read must not be able to disagree about which document they
+    // read, and the refusal must land before either.
+    vmcell::artifact::bundle::reject_unpinned_registrations(&recorded_pins_path(dir))?;
+    let recorded = RecordedRegistrations::read_from(dir)?;
+    let candidates = bundle_candidates(dir, &recorded);
     let present: Vec<(&str, &std::path::Path)> = candidates
         .iter()
         .filter(|(_, p)| p.exists())
@@ -795,12 +1165,6 @@ fn bundle_artifacts(dir: &std::path::Path, out: Option<&std::path::Path>) -> vmc
             "no artifacts found to bundle; run `vmcell build` first".to_string(),
         ));
     }
-    // F7 (§10.5): an unpinned registration is REFUSED here, before a byte of manifest is written —
-    // a manifest naming an artifact whose registration meant "whatever was at that path that day"
-    // is a provenance claim vmcell cannot back, and writing it first and complaining afterwards
-    // would leave that claim on disk. Read from the artifacts dir's own `resolved_pins.json`, so
-    // `bundle` still needs no `--pins` (see `reject_unpinned_registrations`).
-    vmcell::artifact::bundle::reject_unpinned_registrations(&dir.join("resolved_pins.json"))?;
     // Surface what was left out — a silently-omitted artifact would make the manifest
     // read as "covered everything" when it didn't.
     let skipped: Vec<&str> = candidates
@@ -870,9 +1234,10 @@ fn resolve_rootfs_entry(
 /// OCI bootstrap producer or the in-VM `vmcell-rootfs-builder` mmdebstrap source (§4.3, The rootfs-construction contract).
 fn rootfs_stage(
     source: RootfsSourceKind,
-    release: String,
+    release: Option<&str>,
     rootfs_label: Option<&str>,
     rootfs_entry: Option<&vmcell::artifact::RootfsRegistryEntry>,
+    handler_label: Option<&str>,
     applets: Option<Vec<String>>,
     cid_alloc: std::sync::Arc<vmcell::vmm::CidAllocator>,
 ) -> Box<dyn vmcell::artifact::Stage> {
@@ -883,6 +1248,11 @@ fn rootfs_stage(
         RootfsSourceKind::Oci => Box::new(
             vmcell::artifact::rootfs::RootfsStage::labelled(rootfs_label)
                 .with_applets(applets.unwrap_or_default())
+                // …and WHICH handler those applet symlinks point at (§10.5, delta 6b): the roster
+                // above and this label come from the one resolved `handlers` entry, and the pack
+                // tail reads the binary from `handler_artifact_key(this)`. Passing the roster
+                // without the label is how a labelled handler's binary reached no image at all.
+                .with_handler_label(handler_label)
                 // §4.7's per-artifact xattr policy (§18 delta 7), from the SAME resolved entry the
                 // declaration stage beside it renders — so the bytes the packer produces and the
                 // `xattr_preserved` stance the sidecar claims are derived from one declaration.
@@ -900,11 +1270,20 @@ fn rootfs_stage(
                 ),
         ),
         // The mmdebstrap source builds from a release suite, not from a registered digest, so it
-        // has no label to honor. `dispatch` refuses the combination before this point rather than
-        // dropping it here: an accepted-and-ignored `--rootfs-label` would build the default
-        // userland and report success.
+        // has neither a rootfs label nor a handler registration to honor — and the refusals at
+        // the head of `build_stages` are what keep this arm from *dropping* them: an
+        // accepted-and-ignored `--rootfs-label` would build the default userland and report
+        // success, an ignored applet roster would bake the default symlinks under an entry
+        // that asked for others, and an ignored `xattrs`/`format` on the DEFAULT entry — the entry
+        // that describes the very `rootfs.erofs` this arm writes, reached even though the label is
+        // always `None` here — would ship an image contradicting its own declaration (§4.7).
+        // `rootfs_entry` is therefore deliberately unread in this arm rather than partly honored.
+        //
+        // `--release`'s default is applied HERE, at the one arm that consumes it, so the omitted
+        // spelling and `--release trixie` compose the identical stage (and the same cache key)
+        // while the `oci` arm above still sees an untouched `None` to refuse.
         RootfsSourceKind::Mmdebstrap => Box::new(vmcell_rootfs_builder::MmdebstrapRootfsStage {
-            release,
+            release: release.unwrap_or(DEFAULT_RELEASE).to_string(),
             cid_alloc,
             extra: Vec::new(),
         }),
@@ -921,30 +1300,16 @@ async fn dispatch(command: &Commands) -> vmcell::Result<()> {
             handler_label,
             pins,
         } => {
-            // F1 on a flag pair: the mmdebstrap source builds from a release suite, not from a
-            // registered digest, so it has no label to honor. Refuse rather than ignore.
-            //
-            // Keyed on the RAW flag, deliberately — `build_stages` normalizes the reserved
-            // `default` label to `None`, but that normalization is about which pins keys a REGISTRY
-            // request flattens to, and mmdebstrap reads no registry entry at all. Letting the
-            // normalized form through would make `--rootfs-label default --rootfs-source
-            // mmdebstrap` the one spelling that is silently ignored instead of refused.
-            if rootfs_label.is_some() && matches!(rootfs_source, RootfsSourceKind::Mmdebstrap) {
-                return Err(vmcell::Error::Artifact(
-                    "--rootfs-label selects a `rootfs` registry entry (§10.5), which the \
-                     `mmdebstrap` source does not read: it builds from --release. Use \
-                     --rootfs-source oci, or drop --rootfs-label."
-                        .into(),
-                ));
-            }
             // One CID allocator shared by any in-VM builder stage this pipeline runs.
             let cid_alloc = std::sync::Arc::new(vmcell::vmm::CidAllocator::new());
-            // Assemble — and so honor or reject every flag — BEFORE announcing the build: a
-            // refused `--kernel-source` (M3) must not first print "Building artifacts...".
+            // Assemble — and so honor or reject every flag, including the flag-vs-source table
+            // (F1) — BEFORE announcing the build: a refused `--kernel-source` (M3) must not first
+            // print "Building artifacts...". Every refusal lives in `build_stages` so it is
+            // assertable without a build; this arm holds none of its own.
             let stages = build_stages(
                 *kernel_source,
                 *rootfs_source,
-                release.clone(),
+                release.as_deref(),
                 rootfs_label.as_deref(),
                 handler_label.as_deref(),
                 pins.as_deref(),
@@ -1149,10 +1514,18 @@ async fn dispatch(command: &Commands) -> vmcell::Result<()> {
     }
 }
 
-/// Resolves the `cloud-hypervisor` binary path: `$VMCELL_CH_BIN`, else `cloud-hypervisor`
-/// on `PATH`.
+/// Resolves the `cloud-hypervisor` binary path through the library's **one** resolver
+/// ([`vmcell::artifact::ch_binary_path`]: `$VMCELL_CH_BIN`, else `cloud-hypervisor` on `PATH`).
+///
+/// A one-line delegation for the reason [`pins_overlay`] is one. This was a byte-identical THIRD
+/// copy of that resolver (A2), so a change to the law — a second env var, a fallback list, a
+/// `PATH` probe — would have moved the library and every builder stage that reads it and left
+/// `vmcell run`/`create`/`snapshot`/`stats` resolving the old way, which is the per-call-site drift
+/// `ch_binary_path`'s own rustdoc exists to describe. Delegating is not a compile-checked fact, so
+/// `the_cli_resolves_the_ch_binary_through_the_one_library_law` scans for it: this crate names the
+/// env var nowhere and calls the one resolver in exactly one place.
 fn ch_bin() -> String {
-    std::env::var("VMCELL_CH_BIN").unwrap_or_else(|_| "cloud-hypervisor".to_string())
+    vmcell::artifact::ch_binary_path()
 }
 
 /// Resolves the pins overlay for a pipeline-building subcommand: the `--pins` flag wins, else
@@ -1855,7 +2228,7 @@ mod tests {
         let err = build_stages(
             KernelSource::InVm,
             RootfsSourceKind::Oci,
-            "trixie".to_string(),
+            None,
             None,
             None,
             None,
@@ -1888,21 +2261,13 @@ mod tests {
         // not a blanket break of `vmcell build`.
         for source in [KernelSource::Prebuilt, KernelSource::HostMake] {
             for rootfs in [RootfsSourceKind::Oci, RootfsSourceKind::Mmdebstrap] {
-                let stages = build_stages(
-                    source,
-                    rootfs,
-                    "trixie".to_string(),
-                    None,
-                    None,
-                    None,
-                    alloc(),
-                )
-                .unwrap_or_else(|e| {
-                    panic!(
-                        "{} + {rootfs:?} must assemble: {e}",
-                        kernel_source_name(source)
-                    )
-                });
+                let stages = build_stages(source, rootfs, None, None, None, None, alloc())
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "{} + {rootfs:?} must assemble: {e}",
+                            kernel_source_name(source)
+                        )
+                    });
                 let names: Vec<String> = stages.iter().map(|s| s.name().to_string()).collect();
                 let mut expected = vec![
                     "resolve_pins".to_string(),
@@ -1932,6 +2297,360 @@ mod tests {
         }
     }
 
+    // F1 AT THE ASSEMBLY (§4.3/§10.5): each rootfs source REFUSES exactly the input the other one
+    // reads. `--release` was accepted and dropped by the `oci` source, with "(ignored for `oci`)"
+    // written into the flag's own help — the accept-then-ignore shape documented instead of fixed —
+    // and `--rootfs-label` is refused by `mmdebstrap` on the RAW spelling, so the reserved `default`
+    // label is refused too rather than being the one spelling that is silently ignored.
+    //
+    // Driven through `build_stages`, not the predicate alone: this is a call-site rule (no flag may
+    // outlive the assembly unhonored, and nothing is printed or downloaded before it), and a green
+    // predicate beside an assembly that never calls it is the invisible PARTIAL AGENTS.md names.
+    //
+    // RED on the inverse, four ways: drop the `--release` arm (the oci leg assembles instead of
+    // refusing); drop the `--rootfs-label` arm (the mmdebstrap leg assembles); key the label arm on
+    // the NORMALIZED label (the `default` leg assembles); refuse `--release` on both sources (the
+    // mmdebstrap positive control fails).
+    #[test]
+    fn build_refuses_the_input_the_selected_rootfs_source_cannot_honor() {
+        use vmcell::artifact::registry::DEFAULT_LABEL;
+        let assemble = |source, release, rootfs_label| {
+            build_stages(
+                KernelSource::Prebuilt,
+                source,
+                release,
+                rootfs_label,
+                None,
+                None,
+                std::sync::Arc::new(vmcell::vmm::CidAllocator::new()),
+            )
+            // Render the roster so a regression reports WHAT it assembled (`Box<dyn Stage>` is not
+            // `Debug`).
+            .map(|s| {
+                s.iter()
+                    .map(|st| st.name().to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+        };
+
+        // `--release` against `oci`: refused, naming the flag, the value the operator typed, and the
+        // route that reads it.
+        let msg = assemble(RootfsSourceKind::Oci, Some("bookworm"), None)
+            .expect_err("`--release` against the oci source must be refused, not dropped")
+            .to_string();
+        for named in ["--release bookworm", "--rootfs-source mmdebstrap"] {
+            assert!(
+                msg.contains(named),
+                "the refusal must name `{named}`, got: {msg}"
+            );
+        }
+
+        // `--rootfs-label` against `mmdebstrap`: refused for EVERY spelling, the reserved default
+        // included — that one normalizes to `None` a line later, which is why the refusal reads the
+        // raw flag.
+        for label in ["acme", DEFAULT_LABEL] {
+            let msg = assemble(RootfsSourceKind::Mmdebstrap, None, Some(label))
+                .expect_err("`--rootfs-label` against the mmdebstrap source must be refused")
+                .to_string();
+            assert!(
+                msg.contains("--rootfs-label") && msg.contains("--rootfs-source oci"),
+                "the refusal must name the flag and the route, got: {msg}"
+            );
+        }
+
+        // THE POSITIVE CONTROLS: each source still honors the input it does read, and both omitted
+        // forms assemble. Without these the legs above would pass just as well against a `build`
+        // that refused every combination it was handed.
+        assemble(RootfsSourceKind::Mmdebstrap, Some("bookworm"), None)
+            .expect("the mmdebstrap source reads --release");
+        assemble(RootfsSourceKind::Oci, None, Some(DEFAULT_LABEL))
+            .expect("the oci source reads --rootfs-label");
+        assemble(RootfsSourceKind::Oci, None, None).expect("both flags omitted must assemble");
+        assemble(RootfsSourceKind::Mmdebstrap, None, None)
+            .expect("both flags omitted must assemble");
+
+        // THE ARGUMENT SURFACE, which is what makes the refusal expressible at all: an omitted
+        // `--release` must reach `build_stages` as `None`. Re-adding clap's `default_value` would
+        // hand every invocation `Some("trixie")` and turn the refusal above into a refusal of every
+        // `oci` build — a break the legs above cannot see, because they pass `None` in directly.
+        // RED on the inverse (restore `default_value = "trixie"`, or make the field a `String`): the
+        // first claim fails, or this does not compile.
+        use clap::Parser as _;
+        match Cli::try_parse_from(["vmcell", "build"])
+            .expect("a bare `build` parses")
+            .command
+        {
+            Commands::Build { release, .. } => assert_eq!(
+                release, None,
+                "an omitted `--release` must stay distinguishable from a value the operator typed"
+            ),
+            other => panic!("expected Build, got {:?}", std::mem::discriminant(&other)),
+        }
+        match Cli::try_parse_from(["vmcell", "build", "--release", "bookworm"])
+            .expect("`--release` parses")
+            .command
+        {
+            Commands::Build { release, .. } => assert_eq!(release.as_deref(), Some("bookworm")),
+            other => panic!("expected Build, got {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    // The other half of `--release`'s F1 fix, and its migration promise: dropping clap's
+    // `default_value` — so a value the operator typed is distinguishable from the one clap filled in
+    // for everybody, which is what makes the refusal above possible at all — must not move the stage
+    // the omitted spelling composes. [`DEFAULT_RELEASE`] is applied at the one arm that consumes it.
+    //
+    // The observable is `Stage::cache_key`, the only one a `dyn Stage` has and the honest one: the
+    // key decides whether the warm artifacts dir is served, so a default that moved would silently
+    // re-run an hours-long mmdebstrap build for every existing caller.
+    //
+    // RED on the inverse: change `DEFAULT_RELEASE` away from the literal clap's `default_value`
+    // carried (the first claim fails), or make the mmdebstrap arm ignore `release` (the second
+    // collapses, which is the vacuity guard on the first).
+    #[test]
+    fn the_omitted_release_composes_the_stage_claps_default_did() {
+        let inputs = vmcell::artifact::StageInputs::default();
+        let key = |release| {
+            rootfs_stage(
+                RootfsSourceKind::Mmdebstrap,
+                release,
+                None,
+                None,
+                None,
+                None,
+                std::sync::Arc::new(vmcell::vmm::CidAllocator::new()),
+            )
+            .cache_key(&inputs)
+        };
+        assert_eq!(
+            key(None),
+            key(Some("trixie")),
+            "the omitted `--release` must compose the stage `default_value = \"trixie\"` composed"
+        );
+        assert_ne!(
+            key(None),
+            key(Some("bookworm")),
+            "…and the suite must actually reach the stage (non-vacuity)"
+        );
+    }
+
+    // F1 on the OTHER registry selector (§10.5), keyed on the RESOLVED entry rather than on the
+    // flag: `--rootfs-source mmdebstrap` hands its pack tail `PackOptions::new()`, which bakes the
+    // DEFAULT handler with the DEFAULT applet roster and carries no field for either. So the roster
+    // `build_stages` resolves was accepted and dropped — silently for an entry that declares its own
+    // (the image gets the default symlinks), and as a missing-`guest_tools` failure stages later for
+    // a labelled one, which is remedial advice the operator cannot act on.
+    //
+    // RED on the inverse (delete the `reject_unbakeable_handler_for_mmdebstrap` call, or the
+    // `applets` clause alone): the corresponding leg assembles and reports the pipeline it cannot
+    // honor.
+    #[test]
+    fn build_refuses_a_handler_registration_mmdebstrap_cannot_bake() {
+        use vmcell::artifact::registry::DEFAULT_LABEL;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let assemble = |source, handler_label, overlay: &std::path::Path| {
+            build_stages(
+                KernelSource::Prebuilt,
+                source,
+                None,
+                None,
+                handler_label,
+                Some(overlay),
+                std::sync::Arc::new(vmcell::vmm::CidAllocator::new()),
+            )
+            .map(|s| {
+                s.iter()
+                    .map(|st| st.name().to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+        };
+
+        // 1. A LABELLED handler: `GuestToolsStage` publishes it as `guest_tools-acme`, a key the
+        //    mmdebstrap tail never looks up.
+        let labelled = dir.path().join("labelled.json");
+        std::fs::write(
+            &labelled,
+            format!(
+                r#"{{ "handlers": {{ "acme": {{ "digest": "sha256:{}",
+                     "source": {{ "url": "https://example.invalid/tools" }} }} }} }}"#,
+                "a".repeat(64)
+            ),
+        )
+        .expect("write overlay");
+        let msg = assemble(RootfsSourceKind::Mmdebstrap, Some("acme"), &labelled)
+            .expect_err("a labelled handler against the mmdebstrap source must be refused")
+            .to_string();
+        assert!(
+            msg.contains("handlers.acme") && msg.contains("--rootfs-source oci"),
+            "the refusal must name the entry and the route, got: {msg}"
+        );
+
+        // 2. The `applets` clause's PREMISE, which is why that clause is written as an
+        //    unreachable-by-construction guard rather than as a drivable arm: a roster declared on
+        //    the DEFAULT label cannot reach any arm at all. The overlay merge is leaf-wise, so the
+        //    baseline's `build: workspace:vmcell-guest-tools` leaf survives, and the entry parser
+        //    refuses `applets` beside a workspace build — the default handler's roster IS
+        //    `GUEST_TOOLS_APPLETS`, which is exactly what the mmdebstrap tail bakes. Refused for
+        //    BOTH sources, because the refusal is the library's and not this file's.
+        //
+        //    RED on the inverse (a parser that accepted the pair): the roster would resolve, and the
+        //    mmdebstrap arm would drop it silently — the case the guard exists for, and the case
+        //    `the_baseline_default_handler_declares_no_roster_of_its_own` re-checks from the other
+        //    side.
+        let roster = dir.path().join("roster.json");
+        std::fs::write(
+            &roster,
+            format!(r#"{{ "handlers": {{ "{DEFAULT_LABEL}": {{ "applets": ["ip"] }} }} }}"#),
+        )
+        .expect("write overlay");
+        for source in [RootfsSourceKind::Mmdebstrap, RootfsSourceKind::Oci] {
+            let msg = assemble(source, None, &roster)
+                .expect_err("a roster declared on the default handler must be refused")
+                .to_string();
+            assert!(
+                msg.contains("applets") && msg.contains(&format!("handlers.{DEFAULT_LABEL}")),
+                "the refusal must name the key that cannot be honored, got: {msg}"
+            );
+        }
+
+        // THE POSITIVE CONTROL. The `oci` source honors the labelled registration — it has a field
+        // for it — so the refusal above is about what mmdebstrap can bake, not about the entry.
+        assemble(RootfsSourceKind::Oci, Some("acme"), &labelled)
+            .expect("the oci source bakes a labelled handler");
+        // …and mmdebstrap still assembles for the handler it DOES bake: the baseline default entry,
+        // spelled out as well as omitted. `--handler-label default` names the very handler this
+        // source bakes, so refusing the flag's mere presence would have refused it.
+        for label in [None, Some(DEFAULT_LABEL)] {
+            build_stages(
+                KernelSource::Prebuilt,
+                RootfsSourceKind::Mmdebstrap,
+                None,
+                None,
+                label,
+                None,
+                std::sync::Arc::new(vmcell::vmm::CidAllocator::new()),
+            )
+            .map(|s| s.len())
+            .unwrap_or_else(|e| {
+                panic!("mmdebstrap + `--handler-label {label:?}` must assemble: {e}")
+            });
+        }
+    }
+
+    // F1 on the `rootfs` entry's PACKING declarations (§4.7, v33 deltas 7-8), the sibling of the
+    // handler gate above and the same shape: `--rootfs-source mmdebstrap` hands its tail a
+    // hardcoded `XattrPolicy::Strip` and packs through the erofs door, so a declared
+    // `xattrs: preserve` was stripped silently — beside an entry whose derived `xattr_preserved:
+    // true` then travels with bytes that contradict it — and a declared `format: ext4` produced a
+    // `rootfs.erofs`.
+    //
+    // Reachable even though `--rootfs-label` is refused against this source: the label is `None`,
+    // and `None` resolves the DEFAULT entry, which is the entry describing the artifact this source
+    // writes.
+    //
+    // RED on the inverse (delete the `reject_unproducible_rootfs_entry_for_mmdebstrap` call, or
+    // either clause): the corresponding leg assembles and reports a pipeline that drops the
+    // declaration.
+    #[test]
+    fn build_refuses_a_rootfs_declaration_mmdebstrap_cannot_produce() {
+        use vmcell::artifact::registry::DEFAULT_LABEL;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let assemble = |source, overlay: &std::path::Path| {
+            build_stages(
+                KernelSource::Prebuilt,
+                source,
+                None,
+                None,
+                None,
+                Some(overlay),
+                std::sync::Arc::new(vmcell::vmm::CidAllocator::new()),
+            )
+            .map(|s| s.len())
+        };
+
+        // The two declarations, each on the DEFAULT label (the only one this source can reach), and
+        // each written through the type's own spelling so the fixture cannot drift from the parser.
+        for (key, value, source_says) in [
+            (
+                "xattrs",
+                vmcell::artifact::XattrPolicy::Preserve.name(),
+                vmcell::artifact::XattrPolicy::default().name(),
+            ),
+            (
+                "format",
+                vmcell::artifact::RootfsFormat::Ext4.name(),
+                vmcell::artifact::RootfsFormat::default().name(),
+            ),
+        ] {
+            let overlay = dir.path().join(format!("{key}.json"));
+            std::fs::write(
+                &overlay,
+                format!(r#"{{ "rootfs": {{ "{DEFAULT_LABEL}": {{ "{key}": "{value}" }} }} }}"#),
+            )
+            .expect("write overlay");
+
+            let msg = assemble(RootfsSourceKind::Mmdebstrap, &overlay)
+                .expect_err("a declaration this source cannot produce must be refused")
+                .to_string();
+            assert!(
+                msg.contains(&format!("rootfs.{DEFAULT_LABEL}"))
+                    && msg.contains(&format!("`{key}: {value}`"))
+                    && msg.contains(source_says)
+                    && msg.contains("--rootfs-source oci"),
+                "the refusal must name the entry, the declaration, what this source does instead, \
+                 and the route that works, got: {msg}"
+            );
+
+            // THE POSITIVE CONTROL, per declaration: the `oci` source has a field for it (the
+            // `.with_xattrs`/`.with_format` on its stage), so the refusal is about what mmdebstrap
+            // can produce and not about the entry being malformed.
+            assemble(RootfsSourceKind::Oci, &overlay)
+                .unwrap_or_else(|e| panic!("the oci source honors `{key}: {value}`: {e}"));
+        }
+
+        // …and mmdebstrap still assembles against the COMMITTED baseline, whose default entry
+        // declares neither key: both clauses are inert until an overlay declares one, so this is the
+        // leg that keeps the refusals from refusing the shipped invocation.
+        build_stages(
+            KernelSource::Prebuilt,
+            RootfsSourceKind::Mmdebstrap,
+            None,
+            None,
+            None,
+            None,
+            std::sync::Arc::new(vmcell::vmm::CidAllocator::new()),
+        )
+        .expect("mmdebstrap must still assemble against the committed pins");
+    }
+
+    // The other side of that premise, on the BASELINE itself: the default `handlers` entry declares
+    // no roster of its own, so `applet_roster()` answers `GUEST_TOOLS_APPLETS` — the roster
+    // `PackOptions::new()` bakes. That is what makes the mmdebstrap arm's dropped roster provably a
+    // no-op rather than a silent loss, and it is a fact about the committed pins rather than about
+    // this file, so it gets its own claim.
+    //
+    // RED on the inverse: register a `digest` + `applets` default handler in the baseline. That is
+    // the day `reject_unbakeable_handler_for_mmdebstrap`'s `applets` clause becomes reachable and
+    // this test says so, instead of the mmdebstrap image quietly baking the wrong symlinks.
+    #[test]
+    fn the_baseline_default_handler_declares_no_roster_of_its_own() {
+        let entry = resolve_handler_entry(None, None)
+            .expect("the baseline handlers registry resolves")
+            .expect("the baseline registers a default handler");
+        assert_eq!(entry.label, vmcell::artifact::registry::DEFAULT_LABEL);
+        assert!(
+            entry.applets.is_empty(),
+            "the default handler must declare no `applets` — its roster is the const its dispatch \
+             table is asserted against, and the mmdebstrap tail bakes that same one; got {:?}",
+            entry.applets
+        );
+        // Non-vacuity: the entry really does resolve to a roster (the shared const), so "declares
+        // none" is a statement about the DECLARATION and not about an empty handler.
+        assert!(!entry.applet_roster().is_empty());
+    }
+
     // The `--rootfs-label` pre-flight survived becoming an ENTRY resolution (§18 delta 6c). It used
     // to validate the label alone; it now returns the entry, because 6c gave that entry a `features`
     // declaration the build has to emit — and resolving the registry twice, once to check the label
@@ -1948,7 +2667,7 @@ mod tests {
             build_stages(
                 KernelSource::Prebuilt,
                 RootfsSourceKind::Oci,
-                "trixie".to_string(),
+                None,
                 label,
                 None,
                 None,
@@ -2018,7 +2737,7 @@ mod tests {
             build_stages(
                 KernelSource::Prebuilt,
                 RootfsSourceKind::Oci,
-                "trixie".to_string(),
+                None,
                 label,
                 None,
                 None,
@@ -2103,7 +2822,7 @@ mod tests {
         let stages = build_stages(
             KernelSource::Prebuilt,
             RootfsSourceKind::Oci,
-            "trixie".to_string(),
+            None,
             None,
             None,
             Some(&overlay),
@@ -2380,6 +3099,51 @@ mod tests {
         );
     }
 
+    // A2: the CLI resolved the Cloud Hypervisor binary with its own byte-identical copy of
+    // `vmcell::artifact::ch_binary_path` — a THIRD copy of the one resolver (`harness::ch_bin` is the
+    // other), and the copy every VM-lifecycle verb (`run`, `create`, `snapshot`, `stats`) went
+    // through. `ch_binary_path`'s own rustdoc exists because a second env var name had already
+    // shipped once: overriding one left the other on the default.
+    //
+    // A parity assertion (`ch_bin() == ch_binary_path()`) was the first draft and it CANNOT FAIL:
+    // with the variable unset both copies answer `cloud-hypervisor`, so a private copy reading a
+    // different variable stays green. `set_var` would make it drivable and is banned here
+    // (`disallowed-methods`, process-global besides). So the law is scanned in the PRODUCTION half of
+    // this file, the shape `vmcell-privilege`'s call-site gates use — excluding the test half is also
+    // what keeps these needles from matching themselves.
+    //
+    // RED on the inverse (verified both ways): restore the private `std::env::var("VMCELL_CH_BIN")`
+    // body and the ban fails; drop the delegation and the positive control fails.
+    #[test]
+    fn the_cli_resolves_the_ch_binary_through_the_one_library_law() {
+        let production = include_str!("main.rs")
+            .split_once("#[cfg(test)]")
+            .expect("the test module is gated in this file")
+            .0;
+        // Comments stripped, so prose NAMING the variable (this resolver's own rustdoc does) is not
+        // counted as a read of it.
+        let code: String = production
+            .lines()
+            .map(|l| l.split_once("//").map_or(l, |(before, _)| before))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            code.matches("VMCELL_CH_BIN").count(),
+            0,
+            "the CH binary's env var belongs to `vmcell::artifact::ch_binary_path` alone; naming it \
+             here is that resolver's third copy"
+        );
+        // THE POSITIVE CONTROL, without which the ban above would pass on a CLI that resolved no VMM
+        // binary at all: the delegation is there, in exactly one place.
+        assert_eq!(
+            code.matches("artifact::ch_binary_path()").count(),
+            1,
+            "the CLI must resolve the CH binary through the library's one resolver, in one place"
+        );
+        // …and that resolver answers something, so `ch_bin` is not a stub the scan approves of.
+        assert!(!ch_bin().is_empty());
+    }
+
     // The CLI's argument surface really parses the two forms — a gate on the predicate alone would
     // stay green if the positional/flag pair were never wired (the "green test beside an unchanged
     // call site" shape). RED on the inverse (dropping `labels` or `all` from the variant): this
@@ -2479,7 +3243,12 @@ mod tests {
         }
         std::fs::write(dir.path().join("rootfs-acme.cache_key"), b"k").expect("write sidecar");
 
-        let candidates = bundle_candidates(dir.path());
+        // No `resolved_pins.json`: the UNRECORDED leg, where every candidate falls back to what the
+        // filenames say. `acme` carries no dot, so its on-disk and registered spellings coincide —
+        // the recorded leg is `bundle_names_a_rootfs_by_its_registered_spelling_and_declared_format`.
+        let recorded =
+            RecordedRegistrations::read_from(dir.path()).expect("an unrecorded dir reads");
+        let candidates = bundle_candidates(dir.path(), &recorded);
         let named = |name: &str| -> Option<PathBuf> {
             candidates
                 .iter()
@@ -2558,7 +3327,11 @@ mod tests {
                 .expect("write declaration");
         }
 
-        let candidates = bundle_candidates(dir.path());
+        // The UNRECORDED leg again (no `resolved_pins.json`): the format comes from the directory,
+        // which is the only thing there is to read.
+        let recorded =
+            RecordedRegistrations::read_from(dir.path()).expect("an unrecorded dir reads");
+        let candidates = bundle_candidates(dir.path(), &recorded);
         for label in [None, Some("acme")] {
             let key = rootfs_artifact_key(label);
             let image = dir.path().join(rootfs_filename(label, RootfsFormat::Ext4));
@@ -2586,6 +3359,247 @@ mod tests {
                 );
             }
         }
+    }
+
+    // The RECORDED leg (§18 delta 8, §10.5): the two things a filename cannot tell `bundle`, and it
+    // got both wrong.
+    //
+    // The fixture is an artifacts dir mid-migration — the state delta 8 makes ordinary: two entries
+    // re-registered from `erofs` to `ext4`, so each label's stale image still sits beside its current
+    // one, both under the SAME stem (which is the registry's collision key, precisely because the two
+    // formats share their `.cache_key` and `.features` sidecars). And one of the labels carries a
+    // dot, like every label in the committed `kernels` registry does.
+    //
+    // Three claims, each a defect that shipped:
+    //   * the DEFAULT artifact is the declared `rootfs.ext4`, not the `RootfsFormat::ALL`-first
+    //     `rootfs.erofs` the scan found — a manifest that pins the stale image is a durable digest
+    //     claim about bytes no build produced;
+    //   * a labelled artifact is named by its REGISTERED spelling (`rootfs-6.12`), not by the
+    //     sanitized filename spelling (`rootfs-6-12`) — the producers register the dotted key, so the
+    //     sanitized one is a name no consumer can look up;
+    //   * each artifact key appears EXACTLY once — the old walk pushed one candidate per image FILE,
+    //     so a mid-migration label landed twice under one key with two different digests and a
+    //     consumer resolved whichever `read_dir` yielded first.
+    //
+    // RED on the inverse, three ways: revert the default arm to the present-format scan (claim 1);
+    // drop the registered-spelling lookup (claim 2); push `e.path()` per file instead of the one
+    // declared candidate (claim 3, and claim 1's `.erofs` assertion goes with it).
+    #[test]
+    fn bundle_names_a_rootfs_by_its_registered_spelling_and_declared_format() {
+        use vmcell::artifact::RootfsFormat;
+        use vmcell::artifact::rootfs::{
+            features_artifact_key, rootfs_artifact_key, rootfs_filename,
+        };
+        use vmcell::feature::feature_manifest_path;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        // The record the pipeline published into this dir: stage 0 writes it on the very run that
+        // packed these images, which is what makes its `format` the format that build wrote.
+        std::fs::write(
+            recorded_pins_path(dir.path()),
+            format!(
+                r#"{{ "rootfs": {{
+                     "default": {{ "image": "docker.io/library/debian",
+                                   "digest": "sha256:{a}", "format": "ext4" }},
+                     "6.12": {{ "image": "docker.io/library/debian",
+                                "digest": "sha256:{b}", "format": "ext4" }} }} }}"#,
+                a = "a".repeat(64),
+                b = "b".repeat(64)
+            ),
+        )
+        .expect("write the recorded pins");
+        // Both formats of both labels on disk: the ext4 pair is current, the erofs pair is what the
+        // pre-migration build left behind.
+        for label in [None, Some("6-12")] {
+            for format in RootfsFormat::ALL {
+                let image = dir.path().join(rootfs_filename(label, format));
+                std::fs::write(&image, format.name()).expect("write image");
+                std::fs::write(feature_manifest_path(&image), b"xattr_preserved = false\n")
+                    .expect("write declaration");
+            }
+        }
+
+        let recorded = RecordedRegistrations::read_from(dir.path()).expect("the record reads");
+        let candidates = bundle_candidates(dir.path(), &recorded);
+        let paths = |name: &str| -> Vec<PathBuf> {
+            candidates
+                .iter()
+                .filter(|(n, _)| n == name)
+                .map(|(_, p)| p.clone())
+                .collect()
+        };
+        // Composed through the library's laws, never spelled: the KEY keeps the dots, the FILENAME
+        // sanitizes them, and that gap is the whole finding.
+        for (key, image) in [
+            (
+                rootfs_artifact_key(None),
+                dir.path().join(rootfs_filename(None, RootfsFormat::Ext4)),
+            ),
+            (
+                rootfs_artifact_key(Some("6.12")),
+                dir.path()
+                    .join(rootfs_filename(Some("6.12"), RootfsFormat::Ext4)),
+            ),
+        ] {
+            assert_eq!(
+                paths(&key),
+                vec![image.clone()],
+                "`{key}` must be the ONE declared image {image:?}: {candidates:?}"
+            );
+            let sidecar_key = features_artifact_key(&key);
+            assert_eq!(
+                paths(&sidecar_key),
+                vec![feature_manifest_path(&image)],
+                "…and its §7.4 declaration must travel with that image: {candidates:?}"
+            );
+        }
+        // The sanitized spelling is a key the producers never register, so nothing may be named it.
+        assert!(
+            paths(&rootfs_artifact_key(Some("6-12"))).is_empty(),
+            "`rootfs-6-12` is the FILENAME's spelling, not the registration's: {candidates:?}"
+        );
+        // And no candidate points at a stale erofs image — the whole dir still holds two.
+        for (name, path) in &candidates {
+            assert!(
+                !path.to_string_lossy().ends_with(".erofs"),
+                "`{name}` pins the stale pre-migration image {path:?}"
+            );
+        }
+
+        // THE CALL SITE, which is the level the manifest is actually written at: `bundle_artifacts`
+        // must put those same names on disk. Asserted on the manifest TEXT because this crate
+        // deliberately carries no `serde_json` (a `cargo machete` gate); the artifact name is the
+        // only field that renders as a bare quoted `rootfs-6.12`, since the path renders with its
+        // `.ext4` extension.
+        bundle_artifacts(dir.path(), None).expect("a digest-pinned dir must bundle");
+        let manifest = std::fs::read_to_string(dir.path().join("manifest.json"))
+            .expect("the manifest was written");
+        assert!(
+            manifest.contains(&format!("\"{}\"", rootfs_artifact_key(Some("6.12")))),
+            "the written manifest must name the registered spelling: {manifest}"
+        );
+        assert!(
+            !manifest.contains(&format!("\"{}\"", rootfs_artifact_key(Some("6-12")))),
+            "…and never the sanitized one: {manifest}"
+        );
+    }
+
+    // The case every real `vmcell bundle` hits, and the one this fix could have broken outright: a
+    // build with no `--pins` publishes `resolved_pins.json` as the committed baseline VERBATIM (the
+    // §18 delta-1 migration promise), so reading the record back is re-resolving that whole document
+    // as an overlay over itself. The merge is leaf-wise, so it must reproduce the build's own
+    // registries rather than a hybrid — or a colliding shape, or a parse refusal on a namespace the
+    // overlay reader treats differently from the baseline reader.
+    //
+    // The fixture is the committed `pins.json` itself, `include_str!`-ed the way
+    // `vmcell/tests/systemd_cell.rs` reads the justfile: a hand-written stand-in would prove
+    // something about the stand-in.
+    //
+    // RED on the inverse: hand `read_from` a document the overlay reader refuses (drop the
+    // `.exists()` guard and point it at a dir with no record — the read errors instead of yielding
+    // the empty rosters), or let the merge lose a namespace (the equalities fail naming the kind).
+    #[test]
+    fn bundle_reads_the_record_a_no_overlay_build_publishes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            recorded_pins_path(dir.path()),
+            include_str!("../../../pins.json"),
+        )
+        .expect("write the record a no-overlay build publishes");
+
+        let recorded = RecordedRegistrations::read_from(dir.path())
+            .expect("the record a real build publishes must read back");
+        assert_eq!(
+            recorded.kernels,
+            vmcell::artifact::resolve_kernel_registry(None).expect("the baseline kernels registry"),
+            "re-resolving the published record must reproduce the build's own `kernels` registry"
+        );
+        assert_eq!(
+            recorded.rootfs,
+            vmcell::artifact::resolve_rootfs_registry(None).expect("the baseline rootfs registry"),
+            "…and its `rootfs` registry"
+        );
+        // Non-vacuity: both rosters are non-empty, so the equalities are not two empty vectors — and
+        // the dotted-label lookup the walk depends on really answers off this record.
+        assert!(!recorded.kernels.is_empty() && !recorded.rootfs.is_empty());
+        let dotted = recorded
+            .kernels
+            .iter()
+            .find(|e| e.label.contains('.'))
+            .expect("the baseline registers a dotted kernel label");
+        assert_eq!(
+            recorded.kernel_label(&dotted.label.replace('.', "-")),
+            dotted.label,
+            "the record must resolve a sanitized filename label back to its registered spelling"
+        );
+        // An artifacts dir with NO record is not an error: the rosters are empty and every candidate
+        // falls back to the filenames.
+        let empty = tempfile::tempdir().expect("tempdir");
+        let none = RecordedRegistrations::read_from(empty.path())
+            .expect("a dir no pipeline has filled records nothing");
+        assert!(none.kernels.is_empty() && none.rootfs.is_empty());
+    }
+
+    // The same law one kind over, on the live instance: every label in the committed `kernels`
+    // registry carries dots (`6.12.94`), the producers write `vmlinux-6-12-94`, and the artifact key
+    // keeps the dots — so `bundle` recorded `kernel-6-12-94`, a name `build-kernels` registers
+    // nothing under. A consumer looking up what it built found nothing.
+    //
+    // The unregistered leg beside it is what keeps the fix from becoming an omission: a kernel whose
+    // label the recorded pins no longer name keeps its on-disk spelling and stays in the manifest,
+    // rather than being dropped (N-BIN-4) or renamed to something invented.
+    //
+    // RED on the inverse (drop `recorded.kernel_label(...)` and compose the on-disk label): the first
+    // claim fails with `kernel-6-12-94`.
+    #[test]
+    fn bundle_names_a_kernel_by_its_registered_spelling() {
+        use vmcell::artifact::kernel::{kernel_artifact_key, kernel_filename};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        // An empty overlay: the record resolves to the COMMITTED baseline registry, so the dotted
+        // label under test is the one `vmcell build-kernels` really builds rather than a fixture's
+        // invention.
+        std::fs::write(recorded_pins_path(dir.path()), b"{}").expect("write the recorded pins");
+        let registry =
+            vmcell::artifact::resolve_kernel_registry(None).expect("the baseline kernels registry");
+        let dotted = registry
+            .iter()
+            .find(|e| e.label.contains('.'))
+            .expect("the baseline registers a dotted kernel label — the case this test is about");
+        // Written through the producers' own filename composer, so the fixture is the file
+        // `build-kernels` writes and not a hand-sanitized guess.
+        std::fs::write(
+            dir.path().join(kernel_filename(Some(&dotted.label))),
+            b"vmlinux",
+        )
+        .expect("write the labelled kernel");
+        std::fs::write(dir.path().join(kernel_filename(Some("legacy"))), b"vmlinux")
+            .expect("write an unregistered labelled kernel");
+
+        let recorded = RecordedRegistrations::read_from(dir.path()).expect("the record reads");
+        let names: Vec<String> = bundle_candidates(dir.path(), &recorded)
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        let named = |key: &str| names.iter().any(|n| n == key);
+        let registered = kernel_artifact_key(Some(&dotted.label));
+        assert!(
+            named(&registered),
+            "the manifest must name the kernel the way `build-kernels` registers it \
+             (`{registered}`): {names:?}"
+        );
+        // The sanitized spelling is composed here through the same `.`→`-` law the producers' own
+        // filename composer applies, and asserted ABSENT: it is what the pre-fix walk recorded.
+        let sanitized = kernel_artifact_key(Some(&dotted.label.replace('.', "-")));
+        assert!(
+            !named(&sanitized),
+            "…and never the sanitized filename spelling (`{sanitized}`): {names:?}"
+        );
+        // The unregistered one is still covered, under the only spelling there is for it.
+        assert!(
+            named(&kernel_artifact_key(Some("legacy"))),
+            "an unregistered labelled kernel must stay in the manifest: {names:?}"
+        );
     }
 
     // §10.5's F7, last clause, AT ITS CALL SITE: `vmcell bundle` refuses an artifacts dir whose

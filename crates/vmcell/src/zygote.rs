@@ -566,7 +566,7 @@ mod tests {
         for d in dirs.iter() {
             assert_ne!(
                 d, &master,
-                "a clone must never restore from the master (§12.12)"
+                "a clone must never restore from the master (§8.4, law S3)"
             );
             assert!(
                 d.ends_with("zygote-snapshot"),

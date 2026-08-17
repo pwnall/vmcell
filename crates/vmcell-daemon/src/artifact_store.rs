@@ -111,7 +111,21 @@ impl ArtifactStore {
         // §11.3, The artifact store). The sidecar path is derived from the already-validated `path`, never from client
         // input, so it stays anchored inside the artifacts dir.
         let digest = hex_sha256(bytes);
-        write_sidecar(&path, &digest)?;
+        if let Err(e) = write_sidecar(&path, &digest) {
+            // `create` is ALL-OR-NOTHING: a bare `?` here returned a 500 while leaving the artifact
+            // on disk — a name burned in a create-only store (the client cannot re-create it and
+            // never asked to delete it), holding bytes the client believes were rejected, and
+            // bootable by a later `create` (finding `failed-sidecar-write-leaves-the-artifact`).
+            // Roll back to the state the caller's error reply describes.
+            if let Err(rm) = std::fs::remove_file(&path) {
+                tracing::warn!(
+                    artifact = name,
+                    error = %rm,
+                    "cannot roll back an artifact whose sidecar write failed; the name stays taken"
+                );
+            }
+            return Err(e);
+        }
         Ok(ArtifactInfo {
             name: name.to_string(),
             size_bytes: bytes.len() as u64,
@@ -179,7 +193,7 @@ impl ArtifactStore {
 
     /// Deletes an artifact **or a snapshot prefix directory**. (The "is it pinned by a live VM?"
     /// check is the caller's — the handler consults the registry before calling this, design
-    /// §11.3.2, The artifact store.)
+    /// §11.3, The artifact store.)
     ///
     /// A name resolves to either a file (an uploaded artifact) or a directory (`<prefix>/`, written
     /// by [`crate::registry::Registry::snapshot`], §11.4). Both are deletable: since `snapshot` now
@@ -214,9 +228,12 @@ impl ArtifactStore {
         }
         std::fs::remove_file(&path)
             .map_err(|e| DaemonError::Internal(format!("cannot delete artifact {name:?}: {e}")))?;
-        // Best-effort: drop the digest sidecar too, so a later re-create writes a fresh one and
-        // `list` never surfaces an orphaned sidecar (delta 10).
-        let _ = std::fs::remove_file(sidecar_path(&path));
+        // Drop the digest sidecar too, so a later re-create writes a fresh one and `list` never
+        // surfaces an orphaned sidecar (delta 10). Best-effort — a legacy artifact has none — but
+        // LOGGED, never a bare `let _` on a Result (AGENTS.md, fail loud).
+        if let Err(e) = std::fs::remove_file(sidecar_path(&path)) {
+            tracing::debug!(artifact = name, error = %e, "no digest sidecar removed with the artifact");
+        }
         Ok(())
     }
 }
@@ -492,6 +509,76 @@ mod tests {
             matches!(store.delete("snap1"), Err(DaemonError::NotFound(_))),
             "a freed prefix is then absent"
         );
+    }
+
+    // The store-side leg of the name-length law (finding `sidecar-suffix-overruns-name-max`): a name
+    // whose `<name>.sha256` sidecar would overrun NAME_MAX is refused AT THE BOUNDARY — the same
+    // place the reserved suffix is refused — instead of persisting and then 500ing on the sidecar
+    // write. Deterministic, no injection needed: 249..=255 bytes is exactly the overrunning range.
+    //
+    // RED on the inverse (`MAX_ARTIFACT_NAME_LEN = NAME_MAX`): the create returns
+    // `Internal("cannot persist sidecar … File name too long")`, and — without `create`'s rollback —
+    // `exists()` is true, so the name is burned in a create-only store.
+    #[test]
+    fn create_rejects_a_name_whose_sidecar_would_not_fit() {
+        let (_d, store) = store();
+        for len in [
+            crate::name::MAX_ARTIFACT_NAME_LEN + 1, // 249: the first name whose sidecar overruns
+            255,                                    // NAME_MAX itself
+        ] {
+            let name = "a".repeat(len);
+            let err = store
+                .create(&name, b"x")
+                .expect_err("a name whose sidecar cannot exist must be refused");
+            assert!(matches!(err, DaemonError::InvalidName(_)), "got {err:?}");
+            assert_eq!(err.kind().status_code(), 400, "a client error, not a 500");
+            assert!(
+                !store.dir().join(&name).exists(),
+                "the refused upload must leave no artifact behind"
+            );
+        }
+        // Positive control: the longest name that DOES leave room boots the whole path — artifact and
+        // sidecar both on disk, both under NAME_MAX.
+        let longest = "a".repeat(crate::name::MAX_ARTIFACT_NAME_LEN);
+        let info = store.create(&longest, b"x").expect("the ceiling is usable");
+        assert!(store.dir().join(&longest).is_file());
+        let sidecar = format!("{longest}{}", SHA256_SIDECAR_SUFFIX);
+        assert_eq!(sidecar.len(), 255, "the sidecar name is exactly NAME_MAX");
+        assert_eq!(
+            std::fs::read_to_string(store.dir().join(&sidecar))
+                .expect("the sidecar fits")
+                .trim(),
+            info.sha256
+        );
+    }
+
+    // `create` is all-or-nothing across BOTH files it writes (finding
+    // `failed-sidecar-write-leaves-the-artifact`): a sidecar write that fails must not leave the
+    // artifact persisted while the caller is told the create failed — in a create-only store that
+    // burns the name for the daemon's lifetime.
+    //
+    // The failure is injected out-of-band, the way a real one arrives (ENOSPC, a permission change):
+    // a DIRECTORY at the sidecar path, so `rename` onto it fails with EISDIR. RED on the inverse
+    // (`write_sidecar(&path, &digest)?`): the error is the same, but `k` stays on disk and every
+    // later `create("k")` is a 409 the client cannot clear.
+    #[test]
+    fn a_failed_sidecar_write_rolls_the_artifact_back() {
+        let (_d, store) = store();
+        std::fs::create_dir(store.dir().join("k.sha256")).expect("block the sidecar path");
+        let err = store
+            .create("k", b"kernel")
+            .expect_err("a sidecar that cannot be written must fail the create");
+        assert!(matches!(err, DaemonError::Internal(_)), "got {err:?}");
+        assert!(
+            !store.exists("k"),
+            "the artifact must be rolled back, not left behind under a burned name"
+        );
+        // …and the name is genuinely free again: the same create succeeds once the path is clear.
+        std::fs::remove_dir(store.dir().join("k.sha256")).expect("unblock");
+        store
+            .create("k", b"kernel")
+            .expect("the name is free again");
+        assert!(store.exists("k"));
     }
 
     // Delta 10 residue: delete removes the sidecar too — no orphaned digest survives.

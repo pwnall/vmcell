@@ -115,35 +115,112 @@ pub fn setcap_arg(caps: &[Cap]) -> String {
     format!("{}+ep", names.join(","))
 }
 
-/// Builds the operator-facing remediation message shown when a blessed binary lacks
-/// its capabilities.
+/// Why the blessing precondition refused, and therefore which remediation the operator needs.
+///
+/// Both arms **refuse** — the verdict never depends on the euid ([`blessing_verdict`]); they differ
+/// only in what fixes it, and that difference is why the euid is read at all. Telling a
+/// narrowed-root process to run `setcap` is advice that cannot work: a file capability is masked by
+/// the process's own bounding set, so the grant has to happen where that set is configured.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlessingRefusal {
+    /// A process running at a non-zero euid that lacks the file caps — almost always a rebuilt
+    /// binary, fixed by re-running `just bless` (or the `setcap …+ep` it prints).
+    Unblessed(Vec<Cap>),
+    /// A process at `euid == 0` whose own effective set is narrowed: default container root (which
+    /// holds neither `CAP_NET_ADMIN` nor `CAP_SYS_ADMIN`), or a unit with `User=root` and a
+    /// `CapabilityBoundingSet=` that omits one of the three. This used to be accepted as blessed
+    /// (M5), which is the "started clean, then failed every privileged create" degradation law P1
+    /// forbids.
+    NarrowedRoot(Vec<Cap>),
+}
+
+impl BlessingRefusal {
+    /// The caps absent from the effective set, whichever arm refused.
+    #[must_use]
+    pub fn missing(&self) -> &[Cap] {
+        match self {
+            Self::Unblessed(m) | Self::NarrowedRoot(m) => m,
+        }
+    }
+}
+
+/// The blessing precondition's verdict, computed from in-memory inputs — PURE, so the
+/// euid-0-with-a-narrowed-set shape is unit-testable on any host, at any privilege level
+/// (`a_narrowed_root_is_refused_and_a_full_one_is_not`; law P1's start-up gate).
+///
+/// The **effective** set decides, unconditionally: `euid == 0` was a short-circuit that returned
+/// `Ok` for any root process, however narrow its capability set (M5). A genuine full-authority root
+/// process still passes here — it holds the caps in its effective set — so nothing that legitimately
+/// worked stops working; only the degraded shapes now refuse. The euid keys the *refusal*, never the
+/// pass: it selects which [`BlessingRefusal`] (and therefore which remediation) the operator gets.
+///
+/// # Errors
+/// The [`BlessingRefusal`] naming the caps absent from `effective`, tagged with the shape that is
+/// missing them.
+pub fn blessing_verdict(
+    euid: u32,
+    effective: &CapSet,
+    need: &[Cap],
+) -> Result<(), BlessingRefusal> {
+    let missing = compute_missing(effective, need);
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(if euid == 0 {
+        BlessingRefusal::NarrowedRoot(missing)
+    } else {
+        BlessingRefusal::Unblessed(missing)
+    })
+}
+
+/// Builds the operator-facing remediation message for a [`BlessingRefusal`].
 ///
 /// The precondition ([`ensure_blessed_or_explain`]) checks the **effective** set, so
 /// the printed `setcap` must grant `+ep` (effective + permitted). A bare `+p` would
 /// set only the permitted set and the binary would still fail the check.
 ///
-/// The message reports the **actual** `missing` set the precondition computed (each
+/// The message reports the **actual** missing set the precondition computed (each
 /// `Cap` renders as `CAP_…`), so a missing `CAP_DAC_OVERRIDE` — omitted by the pre-fix
-/// hardcoded prose — is named rather than silently dropped (PRIV-6).
+/// hardcoded prose — is named rather than silently dropped (PRIV-6). A
+/// [`BlessingRefusal::NarrowedRoot`] deliberately does **not** print the `setcap` line: the
+/// capability is absent from the process's own bounding set, where a file cap cannot reach it.
 #[must_use]
-pub fn blessing_remediation(uid: u32, exe: &Path, missing: &[Cap]) -> String {
-    let missing_list = missing
+pub fn blessing_remediation(uid: u32, exe: &Path, refusal: &BlessingRefusal) -> String {
+    let missing_list = refusal
+        .missing()
         .iter()
         .map(std::string::ToString::to_string)
         .collect::<Vec<_>>()
         .join(", ");
-    format!(
-        "error: this vmcell binary is missing {missing_list} in its effective set (uid={uid}, no file caps).\n\
-         It was almost certainly rebuilt. Restore its privileges (one-time, until next rebuild):\n\n\
-         sudo setcap {} {}\n\n\
-         Then re-run. See design §13 (Cross-cutting invariants) / §11.2 (Privilege and blessing).",
-        // The printed command grants the FILE set, not just the missing subset: `setcap` REPLACES a
-        // file's capability set rather than adding to it, so echoing back only what is missing
-        // would strip whatever else the file still held — including the transient `CAP_SETPCAP`
-        // that makes the bounding-set shrink work.
-        setcap_arg(&BLESSED_FILE_CAPS),
-        shell_single_quote(exe)
-    )
+    let head = format!(
+        "error: this vmcell binary is missing {missing_list} in its effective set (uid={uid})."
+    );
+    let tail = "See design §13 (Cross-cutting invariants) / §11.2 (Privilege and blessing).";
+    match refusal {
+        BlessingRefusal::Unblessed(_) => format!(
+            "{head}\n\
+             It carries no file caps, so it was almost certainly rebuilt. Restore its privileges \
+             (one-time, until next rebuild):\n\n\
+             sudo setcap {} {}\n\n\
+             Then re-run. {tail}",
+            // The printed command grants the FILE set, not just the missing subset: `setcap`
+            // REPLACES a file's capability set rather than adding to it, so echoing back only what
+            // is missing would strip whatever else the file still held — including the transient
+            // `CAP_SETPCAP` that makes the bounding-set shrink work.
+            setcap_arg(&BLESSED_FILE_CAPS),
+            shell_single_quote(exe)
+        ),
+        BlessingRefusal::NarrowedRoot(_) => format!(
+            "{head}\n\
+             Running as root is not enough, and refusing to start is deliberate (law P1): this \
+             process's own set is narrowed — default container root and a unit whose \
+             CapabilityBoundingSet= omits one of the three both look like this. A file capability \
+             is masked by the bounding set, so blessing the binary {} cannot help; grant the \
+             capabilities where this process is configured (the container runtime's --cap-add, or \
+             the unit's AmbientCapabilities=), then re-run. {tail}",
+            shell_single_quote(exe)
+        ),
+    }
 }
 
 /// Shell-single-quotes a path so a copy-pasted `setcap` command survives a workspace
@@ -171,11 +248,13 @@ pub fn compute_missing(effective: &CapSet, need: &[Cap]) -> Vec<Cap> {
 }
 
 /// The blessing precondition shared by the runner and the daemon: the process must hold
-/// every cap in `need` in its **effective** set, or be running as `euid == 0`.
+/// every cap in `need` in its **effective** set. No euid is exempt.
 ///
-/// Does **not** mutate the process — it only reads the current cap state and (on failure)
-/// resolves `current_exe()` to build the remediation. The daemon calls this once at
-/// start-up and, on `Ok`, keeps its caps; the runner calls it before the transition.
+/// The thin live edge over [`blessing_verdict`] — it reads the process (cap state, euid) and, on a
+/// refusal, resolves `current_exe()` to build the remediation; the decision itself is pure, which is
+/// what lets law P1's start-up gate present a euid-0 process with a narrowed set without needing one.
+/// Does **not** mutate the process. The daemon calls this once at start-up and, on `Ok`, keeps its
+/// caps; the runner calls it before the transition.
 ///
 /// # Errors
 /// Returns the operator-facing remediation string (from [`blessing_remediation`]) when a
@@ -184,23 +263,21 @@ pub fn compute_missing(effective: &CapSet, need: &[Cap]) -> Vec<Cap> {
 pub fn ensure_blessed_or_explain(need: &[Cap]) -> Result<(), String> {
     let caps = CapState::get_current().map_err(|e| e.to_string())?;
 
-    // euid 0 (setuid-root / real-root form) already carries full authority.
-    let euid = rustix::process::geteuid();
-    if euid.as_raw() == 0 {
-        return Ok(());
-    }
-
-    // The privileged window needs these caps in the EFFECTIVE set (file-caps +ep form).
-    let missing = compute_missing(&caps.effective, need);
-    if missing.is_empty() {
-        Ok(())
-    } else {
-        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-        Err(blessing_remediation(
-            rustix::process::getuid().as_raw(),
-            &exe,
-            &missing,
-        ))
+    // The privileged window needs these caps in the EFFECTIVE set (file-caps +ep form) — and the
+    // euid is not a substitute for holding them. It reaches exactly one place, the verdict, where it
+    // picks the remediation; the pre-fix `if euid == 0 { return Ok(()) }` here was M5, and it passed
+    // every default-container root straight into a daemon that fails at first privileged use.
+    let euid = rustix::process::geteuid().as_raw();
+    match blessing_verdict(euid, &caps.effective, need) {
+        Ok(()) => Ok(()),
+        Err(refusal) => {
+            let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+            Err(blessing_remediation(
+                rustix::process::getuid().as_raw(),
+                &exe,
+                &refusal,
+            ))
+        }
     }
 }
 
@@ -661,8 +738,12 @@ mod tests {
     // permitted-only and STILL fail the check. It must grant `+ep` (effective + permitted).
     #[test]
     fn remediation_message_grants_effective_and_permitted() {
-        let missing = [Cap::NET_ADMIN, Cap::SYS_ADMIN, Cap::DAC_OVERRIDE];
-        let msg = blessing_remediation(1000, Path::new("/x/target/debug/vmcelld"), &missing);
+        let missing = vec![Cap::NET_ADMIN, Cap::SYS_ADMIN, Cap::DAC_OVERRIDE];
+        let msg = blessing_remediation(
+            1000,
+            Path::new("/x/target/debug/vmcelld"),
+            &BlessingRefusal::Unblessed(missing),
+        );
         // Recomputed through the one composer, never a test-local literal: this test used to spell
         // the cap list out by hand, which made it a fourth copy — and it went red (correctly) the
         // moment the blessed set grew `cap_setpcap`. The property it guards is the `+ep` flag, not
@@ -685,7 +766,7 @@ mod tests {
         let msg = blessing_remediation(
             1000,
             Path::new("/x/target/debug/vmcelld"),
-            &[Cap::DAC_OVERRIDE],
+            &BlessingRefusal::Unblessed(vec![Cap::DAC_OVERRIDE]),
         );
         assert!(
             msg.contains("CAP_DAC_OVERRIDE"),
@@ -704,7 +785,7 @@ mod tests {
         let msg = blessing_remediation(
             1000,
             Path::new("/home/a b/proj/target/debug/vmcelld"),
-            &[Cap::NET_ADMIN],
+            &BlessingRefusal::Unblessed(vec![Cap::NET_ADMIN]),
         );
         assert!(
             msg.contains("+ep '/home/a b/proj/target/debug/vmcelld'"),
@@ -740,6 +821,154 @@ mod tests {
         assert!(
             compute_missing(&all, &[Cap::NET_ADMIN, Cap::SYS_ADMIN]).is_empty(),
             "no caps missing when all needed are effective"
+        );
+    }
+
+    // ---- law P1's start-up precondition: a degraded process must REFUSE to start ----
+
+    // GATE for law P1 ("a long-lived cap-holder retains and refuses to start degraded", design §13),
+    // which had no start-up precondition test at all — so M5 shipped: `ensure_blessed_or_explain`
+    // returned `Ok` for ANY euid-0 process, however narrow its effective set, while its own rustdoc
+    // twelve lines above stated the effective-set rule. Default container root holds neither
+    // `CAP_NET_ADMIN` nor `CAP_SYS_ADMIN`, and `User=root` with a narrowed `CapabilityBoundingSet=`
+    // is the documented production unit, so both came up "blessed" and then failed every privileged
+    // create at first use.
+    //
+    // The verdict is PURE, so this presents the euid-0-with-a-narrowed-set shape on any host: the
+    // test's answer never depends on the caps of whoever runs it (a box that happens to be root, or
+    // a blessed runner, cannot make it vacuously green).
+    //
+    // RED on the inverse: put `if euid == 0 { return Ok(()) }` back at the top of `blessing_verdict`
+    // (or around its call in `ensure_blessed_or_explain`, which the scan below catches) and the
+    // narrowed-root legs return `Ok`.
+    #[test]
+    fn a_narrowed_root_is_refused_and_a_full_one_is_not() {
+        let mut narrowed = CapSet::empty();
+        narrowed.add(Cap::NET_ADMIN);
+
+        assert_eq!(
+            blessing_verdict(0, &narrowed, &PRIVILEGED_CAPS),
+            Err(BlessingRefusal::NarrowedRoot(vec![
+                Cap::SYS_ADMIN,
+                Cap::DAC_OVERRIDE
+            ])),
+            "euid 0 with a narrowed effective set must REFUSE, naming what is absent"
+        );
+
+        // Positive control: genuine full-authority root still starts. Dropping the short-circuit
+        // costs it nothing — it holds the caps in its effective set, which is what is checked.
+        let mut full = CapSet::empty();
+        for c in PRIVILEGED_CAPS {
+            full.add(c);
+        }
+        assert_eq!(
+            blessing_verdict(0, &full, &PRIVILEGED_CAPS),
+            Ok(()),
+            "a root process that actually holds the caps must still pass"
+        );
+        assert_eq!(
+            blessing_verdict(1000, &full, &PRIVILEGED_CAPS),
+            Ok(()),
+            "the blessed file-cap form must still pass"
+        );
+
+        // The discriminating half: the refusal IDENTITY is what the euid selects, because the two
+        // shapes need different fixes. An arm that collapsed them would hand a containerized root a
+        // `setcap` command that cannot work.
+        assert_eq!(
+            blessing_verdict(1000, &narrowed, &PRIVILEGED_CAPS),
+            Err(BlessingRefusal::Unblessed(vec![
+                Cap::SYS_ADMIN,
+                Cap::DAC_OVERRIDE
+            ])),
+            "a non-root process missing the caps is the rebuilt-binary shape"
+        );
+
+        // No euid is a pass — not 0, and not any of the mapped-root shapes a user namespace hands a
+        // container.
+        for euid in [0, 1, 65_534, 1000] {
+            assert!(
+                blessing_verdict(euid, &narrowed, &PRIVILEGED_CAPS).is_err(),
+                "euid {euid} must not excuse a missing capability"
+            );
+        }
+    }
+
+    // The two refusals must remediate differently, or the split is decoration: `setcap` on the
+    // binary cannot restore a capability the process's bounding set does not carry, so printing it
+    // to a narrowed root is advice that fails silently.
+    //
+    // RED on the inverse: render one message for both arms (the narrowed-root leg then prints the
+    // blessing command and this fails).
+    #[test]
+    fn the_narrowed_root_remediation_does_not_print_the_blessing_command() {
+        let exe = Path::new("/usr/bin/vmcelld");
+        let narrowed =
+            blessing_remediation(0, exe, &BlessingRefusal::NarrowedRoot(vec![Cap::SYS_ADMIN]));
+        assert!(
+            !narrowed.contains(&setcap_arg(&BLESSED_FILE_CAPS)),
+            "a narrowed root must not be told to bless the binary: {narrowed}"
+        );
+        assert!(
+            narrowed.contains("CAP_SYS_ADMIN") && narrowed.contains("bounding set"),
+            "it must name the absent cap and why the file-cap fix cannot reach it: {narrowed}"
+        );
+
+        // Positive control: the rebuilt-binary arm still prints the one blessing command.
+        let unblessed =
+            blessing_remediation(1000, exe, &BlessingRefusal::Unblessed(vec![Cap::SYS_ADMIN]));
+        assert!(
+            unblessed.contains(&setcap_arg(&BLESSED_FILE_CAPS)),
+            "the file-cap arm must still print the blessing command: {unblessed}"
+        );
+    }
+
+    // GATE, the direction the pure verdict test structurally cannot see: that the LIVE precondition
+    // both callers run delegates to that verdict, and never re-branches on the euid beside it. The
+    // precondition is impure (its answer on this box depends on this box's caps), so its window is
+    // scanned instead — the same shape as the two syscall-site scans above.
+    //
+    // The euid read may reach exactly TWO places in that body: the binding, and the one argument it
+    // is passed as. The pre-fix `if euid.as_raw() == 0 { return Ok(()); }` was a third — a
+    // re-added short-circuit is therefore red here even if it reuses the existing binding rather
+    // than reading the euid again.
+    #[test]
+    fn the_live_precondition_delegates_its_verdict_and_never_branches_on_euid() {
+        const SOURCE: &str = include_str!("lib.rs");
+        let prod = SOURCE
+            .split_once("#[cfg(test)]")
+            .expect("the test module is gated in this file")
+            .0;
+        assert_eq!(
+            prod.matches("geteuid").count(),
+            1,
+            "the live euid must be read in exactly one place (the precondition); a second read is a \
+             second policy"
+        );
+
+        let body = prod
+            .split_once("pub fn ensure_blessed_or_explain(")
+            .expect("the precondition is defined in this file")
+            .1
+            .split_once("pub fn lookup_group_gid(")
+            .expect("the precondition is defined before the group lookup")
+            .0;
+        // Comments stripped first, so the prose explaining WHY the euid is not a pass is not
+        // counted as a use of it.
+        let code: String = body
+            .lines()
+            .map(|l| l.split_once("//").map_or(l, |(before, _)| before))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            code.contains("blessing_verdict("),
+            "the live precondition must delegate to the pure verdict, not re-implement it"
+        );
+        assert_eq!(
+            code.replace("geteuid", "").matches("euid").count(),
+            2,
+            "the euid may only be bound and handed to the verdict; a third use is a branch on it \
+             (the M5 short-circuit): {code}"
         );
     }
 
@@ -1262,7 +1491,11 @@ mod tests {
         );
         // The remediation an operator copy-pastes grants the FILE set, never the missing subset —
         // `setcap` REPLACES a file's set, so echoing a subset would silently strip the rest.
-        let msg = blessing_remediation(1000, Path::new("/x/runner"), &[Cap::NET_ADMIN]);
+        let msg = blessing_remediation(
+            1000,
+            Path::new("/x/runner"),
+            &BlessingRefusal::Unblessed(vec![Cap::NET_ADMIN]),
+        );
         assert!(
             msg.contains(&format!(
                 "sudo setcap {} '/x/runner'",

@@ -15,9 +15,29 @@
 //! The in-guest tree/xattr/device diff against a booted `RootfsSource::Block` cell is the battery's
 //! live half and lives with the boot harness.
 //!
-//! **e2fsprogs is required, not optional, for the legs that name it.** They fail loud rather than
-//! skipping: a `println!("SKIP") + return` is a green PASS (AGENTS.md), and `e2fsprogs` is
-//! `Priority: required` on every distribution vmcell builds on.
+//! # An absent e2fsprogs is a RECORDED skip, and CI obtains the facility rather than living with it
+//!
+//! The legs that pack an image used to **panic** here, on the argument that `e2fsprogs` is
+//! `Priority: required` everywhere vmcell builds. The package is; the *version* is not. GitHub's
+//! `ubuntu-24.04` image ships 1.47.0 and `-d <tarball>` needs
+//! [`MIN_E2FSPROGS_VERSION`] — one patch release — so the panic made `test-unit` and
+//! `test-integration` red for four commits (four failing tests, each retried four times by the
+//! integration profile) while the review pass that introduced it ran the suites only on a host with
+//! 1.47.2. A permanently-red job is a job nobody reads, which is a worse outcome than a skip.
+//!
+//! So the legs ask [`common::probe_ext4_or_record_skip`] — **the one law**, shared with `ext4_cell.rs`
+//! and `repack_outside_checkout.rs` — which records `SKIP cloud-hypervisor ext4_producer` to
+//! `VMCELL_SKIP_MANIFEST` before returning `None`. That keeps the gap reviewable through
+//! `just skip-manifest-show` instead of green, which is the whole difference between a recorded skip
+//! and the `println!("SKIP") + return` AGENTS.md names as a green PASS. A *broken* facility still
+//! panics (§7.2 rule 3).
+//!
+//! A skip is not a substitute for coverage, so the other half of the fix is in
+//! `.github/workflows/ci.yml`: every job that runs these legs builds a pinned, checksum-verified
+//! e2fsprogs from source first, non-gating, so the normal outcome is that the battery **runs** and
+//! the recorded skip is the fallback. [`ci_obtains_the_ext4_facility_rather_than_living_with_the_skip`]
+//! is that step's gate, and [`every_ext4_battery_asks_the_one_law`] is the call-site scan that keeps
+//! a fourth answer to "this host has no `mkfs.ext4`" from appearing.
 
 #![cfg(all(feature = "pipeline", feature = "ext4-producer"))]
 
@@ -31,6 +51,8 @@ use vmcell::artifact::ext4::{
 use vmcell::artifact::rootfs::{PackOptions, XattrPolicy};
 use vmcell::artifact::tar2erofs::{merge_to_tar, tar_to_erofs};
 use vmcell::error::Error;
+
+mod common;
 
 /// A real v3 `security.capability` blob (the on-disk form of an effective+permitted
 /// `CAP_NET_RAW`), so the readback below proves the exact bytes survived rather than that
@@ -178,18 +200,6 @@ fn members(tar_bytes: &[u8]) -> Vec<(String, u8)> {
         ));
     }
     out
-}
-
-/// The producer, or a loud failure naming the package — never a green skip.
-fn producer() -> Ext4Producer {
-    match Ext4Producer::probe() {
-        Ok(p) => p,
-        Err(e) => panic!(
-            "the §4.7 ext4 battery needs `{EXT4_PRODUCER_BIN}` (e2fsprogs >= {}.{}.{}, with \
-             libarchive) on PATH; install e2fsprogs. Probe said: {e}",
-            MIN_E2FSPROGS_VERSION.0, MIN_E2FSPROGS_VERSION.1, MIN_E2FSPROGS_VERSION.2
-        ),
-    }
 }
 
 /// One `debugfs -R "<request>"` against `image`, as text.
@@ -658,9 +668,16 @@ fn the_version_probe_refuses_an_absent_binary_and_an_unreadable_banner() {
 }
 
 /// The real tool on this host passes both halves — the positive control every negative above needs.
+///
+/// On a host whose e2fsprogs cannot pack tarballs there is nothing for a positive control to
+/// control, so this returns on the one law's recorded skip like every other packing leg. The
+/// negatives above are stub-driven and keep running there, which is what makes the refusals'
+/// coverage independent of the host's own tool.
 #[test]
 fn the_real_producer_passes_its_own_gate() {
-    let producer = producer();
+    let Some(producer) = common::probe_ext4_or_record_skip() else {
+        return;
+    };
     assert!(
         producer.version() >= MIN_E2FSPROGS_VERSION,
         "the probe must report the version it gated on: {:?}",
@@ -682,7 +699,9 @@ fn the_real_producer_passes_its_own_gate() {
 /// RED on the inverse: drop any one of the three from `mkfs_args`/the env and the two packs differ.
 #[test]
 fn packing_twice_is_byte_identical_and_the_unpinned_control_is_not() {
-    let producer = producer();
+    let Some(producer) = common::probe_ext4_or_record_skip() else {
+        return;
+    };
     let tar_bytes = merged(XattrPolicy::Preserve);
     let dir = tempfile::tempdir().expect("tempdir");
 
@@ -759,7 +778,9 @@ fn packing_twice_is_byte_identical_and_the_unpinned_control_is_not() {
 /// empty and every lookup below would fail).
 #[test]
 fn the_produced_image_is_posix_complete() {
-    let producer = producer();
+    let Some(producer) = common::probe_ext4_or_record_skip() else {
+        return;
+    };
     let dir = tempfile::tempdir().expect("tempdir");
     let out = dir.path().join("rootfs.ext4");
     producer
@@ -862,7 +883,9 @@ fn the_produced_image_is_posix_complete() {
 /// instead of absorbing it.
 #[test]
 fn a_tar_with_missing_parents_fails_loud_and_leaves_no_image() {
-    let producer = producer();
+    let Some(producer) = common::probe_ext4_or_record_skip() else {
+        return;
+    };
     let dir = tempfile::tempdir().expect("tempdir");
     let out = dir.path().join("rootfs.ext4");
 
@@ -940,7 +963,9 @@ fn one_member_with_xattrs(attrs: &[(&str, &[u8])]) -> Vec<u8> {
 /// arrive — so "the attribute is absent" cannot be explained by the tar, the flags or the readback.
 #[test]
 fn the_tarball_route_still_drops_a_user_xattr() {
-    let producer = producer();
+    let Some(producer) = common::probe_ext4_or_record_skip() else {
+        return;
+    };
     let dir = tempfile::tempdir().expect("tempdir");
     let tar_path = dir.path().join("probe.tar");
     let out = dir.path().join("probe.ext4");
@@ -1022,7 +1047,9 @@ fn the_tarball_route_still_drops_a_user_xattr() {
 /// pack succeeds, producing exactly the image whose `user.*` attribute the guest cannot read.
 #[test]
 fn the_producer_refuses_an_xattr_it_would_silently_drop() {
-    let producer = producer();
+    let Some(producer) = common::probe_ext4_or_record_skip() else {
+        return;
+    };
     let dir = tempfile::tempdir().expect("tempdir");
     let out = dir.path().join("rootfs.ext4");
 
@@ -1158,7 +1185,9 @@ fn the_default_format_is_erofs_byte_for_byte() {
 #[tokio::test]
 #[ignore = "pulls and packs a real Debian base"]
 async fn the_real_base_packs_as_ext4() {
-    let producer = producer();
+    let Some(producer) = common::probe_ext4_or_record_skip() else {
+        return;
+    };
     let staging = tempfile::tempdir().expect("tempdir");
 
     // The upstream half of the pipeline `vmcell build` runs, minus the rootfs stage — the same
@@ -1301,4 +1330,389 @@ async fn the_real_base_packs_as_ext4() {
     );
     // The probed producer is what did both — named so the receipt is not an unused binding.
     assert!(producer.version() >= MIN_E2FSPROGS_VERSION);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The one skip law, its call sites, and the CI step that keeps the skip from becoming permanent
+// ---------------------------------------------------------------------------------------------
+
+/// This repository's checked-in CI definition, read as text so the gates below assert on the file
+/// that actually runs rather than on a belief about it — the same shape `ext4_cell`'s
+/// `the_live_legs_are_selected_by_a_suite_recipe` uses against the justfile.
+const CI_WORKFLOW: &str = include_str!("../../../.github/workflows/ci.yml");
+
+/// The one law's own source, so the scan below can prove the direct probe lives THERE and nowhere
+/// else.
+const COMMON_MOD: &str = include_str!("common/mod.rs");
+
+/// `text` with whole-line comments removed — YAML `#` and Rust `//` alike.
+///
+/// Every scan below runs on the stripped form, so prose that *quotes* a banned shape (this file's
+/// own module docs quote `println!("SKIP") + return`, and `ext4_cell`'s rustdoc names it too) is
+/// never a false positive. Stripping can only hide a hit, never invent one.
+fn code_only(text: &str) -> String {
+    text.lines()
+        .filter(|l| {
+            let t = l.trim_start();
+            !t.starts_with('#') && !t.starts_with("//")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// **The skip law's own gate**: an absent ext4 facility is *recorded*, not merely printed — and a
+/// broken one still panics.
+///
+/// This is the difference the whole law exists for. `println!("SKIP") + return` is a green PASS
+/// (AGENTS.md): the test reports success, `just skip-manifest-show` prints nothing, and the reviewer
+/// has no signal that the delta-8 claims went unverified. Driving it needs two seams, because the
+/// arm that matters is unreachable on any host that *can* run this battery — so
+/// [`common::classify_ext4_probe`] takes the probe's verdict and the manifest sink as parameters, and
+/// this hands it a synthetic `CapabilityUnavailable` plus a scratch file. The scratch file is not
+/// fastidiousness: appending a synthetic `SKIP` to the run's own manifest would put a capability gap
+/// that does not exist in front of the next reviewer.
+///
+/// RED ON THE INVERSE, measured both ways: delete the `record_capability_skip_to` call from
+/// `classify_ext4_probe` (i.e. restore the bare `println!` shape docs/90 G3 found in
+/// `repack_outside_checkout.rs`) and the manifest is never created; make the broken arm record and
+/// skip instead of panicking and the second half fails.
+#[test]
+fn the_one_skip_law_records_the_gap_rather_than_only_printing_it() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    // --- An ABSENT facility: no receipt, and a line in the manifest. ------------------------------
+    let manifest = dir.path().join("skips.txt");
+    let verdict = common::classify_ext4_probe(
+        Err(Error::CapabilityUnavailable {
+            op: "ext4 rootfs pack (§4.7)".to_string(),
+            needed: "a synthetic absent facility, driven by this gate".to_string(),
+        }),
+        &manifest,
+    );
+    assert!(
+        verdict.is_none(),
+        "an absent facility must yield no producer receipt — the receipt is what lets a leg pack"
+    );
+    let recorded = std::fs::read_to_string(&manifest).unwrap_or_else(|e| {
+        panic!(
+            "the law must APPEND to the skip manifest, not merely print: {} is unreadable ({e}). A \
+             `println!(\"SKIP\") + return` is a green PASS (AGENTS.md) — a suite that skipped the \
+             whole delta-8 battery would look identical to one that ran it",
+            manifest.display()
+        )
+    });
+    assert_eq!(
+        recorded,
+        format!(
+            "SKIP {} {}\n",
+            common::EXT4_SKIP_VMM,
+            common::EXT4_SKIP_CAPABILITY
+        ),
+        "the recorded line must be the one `just skip-manifest-show` surfaces, composed from the \
+         one place the pair is spelled"
+    );
+
+    // --- A BROKEN facility: panics, and records NOTHING. -----------------------------------------
+    // Recording here would let a misconfigured host (an unrunnable binary, an unparseable banner)
+    // hide behind a manifest entry that reads like an absent facility — §7.2 rule 3's distinction,
+    // which is the reason the law classifies instead of just probing. The panic below is EXPECTED;
+    // its message in the log belongs to this gate, not to a failure.
+    let broken = dir.path().join("broken.txt");
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        common::classify_ext4_probe(
+            Err(Error::Artifact(
+                "cannot read an e2fsprogs version from `mkfs.ext4 -V`".to_string(),
+            )),
+            &broken,
+        )
+    }));
+    assert!(
+        caught.is_err(),
+        "a BROKEN `{EXT4_PRODUCER_BIN}` must panic rather than skip: skipping on it is the \
+         green-PASS defect wearing the probe's clothes"
+    );
+    assert!(
+        !broken.exists(),
+        "a broken facility must record no capability skip — it is a host misconfiguration, not an \
+         absent facility, and the two have different fixes"
+    );
+}
+
+/// **The call-site scan** (AGENTS.md: "a gate binds the call sites, not just the extracted
+/// predicate"): all three delta-8 files ask the one law, and none of them answers an absent
+/// `mkfs.ext4` its own way.
+///
+/// The three answered it three different ways before this pass — a `panic!` here, a bare
+/// `println!("SKIP") + return` in `repack_outside_checkout.rs` (docs/90 G3, in a file that did not
+/// even declare `mod common`), and the recorded skip in `ext4_cell.rs` — so a green unit test on the
+/// extracted law would have proved nothing about what the batteries actually do. Every needle below
+/// is one of those three ways.
+///
+/// RED ON THE INVERSE, per arm: restore the direct probe in any battery (arm 3), restore a bare
+/// SKIP print (arm 4), have a battery record its own manifest line (arm 5), or move the direct probe
+/// out of `common/mod.rs` (arm 6).
+#[test]
+fn every_ext4_battery_asks_the_one_law() {
+    // EVERY needle below is COMPOSED rather than written whole, because this gate lives in one of
+    // the three files it scans: a literal needle would match its own definition and its own failure
+    // message, so `ext4_producer.rs` would report itself as calling the direct probe and printing
+    // its own SKIP. Composition keeps the assertions about the batteries' code rather than about
+    // this scanner's text. (Stripping string literals instead would need a parser, and a
+    // half-parser is how a scan starts lying.)
+    let declares = format!("mod {};", "common");
+    let law = format!("probe_ext4_or_record_{}", "skip()");
+    let direct_probe = format!("Ext4Producer{}", "::probe()");
+    let bare_print = format!("println!(\"{}", "SKIP");
+    let self_record = format!("record_capability_{}", "skip");
+    let batteries = [
+        ("ext4_producer.rs", include_str!("ext4_producer.rs")),
+        ("ext4_cell.rs", include_str!("ext4_cell.rs")),
+        (
+            "repack_outside_checkout.rs",
+            include_str!("repack_outside_checkout.rs"),
+        ),
+    ];
+
+    let mut law_sites = 0usize;
+    for (name, source) in batteries {
+        let code = code_only(source);
+        // Non-vacuity first: a scan over stripped-to-nothing text passes every arm below.
+        assert!(
+            code.contains("fn "),
+            "the {name} scan is vacuous — the comment stripper left no code at all"
+        );
+        // 1. It can reach the law.
+        assert!(
+            code.contains(&declares),
+            "{name} must declare `{declares}` — G3's file did not, which is exactly how its \
+             doc-comment came to claim a skip-recording call that existed nowhere in it"
+        );
+        // 2. …and it does.
+        let sites = code.matches(&law).count();
+        assert!(
+            sites > 0,
+            "{name} must ask the one law (`{law}`) before it packs"
+        );
+        law_sites += sites;
+        // 3. No second probe. `probe_binary` is deliberately NOT banned: this file drives it against
+        //    stubs to produce the refusals the law classifies, which is the opposite of bypassing it.
+        assert!(
+            !code.contains(&direct_probe),
+            "{name} calls `{direct_probe}` directly instead of through the one law — that is how \
+             the three files came to answer an absent facility three different ways, two of them \
+             wrong (a red CI job and a green PASS)"
+        );
+        // 4. Not the shape AGENTS.md names as a green PASS.
+        assert!(
+            !code.contains(&bare_print),
+            "{name} prints its own SKIP (`{bare_print}…`) instead of recording one. That shape is a \
+             green PASS (AGENTS.md): nothing reaches VMCELL_SKIP_MANIFEST, so \
+             `just skip-manifest-show` shows the reviewer no gap at all. Route it through `{law}`"
+        );
+        // 5. And it does not record its own line: the `SKIP <vmm> <capability>` identity is the
+        //    law's, so two spellings cannot drift apart.
+        assert!(
+            !code.contains(&self_record),
+            "{name} records its own capability skip (`{self_record}`). The line's identity belongs \
+             to the one law (`common::EXT4_SKIP_VMM` / `EXT4_SKIP_CAPABILITY`), so a battery that \
+             composes its own is a second copy of it"
+        );
+    }
+    assert!(
+        law_sites >= 10,
+        "only {law_sites} call sites ask the one law across the three batteries — every leg that \
+         packs an ext4 image needs one, so a shrinking count means a leg went back to assuming the \
+         facility"
+    );
+
+    // 6. The direct probe lives in the law, and the law records. Without this the bans above would
+    //    be satisfied by a tree in which nothing probes at all — three files agreeing to skip.
+    //    STRUCTURAL only: it says the two calls exist somewhere in `common/mod.rs`, not that they
+    //    sit on the path a battery takes. The behavioral proof is
+    //    `the_one_skip_law_records_the_gap_rather_than_only_printing_it`, which drives the law and
+    //    reads the file back; measured, deleting the record call from `classify_ext4_probe` reddens
+    //    that gate and leaves this arm green, which is why both exist.
+    let one_law = code_only(COMMON_MOD);
+    assert!(
+        one_law.contains(&direct_probe),
+        "common/mod.rs must hold THE direct probe (`{direct_probe}`) — it is the one place the \
+         batteries delegate to"
+    );
+    assert!(
+        one_law.contains(&format!("{self_record}_to(")),
+        "…and it must RECORD the skip it returns `None` for, which is the entire difference between \
+         this law and the `{bare_print}…` shape it replaced"
+    );
+}
+
+/// **The CI step's gate**: every job that runs the ext4 legs *obtains* e2fsprogs first, so the
+/// recorded skip stays a fallback rather than becoming the permanent state of this battery.
+///
+/// A recorded skip fixes the red job and leaves a coverage hole; obtaining the facility is what
+/// closes it. `ubuntu-24.04` packages e2fsprogs 1.47.0 and [`MIN_E2FSPROGS_VERSION`] is 1.47.1, so
+/// apt cannot supply it at any pin — the workflow builds a pinned, checksum-verified release from
+/// source instead. Two of the arms guard shapes that have already cost this repository something
+/// real: a duplicated roster whose fix reached one copy and not the other (three times — see
+/// `scripts/ban-ci-script-handcopy.sh`), and a tool install whose failure took its whole job down
+/// with it (the `actionlint` install, which reported all 20 lint gates as skipped for two months).
+/// The rest — the ordering, the version pin against the producer's own constant, the checksum — are
+/// the same class one step away.
+///
+/// The set of jobs is *derived* from the workflow (any job invoking a recipe that selects these
+/// legs), never listed here: a third job that runs the suite must carry the step by construction.
+///
+/// RED ON THE INVERSE, per arm: delete the step from either job (arm 1), move it after the suite
+/// step (arm 2), pin a version below `MIN_E2FSPROGS_VERSION` (arm 3), drop the `sha256sum -c`
+/// (arm 4), drop `continue-on-error` (arm 5), drop the `-V` report (arm 6), or edit one job's copy
+/// and not the other's (arm 7).
+#[test]
+fn ci_obtains_the_ext4_facility_rather_than_living_with_the_skip() {
+    /// The marker identifying the facility step, and the env var that carries its pin.
+    const PIN: &str = "E2FSPROGS_VERSION";
+    /// The recipes that select this battery's legs: `test-unit` runs every non-`#[ignore]`d test
+    /// here, `test-privileged` adds the `#[ignore]`d live half in `ext4_cell`.
+    const SUITES: [&str; 2] = ["just test-unit", "just test-privileged"];
+
+    // Split the workflow into jobs by their two-space-indented keys — the same "read the file that
+    // runs, not a copy of it" discipline `scripts/ban-ci-script-handcopy.sh` applies one file over.
+    // The `jobs:` guard matters: `on:`'s own `push:` / `pull_request:` keys sit at the same
+    // indentation and would otherwise be collected as jobs.
+    let mut jobs: Vec<(String, String)> = Vec::new();
+    let mut in_jobs = false;
+    for line in CI_WORKFLOW.lines() {
+        if line == "jobs:" {
+            in_jobs = true;
+            continue;
+        }
+        let is_job_key = in_jobs
+            && line.starts_with("  ")
+            && !line.starts_with("   ")
+            && line.trim_end().ends_with(':')
+            && !line.trim_start().starts_with('#');
+        if is_job_key {
+            jobs.push((line.trim().trim_end_matches(':').to_string(), String::new()));
+        } else if let Some(last) = jobs.last_mut() {
+            last.1.push_str(line);
+            last.1.push('\n');
+        }
+    }
+    assert!(
+        jobs.len() >= 3,
+        "the job split found {} job(s) — the workflow's shape changed and every assertion below \
+         would be scanning the wrong text",
+        jobs.len()
+    );
+
+    let mut facility_steps: Vec<(String, String)> = Vec::new();
+    for suite in SUITES {
+        let runners: Vec<&(String, String)> = jobs
+            .iter()
+            .filter(|(_, body)| code_only(body).contains(suite))
+            .collect();
+        assert_eq!(
+            runners.len(),
+            1,
+            "`{suite}` must be invoked by exactly one job (found {}); this gate derives the jobs \
+             that need the facility from that invocation",
+            runners.len()
+        );
+        let (name, body) = runners[0];
+        let code = code_only(body);
+        // 1 + 2. The step exists in THIS job and runs BEFORE the suite it serves. A facility
+        //        installed afterwards is a facility the suite ran without.
+        let step_at = code.find(PIN).unwrap_or_else(|| {
+            panic!(
+                "job `{name}` runs `{suite}`, which selects the §4.7 ext4 legs, but carries no \
+                 e2fsprogs step: those legs would record a capability skip on every CI run and the \
+                 producer would be exercised nowhere"
+            )
+        });
+        let suite_at = code.find(suite).expect("the filter above matched it");
+        assert!(
+            step_at < suite_at,
+            "job `{name}`'s e2fsprogs step must come BEFORE `{suite}` — $GITHUB_PATH only affects \
+             later steps, so a step placed after it obtains the facility for nobody"
+        );
+        // The step's own text: every `- `-introduced chunk of this job that mentions e2fsprogs,
+        // comment lines dropped so the comparison across jobs is over what RUNS.
+        let mut chunks: Vec<String> = Vec::new();
+        for raw in body.split("\n      - ") {
+            let chunk = code_only(raw);
+            if chunk.to_ascii_lowercase().contains("e2fsprogs") {
+                chunks.push(chunk);
+            }
+        }
+        assert_eq!(
+            chunks.len(),
+            2,
+            "job `{name}` must carry exactly the cache step and the build step for e2fsprogs; \
+             found {} chunk(s), so this gate is reading something other than the pair it asserts on",
+            chunks.len()
+        );
+        let step = chunks.join("\n");
+
+        // 3. The pin satisfies the producer's own gate. One law: the constant, not a copied number.
+        let pinned = step
+            .split_once(&format!("{PIN}: \""))
+            .and_then(|(_, rest)| rest.split_once('"'))
+            .map(|(v, _)| v.to_string())
+            .unwrap_or_else(|| panic!("job `{name}`'s step must pin `{PIN}: \"<x.y.z>\"`: {step}"));
+        let parts: Vec<u32> = pinned
+            .split('.')
+            .map(|p| {
+                p.parse()
+                    .unwrap_or_else(|e| panic!("unparseable e2fsprogs pin {pinned:?}: {e}"))
+            })
+            .collect();
+        assert_eq!(
+            parts.len(),
+            3,
+            "the pin must be `major.minor.patch`: {pinned}"
+        );
+        assert!(
+            (parts[0], parts[1], parts[2]) >= MIN_E2FSPROGS_VERSION,
+            "job `{name}` pins e2fsprogs {pinned}, below the `-d <tarball>` gate \
+             {MIN_E2FSPROGS_VERSION:?} the producer probes for — the build would succeed and the \
+             battery would record a capability skip anyway"
+        );
+        // 4. The download is verified. An unpinned-content fetch in a workflow whose sibling job
+        //    blesses a file-capability runner is the supply-chain shape every other install step
+        //    here is written against.
+        assert!(
+            step.contains("sha256sum -c"),
+            "job `{name}`'s e2fsprogs tarball must be checksum-verified: {step}"
+        );
+        assert!(
+            step.contains("E2FSPROGS_SHA256"),
+            "…against a pinned digest beside the version: {step}"
+        );
+        // 5. Non-gating: a facility this repo cannot obtain must degrade to the recorded skip, which
+        //    is the honest outcome — never to a red job, which is the outcome nobody reads.
+        assert_eq!(
+            step.matches("continue-on-error: true").count(),
+            2,
+            "both of job `{name}`'s e2fsprogs steps must be `continue-on-error: true`: a failed \
+             install has to leave the recorded capability skip as the outcome, not fail the job"
+        );
+        // 6. …and the log says which of the two outcomes happened.
+        assert!(
+            step.contains("mkfs.ext4\" -V") || step.contains("mkfs.ext4 -V"),
+            "job `{name}`'s step must print the resolved `mkfs.ext4 -V`, or the log cannot say \
+             whether the battery ran or skipped: {step}"
+        );
+        facility_steps.push((name.clone(), step));
+    }
+
+    // 7. The two copies are the same text. A `run:` step cannot be shared between jobs, so the
+    //    duplication is forced — and a duplicate that drifts is the defect
+    //    `ban-ci-script-handcopy.sh` exists for, one level down.
+    let (first_job, first) = &facility_steps[0];
+    for (name, step) in &facility_steps[1..] {
+        assert_eq!(
+            first, step,
+            "jobs `{first_job}` and `{name}` carry DIFFERENT e2fsprogs steps. The block is \
+             duplicated because YAML cannot share it; a fix that reaches one job and not the other \
+             is exactly the hand-copy drift this asserts against"
+        );
+    }
 }

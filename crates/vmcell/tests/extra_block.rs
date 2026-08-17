@@ -204,6 +204,120 @@ async fn test_io_throttle_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
     // No trailing removal: `tmp` owns the tree and drops here (and on any panic above).
 }
 
+// docs/90 T4: the `DiskIoLimit::iops` half, which had no live leg at all — the bandwidth leg above
+// was the only evidence that `with_io_limit` reaches a rate limiter, and `iops` travels a
+// DIFFERENT field on every backend (CH's `ops` token bucket, FC's `ops`, QEMU's
+// `throttling.iops-total`). A caller who asks for a 50-IOPS disk and silently gets an unlimited one
+// is testing their retry logic against nothing.
+//
+// Same self-calibrating shape as the bandwidth leg, deliberately: two disks in ONE VM, /dev/vdb
+// un-throttled as the in-VM baseline and /dev/vdc capped, so a broken limiter (both reads fast)
+// reddens without depending on the host's raw disk speed. What differs is the workload — the cap
+// is on OPERATIONS, so the read has to be many small ones. `iflag=direct` is what makes each 4 KiB
+// read its own device request: without O_DIRECT the guest page cache's readahead coalesces the
+// whole file into a handful of large requests, which a 50-IOPS cap would not notice, and the leg
+// would pass against an absent limiter.
+//
+// RED ON THE INVERSE: drop `iops` from a backend's rate-limiter builder (CH/FC `ops`, QEMU's
+// `throttling.iops-total`) and the throttled read finishes as fast as the baseline — both the
+// absolute floor and the ratio go red. (Demonstrated by raising the cap to 1_000_000 IOPS:
+// `vdb 19ms, vdc 14ms` and "the iops rate limiter did not take effect".)
+//
+// MEASURED 2026-08-17, all three throttling backends: CH `vdb 10ms / vdc 5067ms`, FC
+// `vdb 9ms / vdc 4362ms`, QEMU `vdb 13ms / vdc 5882ms`; crosvm records
+// `SKIP crosvm disk_io_throttle`.
+vmm_matrix_test!(extra_block_iops_throttle, |vmm| {
+    // Same skip as the bandwidth leg: crosvm's `--block` exposes no iops key either. The
+    // descriptor value is pinned KVM-free by `capability_honesty_disk_io_throttle` above.
+    require_cap!(vmcell::vmm::Vmm::capabilities(&vmm), disk_io_throttle, vmm);
+    test_iops_throttle_impl(&vmm).await;
+});
+
+/// The requested IOPS cap, and the number of 4 KiB direct reads each leg issues. 300 requests
+/// against a 50-IOPS bucket floors the throttled read at ~5s (the first `IOPS_CAP` are the initial
+/// bucket, the rest refill at `IOPS_CAP`/s); the same 300 reads off an un-throttled page-cached
+/// host file finish in tens of milliseconds.
+const IOPS_CAP: u64 = 50;
+const IOPS_READS: usize = 300;
+
+async fn test_iops_throttle_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
+    const MIB: usize = 1 << 20;
+    let id = uuid::Uuid::new_v4();
+    // OWNED (`common::TempTree`): see `test_extra_block_impl` — same leak-on-panic shape.
+    let tmp = common::TempTree::create(&format!("vmcell-test-iops-{}-{}", std::process::id(), id));
+    // 4 MiB each, comfortably more than the 300 * 4 KiB = 1.2 MiB each leg reads.
+    let fast_img = tmp.join("fast.raw");
+    write_raw_image(&fast_img, b"", 4 * MIB);
+    let slow_img = tmp.join("slow.raw");
+    write_raw_image(&slow_img, b"", 4 * MIB);
+
+    let cfg = VmConfig::builder(
+        common::get_vmlinux(),
+        RootfsSource::Erofs {
+            image: common::get_rootfs(),
+        },
+    )
+    .with_extra_disk(BlockDevice::read_only(&fast_img))
+    .with_extra_disk(BlockDevice::read_only(&slow_img).with_io_limit(DiskIoLimit::iops(IOPS_CAP)))
+    .network_disabled()
+    .build()
+    .unwrap();
+
+    let mut vm = common::start_vm(vmm, cfg).await;
+    let steward = vm
+        .steward(Some(std::time::Duration::from_secs(120)))
+        .await
+        .expect("steward ready");
+
+    /// Issues `IOPS_READS` 4 KiB O_DIRECT reads off `dev`, timing the exec host-side.
+    async fn timed_direct_reads(
+        steward: &mut vmcell::steward::StewardClient,
+        dev: &str,
+    ) -> (vmcell::ExecOutcome, u128) {
+        let start = std::time::Instant::now();
+        let out = steward
+            .exec(vmcell::ExecRequest::new(vec![
+                "dd".to_string(),
+                format!("if={dev}"),
+                "of=/dev/null".to_string(),
+                "bs=4096".to_string(),
+                format!("count={IOPS_READS}"),
+                // One device request per read: O_DIRECT bypasses the page cache, so readahead
+                // cannot coalesce 300 small reads into a few large ones and hide an IOPS cap.
+                "iflag=direct".to_string(),
+            ]))
+            .await
+            .expect("dd direct read");
+        (out, start.elapsed().as_millis())
+    }
+
+    let (fast, fast_ms) = timed_direct_reads(steward, "/dev/vdb").await;
+    assert_eq!(
+        fast.code, 0,
+        "un-throttled direct read failed (does this guest's dd support iflag=direct?): {fast:?}"
+    );
+    let (slow, slow_ms) = timed_direct_reads(steward, "/dev/vdc").await;
+    assert_eq!(slow.code, 0, "throttled direct read failed: {slow:?}");
+    println!("iops={IOPS_CAP}: {IOPS_READS} direct 4K reads — vdb {fast_ms}ms, vdc {slow_ms}ms");
+
+    // Floor: 300 requests through a 50/s bucket cannot complete faster than ~5s; 2.5s is half
+    // that, leaving room for the bucket's initial fill and refill granularity while staying an
+    // order of magnitude above the un-throttled time.
+    assert!(
+        slow_ms >= 2500,
+        "{IOPS_READS} direct 4 KiB reads at {IOPS_CAP} IOPS must take >= 2.5s; got {slow_ms}ms — \
+         the iops rate limiter did not take effect"
+    );
+    assert!(
+        slow_ms > fast_ms.saturating_mul(3),
+        "the throttled read ({slow_ms}ms) must be far slower than the un-throttled baseline \
+         ({fast_ms}ms) in the same VM on this host"
+    );
+
+    vm.kill().await.unwrap();
+    // No trailing removal: `tmp` owns the tree and drops here (and on any panic above).
+}
+
 // §4.6 (Extra virtio-blk devices and disk-I/O throttling): "plain virtio-blk composes with snapshot" (§17, Open gaps and future capabilities) — the V:high headline
 // claim, proven on the DATA PLANE. A marker written into a writable extra disk before
 // snapshot must be readable off `/dev/vdb` after a restore into a fresh VM. Extra disks

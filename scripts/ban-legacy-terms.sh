@@ -45,7 +45,7 @@
 # lowercase `imp` patterns require a trailing `-`/`_` (or the uppercase `IMP_` env form) — so
 # `Implementation` / `Import` / `impl` (where `Imp`/`imp` is followed by a word character) never match.
 # The capitalized standalone `Imp` origin-harness name is now flagged too: the project moved to the
-# generic "hypothetical agent-harness testing project" phrasing, retiring the old §10.7-C exemption.
+# generic "hypothetical agent-harness testing project" phrasing, retiring the old v14 §10.7-C exemption.
 #
 # Line comments are stripped before pattern-matching (`//` for Rust/C sources, `#` for non-.rs files
 # like the justfile / shell / toml), so prose in a comment that mentions a banned word (e.g. a note

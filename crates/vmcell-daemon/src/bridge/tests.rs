@@ -1,5 +1,5 @@
-//! KVM-free gates for the setup-broker bridge (design §12.4, Layer 3 — the setup broker (network
-//! surface never holds caps); v27 §20.5 / §12.23): the `VmEngine` RPC
+//! KVM-free gates for the setup-broker bridge (design §12.4, Layer 3 — the setup broker: the
+//! network surface never holds caps): the `VmEngine` RPC
 //! round-trips over a real socketpair, errors preserve their HTTP status across the boundary, the
 //! multiplex serves concurrent requests, and the framed codec rejects an over-cap length.
 

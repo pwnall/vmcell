@@ -1,5 +1,5 @@
-# The out-of-tree downstream-consumer example (design v30 §5.6, The downstream kernel toolkit;
-# §10.4, The downstream toolkit contract; §18 delta 5).
+# The out-of-tree downstream-consumer example (design §5.6, The downstream kernel toolkit;
+# §10.4, The downstream toolkit contract; v30 §18 delta 5, extended by the v33 register).
 #
 # This is its OWN cargo workspace — the bare `[workspace]` table below makes this directory a
 # workspace root holding exactly one package. vmcell's root `Cargo.toml` `exclude`s it (beside
@@ -16,8 +16,9 @@
 # *from a vmcell checkout*).
 #
 # The path deps carry no `version = "…"` requirement on purpose: a consumer pins by `rev`, and a
-# duplicated version requirement here would be a second place the 0.12 → 0.13 ledger bump has to
-# be remembered — the sort of drift the contract exists to remove.
+# duplicated version requirement here would be a second place every ledgered contract bump has to
+# be remembered — the sort of drift the contract exists to remove. (The version itself is not quoted
+# anywhere in this workspace on purpose: read it from `crates/vmcell/Cargo.toml`.)
 [workspace]
 
 [package]
@@ -45,7 +46,7 @@ path = "src/main.rs"
 # (`cloud-hypervisor`, `metrics`, `pipeline`) — without `pipeline` the whole `vmcell::artifact`
 # toolkit is not even compiled — plus `net-unprivileged`, which is what pulls `vhost` /
 # `vhost-user-backend` into the graph and therefore makes the `[patch.crates-io]` stanza below
-# load-bearing: this workspace is the vendored-patch assertion's POSITIVE CONTROL (§18 delta 2), and
+# load-bearing: this workspace is the vendored-patch assertion's POSITIVE CONTROL (v30 §18 delta 2), and
 # a feature set that never resolved vhost would make `check-vendored-vhost.sh` report
 # "not applicable" and control nothing.
 vmcell = { path = "../../crates/vmcell", features = [
@@ -60,6 +61,17 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "time"] 
 [dev-dependencies]
 # The overlay-typo leg writes a throwaway overlay; a consumer would reach for the same crate.
 tempfile = "3"
+# `vmcell::artifact::Stage` is an `#[async_trait]` trait, so a consumer that implements one (the
+# downstream producer in `tests/contract.rs`) needs the same attribute macro. A DEV-dependency
+# because only the contract tests implement a stage; a consumer whose own producer is production
+# code takes it as a normal one. The version tracks `vmcell`'s so the lockfile resolves ONE copy —
+# two `async-trait` versions would be two incompatible desugarings of the same trait.
+async-trait = "0.1"
+# `vmcell::artifact::hash_artifacts_sorted` takes the hasher by `&mut blake3::Hasher`, so a consumer
+# folding its upstream artifact set — the documented reason that helper is public — names the same
+# crate. Same version requirement as `vmcell`'s (`1`) so ONE `blake3` resolves: two majors would be
+# two incompatible `Hasher` types at that call.
+blake3 = "1"
 
 # Git-dep guidance item (2) — the replicated vendored-vhost stanza (design §10.4). Cargo honors
 # `[patch.crates-io]` only from the CONSUMING workspace root, so without these two lines this

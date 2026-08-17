@@ -196,7 +196,7 @@ pub fn openapi_document() -> Value {
         "openapi": "3.1.0",
         "info": {
             "title": "vmcelld control-plane API",
-            "description": "The vmcell daemon HTTP REST API (design §D).",
+            "description": "The vmcell daemon HTTP REST API (design §11).",
             "version": "1",
         },
         "paths": Value::Object(paths),
@@ -207,6 +207,196 @@ pub fn openapi_document() -> Value {
             "schemas": { ERROR_SCHEMA_NAME: error_body_schema() }
         }
     })
+}
+
+/// **The design-reference gate** (finding `served-openapi-cites-a-nonexistent-design-section`).
+///
+/// The daemon *serves* its OpenAPI document to clients, and that document's description pointed at
+/// design section `D` — which has never existed. Four sibling citations in this tier dangled the same
+/// way (`11.5.3`, `11.3.2`, `12.18`, and a superseded v27 `20.5`/`12.23` pair no reader can resolve
+/// against the shipped design), so the instance is a class, and this gate closes the class: every
+/// section citation in the daemon tier — code, rustdoc, and plain comments alike — must name a section
+/// the newest design document actually declares.
+///
+/// It reads the design at **run time** rather than `include_str!`-ing a version-pinned file name, so
+/// a reissue moves the gate's corpus without an edit here (the same "newest version you find" rule
+/// AGENTS.md states for the versioned docs), and it derives the valid set from the document's own
+/// headings rather than embedding a section count that would go stale silently.
+#[cfg(test)]
+mod design_reference_gate {
+    use std::collections::BTreeSet;
+    use std::path::{Path, PathBuf};
+
+    /// The source roots this gate owns: this crate plus the client that re-exports its wire schema.
+    /// Scoped to the tier deliberately — every crate carries its own citations, and a gate that
+    /// reddened on a sibling crate's text would fire in the wrong place.
+    fn tier_roots() -> Vec<PathBuf> {
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        vec![
+            manifest.join("src"),
+            manifest.join("../vmcell-daemon-client/src"),
+        ]
+    }
+
+    /// Every `.rs` file under `dir`, recursively.
+    fn rust_sources(dir: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let entries = std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read {dir:?}: {e}"));
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                out.extend(rust_sources(&path));
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+        out
+    }
+
+    /// The newest design document under `docs/` (`*design-v<N>.md`, highest `N` wins), as
+    /// `(path, body)`. Fails loud rather than skipping: a gate that quietly finds no corpus is
+    /// theater.
+    fn newest_design() -> (PathBuf, String) {
+        let docs = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs");
+        let mut best: Option<(u32, PathBuf)> = None;
+        let entries = std::fs::read_dir(&docs).unwrap_or_else(|e| panic!("read {docs:?}: {e}"));
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let Some(rest) = name.strip_suffix(".md") else {
+                continue;
+            };
+            let Some((_, version)) = rest.split_once("-design-v") else {
+                continue;
+            };
+            let Ok(version) = version.parse::<u32>() else {
+                continue;
+            };
+            if best.as_ref().is_none_or(|(b, _)| version > *b) {
+                best = Some((version, entry.path()));
+            }
+        }
+        let (_, path) = best.unwrap_or_else(|| {
+            panic!("no `*-design-v<N>.md` in {docs:?} — the gate has no corpus to check against")
+        });
+        let body = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
+        (path, body)
+    }
+
+    /// The section ids the design declares, from its own headings: `## 11.` → `11`,
+    /// `### 11.5 …` → `11.5`. A lettered heading (`### Appendix A — …`) declares no section id and is
+    /// skipped, which is exactly why a lettered citation must not resolve.
+    fn declared_sections(body: &str) -> BTreeSet<String> {
+        let mut out = BTreeSet::new();
+        for line in body.lines() {
+            let Some(rest) = line
+                .strip_prefix("#### ")
+                .or_else(|| line.strip_prefix("### "))
+                .or_else(|| line.strip_prefix("## "))
+            else {
+                continue;
+            };
+            let token = rest
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .trim_end_matches('.');
+            if !token.is_empty() && token.chars().all(|c| c.is_ascii_digit() || c == '.') {
+                out.insert(token.to_string());
+            }
+        }
+        out
+    }
+
+    /// Every section citation in `text`, as `(line number, id)`.
+    ///
+    /// A citation is the section sign followed immediately by an **alphanumeric** character, and the
+    /// id runs to the first character that cannot be part of one — so `13,` / `18's` / `11.5)` all
+    /// yield the id alone, and a lettered id like `D` yields `"D"`, which no numeric heading declares.
+    /// The sign followed by a space, a `{`, or punctuation is prose or a format placeholder (this
+    /// module's own messages interpolate one), never a citation.
+    fn section_refs(text: &str) -> Vec<(usize, String)> {
+        let mut out = Vec::new();
+        for (i, line) in text.lines().enumerate() {
+            for tail in line.split('\u{a7}').skip(1) {
+                if !tail.starts_with(|c: char| c.is_ascii_alphanumeric()) {
+                    continue;
+                }
+                let id: String = tail
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '.')
+                    .collect();
+                out.push((i + 1, id.trim_end_matches('.').to_string()));
+            }
+        }
+        out
+    }
+
+    /// Asserts every citation in `text` resolves, naming the file for the operator.
+    fn assert_refs_resolve(
+        label: &str,
+        text: &str,
+        design: &Path,
+        sections: &BTreeSet<String>,
+    ) -> usize {
+        let refs = section_refs(text);
+        for (line, id) in &refs {
+            assert!(
+                sections.contains(id),
+                "{label}:{line} cites design section {id} — {design:?} declares no such section. \
+                 Cite the section that owns the fact; a lettered appendix is cited as \"Appendix X\" \
+                 (never as a section number), and a superseded numbering (a v27 one) resolves for no \
+                 reader."
+            );
+        }
+        refs.len()
+    }
+
+    // The served document — the client-visible half of this finding. RED on the inverse (put the
+    // lettered `D` back in the description): the document's citation resolves to nothing.
+    #[test]
+    fn the_served_document_cites_a_real_design_section() {
+        let (design, body) = newest_design();
+        let sections = declared_sections(&body);
+        let doc = super::openapi_document().to_string();
+        let cited = assert_refs_resolve("openapi_document()", &doc, &design, &sections);
+        assert!(
+            cited > 0,
+            "the served document cites no design section at all — this gate would be vacuous"
+        );
+    }
+
+    // The class: every citation in the daemon tier resolves. RED on the inverse (any of the five
+    // dangling citations this finding closed — `12.18` in auth.rs, `11.5.3` in error.rs, `11.3.2` in
+    // artifact_store.rs, the v27 pair in bridge/tests.rs, or the served `D` above).
+    #[test]
+    fn every_design_reference_in_the_daemon_tier_resolves() {
+        let (design, body) = newest_design();
+        let sections = declared_sections(&body);
+        assert!(
+            sections.len() > 50,
+            "{design:?} yielded only {} section headings — the parser is not reading it, so every \
+             assertion below would pass vacuously",
+            sections.len()
+        );
+        let mut files = 0;
+        let mut cited = 0;
+        for root in tier_roots() {
+            for file in rust_sources(&root) {
+                let text =
+                    std::fs::read_to_string(&file).unwrap_or_else(|e| panic!("read {file:?}: {e}"));
+                let label = file.file_name().map_or_else(
+                    || file.display().to_string(),
+                    |n| n.to_string_lossy().to_string(),
+                );
+                cited += assert_refs_resolve(&label, &text, &design, &sections);
+                files += 1;
+            }
+        }
+        assert!(
+            files >= 14 && cited > 100,
+            "the scan read {files} files and {cited} citations — too few to be reading the tier"
+        );
+    }
 }
 
 #[cfg(test)]

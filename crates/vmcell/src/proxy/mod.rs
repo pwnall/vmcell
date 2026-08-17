@@ -208,7 +208,11 @@ impl EgressProxy {
             };
 
             if let Some(ref netns) = cfg.netns {
-                match std::fs::File::open(format!("/var/run/netns/{netns}")) {
+                // One law: the `/var/run/netns` layout is composed in exactly one place
+                // (`net::tap::netns_path`), so the namespace this proxy enters is by construction
+                // the one the datapath bound the VM's tap into.
+                let path = crate::net::tap::netns_path(netns);
+                match std::fs::File::open(&path) {
                     Ok(file) => {
                         // The current-thread tokio runtime built below runs solely
                         // on this worker thread, so the listener it binds inherits
@@ -220,7 +224,10 @@ impl EgressProxy {
                         }
                     }
                     Err(e) => {
-                        let _ = tx.send(Err(format!("Failed to open netns file: {e}")));
+                        let _ = tx.send(Err(format!(
+                            "Failed to open netns file {}: {e}",
+                            path.display()
+                        )));
                         return;
                     }
                 }

@@ -23,6 +23,8 @@ use vmcell::artifact::guest_tools::GuestToolsStage;
 use vmcell::artifact::handler::HandlerSource;
 use vmcell::artifact::{Stage, StageInputs};
 
+mod common;
+
 /// Env marker putting the re-exec'd child in the **consumer position**: no `CARGO_MANIFEST_DIR`,
 /// and a CWD with no vmcell checkout above it.
 const CONSUMER_POSITION: &str = "VMCELL_TEST_REPACK_CONSUMER_POSITION";
@@ -289,24 +291,6 @@ fn ext4_probe_layer() -> Vec<u8> {
     buf
 }
 
-/// Whether this host can produce ext4 images at all, recording a reviewable capability skip when it
-/// cannot (§7.2 — an absent facility, classified by the product's own probe).
-///
-/// The **parents** ask, not the child: a child that skipped would print no banner and
-/// [`expect_child_ok`] would report it as "the filter selected zero tests", which is a true
-/// statement about the wrong thing.
-#[cfg(all(feature = "pipeline", feature = "ext4-producer"))]
-fn ext4_available() -> bool {
-    match vmcell::artifact::ext4::Ext4Producer::probe() {
-        Ok(_) => true,
-        Err(vmcell::error::Error::CapabilityUnavailable { op, needed }) => {
-            println!("SKIP: this host cannot produce ext4 rootfs images ({op}: {needed})");
-            false
-        }
-        Err(other) => panic!("`mkfs.ext4` is present but broken on this host: {other}"),
-    }
-}
-
 // §18 delta 8's *Gate*, second clause: "the delta-7 from-outside-a-checkout leg repeated for this
 // producer (R6's capability sentence covers both packers)". From a directory with no vmcell
 // checkout above it and no `CARGO_MANIFEST_DIR`, the ONE tail packs an **ext4** image — and reaches
@@ -322,7 +306,12 @@ fn ext4_available() -> bool {
 #[cfg(all(feature = "pipeline", feature = "ext4-producer"))]
 #[test]
 fn the_ext4_producer_packs_from_outside_a_checkout() {
-    if !ext4_available() {
+    // The **parent** asks the one law, not the child: a child that skipped would print no banner and
+    // `expect_child_ok` would report it as "the filter selected zero tests", which is a true
+    // statement about the wrong thing. Before this the file answered an absent `mkfs.ext4` with a
+    // bare `println!("SKIP") + return` under a doc comment claiming to record a skip — docs/90 G3, a
+    // green PASS with nothing in the manifest for the reviewer to see.
+    if common::probe_ext4_or_record_skip().is_none() {
         return;
     }
     let outside = tempfile::tempdir().expect("tempdir");
@@ -356,7 +345,8 @@ fn the_ext4_producer_packs_from_outside_a_checkout() {
 #[cfg(all(feature = "pipeline", feature = "ext4-producer"))]
 #[test]
 fn the_ext4_producer_still_packs_inside_a_checkout() {
-    if !ext4_available() {
+    // The parent asks — see the sibling leg above for why it is not the child.
+    if common::probe_ext4_or_record_skip().is_none() {
         return;
     }
     let scratch = tempfile::tempdir().expect("tempdir");

@@ -583,41 +583,55 @@ impl FeatureSet {
     }
 }
 
-/// The host's contribution to the intersection, derived from [`crate::hostcaps::HostCapabilities`].
+/// The host's contribution to the intersection, **derived from — never probed beside** —
+/// [`crate::hostcaps::HostCapabilities`].
 ///
 /// A thin newtype rather than a second descriptor: the host axis speaks about exactly the features
-/// it can actually decide, and says nothing about the rest.
+/// it can actually decide (today that is [`Feature::NestedVirt`], and nothing else), and says
+/// nothing about the rest. The facts themselves come from the one start-up descriptor, which is
+/// where §7.2 rule 1 puts every host probe; this type is the projection of it that the intersection
+/// consumes, so growing the axis means growing `HostCapabilities` and
+/// [`Self::from_host_capabilities`], never adding a read here.
 #[cfg(feature = "host-common")]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct HostDeclaration {
-    /// Whether the host has nested virtualization enabled (`kvm_intel.nested` / `kvm_amd.nested`).
+    /// Whether the host has nested virtualization enabled
+    /// ([`crate::hostcaps::HostCapabilities::nested_virt`]).
     pub nested_virt: bool,
 }
 
 #[cfg(feature = "host-common")]
 impl HostDeclaration {
-    /// Probes the host axis.
+    /// Derives the host axis from the one start-up [`crate::hostcaps::HostCapabilities`] descriptor.
+    ///
+    /// **This is what makes §7.4's "the host contributes `HostCapabilities`" true.** Before docs/90
+    /// D5 it was not: this type ran its own `/sys/module/*/parameters/nested` read, so the host axis
+    /// had two probes and the descriptor §7.4 named contributed nothing — while this module's own
+    /// rustdoc claimed the derivation that did not exist. A caller holding the boot-time descriptor
+    /// (the daemon logs one, §11.2) passes it here rather than re-probing.
     ///
     /// Nested virtualization is the worked example of why the intersection earns its keep (§7.4):
     /// it is true only when the backend advertises it, **and** the kernel artifact declares the KVM
     /// symbols, **and** the host has nested enabled — three axes the pre-v33 tree checked in three
-    /// unrelated places with three different failure shapes. This reads the third.
+    /// unrelated places with three different failure shapes. This carries the third.
+    #[must_use]
+    pub fn from_host_capabilities(caps: &crate::hostcaps::HostCapabilities) -> Self {
+        HostDeclaration {
+            nested_virt: caps.nested_virt,
+        }
+    }
+
+    /// Probes the host axis, for a caller that has **no** descriptor in hand.
     ///
-    /// A module parameter that cannot be read is treated as **enabled**, not disabled: the host axis
-    /// removes a feature only when it can positively say the facility is off. An unreadable
-    /// `/sys/module/*/parameters/nested` (a non-KVM host, a locked-down sysfs) is an unasked
-    /// question, and the F1 distinction between "absent facility" and "unasked question" is exactly
-    /// what keeps an unprobed axis from removing everything it could have.
+    /// One probe, not two: this runs [`crate::hostcaps::HostCapabilities::probe`] and projects it
+    /// through [`Self::from_host_capabilities`], so the nested-virt read has exactly one
+    /// implementation and one home (the descriptor's). The extra reads a full probe performs are
+    /// `/proc/self/status`, `/dev/kvm` and three cgroup control files — microseconds against a VM
+    /// boot, and cheaper than the second source of truth this used to be. A caller that already
+    /// probed should pass its descriptor instead.
     #[must_use]
     pub fn probe() -> Self {
-        let nested = ["kvm_intel", "kvm_amd"].iter().find_map(|m| {
-            std::fs::read_to_string(format!("/sys/module/{m}/parameters/nested"))
-                .ok()
-                .map(|v| matches!(v.trim(), "Y" | "1" | "y"))
-        });
-        HostDeclaration {
-            nested_virt: nested.unwrap_or(true),
-        }
+        Self::from_host_capabilities(&crate::hostcaps::HostCapabilities::probe())
     }
 
     fn removals(&self) -> Vec<(Feature, &'static str)> {
@@ -860,6 +874,70 @@ mod host_tests {
         }
     }
 
+    /// docs/90 D5: the host axis is **derived from** the one `HostCapabilities` descriptor, which is
+    /// what §7.4's "the host contributes `HostCapabilities`" says and what the code did not do.
+    ///
+    /// Both directions, and through the whole intersection rather than at the projection alone — a
+    /// derivation that hardcoded a stance, or read anything other than the descriptor's field, goes
+    /// red here. The complementary half is
+    /// `the_host_axis_reads_the_nested_parameter_in_exactly_one_place`: this test proves the
+    /// derivation is faithful, the scan proves nothing probes beside it.
+    #[test]
+    fn the_host_axis_is_derived_from_the_one_host_capabilities_descriptor() {
+        let host_with = |nested: bool| crate::hostcaps::HostCapabilities {
+            cap_net_admin: false,
+            cap_sys_admin: false,
+            kvm_accessible: true,
+            netns_reachable: false,
+            delegated_controllers: std::collections::BTreeSet::new(),
+            domain_leaf: false,
+            nested_virt: nested,
+        };
+
+        for nested in [true, false] {
+            assert_eq!(
+                HostDeclaration::from_host_capabilities(&host_with(nested)),
+                HostDeclaration {
+                    nested_virt: nested
+                },
+                "the declaration must carry the descriptor's stance, not one of its own"
+            );
+        }
+
+        // Through the intersection: a descriptor saying "nested off" removes the feature with HOST
+        // provenance on a fully-capable backend…
+        let off = FeatureSet::intersect(
+            "cloud-hypervisor",
+            &caps_all(true),
+            Some(&HostDeclaration::from_host_capabilities(&host_with(false))),
+            &[],
+        );
+        let removal = off
+            .why_absent(Feature::NestedVirt)
+            .expect("a host that says nested is off removes it");
+        assert_eq!(removal.by, Source::Host);
+        assert_eq!(removal.feature.name(), "nested_virt");
+        // …and the same descriptor with the stance flipped is the positive control.
+        assert!(
+            FeatureSet::intersect(
+                "cloud-hypervisor",
+                &caps_all(true),
+                Some(&HostDeclaration::from_host_capabilities(&host_with(true))),
+                &[],
+            )
+            .has(Feature::NestedVirt),
+            "positive control: a descriptor saying nested is ON must keep the feature"
+        );
+
+        // `probe()` is the no-descriptor convenience, and it must agree with the derivation applied
+        // to a fresh probe — i.e. it is a projection, not a second source of truth.
+        assert_eq!(
+            HostDeclaration::probe(),
+            HostDeclaration::from_host_capabilities(&crate::hostcaps::HostCapabilities::probe()),
+            "probe() must be from_host_capabilities(HostCapabilities::probe()) on this host"
+        );
+    }
+
     /// An unprobed host axis removes nothing — "not asked" is not "absent" (the F1 distinction).
     #[test]
     fn an_unprobed_host_removes_nothing() {
@@ -1074,7 +1152,7 @@ mod host_tests {
 /// F6's **call-site** gates: source scans over the whole workspace, not over one extracted
 /// predicate.
 ///
-/// Both live here rather than in `scripts/` because a call-site scan is a Rust source-scan test (the
+/// They live here rather than in `scripts/` because a call-site scan is a Rust source-scan test (the
 /// shipped precedent is `vmcell-qemu`'s `virtiofs_pacing_gate`), so the one `gates` recipe's roster
 /// — and `ban-ci-script-handcopy.sh`'s both-direction assertion over it — does not grow.
 ///
@@ -1282,6 +1360,63 @@ mod call_site_gates {
             "F6: {} production site(s) hand-spell a feature string:\n{}",
             violations.len(),
             violations.join("\n")
+        );
+    }
+
+    /// **docs/90 D5: the host axis has exactly ONE probe, and it lives in the descriptor.**
+    ///
+    /// §7.4 says the host contributes `HostCapabilities`; §7.2 rule 1 says that descriptor is probed
+    /// **once**. Both were true of everything except the axis §7.4 named: `HostDeclaration::probe`
+    /// read `/sys/module/*/parameters/nested` itself, beside the descriptor, and its own rustdoc
+    /// claimed the derivation it did not perform. The read now lives in
+    /// `hostcaps::nested_virt_enabled` and the declaration is a projection of the descriptor.
+    ///
+    /// A derivation test alone would not hold that: it proves the projection is faithful, not that
+    /// nothing probes beside it — which is exactly the completeness-audit lesson (a green unit test
+    /// standing beside an unchanged call site). So this is the call-site half, and it is scoped by
+    /// the parameter path rather than by a function name, because the defect shape is a *reader*
+    /// appearing anywhere — a backend deciding nested-virt for itself, a daemon short-cutting the
+    /// descriptor — not a particular spelling.
+    ///
+    /// `hostcaps.rs` is tolerated whole: it owns the read and the test that pins the decode. Doc
+    /// comments are stripped by `code_lines`, so prose quoting the path is not a violation — but a
+    /// *code* line spelling it is, including this test's own needle, which is why the needle is
+    /// composed rather than written out (the first cut of this gate reported itself, at the one line
+    /// that had to be exempt-free).
+    #[test]
+    fn the_host_axis_reads_the_nested_parameter_in_exactly_one_place() {
+        let param = ["parameters", "nested"].join("/");
+        let param = param.as_str();
+        let mut sites: Vec<String> = Vec::new();
+        for (path, body) in production_sources() {
+            if path.ends_with("hostcaps.rs") {
+                continue; // the law's home
+            }
+            for (line, code) in code_lines(&body) {
+                if code.contains(param) {
+                    sites.push(format!("{}:{line}", path.display()));
+                }
+            }
+        }
+        assert!(
+            sites.is_empty(),
+            "the host axis must read `{param}` in exactly ONE place — \
+             `hostcaps::nested_virt_enabled`, projected into `feature::HostDeclaration` through \
+             `from_host_capabilities` — so §7.4's \"the host contributes HostCapabilities\" and \
+             §7.2 rule 1's one probe both hold. Second reader(s): {sites:#?}"
+        );
+
+        // Non-vacuity: the home this gate exempts must actually contain the read, or the scan is
+        // green because the law moved somewhere it is no longer looking.
+        let home = production_sources()
+            .into_iter()
+            .find(|(path, _)| path.ends_with("hostcaps.rs"))
+            .map(|(_, body)| body)
+            .expect("gate misconfigured: crates/vmcell/src/hostcaps.rs was not scanned");
+        assert!(
+            code_lines(&home).any(|(_, code)| code.contains(param)),
+            "gate misconfigured: hostcaps.rs no longer reads `{param}` — the one probe moved, so \
+             this scan would pass with no reader anywhere"
         );
     }
 }

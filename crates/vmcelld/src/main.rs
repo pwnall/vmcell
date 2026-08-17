@@ -118,9 +118,13 @@ fn main() {
 fn run() -> Result<(), i32> {
     let cli = Cli::parse();
 
-    // Blessing precondition (shared with the test-runner): the three privileged caps must be in the
-    // EFFECTIVE set, or euid 0. Checked BEFORE the fork so both the broker child (which keeps them)
-    // and the parent (which drops them) start from a known-blessed state.
+    // Blessing precondition (shared with the test-runner): all three privileged caps must be in this
+    // process's own EFFECTIVE set. Nothing else substitutes — a root process whose effective set was
+    // narrowed (default container root, a unit with `User=root` and a `CapabilityBoundingSet=` that
+    // omits one of the three) is REFUSED here, because starting it means failing every privileged
+    // create at first use, which is the degraded server law P1 forbids (M5 deleted the euid-0
+    // short-circuit that used to accept exactly that). Checked BEFORE the fork so both the broker
+    // child (which keeps them) and the parent (which drops them) start from a known-blessed state.
     if let Err(remediation) = vmcell_privilege::ensure_blessed_or_explain(&PRIVILEGED_CAPS) {
         tracing::error!("{remediation}");
         return Err(1);
@@ -477,4 +481,116 @@ fn id_seed() -> u64 {
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
     nanos ^ (u64::from(std::process::id()) << 32)
+}
+
+/// The blessing precondition's gate, at **this** call site rather than only inside the predicate
+/// (AGENTS.md: a gate binds the call sites). Two halves, because the defect had two:
+/// [`vmcell_privilege::ensure_blessed_or_explain`] used to return `Ok` for any euid-0 process
+/// however narrow its capability set (M5), and the comment above the call here went on asserting
+/// that exemption after the code stopped granting it.
+///
+/// The scanner is a per-crate copy on purpose, the same trade the backends' source-scanning gates
+/// record: it must read *this file's* text, and `include_str!`-ing a sibling crate's source compiles
+/// only from a workspace checkout. The law itself is not duplicated — it is
+/// [`vmcell_privilege::blessing_verdict`], which both halves below read.
+#[cfg(test)]
+mod blessing_precondition_gate {
+    use vmcell_privilege::{BlessingRefusal, Cap, CapSet, PRIVILEGED_CAPS, blessing_verdict};
+
+    const SOURCE: &str = include_str!("main.rs");
+
+    /// The line the comment under test sits above: the shared precondition's one call in this
+    /// binary.
+    const CALL_SITE: &str =
+        "if let Err(remediation) = vmcell_privilege::ensure_blessed_or_explain(";
+
+    /// The `//` comment block immediately above `anchor`, with the markers stripped.
+    ///
+    /// Panics if the anchor is missing or carries no comment — an extraction that silently returned
+    /// nothing would make every assertion below vacuous.
+    fn comment_block_before(source: &str, anchor: &str) -> String {
+        let before = source
+            .split_once(anchor)
+            .unwrap_or_else(|| panic!("`{anchor}` must exist in this file"))
+            .0;
+        let mut block: Vec<&str> = Vec::new();
+        for line in before.lines().rev() {
+            let trimmed = line.trim_start();
+            if let Some(rest) = trimmed.strip_prefix("//") {
+                block.push(rest);
+                continue;
+            }
+            // The anchor is mid-line, so the split's last "line" is the call's own indentation;
+            // blank lines may also sit between a comment and its statement. Neither ends the block
+            // before it has started — anything else does.
+            if block.is_empty() && trimmed.is_empty() {
+                continue;
+            }
+            break;
+        }
+        assert!(!block.is_empty(), "`{anchor}` must carry a comment block");
+        block.reverse();
+        block.join(" ")
+    }
+
+    /// Whether `comment` offers something *other than* holding the caps as a way to satisfy the
+    /// precondition. The stale spellings, listed rather than guessed: this is what "the three
+    /// privileged caps must be in the EFFECTIVE set, **or euid 0**" reads as once the short-circuit
+    /// is gone.
+    fn claims_an_exemption(comment: &str) -> bool {
+        let lower = comment.to_lowercase();
+        [
+            "or euid",
+            "or if euid",
+            "or uid",
+            "or be running as",
+            "or running as",
+        ]
+        .iter()
+        .any(|stale| lower.contains(stale))
+    }
+
+    // THE PROSE HALF. RED on the inverse: restore ", or euid 0." to the comment above the call.
+    #[test]
+    fn the_call_sites_comment_claims_no_euid_exemption() {
+        let comment = comment_block_before(SOURCE, CALL_SITE);
+        assert!(
+            !claims_an_exemption(&comment),
+            "the precondition admits no alternative to holding the caps (M5, law P1); this comment \
+             still offers one:\n{comment}"
+        );
+        // Non-vacuity for the extraction AND the predicate: the block must actually be the one that
+        // describes the precondition, so a comment that says nothing cannot pass by saying nothing.
+        assert!(
+            comment.contains("EFFECTIVE"),
+            "the comment must name the set that decides — the effective one:\n{comment}"
+        );
+        // The predicate's own control: it flags the historical sentence and accepts the shipped one.
+        assert!(claims_an_exemption(
+            "the three privileged caps must be in the EFFECTIVE set, or euid 0."
+        ));
+    }
+
+    // THE BEHAVIORAL HALF, so the prose above is pinned to what this binary's precondition actually
+    // answers rather than to itself. RED on the inverse: put `if euid == 0 { return Ok(()) }` back
+    // into `blessing_verdict` and the narrowed-root leg returns `Ok`.
+    #[test]
+    fn a_narrowed_root_cannot_start_this_daemon() {
+        let mut narrowed = CapSet::empty();
+        narrowed.add(Cap::NET_ADMIN);
+        assert!(
+            matches!(
+                blessing_verdict(0, &narrowed, &PRIVILEGED_CAPS),
+                Err(BlessingRefusal::NarrowedRoot(_))
+            ),
+            "euid 0 with a narrowed effective set must refuse to start (P1), not start degraded"
+        );
+        // Positive control: a root process that genuinely holds the caps still starts, so the
+        // refusal above is about the narrowing and not about the uid.
+        let mut full = CapSet::empty();
+        for c in PRIVILEGED_CAPS {
+            full.add(c);
+        }
+        assert_eq!(blessing_verdict(0, &full, &PRIVILEGED_CAPS), Ok(()));
+    }
 }

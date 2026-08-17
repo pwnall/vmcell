@@ -6,6 +6,65 @@
 //! integrator anticipated is that a host path becomes an **upload**: [`DaemonClient::upload_artifact`]
 //! (design §18, Delta register: changes from the validated v27 build). DTOs are re-exported from `vmcell-daemon` (linked without its server stack), so a
 //! request the client serializes and the daemon deserializes are the SAME type.
+//!
+//! # Example: an upload and two round trips
+//!
+//! `no_run` — it needs a listening `vmcelld` and its API-key file. `just test-doc` compiles it, so
+//! the verbs and DTOs below are the ones this client ships today.
+//!
+//! ```no_run
+//! use std::path::Path;
+//! use url::Url;
+//! use vmcell_daemon_client::{DaemonClient, dto::ExecRequestDto};
+//!
+//! # #[tokio::main]
+//! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! // The daemon takes its key from a perms-checked FILE, never from argv or the environment
+//! // (design §11.6) — so console logs and process listings never carry it. A client holds the same
+//! // secret; nothing in this crate enforces that, so the discipline is the caller's to keep.
+//! let api_key = std::fs::read_to_string("/run/vmcell/api-key")?;
+//! let client = DaemonClient::new(Url::parse("http://127.0.0.1:8787")?, api_key.trim())?;
+//!
+//! // The one forced divergence from the library API: the daemon addresses artifacts by NAME, so a
+//! // host path becomes an upload. The store is create-only, so re-uploading a name is a typed
+//! // `ErrorKind::AlreadyExists` rather than a silent overwrite.
+//! client.upload_artifact("vmlinux", Path::new("/artifacts/vmlinux")).await?;
+//! let rootfs = client
+//!     .upload_artifact("rootfs.erofs", Path::new("/artifacts/rootfs.erofs"))
+//!     .await?;
+//! // The daemon hashes what it stored, so an upload can be verified without downloading it back.
+//! assert_eq!(rootfs.sha256.len(), 64);
+//!
+//! // `run`: boot, exec, tear down — the one-shot verb, addressed by artifact name.
+//! let outcome = client
+//!     .run("vmlinux", "rootfs.erofs", vec!["/bin/echo".into(), "hi".into()])
+//!     .await?;
+//! assert_eq!(outcome.code, 0);
+//!
+//! // Or keep the cell: `create` / `exec` / `destroy` are one-to-one with the `vmcell` entry points.
+//! let vm = client.create("vmlinux", "rootfs.erofs").await?;
+//! let outcome = client
+//!     .exec(&vm.id, ExecRequestDto::new(vec!["/bin/true".into()]))
+//!     .await?;
+//! assert_eq!(outcome.code, 0);
+//! client.destroy(&vm.id).await?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! A server-side condition arrives as the same matchable [`dto::ErrorKind`] the daemon names, so a
+//! caller branches on the kind and never on a raw status:
+//!
+//! ```no_run
+//! # use vmcell_daemon_client::{ClientError, DaemonClient, dto::ErrorKind};
+//! # async fn artifact_size(client: &DaemonClient) -> Result<Option<u64>, ClientError> {
+//! match client.get_artifact("vmlinux").await {
+//!     Ok(info) => Ok(Some(info.size_bytes)),
+//!     Err(e) if e.kind() == Some(ErrorKind::NotFound) => Ok(None),
+//!     Err(e) => Err(e),
+//! }
+//! # }
+//! ```
 #![deny(missing_docs, unsafe_op_in_unsafe_fn, rustdoc::broken_intra_doc_links)]
 #![deny(unreachable_pub)] // pub-in-private-module API-surface honesty
 #![deny(
@@ -166,6 +225,32 @@ impl DaemonClient {
             .map_err(|e| ClientError::Url(format!("{path}: {e}")))
     }
 
+    /// The **one** place a caller-supplied name becomes part of a request path: `template`'s `{}` is
+    /// replaced by `segment`, which [`validate_path_segment`] has cleared first. Every verb that
+    /// names a resource goes through this — never `self.url(&format!(…))` with a caller string.
+    fn resource_url(&self, kind: &str, segment: &str, template: &str) -> Result<Url, ClientError> {
+        validate_path_segment(kind, segment)?;
+        self.url(&template.replace("{}", segment))
+    }
+
+    /// The artifact-name URL: the daemon's **own** name law first (so a bad name is refused with the
+    /// reason the daemon would have given, before a round trip), then the one path-segment join.
+    fn artifact_url(&self, artifact_name: &str) -> Result<Url, ClientError> {
+        name::validate_artifact_name(artifact_name).map_err(|e| ClientError::Api {
+            kind: Some(ErrorKind::InvalidName),
+            status: 400,
+            message: e.to_string(),
+        })?;
+        self.resource_url("artifact name", artifact_name, "v1/artifacts/{}")
+    }
+
+    /// A VM-scoped URL. A [`VmId`] is an opaque server-minted string a caller can nonetheless spell
+    /// itself (`VmId::from_str` is infallible), so it is caller-supplied input like any other and
+    /// carries no name law of its own — [`validate_path_segment`] is the whole check.
+    fn vm_url(&self, id: &VmId, template: &str) -> Result<Url, ClientError> {
+        self.resource_url("vm id", &id.0, template)
+    }
+
     // ---- artifact store (paths -> upload, the design §18, Delta register: changes from the validated v27 build divergence) ----
 
     /// Uploads an artifact (create; the daemon rejects an existing name — "no update").
@@ -178,14 +263,9 @@ impl DaemonClient {
         artifact_name: &str,
         body: impl Into<UploadBody>,
     ) -> Result<ArtifactInfo, ClientError> {
-        // Validate client-side for a clear early error (the same predicate the daemon enforces).
-        name::validate_artifact_name(artifact_name).map_err(|e| ClientError::Api {
-            kind: Some(ErrorKind::InvalidName),
-            status: 400,
-            message: e.to_string(),
-        })?;
+        // Validated client-side for a clear early error (the same predicate the daemon enforces).
+        let url = self.artifact_url(artifact_name)?;
         let bytes = body.into().into_bytes()?;
-        let url = self.url(&format!("v1/artifacts/{artifact_name}"))?;
         self.send_json(self.http.put(url).body(bytes)).await
     }
 
@@ -203,7 +283,7 @@ impl DaemonClient {
     /// # Errors
     /// [`ClientError`] (e.g. [`ErrorKind::NotFound`]).
     pub async fn get_artifact(&self, artifact_name: &str) -> Result<ArtifactInfo, ClientError> {
-        let url = self.url(&format!("v1/artifacts/{artifact_name}"))?;
+        let url = self.artifact_url(artifact_name)?;
         self.send_json(self.http.get(url)).await
     }
 
@@ -212,7 +292,7 @@ impl DaemonClient {
     /// # Errors
     /// [`ClientError`] (e.g. [`ErrorKind::InUse`] if a live VM pins it).
     pub async fn delete_artifact(&self, artifact_name: &str) -> Result<(), ClientError> {
-        let url = self.url(&format!("v1/artifacts/{artifact_name}"))?;
+        let url = self.artifact_url(artifact_name)?;
         self.send_no_content(self.http.delete(url)).await
     }
 
@@ -270,7 +350,7 @@ impl DaemonClient {
     /// # Errors
     /// [`ClientError`] (e.g. [`ErrorKind::NotFound`]).
     pub async fn get(&self, id: &VmId) -> Result<VmInfo, ClientError> {
-        let url = self.url(&format!("v1/vms/{id}"))?;
+        let url = self.vm_url(id, "v1/vms/{}")?;
         self.send_json(self.http.get(url)).await
     }
 
@@ -283,7 +363,7 @@ impl DaemonClient {
         id: &VmId,
         req: ExecRequestDto,
     ) -> Result<ExecOutcomeDto, ClientError> {
-        let url = self.url(&format!("v1/vms/{id}/exec"))?;
+        let url = self.vm_url(id, "v1/vms/{}/exec")?;
         self.send_json(self.http.post(url).json(&req)).await
     }
 
@@ -292,7 +372,7 @@ impl DaemonClient {
     /// # Errors
     /// [`ClientError`] on failure.
     pub async fn stats(&self, id: &VmId) -> Result<ResourceUsageDto, ClientError> {
-        let url = self.url(&format!("v1/vms/{id}/stats"))?;
+        let url = self.vm_url(id, "v1/vms/{}/stats")?;
         self.send_json(self.http.get(url)).await
     }
 
@@ -305,7 +385,7 @@ impl DaemonClient {
         id: &VmId,
         artifact_prefix: &str,
     ) -> Result<SnapshotInfo, ClientError> {
-        let url = self.url(&format!("v1/vms/{id}/snapshot"))?;
+        let url = self.vm_url(id, "v1/vms/{}/snapshot")?;
         let body = SnapshotRequest {
             artifact_prefix: artifact_prefix.to_string(),
         };
@@ -317,7 +397,7 @@ impl DaemonClient {
     /// # Errors
     /// [`ClientError`] (e.g. [`ErrorKind::NotFound`]).
     pub async fn destroy(&self, id: &VmId) -> Result<(), ClientError> {
-        let url = self.url(&format!("v1/vms/{id}"))?;
+        let url = self.vm_url(id, "v1/vms/{}")?;
         self.send_no_content(self.http.delete(url)).await
     }
 
@@ -361,6 +441,49 @@ impl DaemonClient {
     async fn read_body(&self, resp: reqwest::Response) -> String {
         resp.text().await.unwrap_or_default()
     }
+}
+
+/// The ONE predicate a caller-supplied string passes before it becomes part of a request path
+/// (design §11.7, The client library and CLI; the client-side half of the daemon's own
+/// `resolve_artifact_path` law).
+///
+/// `Url::join` takes a **relative reference**, so an unvalidated segment does not produce a 404 — it
+/// produces a request against a *different endpoint*: `delete_artifact("../vms/vm-1")` joins to
+/// `DELETE /v1/vms/vm-1` and destroys a VM, `get("..")` reads the collection, and a `?`/`#` truncates
+/// the path into a query or fragment. Every verb that names a resource therefore routes through
+/// [`DaemonClient::resource_url`], which calls this first (finding
+/// `client-joins-unvalidated-names-into-request-paths`).
+///
+/// An **allowlist** (`[A-Za-z0-9._~-]`, and never `.`/`..`), not a denylist of bad substrings: the
+/// daemon's own name predicate makes the same choice for the same reason — a denylist is the
+/// divergence trap where you always forget one spelling.
+///
+/// # Errors
+/// [`ClientError::Api`] with [`ErrorKind::InvalidName`] and status 400 — the same shape the daemon
+/// would have replied with, decided locally so the request never leaves the process.
+fn validate_path_segment(kind: &str, value: &str) -> Result<(), ClientError> {
+    let reject = |why: &str| {
+        Err(ClientError::Api {
+            kind: Some(ErrorKind::InvalidName),
+            status: 400,
+            message: format!("{kind} {value:?} {why}"),
+        })
+    };
+    if value.is_empty() {
+        return reject("must not be empty");
+    }
+    if value == "." || value == ".." {
+        return reject("must not be `.` or `..` (it would climb the request path)");
+    }
+    if let Some(bad) = value
+        .bytes()
+        .find(|b| !(b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'~')))
+    {
+        return reject(&format!(
+            "may only contain [A-Za-z0-9._~-] to be a single URL path segment; found byte {bad:#04x}"
+        ));
+    }
+    Ok(())
 }
 
 /// Parses a non-2xx body into a typed [`ClientError::Api`], recovering the matchable kind from the
@@ -417,6 +540,155 @@ mod tests {
         let err = api_error(502, "bad gateway");
         assert_eq!(err.kind(), None);
         assert!(matches!(err, ClientError::Api { status: 502, .. }));
+    }
+
+    /// A client pointed at a port nothing listens on: any verb that actually SENDS returns
+    /// `Transport`, so a `Transport` error in the tests below would prove the request left the
+    /// process — the discriminator that makes "refused before the wire" a real assertion.
+    fn offline_client() -> DaemonClient {
+        DaemonClient::new(Url::parse("http://127.0.0.1:1/").expect("url"), "k").expect("client")
+    }
+
+    // Every verb that names a resource validates the name BEFORE joining it into the request path
+    // (finding `client-joins-unvalidated-names-into-request-paths`): `Url::join` resolves a relative
+    // reference, so `../vms/<id>` on an artifact verb is not a 404 — it is a DELETE against a VM.
+    //
+    // Driven verb-by-verb rather than through the predicate alone, because the defect was per-call-
+    // site: `upload_artifact` validated and the other seven did not. RED on the inverse (revert any
+    // one verb to `self.url(&format!(…))`): that verb returns `Transport` (it reached the wire) or
+    // `Url`, never `InvalidName`.
+    #[tokio::test]
+    async fn every_resource_verb_refuses_a_traversing_name_before_the_wire() {
+        let c = offline_client();
+        let escape_name = "../vms/vm-1";
+        let escape_id = VmId("../artifacts/vmlinux".to_string());
+
+        let mut refused: Vec<(&str, ClientError)> = Vec::new();
+        refused.push((
+            "upload_artifact",
+            c.upload_artifact(escape_name, vec![1u8])
+                .await
+                .expect_err("upload"),
+        ));
+        refused.push((
+            "get_artifact",
+            c.get_artifact(escape_name).await.expect_err("get_artifact"),
+        ));
+        refused.push((
+            "delete_artifact",
+            c.delete_artifact(escape_name)
+                .await
+                .expect_err("delete_artifact"),
+        ));
+        refused.push(("get", c.get(&escape_id).await.expect_err("get")));
+        refused.push((
+            "exec",
+            c.exec(&escape_id, ExecRequestDto::new(vec!["true".into()]))
+                .await
+                .expect_err("exec"),
+        ));
+        refused.push(("stats", c.stats(&escape_id).await.expect_err("stats")));
+        refused.push((
+            "snapshot",
+            c.snapshot(&escape_id, "snap1").await.expect_err("snapshot"),
+        ));
+        refused.push(("destroy", c.destroy(&escape_id).await.expect_err("destroy")));
+
+        assert_eq!(refused.len(), 8, "every resource-naming verb is covered");
+        for (verb, err) in &refused {
+            assert_eq!(
+                err.kind(),
+                Some(ErrorKind::InvalidName),
+                "{verb} must refuse the name locally, got {err:?}"
+            );
+        }
+
+        // The unreachable-base control: a verb whose path carries no caller string DOES reach the
+        // wire, so the refusals above are about the validation and not about the offline client.
+        assert!(
+            matches!(
+                c.ls().await.expect_err("no daemon there"),
+                ClientError::Transport(_)
+            ),
+            "a path with no caller-supplied segment is sent, and fails as transport"
+        );
+    }
+
+    // The segment predicate's own inverses and its positive control: the real minted id shape and the
+    // real artifact names must pass, or the gate above would be satisfied by a client that refuses
+    // everything.
+    #[test]
+    fn path_segment_predicate_rejects_only_unsafe_segments() {
+        for bad in [
+            "",
+            ".",
+            "..",
+            "a/b",
+            "/abs",
+            "../escape",
+            "a?q=1",
+            "a#frag",
+            "a%2fb",
+            "a b",
+            "a\\b",
+        ] {
+            assert!(
+                validate_path_segment("vm id", bad).is_err(),
+                "must reject {bad:?}"
+            );
+        }
+        for good in [
+            "vm-1-0123456789abcdef", // the minted VmId shape
+            "vmlinux",
+            "rootfs.erofs",
+            "snap_2024",
+            "k1",
+        ] {
+            assert!(
+                validate_path_segment("vm id", good).is_ok(),
+                "must accept {good:?}"
+            );
+        }
+    }
+
+    // The call-site scan (AGENTS.md: a gate binds the call SITES, not just the extracted predicate).
+    // Every verb's URL is either a literal collection path or one of the two checked helpers, so the
+    // shape the finding describes — a caller string interpolated straight into a path — cannot come
+    // back without reddening here.
+    #[test]
+    fn no_verb_interpolates_a_caller_string_into_a_request_path() {
+        const SRC: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
+        let prod = SRC.split("\n#[cfg(test)]\n").next().unwrap_or(SRC);
+        let mut checked_joins = 0;
+        let mut segment_predicate_call_sites = 0;
+        for (i, line) in prod.lines().enumerate() {
+            let code = line.split("//").next().unwrap_or("");
+            if ["self.resource_url(", "self.artifact_url(", "self.vm_url("]
+                .iter()
+                .any(|call| code.contains(call))
+            {
+                checked_joins += 1;
+            }
+            if code.contains("validate_path_segment(") && !code.contains("fn validate_path_segment")
+            {
+                segment_predicate_call_sites += 1;
+            }
+            assert!(
+                !(code.contains("format!(\"v1/") || code.contains("self.url(&format!")),
+                "lib.rs:{}: a request path built by interpolation — route the segment through \
+                 `resource_url`/`artifact_url` so it is validated first: {}",
+                i + 1,
+                code.trim()
+            );
+        }
+        assert!(
+            checked_joins >= 9,
+            "the scan found only {checked_joins} checked joins — it is not reading the verbs"
+        );
+        assert_eq!(
+            segment_predicate_call_sites, 1,
+            "one law, one call site: only `resource_url` may call the segment predicate"
+        );
     }
 
     #[test]

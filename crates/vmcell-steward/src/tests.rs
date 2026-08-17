@@ -16,7 +16,7 @@ use crate::{ReaperCoordinator, ServeContext};
 use std::collections::HashMap;
 use std::io::Read;
 use std::os::fd::OwnedFd;
-use std::os::unix::process::CommandExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -624,6 +624,81 @@ fn spawn_group_child() -> std::process::Child {
     cmd.spawn().expect("spawn a test child")
 }
 
+/// A [`spawn_group_child`] owned by the test: killed and reaped on drop, so a gate that reddens —
+/// i.e. the code under test did *not* kill it — still leaves no process behind. A test's own
+/// fixtures are residue too (AGENTS.md).
+struct GroupChild {
+    child: std::process::Child,
+    reaped: bool,
+}
+
+impl GroupChild {
+    fn new() -> Self {
+        GroupChild {
+            child: spawn_group_child(),
+            reaped: false,
+        }
+    }
+
+    fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// Whether the child is still running — the non-vacuity check a kill assertion needs.
+    fn is_running(&mut self) -> bool {
+        match self.child.try_wait().expect("try_wait") {
+            Some(_) => {
+                self.reaped = true;
+                false
+            }
+            None => true,
+        }
+    }
+
+    /// The signal that killed this child, waited for with a **bound**: a child nobody killed must
+    /// redden the gate rather than hang the suite (the in-crate `recv_timeout` idiom).
+    fn killing_signal(&mut self, within: Duration) -> Option<i32> {
+        let deadline = Instant::now() + within;
+        loop {
+            match self.child.try_wait().expect("try_wait") {
+                Some(status) => {
+                    self.reaped = true;
+                    return status.signal();
+                }
+                None if Instant::now() >= deadline => return None,
+                None => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
+    }
+}
+
+impl Drop for GroupChild {
+    fn drop(&mut self) {
+        // Never signal a pid we already reaped — the kernel may have recycled it.
+        if !self.reaped {
+            kill_group(self.child.id());
+            let _ = self.child.wait();
+        }
+    }
+}
+
+/// A [`vsock::VsockListener`] over a plain `AF_UNIX` listener, plus the address a client connects
+/// to — the seam that makes the accept loop drivable with no vsock device.
+///
+/// `VsockListener` is a thin `OwnedFd` wrapper whose `accept` is a raw `accept(2)` that never
+/// inspects the address family, so a unix listener drives the real loop verbatim (the same
+/// reasoning as [`vsock_pair`]). The abstract socket name leaves no filesystem residue.
+fn unix_backed_listener(tag: &str) -> (vsock::VsockListener, std::os::unix::net::SocketAddr) {
+    use std::os::linux::net::SocketAddrExt;
+    let name = format!("vmcell-steward-{}-{tag}", std::process::id());
+    let addr = std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes())
+        .expect("abstract socket address");
+    let listener =
+        std::os::unix::net::UnixListener::bind_addr(&addr).expect("bind the abstract listener");
+    listener.set_nonblocking(true).expect("set_nonblocking");
+    (vsock::VsockListener::from(OwnedFd::from(listener)), addr)
+}
+
 // m13 — "every recover-by-rebind path is rate-limited" is now a fact about ONE
 // predicate instead of a claim each arm had to remember; the POLLERR arm did
 // not, and the comment two arms over said it did.
@@ -939,7 +1014,7 @@ fn apply_cmdline_honors_the_declared_port_and_the_tuning_tokens() {
     assert_eq!(opts.tuning, Tuning::default());
 }
 
-// Law C3 on the service-mode shutdown path needs a registry, because the `Sessions` table is
+// Law C3 on the service-mode shutdown path needs a registry, because a connection's state is
 // created per connection inside `serve_connection` and is reachable from nowhere else. Before v33
 // that was fine — the only SIGTERM policy was power-off, which reaches no session at all.
 //
@@ -950,8 +1025,8 @@ fn the_connection_registry_publishes_and_reclaims_each_connection() {
     let registry = Arc::new(ConnectionRegistry::new());
     assert_eq!(registry.len(), 0);
 
-    let a: Sessions = Arc::new(Mutex::new(HashMap::new()));
-    let b: Sessions = Arc::new(Mutex::new(HashMap::new()));
+    let a = Arc::new(ConnectionState::default());
+    let b = Arc::new(ConnectionState::default());
     let ticket_a = registry.register(Arc::clone(&a));
     let ticket_b = registry.register(Arc::clone(&b));
     assert_eq!(registry.len(), 2, "both live connections must be visible");
@@ -959,8 +1034,8 @@ fn the_connection_registry_publishes_and_reclaims_each_connection() {
     // `teardown_all` reports what it swept and leaves the tables drained, which is the C3 residue
     // assertion in its KVM-free form (the live leg asserts the process groups are actually gone).
     assert_eq!(registry.teardown_all(), 2);
-    assert!(a.lock().expect("lock").is_empty());
-    assert!(b.lock().expect("lock").is_empty());
+    assert!(a.sessions.lock().expect("lock").is_empty());
+    assert!(b.sessions.lock().expect("lock").is_empty());
 
     drop(ticket_a);
     assert_eq!(registry.len(), 1, "a dropped ticket must deregister");
@@ -977,34 +1052,291 @@ fn the_connection_registry_publishes_and_reclaims_each_connection() {
     );
 }
 
-// The shutdown seam itself: `serve_vsock` was an unconditional `loop {}` with no exit condition,
-// so "stop accepting, tear down, exit" had nothing to hook. This drives the real listener thread
-// and requires it to RETURN when the flag is set.
+// Law C3 owns EVERY exit path of a connection, the panic included. `serve_connection` used to call
+// `teardown_sessions` on the line *after* the dispatch loop, so a panicking connection thread
+// unwound straight past it — while the registry ticket in that same frame still deregistered the
+// state, putting it out of a later shutdown sweep's reach too. The sessions were then orphaned
+// with nothing left in the guest that knew their pgids. Teardown is now that ticket's own drop,
+// which is the one path all three exits (normal, `?`, unwind) share.
 //
-// RED on removing either shutdown check in `serve_vsock` (the outer bind-retry one or the inner
-// poll one): the thread never returns and `recv_timeout` reddens instead of the suite hanging —
-// the in-crate idiom `reserve_after_fast_child_already_drained_delivers_status` established for
-// exactly this failure shape.
+// The one-shot entry is published here the way `handle_exec`'s ticket publishes it, but with no
+// per-exec guard of its own: what this gate is about is the CONNECTION ticket's drop sweeping both
+// tables (the per-exec guard has its own gate below).
+//
+// RED on the inverse (drop `teardown_connection(&self.state)` from `ConnectionTicket::drop` and
+// restore the explicit `teardown_sessions` call in `serve_connection`): both children survive the
+// unwind, `killing_signal` returns `None` after its 5 s bound, and neither table is drained. The
+// panic message this test prints on stderr is expected — it is the failure being reproduced.
 #[test]
-fn the_shutdown_flag_stops_the_vsock_listener() {
+fn a_panicking_connection_thread_still_tears_down_its_sessions_and_exec_children() {
+    let registry = Arc::new(ConnectionRegistry::new());
+    let state = Arc::new(ConnectionState::default());
+
+    let mut session_child = GroupChild::new();
+    let mut exec_child = GroupChild::new();
+    let id = SessionId(4);
+    state
+        .sessions
+        .lock()
+        .expect("sessions")
+        .insert(id, SessionHandle::new(id, None, None, session_child.pid()));
+    state
+        .one_shot
+        .lock()
+        .expect("one-shot")
+        .insert(exec_child.pid(), Arc::new(AtomicBool::new(false)));
+
+    let ticket = registry.register(Arc::clone(&state));
+    assert_eq!(registry.len(), 1);
+    assert!(
+        session_child.is_running() && exec_child.is_running(),
+        "both children must be alive before the panic, or this gate is vacuous"
+    );
+
+    // The connection thread's panic path exactly: the ticket is owned by the frame that unwinds.
+    let connection = std::thread::spawn(move || {
+        let _ticket = ticket;
+        panic!("a connection thread panicked mid-dispatch");
+    });
+    assert!(
+        connection.join().is_err(),
+        "the connection thread must actually have panicked, or this gate proves nothing"
+    );
+
+    assert_eq!(
+        session_child.killing_signal(Duration::from_secs(5)),
+        Some(libc::SIGKILL),
+        "an unwinding connection thread must still kill its sessions' process groups (C3)"
+    );
+    assert_eq!(
+        exec_child.killing_signal(Duration::from_secs(5)),
+        Some(libc::SIGKILL),
+        "…and the one-shot exec children it had in flight"
+    );
+    assert!(state.sessions.lock().expect("sessions").is_empty());
+    assert!(state.one_shot.lock().expect("one-shot").is_empty());
+    assert_eq!(
+        registry.len(),
+        0,
+        "the registry must not outlive the connection it named"
+    );
+}
+
+// The service-mode shutdown sweep must reach one-shot `exec` children, not just sessions. A
+// `Service` steward EXITS on SIGTERM, and until this landed a one-shot child's pgid lived solely in
+// the connection thread's stack frame: that frame dies with the process, so `systemctl stop`
+// mid-`exec` left the child running under the real init with nothing left that could kill it.
+//
+// Drives the REAL `handle_exec`, because the call site is half the law (a green predicate beside an
+// unchanged call site is how two of the v33 completeness PARTIALs stayed invisible), and asserts on
+// the data plane: the swept child's terminal frame carries the 128+9 that only a SIGKILL produces.
+// A miniature reaper stands in for `run`'s SIGCHLD drain, targeted at this one pid — never a
+// blanket `wait()`, which would steal another test's child if the suite is ever run in one process.
+//
+// RED on the inverse (drop the `OneShotTicket::register` call from `handle_exec`): the table stays
+// empty, the pid poll below times out at 5 s, and nothing sweeps the child.
+#[test]
+fn a_service_shutdown_kills_a_live_one_shot_exec_child() {
     let ctx = test_ctx();
-    let listener_ctx = Arc::clone(&ctx);
-    // A short rebind window so the flag is observed promptly; `accept_poll` paces the bind-retry
-    // path, which is the arm this test actually exercises when AF_VSOCK is unavailable (no KVM
-    // needed either way — both arms check the flag).
+    let state = Arc::new(ConnectionState::default());
+    let _ticket = ctx.connections.register(Arc::clone(&state));
+    let (steward_side, mut host_side) = vsock_pair();
+    host_side
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("read timeout");
+    let writer: Writer = Arc::new(Mutex::new(steward_side));
+
+    // A long-running child with a timeout far past the test, so its death can only come from the
+    // shutdown sweep — the exec path's own kill thread is not what is under test here.
+    let exec_ctx = Arc::clone(&ctx);
+    let exec_state = Arc::clone(&state);
+    let exec_writer = Arc::clone(&writer);
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let req = protocol::ExecRequest::new(vec!["sleep".to_string(), "60".to_string()])
+            .with_timeout(Duration::from_secs(300));
+        let outcome = handle_exec(req, &exec_writer, &exec_ctx, &exec_state.one_shot);
+        let _ = done_tx.send(outcome.is_ok());
+    });
+
+    // The call-site assertion: the exec publishes its live child before it starts streaming.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let pid = loop {
+        if let Some(&pid) = state.one_shot.lock().expect("one-shot").keys().next() {
+            break pid;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "handle_exec must publish its live child on the connection's one-shot table"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+
+    // `run`'s reaper in miniature. The blocking wait happens OUTSIDE the coordinator lock —
+    // `drain_reaped` holds it, so a blocking wait in there would deadlock the exec's own waiter.
+    let reaper = Arc::clone(&ctx.reaper);
+    std::thread::spawn(move || {
+        let target = rustix::process::Pid::from_raw(pid.cast_signed()).expect("a live pid");
+        if let Ok(Some((_, status))) =
+            rustix::process::waitpid(Some(target), rustix::process::WaitOptions::empty())
+        {
+            reaper.record_exit(
+                pid,
+                crate::exit_code_from_termination(
+                    status.terminating_signal(),
+                    status.exit_status(),
+                ),
+            );
+        }
+    });
+
+    // The sweep under test — SIGTERM's `teardown_all`, with the connection still mid-exec.
+    assert_eq!(ctx.connections.teardown_all(), 1);
+
+    let mut frames = Vec::new();
+    loop {
+        let msg = read_msg(&mut host_side);
+        let terminal = matches!(msg, Message::Exit(_));
+        frames.push(msg);
+        if terminal {
+            break;
+        }
+    }
+    assert_eq!(
+        frames.last(),
+        Some(&Message::Exit(137)),
+        "a swept one-shot child must report the SIGKILL that ended it (128+9), not a clean exit: \
+         {frames:?}"
+    );
+    assert!(
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the exec call must return once its child is swept"),
+        "handle_exec must complete without an error"
+    );
+    assert!(
+        state.one_shot.lock().expect("one-shot").is_empty(),
+        "the sweep drains the table it swept"
+    );
+}
+
+// The shutdown seam itself: `serve_vsock` was an unconditional `loop {}` with no exit condition,
+// so "stop accepting, tear down, exit" had nothing to hook. The flag is checked at BOTH loop
+// levels, which is two separate laws, so it takes two legs — this one is the OUTER check, on the
+// bind-retry path.
+//
+// A bind that always fails means only the outer check can end this loop, and the flag is set after
+// the retry loop has demonstrably run (two bind attempts) rather than before the thread started —
+// otherwise the very first iteration answers it and the retry path is never exercised at all.
+//
+// RED on the inverse (delete the `ctx.shutdown` check at the top of the outer `loop`): the loop
+// retries bind→sleep forever and `recv_timeout` reddens instead of the suite hanging — the in-crate
+// idiom `reserve_after_fast_child_already_drained_delivers_status` established for this shape.
+#[test]
+fn the_shutdown_flag_stops_the_vsock_listener_between_bind_retries() {
+    let ctx = test_ctx();
     let tuning = Tuning {
         accept_poll: Duration::from_millis(5),
-        rebind_idle: Duration::from_millis(20),
+        rebind_idle: Duration::from_secs(30),
     };
+    let binds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let bind_count = Arc::clone(&binds);
+    let listener_ctx = Arc::clone(&ctx);
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        serve_vsock(&listener_ctx, vmcell_protocol::STEWARD_VSOCK_PORT, tuning);
+        serve_vsock_with(
+            &listener_ctx,
+            move || {
+                bind_count.fetch_add(1, Ordering::SeqCst);
+                None
+            },
+            tuning,
+        );
         let _ = tx.send(());
     });
 
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while binds.load(Ordering::SeqCst) < 2 {
+        assert!(
+            Instant::now() < deadline,
+            "the bind-retry path must actually be running, or this leg is vacuous"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
     ctx.shutdown.store(true, Ordering::SeqCst);
     rx.recv_timeout(Duration::from_secs(5))
-        .expect("the listener must observe the shutdown flag and RETURN, not loop forever");
+        .expect("the bind-retry loop must observe the shutdown flag and RETURN, not loop forever");
+}
+
+// The same seam's INNER check: a flag set while the accept loop is parked in `poll(2)` must be
+// observed at the loop's next wake, not only once the whole re-bind window has run out. The pre-fix
+// gate set the flag before the loop had bound anything, so the OUTER check answered it and this
+// half — half of what that gate's own comment claimed — could not go red (AGENTS.md rule 2).
+//
+// The 30 s re-bind window is what makes the leg discriminating: leaving the inner loop requires
+// that window to elapse (or a listener failure), so a return inside the 5 s budget can only have
+// come from the inner check, and the bind count pins that the loop did not re-bind. The wake is a
+// real accept — the `Ready` frame read back below is what keeps a spurious-wakeup path from passing
+// for one.
+//
+// RED on the inverse (delete the `ctx.shutdown` check inside the `while let Some(remaining)` loop):
+// the loop accepts, polls again for the remaining ~30 s, and `recv_timeout` reddens.
+#[test]
+fn the_shutdown_flag_stops_the_vsock_listener_parked_in_poll() {
+    let ctx = test_ctx();
+    let (listener, addr) = unix_backed_listener("inner-shutdown");
+    let tuning = Tuning {
+        accept_poll: Duration::from_secs(30),
+        rebind_idle: Duration::from_secs(30),
+    };
+    let binds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let bind_count = Arc::clone(&binds);
+    let listener_ctx = Arc::clone(&ctx);
+    let mut once = Some(listener);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        serve_vsock_with(
+            &listener_ctx,
+            move || {
+                bind_count.fetch_add(1, Ordering::SeqCst);
+                once.take()
+            },
+            tuning,
+        );
+        let _ = tx.send(());
+    });
+
+    // Wait for the bind, then give the loop time to reach its `poll`.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while binds.load(Ordering::SeqCst) == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the accept loop must bind the seam's listener"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    std::thread::sleep(Duration::from_millis(100));
+
+    ctx.shutdown.store(true, Ordering::SeqCst);
+    let mut host = std::os::unix::net::UnixStream::connect_addr(&addr).expect("connect");
+    host.set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("read timeout");
+    assert_eq!(
+        read_msg(&mut host),
+        Message::Ready,
+        "the accepted connection must send Ready, so this leg's wake is a real accept"
+    );
+
+    rx.recv_timeout(Duration::from_secs(5)).expect(
+        "a shutdown observed while parked in poll must return at the next wake, not after the \
+         whole re-bind window",
+    );
+    assert_eq!(
+        binds.load(Ordering::SeqCst),
+        1,
+        "the loop must not have re-bound: this leg is about the inner check, not the outer one"
+    );
 }
 
 // The `Pid1` floor, stated as a test rather than as a comment: a steward that names no placement

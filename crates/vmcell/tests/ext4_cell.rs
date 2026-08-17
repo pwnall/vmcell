@@ -41,14 +41,16 @@
 //!
 //! Unlike `systemd_cell`'s `VMCELL_TEST_SYSTEMD`, nothing here is switched on by an environment
 //! variable: the battery is cheap (no network pull beyond the base every suite already fetches)
-//! and `test-privileged` selects it. What it *needs* is `mkfs.ext4` from e2fsprogs ≥
-//! [`MIN_E2FSPROGS_VERSION`], whose `-d <tarball>` form is younger than several distributions'
-//! packages — including, most likely, the `ubuntu-24.04` image the CI KVM job runs on. So the legs
-//! ask the **product's own probe** and record a reviewable capability skip when the facility is
-//! genuinely absent (§7.2), rather than baking in a belief about any particular host: if CI's
-//! e2fsprogs is new enough the gate runs there for free, and if it is not, the skip is in the
-//! manifest `just skip-manifest-show` prints. Anything the probe classifies as a *broken* facility
-//! rather than an absent one still fails loud.
+//! and `test-privileged` selects it. What it *needs* is `mkfs.ext4` from e2fsprogs new enough for
+//! `-d <tarball>`, a version younger than several distributions' packages — including the
+//! `ubuntu-24.04` image the CI jobs run on, whose 1.47.0 is one patch release short. So the legs
+//! ask [`common::probe_ext4_or_record_skip`] — **the one law**, shared with `ext4_producer.rs` and
+//! `repack_outside_checkout.rs`, which asks the product's own probe and records a reviewable
+//! capability skip when the facility is genuinely absent (§7.2) rather than baking in a belief
+//! about any particular host. If CI's e2fsprogs can pack tarballs the gate runs there for free
+//! (`ci.yml` builds a pinned one so it can), and if it cannot, the skip is in the manifest
+//! `just skip-manifest-show` prints. Anything the probe classifies as a *broken* facility rather
+//! than an absent one still fails loud.
 //!
 //! CH-only. The image is a host-side packing product and the reader is the guest kernel's ext4
 //! driver; the per-backend half of `RootfsSource::Block` — that each backend attaches the root
@@ -59,60 +61,13 @@
 use std::collections::BTreeMap;
 
 use vmcell::artifact::RootfsFormat;
-use vmcell::artifact::ext4::{Ext4Producer, MIN_E2FSPROGS_VERSION};
+use vmcell::artifact::ext4::Ext4Producer;
 use vmcell::artifact::rootfs::{PackOptions, XattrPolicy};
 use vmcell::config::{RootfsSource, VmConfig};
-use vmcell::error::Error;
 
 mod common;
 
-// -----------------------------------------------------------------------------------------------
-// The facility probe, in its own module so no leg can pack or boot without it.
-// -----------------------------------------------------------------------------------------------
-
-/// The e2fsprogs probe, in its own module so its receipt cannot be forged.
-///
-/// Rust privacy is per-module: [`Ext4Available`]'s field is private here and
-/// [`probe_or_record_skip`] is its only constructor, so "no leg packs an ext4 image without first
-/// asking the product whether this host can" is a **compile error** rather than a convention. The
-/// same shape `systemd_cell`'s `OptedIn` uses, for a different reason — that one gates a cost, this
-/// one gates a facility.
-mod producer_gate {
-    use super::{Error, Ext4Producer, MIN_E2FSPROGS_VERSION};
-
-    /// Proof that this host's `mkfs.ext4` passed [`Ext4Producer::probe`]'s full gate.
-    #[derive(Clone, Copy, Debug)]
-    pub struct Ext4Available(());
-
-    /// `Some(Ext4Available)` when the producer's own probe succeeds; `None`, after recording a
-    /// reviewable capability skip, when it classifies the facility as **absent**.
-    ///
-    /// A probe result the product calls *broken* — present but unexecutable, an unparseable banner
-    /// — **panics**: that is a host misconfiguration this battery must not paper over, and it is
-    /// exactly the distinction §7.2 rule 3 draws. Skipping on it would be the
-    /// `println!("SKIP") + return` green-PASS defect wearing the probe's clothes.
-    #[must_use]
-    pub fn probe_or_record_skip() -> Option<Ext4Available> {
-        match Ext4Producer::probe() {
-            Ok(_) => Some(Ext4Available(())),
-            Err(Error::CapabilityUnavailable { op, needed }) => {
-                crate::common::record_capability_skip("cloud-hypervisor", "ext4_producer");
-                let (ma, mi, pa) = MIN_E2FSPROGS_VERSION;
-                println!(
-                    "SKIP: this host cannot produce ext4 rootfs images ({op}: {needed}). The \
-                     §15.4 ext4 battery needs e2fsprogs >= {ma}.{mi}.{pa} with libarchive support"
-                );
-                None
-            }
-            Err(other) => panic!(
-                "`mkfs.ext4` is present but BROKEN on this host, which is a misconfiguration and \
-                 not an absent facility — fix it rather than skipping the delta-8 gate: {other}"
-            ),
-        }
-    }
-}
-
-use producer_gate::{Ext4Available, probe_or_record_skip};
+use common::probe_ext4_or_record_skip;
 
 // -----------------------------------------------------------------------------------------------
 // The fixture layer: every POSIX shape the pinned Debian base cannot demonstrate.
@@ -524,9 +479,11 @@ fn registered_base() -> (String, String) {
 /// `xattr` applet in the booted guest is this tree's rather than whatever `vmcell build` last
 /// published.
 ///
-/// Takes the [`Ext4Available`] receipt, so a leg cannot reach `mkfs.ext4` without having asked
-/// whether this host has one.
-async fn pack_ext4_rootfs(staging: &std::path::Path, _probed: Ext4Available) -> std::path::PathBuf {
+/// Takes the probed [`Ext4Producer`] receipt — the product's own, whose fields are private to
+/// `vmcell` so only [`Ext4Producer::probe`] can mint one — which is what makes "a leg cannot reach
+/// `mkfs.ext4` without having asked whether this host has one" a compile error rather than a
+/// convention. The pack itself goes through the one tail, so the receipt is held rather than used.
+async fn pack_ext4_rootfs(staging: &std::path::Path, _probed: &Ext4Producer) -> std::path::PathBuf {
     std::fs::create_dir_all(staging).expect("create the staging dir");
 
     let built = vmcell::artifact::Pipeline::new(staging.to_path_buf())
@@ -755,7 +712,7 @@ fn hex(bytes: &[u8]) -> String {
 #[tokio::test]
 #[ignore = "needs KVM"]
 async fn an_ext4_root_boots_and_matches_the_packed_manifest() {
-    let Some(probed) = probe_or_record_skip() else {
+    let Some(probed) = probe_ext4_or_record_skip() else {
         return;
     };
     // Ensure the canonical artifacts FIRST: that is what warms the shared OCI blob cache the pack
@@ -765,7 +722,7 @@ async fn an_ext4_root_boots_and_matches_the_packed_manifest() {
     // A `TempDir` — cleanup on the panic path as well as the success path. A leaked ~130 MiB image
     // per attempt is how this suite once filled a host tmpfs and reddened an unrelated one.
     let staging = tempfile::tempdir().expect("staging tempdir");
-    let image = pack_ext4_rootfs(staging.path(), probed).await;
+    let image = pack_ext4_rootfs(staging.path(), &probed).await;
 
     let vmm = vmcell::vmm::cloud_hypervisor::CloudHypervisor::new(common::ch_bin());
     let mut vm = boot_ext4_cell(&vmm, image).await;
@@ -924,12 +881,12 @@ async fn an_ext4_root_boots_and_matches_the_packed_manifest() {
 #[tokio::test]
 #[ignore = "needs KVM"]
 async fn the_ext4_root_is_read_only_and_the_overlay_never_reaches_it() {
-    let Some(probed) = probe_or_record_skip() else {
+    let Some(probed) = probe_ext4_or_record_skip() else {
         return;
     };
     let _ = common::get_rootfs();
     let staging = tempfile::tempdir().expect("staging tempdir");
-    let image = pack_ext4_rootfs(staging.path(), probed).await;
+    let image = pack_ext4_rootfs(staging.path(), &probed).await;
 
     let vmm = vmcell::vmm::cloud_hypervisor::CloudHypervisor::new(common::ch_bin());
     let mut vm = boot_ext4_cell(&vmm, image).await;

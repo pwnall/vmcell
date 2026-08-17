@@ -22,6 +22,14 @@
 //! property reached through a host-side cmdline feature, so one primary-backend data-plane proof
 //! suffices, and QEMU's external vsock-daemon bring-up would only add non-standard-boot flake.
 //!
+//! **With one exception, and it is a structural one** (finding M1): the post-boot control-plane
+//! health gate is a no-op on CH and FC (their vsock is internal to the VMM) and runs *only* on
+//! QEMU's external-`vhost-device-vsock` transport. So a declared port that the host bakes into the
+//! endpoint the gate probes is unobservable on CH by construction — QEMU baked the protocol default
+//! and re-spawned a healthy `Service{5100}` cell to exhaustion, with every `Service` leg in the tree
+//! green. `the_qemu_health_gate_probes_the_declared_port` is that leg, and it accepts the extra
+//! bring-up flake deliberately: the gate it exercises is the very mechanism that recovers from it.
+//!
 //! **These legs mean nothing against a stale rootfs.** `mini-init` is baked into `rootfs.erofs`;
 //! run `vmcell build --kernel-source host-make` after any change to `vmcell-guest-tools` or
 //! `vmcell-steward`, or the guest boots an image whose `/vmcell-tools/mini-init` does not exist.
@@ -46,16 +54,14 @@ const STEWARD_PID_SH: &str = "for p in /proc/[0-9]*; do \
      [ \"$(cat \"$p/comm\" 2>/dev/null)\" = vmcell-steward ] && echo \"${p#/proc/}\"; \
      done";
 
-/// Boots a cell whose PID 1 is `mini-init`, with the steward declared as a service.
+/// The config for a cell whose PID 1 is `mini-init`, with the steward declared as a service.
 ///
 /// `port` is the declared vsock port. Passing a non-default one exercises the full
 /// `vmcell_steward_port=` path — emitted by the host cmdline builder, dialed by
-/// `VsockEndpoint::with_port`, and (as of this delta) actually **bound** by the guest.
-async fn boot_service_cell(
-    vmm: &vmcell::vmm::cloud_hypervisor::CloudHypervisor,
-    port: u32,
-) -> vmcell::MicroVm<vmcell::vmm::cloud_hypervisor::CloudHypervisor> {
-    let cfg = VmConfig::builder(
+/// `VsockEndpoint::with_port`, baked into the endpoint the QEMU health gate probes, and (as of this
+/// delta) actually **bound** by the guest.
+fn service_cell_cfg(port: u32) -> VmConfig {
+    VmConfig::builder(
         common::get_vmlinux(),
         RootfsSource::Erofs {
             image: common::get_rootfs(),
@@ -66,9 +72,16 @@ async fn boot_service_cell(
     .kernel_verbosity(KernelVerbosity::Verbose)
     .network_disabled()
     .build()
-    .expect("Service composes with a custom init — only Pid1+init is the contradiction");
+    .expect("Service composes with a custom init — only Pid1+init is the contradiction")
+}
 
-    common::start_vm(vmm, cfg).await
+/// Boots [`service_cell_cfg`] on Cloud Hypervisor, the primary backend every leg but the QEMU
+/// health-gate one runs on.
+async fn boot_service_cell(
+    vmm: &vmcell::vmm::cloud_hypervisor::CloudHypervisor,
+    port: u32,
+) -> vmcell::MicroVm<vmcell::vmm::cloud_hypervisor::CloudHypervisor> {
+    common::start_vm(vmm, service_cell_cfg(port)).await
 }
 
 /// Boots an ordinary `Pid1` cell: the twin every `Service` leg here is compared against.
@@ -537,6 +550,72 @@ async fn a_non_default_declared_port_is_actually_bound_by_the_guest() {
         default_port.is_err(),
         "the steward must bind ONLY the declared port 5100; something is still listening on the \
          default 5000"
+    );
+
+    vm.kill().await.unwrap();
+}
+
+/// **The declared port on QEMU: the one backend whose health gate actually dials it** (M1).
+///
+/// `MicroVm::start`'s post-boot control-plane gate is a no-op for CH and FC — their vsock is internal
+/// to the VMM and cannot half-initialize — and for a QEMU cell on the in-kernel transport. It probes
+/// exactly one shape: QEMU over the external `vhost-device-vsock` daemon, which is what a
+/// non-snapshotting cell gets (`VsockTransport::Auto`). That probe dials the endpoint baked at spawn,
+/// so the endpoint has to carry the DECLARED port; it carried the protocol default instead.
+///
+/// The failure was not a hang but a false negative: the daemon accepts the host `CONNECT` and never
+/// answers a port with no guest listener, so every probe ran out its budget, the VM was destroyed and
+/// re-spawned, and after `MAX_CONTROL_PLANE_RESPAWNS` `start()` returned "guest control plane did not
+/// come up after 4 re-spawns" — a healthy cell, killed four times and refused. So the assertion here
+/// is simply that `start()` RETURNS, plus an exec to prove the control plane the gate signed off on
+/// is really usable.
+///
+/// RED ON INVERSE: bake `vmcell::vmm::STEWARD_VSOCK_PORT` into `steward_endpoint`'s port again and
+/// this leg fails inside `start_vm` with the re-spawn error — the pre-fix behavior said out loud. The
+/// port is 5100 deliberately: with the default the buggy and correct hosts agree everywhere, which is
+/// why no `Service` leg in the tree noticed.
+///
+/// The KVM-free half of this gate lives in `vmcell-qemu`
+/// (`the_spawned_endpoint_carries_the_declared_steward_port` plus the one-composition-site scan),
+/// because it is what runs on a host with no QEMU binary.
+#[cfg(feature = "qemu")]
+#[tokio::test]
+#[ignore = "needs KVM"]
+async fn the_qemu_health_gate_probes_the_declared_port() {
+    let vmm = vmcell_qemu::Qemu::new(common::qemu_bin());
+    let cfg = service_cell_cfg(5100);
+    // The transport this leg needs, asserted rather than assumed: only the external-daemon shape
+    // probes at all, and `Auto` + no snapshotting is what selects it. A future default that flipped
+    // to the in-kernel device would make this leg vacuous instead of failing.
+    assert!(
+        !cfg.snapshotting
+            && matches!(
+                cfg.vsock_transport,
+                vmcell::config::VsockTransport::Auto
+                    | vmcell::config::VsockTransport::ExternalDaemon
+            ),
+        "this leg must run on QEMU's external vsock daemon — the only transport the health gate \
+         probes"
+    );
+
+    // `start_vm` panics on failure, and the failure IS the finding: a wedge-free guest refused after
+    // four re-spawns because the gate dialed 5000 while the steward bound 5100.
+    let mut vm = common::start_vm(&vmm, cfg).await;
+
+    // The control plane the gate signed off on must be genuinely usable, on the declared port.
+    assert_eq!(
+        sh_out(&mut vm, "echo qemu-declared-port").await,
+        "qemu-declared-port"
+    );
+
+    // Negative control, as in the CH leg: `dial_vsock` is placement-blind, so it reaches the guest's
+    // vsock device directly — nobody may be listening on the default port, which is what makes
+    // "5100 answered" mean the steward MOVED rather than that it bound both.
+    assert!(
+        vm.dial_vsock(vmcell_protocol::STEWARD_VSOCK_PORT, Duration::from_secs(5))
+            .await
+            .is_err(),
+        "the steward must bind ONLY the declared port 5100; something is still listening on 5000"
     );
 
     vm.kill().await.unwrap();

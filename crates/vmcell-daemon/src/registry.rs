@@ -85,6 +85,17 @@ impl VmSlot {
         self.status().state = state;
     }
 
+    /// Leaves `Snapshotting` when the write finishes — but never overwrites `Destroying`, which is a
+    /// **one-way** door: a destroy marks it in place and then waits for the handle lock this write
+    /// holds (see [`Registry::teardown_slot`]), so restoring `Ready` here would re-advertise a VM
+    /// whose teardown is already parked behind the write and let a new op in behind it.
+    fn leave_snapshotting(&self) {
+        let mut status = self.status();
+        if status.state == VmState::Snapshotting {
+            status.state = VmState::Ready;
+        }
+    }
+
     /// The one state predicate every op shares: `Conflict` (409) unless the VM is in `want`.
     fn require_state(&self, want: VmState, id: &VmId) -> DaemonResult<()> {
         let state = self.state();
@@ -304,12 +315,17 @@ impl Registry {
             return Ok(CreatedVm { info, exec: None });
         };
         let outcome = self.exec(&id, ExecRequestDto::new(cmd)).await;
-        if req.ephemeral {
-            // Tear down regardless of the exec result (the one-shot contract); a teardown error is
-            // logged, never masked over the exec outcome the caller asked for.
-            if let Err(e) = self.destroy(&id).await {
-                tracing::warn!(vm = %id, error = %e, "ephemeral teardown failed");
-            }
+        // Tear down when the request asked for a one-shot (regardless of the exec result — the
+        // `ephemeral` contract) AND whenever the exec itself FAILED, because `create` is one
+        // operation: the error reply carries no `CreateVmResponse`, so a kept VM would be a booted,
+        // resource-holding cell whose id the caller never received and cannot destroy (finding
+        // `create-leaks-the-vm-a-failed-inline-exec-abandons`). A command that RAN and exited
+        // non-zero is an `Ok` outcome and keeps its VM, as `ephemeral: false` asks.
+        // A teardown error is logged, never masked over the exec outcome the caller asked for.
+        if (req.ephemeral || outcome.is_err())
+            && let Err(e) = self.destroy(&id).await
+        {
+            tracing::warn!(vm = %id, error = %e, "teardown after inline exec failed");
         }
         Ok(CreatedVm {
             info,
@@ -416,7 +432,7 @@ impl Registry {
             Ok(handle) => {
                 slot.set_state(VmState::Snapshotting);
                 let r = handle.snapshot(&out_dir).await;
-                slot.set_state(VmState::Ready); // still live whether or not the snapshot succeeded
+                slot.leave_snapshotting(); // still live whether or not the snapshot succeeded
                 r
             }
             Err(e) => Err(e),
@@ -459,19 +475,53 @@ impl Registry {
         })
     }
 
-    /// Destroys a VM: removes it from the table (so no new op finds it), marks it `Destroying`, and
-    /// runs its graceful ordered teardown (`MicroVm::shutdown`).
+    /// Destroys a VM: marks it `Destroying` (so no new op is admitted), runs its graceful ordered
+    /// teardown (`MicroVm::shutdown`), and drops it from the table.
+    ///
+    /// An op racing a teardown is refused by the state, not by the VM's absence: it sees
+    /// `Destroying` and gets a prompt [`DaemonError::Conflict`] until the teardown completes, then
+    /// [`DaemonError::NotFound`]. The slot leaves the table **last**, with the handle lock already
+    /// held, so an in-flight snapshot's prefix stays pinned for the whole teardown — see the private
+    /// `teardown_slot`, the one ordered helper this and `shutdown_all` share.
     ///
     /// # Errors
     /// [`DaemonError::NotFound`] if there is no such VM; a teardown failure is propagated.
     pub async fn destroy(&self, id: &VmId) -> DaemonResult<()> {
-        let slot = {
-            let mut map = self.vms.lock().await;
-            map.remove(id)
-        }
-        .ok_or_else(|| DaemonError::NotFound(format!("no vm {id}")))?;
-        let mut inner = slot.inner.lock().await;
+        let slot = self.slot(id).await?;
+        self.teardown_slot(&slot).await
+    }
+
+    /// The one ordered per-slot teardown [`Registry::destroy`] and [`Registry::shutdown_all`] share
+    /// (AGENTS.md: teardown is ownership, through **one** ordered helper — never a second copy).
+    ///
+    /// All three steps are load-bearing, in this order:
+    ///
+    /// 1. mark `Destroying` **in place**, so a racing op sees a doomed VM rather than a `Ready` one;
+    /// 2. take the handle lock — which is where a teardown *waits*, for as long as an in-flight
+    ///    snapshot holds it (a multi-second guest-RAM write);
+    /// 3. remove the slot from `self.vms`, with the handle already in hand.
+    ///
+    /// Step 3 used to be step 1, and that **unpinned the VM for the whole of step 2**: the
+    /// delete-in-use scan reads pins — kernel, rootfs, extra disks, and the snapshot prefix being
+    /// written right now — only through this table, so a `DELETE /v1/artifacts/<prefix>` landing in
+    /// that window found a pin-free table, returned 204, and `remove_dir_all`'d the directory the VMM
+    /// was still writing into (finding `destroy-unpins-an-in-flight-snapshot-prefix`).
+    ///
+    /// Lock order here is `inner` → `vms`; no other path holds `vms` across an `await` on `inner`
+    /// (`slot()` drops the map guard before returning), so the pair cannot cycle.
+    ///
+    /// A teardown **cancelled** while parked (an HTTP client that disconnects) leaves the slot in the
+    /// table as `Destroying` with its handle intact: accounted for in `GET /v1/vms`, refusing new ops,
+    /// and completed by a retried `DELETE` or by `shutdown_all` — recovery stays retryable rather than
+    /// silently dropping a live VM out of the registry.
+    async fn teardown_slot(&self, slot: &Arc<VmSlot>) -> DaemonResult<()> {
         slot.set_state(VmState::Destroying);
+        let mut inner = slot.inner.lock().await;
+        // `None` is legitimate: a concurrent destroy of the same id got here first. Ids are minted
+        // once and never reused, so the entry under this id can only ever be this slot.
+        if self.vms.lock().await.remove(&slot.id).is_none() {
+            tracing::debug!(vm = %slot.id, "slot already removed by a concurrent teardown");
+        }
         match inner.handle.take() {
             Some(h) => h.shutdown().await,
             None => Ok(()),
@@ -522,16 +572,12 @@ impl Registry {
     /// `MicroVm::shutdown`; independent VMs have no ordering constraint between them. (A hard kill
     /// skips this and relies on the next boot's orphan sweep.)
     pub async fn shutdown_all(&self) {
-        let slots: Vec<Arc<VmSlot>> = {
-            let mut map = self.vms.lock().await;
-            map.drain().map(|(_, s)| s).collect()
-        };
+        // CLONE the slot list rather than draining the table: each slot leaves it through
+        // `teardown_slot`, which keeps its pins visible until its handle lock is held (a VM still
+        // writing a snapshot when the daemon is asked to stop is exactly that case).
+        let slots: Vec<Arc<VmSlot>> = self.vms.lock().await.values().cloned().collect();
         for slot in slots {
-            let mut inner = slot.inner.lock().await;
-            slot.set_state(VmState::Destroying);
-            if let Some(h) = inner.handle.take()
-                && let Err(e) = h.shutdown().await
-            {
+            if let Err(e) = self.teardown_slot(&slot).await {
                 tracing::warn!(vm = %slot.id, error = %e, "VM shutdown during daemon teardown failed");
             }
         }
@@ -621,6 +667,7 @@ fn splitmix64(mut x: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dto::NetMode;
     use async_trait::async_trait;
     use std::sync::atomic::AtomicUsize;
 
@@ -653,6 +700,10 @@ mod tests {
         vmid: u32,
         shutdowns: Arc<AtomicUsize>,
         snapshot_behavior: SnapshotBehavior,
+        /// Fails every `exec` with a transport-shaped error — the fault a `create` carrying an
+        /// inline command must not leak its VM through. A non-zero *exit* is a different thing (an
+        /// `Ok` outcome), so this arm is the only way to drive the error path.
+        fail_exec: bool,
     }
 
     #[async_trait]
@@ -661,6 +712,11 @@ mod tests {
             self.vmid
         }
         async fn exec(&mut self, req: ExecRequestDto) -> DaemonResult<ExecOutcomeDto> {
+            if self.fail_exec {
+                return Err(DaemonError::Internal(
+                    "fake exec: the steward connection died mid-call".to_string(),
+                ));
+            }
             Ok(ExecOutcomeDto::from_bytes(
                 0,
                 req.argv.join(" ").as_bytes(),
@@ -722,6 +778,7 @@ mod tests {
         next_vmid: AtomicU64,
         shutdowns: Arc<AtomicUsize>,
         snapshot_behavior: SnapshotBehavior,
+        fail_exec: bool,
         launches: LaunchLog,
     }
 
@@ -733,6 +790,7 @@ mod tests {
                 vmid: self.next_vmid.fetch_add(1, Ordering::SeqCst) as u32,
                 shutdowns: self.shutdowns.clone(),
                 snapshot_behavior: self.snapshot_behavior.clone(),
+                fail_exec: self.fail_exec,
             }))
         }
     }
@@ -754,6 +812,15 @@ mod tests {
     fn registry_capturing(
         snapshot_behavior: SnapshotBehavior,
     ) -> (Registry, Arc<AtomicUsize>, LaunchLog, tempfile::TempDir) {
+        registry_faulty(snapshot_behavior, false)
+    }
+
+    /// The one registry builder, with the fake's whole fault menu: the snapshot behavior plus
+    /// whether every `exec` fails.
+    fn registry_faulty(
+        snapshot_behavior: SnapshotBehavior,
+        fail_exec: bool,
+    ) -> (Registry, Arc<AtomicUsize>, LaunchLog, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
         let artifacts =
             ArtifactStore::open(dir.path().join("artifacts"), 1 << 20).expect("artifacts");
@@ -765,6 +832,7 @@ mod tests {
             next_vmid: AtomicU64::new(1),
             shutdowns: shutdowns.clone(),
             snapshot_behavior,
+            fail_exec,
             launches: launches.clone(),
         };
         let reg = Registry::new(Box::new(launcher), artifacts, 0xdead_beef);
@@ -879,6 +947,107 @@ mod tests {
             ),
             "a missing extra-disk artifact must fail loud"
         );
+    }
+
+    // §11.5, the snapshot-eligibility refusal at the DAEMON's own boundary: `snapshotting: true`
+    // beside a net mode that attaches a vhost-user device is a 400 before any launch, naming the net
+    // mode the client typed — deferring to `VmConfigBuilder` would instead name a vhost-user device
+    // the client never mentioned, and would report a client error as a launch failure. Neither this
+    // guard nor `NetMode::snapshot_eligible` had a test anywhere (finding T5).
+    //
+    // RED on the inverse: delete the guard from `create` (or invert the predicate) — the request
+    // reaches the launcher, which the empty-log assertion catches.
+    #[tokio::test]
+    async fn snapshotting_on_an_ineligible_net_mode_is_refused_at_the_daemon_boundary() {
+        let (reg, _s, log, _d) = registry_capturing(SnapshotBehavior::Normal);
+        let err = reg
+            .create(
+                create_req()
+                    .with_net(NetMode::Unprivileged)
+                    .with_snapshotting(true),
+            )
+            .await
+            .expect_err("the smoltcp NAT is a vhost-user device: not snapshot-eligible");
+        assert_eq!(
+            err.kind().status_code(),
+            400,
+            "a client error, refused before the launch: {}",
+            err.message()
+        );
+        assert!(
+            err.message().contains("Unprivileged"),
+            "the refusal must name the net mode the CLIENT typed: {}",
+            err.message()
+        );
+        assert!(
+            log.lock().expect("log").is_empty(),
+            "a refused request must never reach the launcher"
+        );
+
+        // Positive control 1: the same net mode without `snapshotting` boots — the refusal is about
+        // the pair, not about the NAT.
+        reg.create(create_req().with_net(NetMode::Unprivileged))
+            .await
+            .expect("the unprivileged NAT boots fine when no snapshot is asked for");
+        // Positive control 2: `snapshotting` with either eligible mode boots — the refusal is about
+        // the net mode, not about `snapshotting`.
+        for net in [NetMode::None, NetMode::Privileged] {
+            reg.create(create_req().with_net(net).with_snapshotting(true))
+                .await
+                .unwrap_or_else(|e| panic!("{net:?} is snapshot-eligible: {}", e.message()));
+        }
+        let specs = log.lock().expect("log");
+        assert_eq!(
+            specs.len(),
+            3,
+            "every positive control reached the launcher"
+        );
+        assert!(
+            specs.iter().filter(|s| s.snapshotting).count() == 2,
+            "the accepted `snapshotting` flag reaches the launcher"
+        );
+    }
+
+    // A `create` whose inline command fails at the TRANSPORT level (not a non-zero exit, which is an
+    // `Ok` outcome) must leave no VM behind: the error reply carries no `CreateVmResponse`, so a kept
+    // VM is a booted, resource-holding cell whose id the caller never received and cannot destroy
+    // (finding `create-leaks-the-vm-a-failed-inline-exec-abandons`).
+    //
+    // RED on the inverse (tear down only `if req.ephemeral`): the registry still owns the VM and
+    // `shutdowns` stays 0.
+    #[tokio::test]
+    async fn a_create_whose_inline_exec_fails_leaves_no_vm_behind() {
+        let (reg, shutdowns, _log, _d) = registry_faulty(SnapshotBehavior::Normal, true);
+        let mut req = create_req();
+        req.command = Some(vec!["echo".into(), "hi".into()]);
+        req.ephemeral = false; // the caller asked to KEEP the VM
+        let err = reg
+            .create(req)
+            .await
+            .expect_err("the failing exec must surface");
+        assert!(matches!(err, DaemonError::Internal(_)), "got {err:?}");
+        assert!(
+            reg.is_empty().await,
+            "a create that returns an error must own no VM: its id never reached the caller"
+        );
+        assert_eq!(
+            shutdowns.load(Ordering::SeqCst),
+            1,
+            "the abandoned VM is torn down through the ordered teardown, not leaked"
+        );
+
+        // Positive control: the same non-ephemeral create with a WORKING exec keeps its VM, so the
+        // teardown above is about the failure and not about `command` itself.
+        let (reg, shutdowns, _log, _d) = registry_faulty(SnapshotBehavior::Normal, false);
+        let mut req = create_req();
+        req.command = Some(vec!["echo".into(), "kept".into()]);
+        let created = reg.create(req).await.expect("create + inline exec");
+        assert_eq!(
+            created.exec.expect("outcome").stdout().expect("decode"),
+            b"echo kept"
+        );
+        assert_eq!(reg.len().await, 1, "a successful inline exec keeps its VM");
+        assert_eq!(shutdowns.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -1079,6 +1248,94 @@ mod tests {
         reg.delete_artifact_if_unused("snap-live")
             .await
             .expect("the prefix is deletable once the write is done");
+        assert!(!prefix_dir.exists(), "prefix gone after the delete");
+    }
+
+    // The same pin, now against a DESTROY parked on the handle lock (finding
+    // `destroy-unpins-an-in-flight-snapshot-prefix`): a teardown waits for the in-flight snapshot to
+    // release `inner`, and for that whole wait the VM — and therefore its prefix pin — must stay
+    // visible to the delete-in-use scan, which reads pins only through `self.vms`. A racing op is
+    // refused by the `Destroying` STATE rather than by the VM's absence, promptly.
+    //
+    // RED on the pre-fix order (remove from `self.vms` before awaiting `inner`): the scan finds a
+    // pin-free table, the delete returns Ok and `remove_dir_all`s the directory the backend is still
+    // writing into — the `InUse` assertion fails, and so does the snapshot's read-back.
+    #[tokio::test]
+    async fn a_destroy_parked_on_the_handle_lock_keeps_the_snapshot_prefix_pinned() {
+        let gate = Arc::new(SnapshotGate::default());
+        let (reg, shutdowns, _d) = registry_with(SnapshotBehavior::Blocked(gate.clone()));
+        let reg = Arc::new(reg);
+        let created = reg.create(create_req()).await.expect("create");
+        let prefix_dir = reg.artifacts().dir().join("snap-doomed");
+        let budget = std::time::Duration::from_millis(500);
+
+        let snap_reg = reg.clone();
+        let snap_id = created.info.id.clone();
+        let snap = tokio::spawn(async move { snap_reg.snapshot(&snap_id, "snap-doomed").await });
+        gate.entered.notified().await; // the guest-RAM write holds `inner`
+
+        let kill_reg = reg.clone();
+        let kill_id = created.info.id.clone();
+        let kill = tokio::spawn(async move { kill_reg.destroy(&kill_id).await });
+        // Rendezvous on the teardown having CLAIMED the slot: `Destroying` with the fix, gone
+        // outright with the pre-fix removal. Either way it cannot proceed past the held handle lock,
+        // so the assertions below run inside the window this finding is about.
+        tokio::time::timeout(budget, async {
+            loop {
+                match reg.get(&created.info.id).await {
+                    Ok(info) if info.state != VmState::Destroying => tokio::task::yield_now().await,
+                    _ => return,
+                }
+            }
+        })
+        .await
+        .expect("the destroy must claim the slot promptly rather than queue invisibly");
+
+        let err = reg
+            .delete_artifact_if_unused("snap-doomed")
+            .await
+            .expect_err("a prefix being written stays pinned while its VM is torn down");
+        assert!(matches!(err, DaemonError::InUse(_)), "got {err:?}");
+        assert_eq!(err.kind().status_code(), 409);
+        assert!(
+            prefix_dir.is_dir(),
+            "the refused delete must leave the in-flight snapshot dir"
+        );
+
+        // A racing op is refused by the state, and promptly — it must not queue behind the teardown.
+        let exec_err = tokio::time::timeout(
+            budget,
+            reg.exec(&created.info.id, ExecRequestDto::new(vec!["echo".into()])),
+        )
+        .await
+        .expect("an op against a doomed VM must not queue behind its teardown")
+        .expect_err("a VM being torn down accepts no further ops");
+        assert!(
+            matches!(exec_err, DaemonError::Conflict(_)),
+            "a doomed VM is a 409 while the teardown runs, got {exec_err:?}"
+        );
+
+        gate.release.notify_one();
+        let info = snap
+            .await
+            .expect("join snapshot")
+            .expect("the snapshot the delete could not touch completes");
+        assert_eq!(
+            info.files,
+            vec!["state.json".to_string()],
+            "its bytes were never removed under it"
+        );
+        kill.await.expect("join destroy").expect("destroy");
+        assert_eq!(shutdowns.load(Ordering::SeqCst), 1, "the teardown ran once");
+        assert!(
+            reg.is_empty().await,
+            "the slot leaves the table WITH the teardown"
+        );
+
+        // Positive control: with the VM gone the pin is gone, so the same delete now succeeds.
+        reg.delete_artifact_if_unused("snap-doomed")
+            .await
+            .expect("an unpinned prefix is deletable");
         assert!(!prefix_dir.exists(), "prefix gone after the delete");
     }
 

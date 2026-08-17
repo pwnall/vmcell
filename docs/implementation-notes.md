@@ -742,10 +742,25 @@ Delta 9/11 notes above were corrected in the same pass. Justified deviations rec
   snapshot root is inside the tamper hash (previously only per-entry modes were folded). Gate:
   `test_hash_output_folds_root_dir_mode`.
 
-- **(Accepted limitation) tar2erofs does not preserve PAX `SCHILY.xattr` records** (incl.
-  `security.capability`). Rationale: the guest agent and every in-guest `exec` run as root (§4.2), so
-  file capabilities are moot; the erofs `Node`/`XattrSpec` plumbing exists but is unused. Pinned by
-  `tar2erofs::tests::test_pax_xattrs_are_not_preserved`. Retire if xattr passthrough is implemented.
+- **(RETIRED 2026-08-17 — the entry met its own retirement condition) tar2erofs does not preserve
+  PAX `SCHILY.xattr` records.** It ended "Retire if xattr passthrough is implemented"; v33 delta 7
+  implemented it, so the limitation is empirically disproven and what survives is a pointer.
+  `XattrPolicy` is now a per-artifact parameter of the one inject+pack tail: the default `Strip`
+  drops every record (which is what keeps the canonical artifact byte-identical), and `Preserve`
+  folds each one into the erofs namespace index `mkfs.erofs` uses — through the `Node`/`XattrSpec`
+  plumbing this entry called unused. The named test moved with the behavior, which is the drift
+  docs/90 D8 reports: it is now the pair
+  `tar2erofs::tests::pax_xattrs_are_stripped_under_the_default_policy` /
+  `…_preserved_under_the_preserve_policy` (`crates/vmcell/src/artifact/tar2erofs.rs:1339,1361`), and
+  the `Strip` leg is no longer waiting to be retired — it is what pins the canonical bytes. See
+  "v33 delta 7" below for the as-built record, including the one route where `Preserve` is refused
+  rather than honored (`mkfs.ext4 -d <tarball>` silently drops every namespace but
+  `security.capability`, so the ext4 producer fails loud naming the member and the attribute).
+  **The neighbour below was spot-checked in the same pass and stands**: the opaque-whiteout
+  assumption is still the shipped behavior (`tar2erofs.rs:404-419` clears the parent subtree in the
+  flat merged map at marker-processing time), its named test
+  `tar2erofs::tests::test_opaque_marker_ordering_contract` still exists under that name (`:1799`),
+  and its retirement condition — per-layer whiteout application — has not landed.
 
 - **(Accepted assumption) tar2erofs opaque-whiteout (`.wh..wh..opq`) is applied against the flat
   merged map at marker-processing time, not per-layer**: a same-layer child written *before* the
@@ -4646,7 +4661,29 @@ Writability would have scoped to `Service`/`None`, making delta 8 depend on delt
 surviving motivation is the real one**: POSIX-completeness — device nodes, xattrs, ACLs — and
 workloads asserting on ext4 semantics, which is exactly what the mount-and-diff gate measures. The
 reasoning is written onto `RootfsSource::Block` and `root_device_read_only`, so a later reader finds
-it at the type. §4.7's sentence should be corrected on the next reissue.
+it at the type.
+
+**The writable-root claim lived at THREE design sites, not one** (docs/90 D10). This entry named only
+§4.7's, and a reissue that fixes one and leaves two is exactly the failure the widening prevents, so
+all three are named here — with what each now says, since all three were corrected together on
+2026-08-17:
+
+* **§4.7**, the producer's own pitch, was "workloads that need a **writable**, POSIX-complete root".
+  It now pitches POSIX-completeness and says outright "**Not a writable one:** the ext4 root is
+  attached and mounted **read-only**, like the erofs one", naming `root_device_read_only` as the one
+  law and keeping the reasoning above for why writability was declined.
+* **§4.6**, the per-backend extra-disk wiring bullet, called CH's sector-0 auto-detect bug one that
+  "also lurked on the writable `Block` rootfs path". It now scopes that to the past — the bug "lurked
+  on the `Block` rootfs path **back when that path attached the root read-write**; it is read-only on
+  every variant now" — so the historical measurement keeps its record without asserting a present
+  writability, and it says which disk kind can still meet the bug (a writable **extra** one).
+* **§5.3**, the custom-init paragraph, told a caller that a custom-init VM "typically pairs with a
+  writable `Block` rootfs (§4.7's producer fills it)" — the one of the three that sent a reader to
+  build something the product refuses. It now states the true rule for both variants ("A custom init
+  has no writable `/` under **either** root variant") and gives the honest pairings: its own tmpfs, a
+  writable **extra** disk, or a read-write share.
+
+The authority in all three cases is `RootfsSource::root_device_read_only`, gated in both directions.
 
 **Booting `RootfsSource::Block` for the first time in this repository's history found two real
 defects.** The variant had been consumable since v22 with no producer, so no test had ever booted
@@ -4797,6 +4834,12 @@ Every suite was executed on this host during the review, not presumed: `just ci`
 `test-unprivileged` 4/4, `test-daemon` 16/16, `test-validator` 4/4, `test-crosvm` 30/30,
 `test-systemd` 2/2, nine capability skips matching the recorded roster.
 
+**The fix pass landed the next day.** Entries below that it superseded carry a dated superseding note
+at their own end; the two whose shape was already right record that the justification now lives in the
+ledger, the design and the README as well, which is what was missing. The as-built record of what was
+built — and where the shipped fix deliberately deviates from what docs/90 directed — is the section
+that follows this one ("As built: the docs/90 fix waves").
+
 ## Recorded (justified): `pack_rootfs_with_injection` is the general pack tail, and `pack_erofs_with_injection` is its erofs door
 
 Delta 8 needed the one inject+pack tail to emit two formats. Rather than widen the §10.4-listed
@@ -4813,7 +4856,18 @@ surprise. What was missing is the record: the new entry point appears in **neith
 of it, so the only route to an ext4 artifact through the pack tail is a public function the contract
 does not name. Adding a `pub fn` is additive, so `cargo semver-checks` is silent by construction —
 which is the whole reason §10.4 asks for a ledger entry rather than trusting the tool. This entry is
-that record; the ledger and §10.4 line are named as fixes in docs/90.
+that record.
+
+**The record is no longer only here (2026-08-17).** The `0.19.0 → 0.20.0` edge in
+`crates/vmcell/Cargo.toml` now carries the split — ledgered late, and saying so — naming
+`pack_rootfs_with_injection` as "the entry point to call from here on" and
+`pack_erofs_with_injection` as the erofs-only door onto it; and README's contract-surface list names
+the pair the same way, with the trade stated (a caller packing erofs needs no edit; a caller passing
+`Ext4` to the door gets a typed refusal). The shape recorded above is unchanged — this is the missing
+record arriving, not a decision moving. What no gate can supply is the part that was missing: a new
+`pub fn` inside an existing edge is invisible to `cargo semver-checks` *and* to
+`tests/contract_ledger.rs`, which gates the chain's shape and never an entry's content, and says so
+in its own header.
 
 ## Recorded (justified): there is no `build_labelled_rootfs` / `build_labelled_handler` — the labelled constructors are the shipped shape
 
@@ -4834,8 +4888,19 @@ names/signatures are advisory; the behavior and its gate bind; a shift is record
 delta 6 landed the behavior and its gates and did not record the shift. This is that record.
 
 The consequence worth stating: a git-dep consumer building a labelled rootfs today writes more code
-than one building a labelled kernel, and §10.4 tells it to call a function that is not there. The
-doc correction is named in docs/90.
+than one building a labelled kernel, and §10.4 tells it to call a function that is not there.
+
+**Closed on the documentation side (2026-08-17), and the record is no longer only here.** All three
+places a consumer or a maintainer looks now name the shipped shape: §10.4's contract list names "the
+**labelled rootfs/handler stage constructors** — `RootfsStage::labelled(label)` and
+`GuestToolsStage::labelled(label, source)`"; §10.5's "where selection lives" paragraph records the
+second shift explicitly — that there is deliberately no `build_labelled_rootfs`/`…_handler` thin
+assembler, with the reason (a kernel build is a fixed two-stage assembly; a rootfs or handler build
+composes with injections, extra files, a pack format and an xattr policy, so an assembler would either
+hide those or grow a parameter per knob) and a pointer back to this file; and README's list says the
+same, "**rather than as free functions**". So the register's convention is satisfied at last — the
+behavior bound, the shift is recorded, and nothing sends a consumer to a symbol that does not exist.
+The constructors stay.
 
 ## Recorded (justified): delta 3's battery budget is the conformance battery's, not `validate()`'s
 
@@ -4853,8 +4918,25 @@ battery R4 added. `validate()`'s per-check deadlines are unchanged and each one 
 What is not defensible is §17 reading as though the older entry point were fixed: it is the
 documented downstream conformance route (§9.1, §10.4), a `Level::Full` run boots several VMs
 sequentially, and a wedged boot there is still bounded only by the sum of the per-check deadlines.
-Recorded here so the gap is not lost when §17's line is read as closed; docs/90 names both the doc
-correction and the one-field code fix.
+Recorded here so the gap is not lost when §17's line is read as closed.
+
+**SUPERSEDED 2026-08-17 by a later decision, not by disproof.** The fix pass took the one-field
+option: `ValidationOptions` now carries `run_budget: Option<Duration>`, defaulting to
+`Some(DEFAULT_RUN_BUDGET)` (20 minutes), and it bounds the **whole** run across every level
+(`crates/vmcell-artifact-validator/src/lib.rs`). Per-check deadlines are untouched and each still
+fails loud; exceeding the budget is `Error::Timeout` naming the budget, the level that outran it and
+the checks that completed first — never a hang and never a green report with its tail missing. `None`
+opts out explicitly, for a caller that bounds the run itself. So the scoping recorded above was
+defensible and is no longer the shipped shape; what stays true is the reason it was defensible. §17
+now records the gap as closed **by its own field, not by delta 3's**, and §10.4 records the addition as
+the breaking, ledger-owing edge it is. **The two budgets stay two constants on purpose** —
+`DEFAULT_RUN_BUDGET` and `conformance::DEFAULT_BATTERY_BUDGET` bound different rosters, and one const
+for both would silently re-budget one when the other's roster grew.
+
+One design sentence outside §17 still states the old fact and is the same one-claim-three-sites shape
+as D10, one document over: **§5.6's** toolkit paragraph says "there is deliberately **no overall
+wall-clock budget on `validate()`**", which the field above makes false. Noted here rather than fixed
+because §17 and §10.4 were the two the fix pass was directed at.
 
 ## Recorded (AGENTS rule 4 — "cover it or record it"): the shipped-knob live-coverage gap
 
@@ -4890,6 +4972,74 @@ correctness risk to the default path. The two worth closing first are `ksm_merge
 KVM-free serialization assertion on the CH payload, the `CH_RAW_IMAGE_TYPE` shape, costs nothing)
 and a `cpu_max_pct` leg (the one limit whose enforcement mechanism differs from memory's).
 
+**SUPERSEDED IN PART, 2026-08-17 — the true remaining state, and the legs that now exist.** The fix
+pass closed most of this enumeration, so the list above is history; what follows is the record rule 4
+actually asks for.
+
+*Closed, each with the leg that closes it:*
+
+- **`cpu_max_pct`** — `metrics_cpu_quota`, a matrix leg
+  (`crates/vmcell/tests/metrics_limits.rs`): `cpu.max` reads back the exact `(quota, period)` pair a
+  25% request renders to, **and** the same in-guest load the un-throttled leg runs measures inside a
+  band whose ceiling sits below that leg's floor — so the two legs cannot both be green on a host
+  where the quota is a no-op.
+- **`pids_max`** — `metrics_pids_max`, matrix. The subject is the **host** tasks in the VM's slice,
+  not the guest's processes, so the load is a helper shell that moves itself into the slice and forks
+  until the kernel refuses; the data plane is `pids.events`' `max` counter going 0 → nonzero, with the
+  booted VM's own `max 0` as the positive control. The cap is 64, and the figure is measured, not
+  guessed: `pids.peak` on a booted VM is 9/4/7/**18** for CH/FC/QEMU/crosvm and transient device
+  activation runs higher, which reddened a 32 once in four runs.
+- **`ConsoleMode::VirtioConsole`** — `virtio_console`, matrix (`crates/vmcell/tests/nested_virt.rs`),
+  two data-plane assertions for the two halves of the desync it guards: the guest's *active* console
+  is `hvc0` (`/sys/class/tty/console/active`, so the cmdline token took effect) and a marker the guest
+  writes to `/dev/console` arrives in the host's `serial.log` (so the attached device sinks there).
+  `require_cap!` makes the FC skip honest, and the KVM-free honesty pin beside it is what keeps that
+  skip from going dark. Recorded at the leg: CH, QEMU **and crosvm** pass it; crosvm's
+  `--serial hardware=virtio-console` claim previously rested on an arg-builder unit test alone.
+- **`ksm_mergeable`** — `ch_memory_payload_couples_ksm_mergeable_to_unshared_memory`
+  (`crates/vmcell/src/vmm/cloud_hypervisor.rs:1217`), the KVM-free serialization pin this entry asked
+  for, both ways. The arm also moved out of `create()`'s body into a named function so the string
+  `ksm` appears in the file at all.
+- **`DiskIoLimit::iops`** — `extra_block_iops_throttle`, matrix
+  (`crates/vmcell/tests/extra_block.rs`): two disks in one VM, one un-throttled as the in-VM baseline,
+  and 300 4 KiB **`iflag=direct`** reads so the guest page cache cannot coalesce 300 requests into a
+  handful and hide a 50-IOPS cap. Recorded at the leg: CH 10 ms/5067 ms, FC 9 ms/4362 ms,
+  QEMU 13 ms/5882 ms; crosvm records `SKIP crosvm disk_io_throttle`.
+- **The daemon's `ExtraDiskSpec.io_limit`** — `extra_disk_io_limit_over_api_throttles_the_guest_read`
+  (`crates/vmcelld/tests/integration.rs`), same self-calibrating shape over REST, which is what makes
+  the DTO → `vmcell::DiskIoLimit` translation observable (swapping `DiskIoLimit::new`'s two positional
+  arguments used to keep every gate green).
+- **`NetMode::snapshot_eligible`** and the daemon's snapshot-ineligibility refusal (docs/90 T5) —
+  `snapshotting_on_an_ineligible_net_mode_is_refused_at_the_daemon_boundary`
+  (`crates/vmcell-daemon/src/registry.rs:961`), KVM-free with its positive controls, plus
+  `snapshot_eligible_is_exactly_the_net_modes_with_no_vhost_user_device` on the predicate itself.
+- **The confinement state of a running VMM** (docs/90 T6) — `crates/vmcell/tests/vmm_confinement.rs`,
+  which resolves the live CH pid through `naming::scratch_dir_name` (never a test-local `format!`)
+  and reads `/proc/<pid>/status`, with a `VmmSeccomp::Disabled` boot as the red-on-inverse control.
+  Everything the `/bin/cat` stand-in cannot reach — CH re-arming handlers, installing its own filters,
+  spawning vcpu/api threads — happens after the stand-in's last assertion.
+
+*Still open, and now stated precisely:*
+
+- **`io_max`'s enforcement half.** What landed is the **refusal** path:
+  `requested_io_max_is_refused_loudly_and_never_silently_unenforced` proves a requested `io.max` that
+  cannot be applied refuses the boot rather than reporting isolation the VM does not have, with the
+  same config minus `io_max` as the positive control, and it asserts *which* of two errors specifically
+  — decided by a measured host fact (`io` in the parent's `cgroup.controllers`) rather than "either
+  error will do". **Which arm runs is measured, and it is the not-delegated one**: a default systemd
+  *user* session delegates `cpu memory pids` and not `io`, all the way down, so the kernel's own
+  `ENODEV` verdict on a bad `major:minor` — the sharp half this entry named — stays unobserved on this
+  host class and that arm is written-but-dead here. And no leg anywhere measures an `io.max` actually
+  *throttling* a guest, because the controller it needs is not delegated to reach.
+- **`Timeouts::low_latency()` / `throughput()` as presets.** No suite boots either one. What the fix
+  pass added is the property the presets differ in: `crates/vmcell/tests/guest_tuning.rs` boots a cell
+  whose `guest_rebind_idle` is 16× the default and catches the guest honoring it (see the next entry),
+  and `every_shipped_timeouts_profile_is_honored_by_the_guest_verbatim` pins KVM-free that each
+  shipped preset's values sit inside the shared clamp window, so a preset would be honored verbatim
+  rather than clamped. The other fields of a preset still reach no live boot.
+- **`RestoreMode::Eager` / `Lazy`.** Unchanged: refusal and argv assertions only; no gate performs a
+  restore under either mode.
+
 ## Recorded: the guest tuning-token channel has no falsifiable end-to-end gate
 
 `vmcell_accept_poll_ms=` / `vmcell_rebind_idle_ms=` are hand-spelled on both sides of the process
@@ -4905,11 +5055,43 @@ suite stays green — the steward falls back to exactly the numbers the host mea
 The user-visible consequence is narrow but real: a caller selecting `low_latency()` (5 ms / 150 ms)
 gets the compiled 20 / 250 cadence, and nothing reports that the request was ignored — including the
 post-restore re-bind window, which bounds how long a restored guest stays unreachable after CH
-re-creates the vhost-vsock device. Recorded rather than fixed because the cheap half (move the two
-token names into `vmcell-protocol` as consts both crates import, the `STEWARD_VSOCK_PORT`
-precedent) removes the *spelling* drift but not the unfalsifiability; only a live boot under a
-non-default profile that reads the honored cadence back does that, and it is the same boot the entry
-above already asks for.
+re-creates the vhost-vsock device.
+
+**SUPERSEDED 2026-08-17: both halves landed, and one narrow half of the unfalsifiability remains.**
+
+- **The spelling drift is closed at compile time.** Each token is now **one** value in
+  `vmcell-protocol` — the crate both sides link — carrying the four facts the two ends must agree on
+  together: `TuningToken { token, default, floor, ceiling }`, as `STEWARD_ACCEPT_POLL` and
+  `STEWARD_REBIND_IDLE`. The host renders through `TuningToken::render` and derives
+  `Timeouts::default()`'s values and `clamped()`'s floors from the same consts
+  (`crates/vmcell/src/config.rs:385,409,473`); the guest's fallbacks are `= token.default` and its
+  untrusted-input parse takes the floor and ceiling from the same place
+  (`crates/vmcell-steward/src/options.rs:137,150,213`). So "the guest's fallback equals the host's
+  default" is now true **by construction** rather than by coincidence — which is the point worth
+  keeping: the two being equal was never the defect, and making them deliberately different would turn
+  an omitted token into a silent behavior change for every already-packed rootfs. The `token` string is
+  a compatibility surface (the parser is baked into `rootfs.erofs`), so it is pinned as a literal by
+  `the_tuning_tokens_are_the_wire_spelling` in `vmcell-protocol` while renaming the *const* is a
+  compile-time move on both sides at once.
+- **The unfalsifiability is closed for the re-bind window**, by a live boot rather than a shared const:
+  `crates/vmcell/tests/guest_tuning.rs` boots a `Pid1` cell whose only non-default property is
+  `guest_rebind_idle` at 16× the default and **counts the distinct `socket:[…]` targets under
+  `/proc/1/fd`** over a fixed in-guest sampling window — a fresh `bind` gets a fresh inode, so the
+  count *is* the honored cadence, read out of the kernel's own bookkeeping with no guest-side code
+  added for the test (law C6's spirit). Paired in one test against a default-window cell on the same
+  rootfs, because the number alone means nothing: a guest that ignores the token produces the *same*
+  count for both, which is the pre-fix behavior said out loud. The elapsed seconds are asserted too,
+  so a `sleep` that did not sleep cannot make the low-churn half pass vacuously. The serial log is
+  deliberately not the observable — the steward logs at `info`, the guest carries no `RUST_LOG`, and
+  `tracing_subscriber` keeps everything below `error` off the console, the trap the declared-port leg
+  already fell into.
+- **What remains: `guest_accept_poll` has no live observation.** Its cadence is not the connect
+  latency — the accept path blocks in `poll(2)` and wakes sub-millisecond — so it is load-bearing only
+  on the failure paths (the `bind` retry, and everything `recovery_backoff` rate-limits), and no live
+  suite drives those. Its spelling, default, floor, ceiling and rendering are all shared and pinned;
+  what is unobserved is a guest *acting* on a non-default value of it. Left open deliberately: the boot
+  that would close it has to induce a steward failure path, which is a different fixture from the one
+  above.
 
 ## Recorded: `review-preflight-priv.sh`'s READY answers "can the suites run", not "is the runner current"
 
@@ -4932,6 +5114,422 @@ current. The exposure is the local reviewer path, which AGENTS rule 5 sends thro
 and the v5 handoff's reproduction sequence omits the bless step. No behavioral difference between
 the two binaries has been demonstrated — the risk is that the live gate on the runner's *own*
 posture (`the_bounding_set_is_shrunk_to_exactly_the_delivered_caps`) certifies whichever binary
-happens to be blessed. docs/90 names the fix: give the preflight a third verdict for a stale stamp,
-mapping onto the existing BLOCKED-ON-BLESS exit, and add the bless step to the documented sequence.
+happens to be blessed.
 
+**SUPERSEDED 2026-08-17 — the preflight now answers both questions, and the answer is clearable.**
+`scripts/review-preflight-priv.sh` gained a **blessing-freshness** verdict beside its capability and
+mode checks, and it decides freshness the way a non-interactive session can: sha256 of the stable copy
+against the `.blessed` stamp, plus `find -newer` over the runner's whole in-tree source closure
+(`crates/vmcell-test-runner/src`, `crates/vmcell-privilege/src`, `Cargo.lock` — overridable through
+`VMCELL_RUNNER_SRC_PATHS`, and a root that does not exist is skipped so a partial checkout cannot make
+the probe fail). No cargo, so it takes no build lock. A stale blessing maps onto the **existing**
+BLOCKED-ON-BLESS exit (2) rather than a new verdict, so nothing that consumes the exit code needs to
+learn a third one — the agent contract is unchanged: block and ask for one `just bless`, never
+downgrade to static-only on a capable host.
+
+**One anti-wedge rides with it, and is the deviation worth naming.** The freshness probe's inputs are
+timestamps, and `just bless`'s own hash check legitimately takes a *skip* path when the runner's bytes
+are unchanged — which would leave the copy un-re-dated and the preflight blocking forever on a
+blessing it cannot clear. So `bless` `touch`es the stable copy and its stamp at both exits where it
+*knows* the hash matches (`redate_for_freshness_proxy`). That is deliberately a timestamp-only move: it
+never re-runs `setcap` and never changes what the copy contains, so it cannot manufacture a blessing —
+it only lets the one command that authoritatively knows the verdict is spurious clear it. The
+anti-wedge has its own gate, a harness that runs the real recipe against the real preflight in fixture
+repos (`scripts/test-bless-redates-blessed-copy.sh`) and asserts this checkout's own `.vmcell-bin` was
+not touched.
+
+The measurement above stands as the record of what was true on 2026-08-16, and the documented
+reproduction sequence in the rubric now carries the bless step. `docs/historical/89-claude-handoff-notes-v5.md`
+is deliberately left as written — see the docs/90 fix-wave section below for why a retired handoff is
+not corrected.
+
+
+---
+
+# As built: the docs/90 fix waves (2026-08-17)
+
+Three lanes landed the code half of `docs/90` in one pass: the correctness findings, the gates that
+could not go red, and the coverage legs. **The per-fix record is at the fix** — each one ships its
+red-on-inverse and its rationale in the source it changed, and the gate roster's own record is
+`just gates` plus each script's header. What follows is what those cannot carry: the places the
+shipped fix **deliberately deviates** from what docs/90 directed, and the reason. Where a finding was
+fixed the way it was directed, it is not here.
+
+## The health-gate window is selected PER ATTEMPT, and the caller's budget enters as its default (M2)
+
+docs/90 M2 directed "select the budget on the placement, keeping the 4 s constant for `Pid1` and
+deriving the `Service` window from the caller's connect budget **threaded into `start()`**". The
+selection landed; the threading did not, and the window is per-attempt rather than overall. Both are
+deliberate.
+
+`orchestrator::control_plane_probe_budget(placement)` is the one policy site — exhaustive on
+`StewardPlacement`, so a new placement is a compile error rather than a silent inheritance — and it
+answers `CONTROL_PLANE_PROBE_BUDGET` (4 s) for `Pid1` and `None` and `DEFAULT_STEWARD_CONNECT_BUDGET`
+(10 s) for `Service`.
+
+* **Per attempt, not overall.** §3.5 said "the gate's overall window"; this bounds one probe, and a
+  re-spawn buys a fresh one. The re-spawn loop exists for QEMU's vhost-user vsock bring-up race, which
+  is **placement-independent**, so collapsing the gate into a single overall window would shrink a
+  `Service` cell's recovery from four re-spawns to one — trading the failure §3.5's sizing exists to
+  prevent for a different one.
+* **The caller's budget is its default, because `start()` has no other access to it.** `Timeouts`
+  carries no connect-budget field — §9.3 says so deliberately — and the real per-call window is
+  `steward(timeout)`'s argument, which arrives *after* `start()` has returned. Giving `MicroVm::start`
+  a budget parameter would be a breaking signature change on a contract crate (§10.4), taken to move a
+  bound the default already sizes correctly. So `DEFAULT_STEWARD_CONNECT_BUDGET` is named once and read
+  by three sites — the two connect entry points' `unwrap_or` and the selector — which keeps a change to
+  the default from moving the gate out from under it.
+
+**Both narrowings are now in §3.5 itself**, named as narrowings of the wording it used to carry, so the
+design and the code agree and this entry is the reasoning rather than an erratum. The comment above the
+call site — which used to restate the unimplemented sentence almost verbatim, asserting it as shipped —
+now says the sizing is a branch and points at the selector.
+
+The gate is a call-site scan with its own red-on-inverse:
+`the_health_gate_is_handed_the_window_the_placement_selects` requires the one
+`.verify_control_plane(` site to pass the selector, and requires `CONTROL_PLANE_PROBE_BUDGET` to
+appear **exactly twice** in production text (its `const` and the selector's `Pid1` arm) — a third
+mention is a second policy site, which is how the branch got lost the first time.
+`the_window_predicate_rejects_a_bare_constant_and_a_second_policy_site` drives the predicate against
+the M2 defect itself, an inline literal, a bypassing second probe, and no probe at all.
+
+## The restored VM reserves its ancestor's vmid when free, and WARNS when it is already claimed (M9)
+
+docs/90 M9 directed "reserve the ancestor's vmid across the restore". It is reserved — but a
+conflicting reservation is accepted with a warning, not propagated, and that is the deviation.
+
+`MicroVm::restore` asks `vmm::adopted_scratch_vmid(prefix, own_dir, instance.vsock_path())` whether
+the backend adopted somebody else's scratch directory (Firecracker does: `PUT /snapshot/load` has no
+override for the baked vsock UDS), and on `Some(ancestor)` calls `VmidGuard::adopt_lineage(ancestor)`
+**before** the resume — a squatting VM must not be brought back up. The guard carries the ancestor as
+a second `Option<u32>` field, released in the same `Drop`, so the `m2` teardown order holds for free.
+
+**Why not unconditional.** The property wanted is "no *other* VM may draw `ancestor` while we live in
+its directory", not exclusive ownership of the claim — and two live restore suites deliberately hold
+the source's vmid across the restore precisely to force rotation
+(`crates/vmcell/tests/snapshot_restore.rs:356` and `crates/vmcell/tests/extra_block.rs:407`, each with
+the same recorded reason: without the reservation the freed vmid can be re-handed and the rotation
+assertions pass on a no-op). Failing a restore for being in the state the reservation exists to create
+would be backwards. So an already-claimed id satisfies the property and is accepted with a warning
+saying whose claim it is; `self.lineage` is set **only** when the claim is ours, so `Drop` can never
+hand a live VM's identity back to the pool — a worse version of the defect being fixed. The
+destructive shape (a *live* VM in the ancestor's directory) is still refused one layer down, by the
+backend's own `reject_live_baked_vsock` probe the restore already ran. Non-conflict errors do
+propagate: an out-of-range id is `Error::Config`, an unusable lock directory is `Error::Io`, because an
+unusable lock directory is not a conflict.
+
+Gates: `adopted_scratch_vmid_names_the_ancestor_and_only_a_real_scratch_path` and
+`a_restore_holds_the_ancestor_vmid_its_adopted_paths_are_keyed_on`
+(`crates/vmcell/src/vmm/mod.rs:1755,1820`).
+
+## The NAT's guest→host queue is bounded, which means a stalled poll tick TAIL-DROPS guest frames (M7)
+
+Two changes in one module, and the second is a behavior change worth stating plainly.
+
+* **A refused avail ring costs one pass, never the vring worker.** `process_tx_queue` returns a
+  `TxPass` value (`Drained` / `Unreadable`) instead of `io::Result`, because an `Err` out of
+  `VhostUserBackendMut::handle_event` is **terminal** in the vendored framework: the worker thread
+  returns and `VhostUserHandler::drop` discards that value at `join` (it only reports a panic), while
+  the device stays attached — so the guest keeps seeing a live link that never drains again, the B1
+  silent-wedge shape one error path over. `virtio-queue` refuses the ring for three guest-reachable
+  reasons (its own misbehaviour detection, a not-ready queue, an unmappable ring address), and the NAT
+  exists to survive a hostile guest. `Unreadable` ends the tick and re-arms the kick, so a guest that
+  re-initializes its ring is served again; re-polling a refused ring would spin on the state mutex the
+  net thread needs. Gate: `a_refused_avail_ring_costs_one_pass_not_the_vring_worker`, whose comment
+  records the two ways it goes red — restore the `?` and `handle_event` returns `Err`; re-poll and it
+  never terminates.
+* **THE BEHAVIOR CHANGE: `tx_queue` is bounded at `MAX_TX_QUEUE_FRAMES` (4 × `QUEUE_SIZE`, ≈6 MB at
+  the 1512-byte frame cap), and a full queue tail-drops.** The queue's only consumer is `run_network`'s
+  poll tick, and that tick legitimately stalls — one mapping's host dial owns the single datapath task
+  for up to `HOST_DIAL_BUDGET` — so an unbounded queue handed a guest that keeps kicking its TX ring
+  during such a stall unbounded *host* memory. Per-frame bytes were bounded by `MAX_FRAME_LEN`; the
+  frame **count** was not. Dropping is the only correct answer at that site: the alternative, blocking
+  the vhost worker until the net thread catches up, holds the state mutex the net thread needs to drain
+  the queue. The descriptor is still returned to the guest so its ring never stalls, and TCP
+  retransmits what was dropped — which is why the depth is four ring-depths rather than one: the vhost
+  worker can drain the guest's whole 1024-descriptor ring several times between two 5 ms poll ticks, so
+  only a genuinely stalled consumer ever reaches the bound. A legitimately bursty guest is not dropped;
+  a guest that outruns a wedged consumer loses frames instead of the host losing memory. Gate:
+  `push_tx_frame_bounds_the_queue_depth`.
+
+## Inputs `VmConfigBuilder::build` used to accept are now REJECTED (M3 and its siblings)
+
+A deliberate boundary tightening, observable by a consumer, so it is recorded here as well as in the
+`build()` rustdoc's own error list — which is the authoritative roster; these are the three classes it
+grew.
+
+* **A `"` in an `init` override, an append-only extra kernel arg, a share `tag`, or a share
+  `guest_path`.** One law, `config::is_cmdline_unsafe_char` (whitespace, control characters, `"`),
+  shared by all four surfaces because all four land in the kernel's whitespace-separated token list.
+  `"` breaks F3 two different ways: `next_arg` strips a **leading** quote *before* taking the parameter
+  name, so `"rw` runs `__setup("rw")` and clears `MS_RDONLY` under the owned `ro` + `rootflags=noload`
+  (silent filesystem corruption), and a quote anywhere else toggles `in_quote`, so whitespace stops
+  separating parameters and every token emitted after it — `panic=1`, `init=`, `vmcell_vmid=` — is
+  swallowed into that token's value. The first was reachable from any authenticated REST client
+  (`CreateVmRequest::extra_kernel_args` threads straight to `with_kernel_arg`).
+  **Two independent layers landed, not one**: the character rejection above, and
+  `normalize_cmdline_key` now folding a leading `"` the way it already folded `-` → `_`, so
+  `is_reserved_cmdline_arg` answers about the token the *kernel* reads even on a caller path that never
+  met the first guard. The single-token guard runs **before** the collision check, so a quoted token is
+  refused outright rather than keyed.
+* **A relative `kernel` path.** Every other host path this config names was checked for absoluteness
+  at the boundary (rootfs image and overlay, extra-disk images, share host paths); the kernel was the
+  one that was not, so a relative path resolved against whatever CWD the VMM child inherited — the
+  daemon's, not the caller's — and surfaced three layers down as a VMM "cannot open kernel".
+  Existence stays unchecked, as for every other artifact path.
+* **`host_services_port: Some(0)`.** Port 0 is `bind`'s wildcard, never a reachable service, and the
+  NAT registers this port as a **permanent** forward listener whose re-arm discards its `Result` on the
+  stated grounds that "forward ports are non-zero". That precondition was nobody's job to enforce, so
+  `Some(0)` built a VM with a listener that could never come up, silently; enforcing it here is what
+  makes the discard honest (F1).
+
+Gates: `extra_kernel_args_cannot_clobber_reserved_tokens` (`crates/vmcell/src/config.rs:4609`) carries
+the quoted-reserved-key legs **and** an assertion on the *composed* line that no emitted token carries
+a `"` — the alias class the emitted-token coverage gate structurally cannot discover;
+`test_reject_relative_kernel_path` pairs the refusal with a positive control on the same shape (the
+absolute path builds, and a non-existent one still builds), because over-rejecting here would break
+every caller. The fuzz oracle moved with the predicate
+(`fuzz/fuzz_targets/kernel_cmdline_args.rs`) — it had shared the blind spot by modelling the key the
+same way.
+
+## The euid-0 short-circuit is gone, deviating from §11.2's letter — and the letter moved with it (M5)
+
+§11.2 stated the blessing precondition as "the three caps present in the **effective** set, **or**
+`euid == 0`". The `or` is deleted: `vmcell_privilege::blessing_verdict(euid, effective, need)` refuses
+whenever a cap is missing, at any euid — a deliberate deviation from the design as written, and §11.2
+now reads "unconditionally, with **no euid exemption**", carrying the reasoning below and the
+short-circuit's history as the fail-open it was. So the two agree; what follows is why the code, not
+the design, was the side that was right.
+
+**Why the design's letter was wrong rather than the code.** Real root with a narrowed effective set is
+the *common* production shape, not an edge case: default container root holds neither `CAP_NET_ADMIN`
+nor `CAP_SYS_ADMIN`, and a systemd unit with `User=root` plus a `CapabilityBoundingSet=` that omits one
+of the three is the documented deployment. Under the short-circuit `vmcelld` started cleanly there,
+printed its precondition as satisfied, and then failed every privileged create at first use — the
+"degraded server" outcome law P1 exists to forbid, arrived at through the one function the daemon and
+the runner share. A genuine full-authority root process still passes, because it holds the caps in its
+effective set, so nothing that legitimately worked stops working.
+
+**The euid did not become unused — it moved from deciding the verdict to selecting the remediation**,
+which is the reason it is still read. `BlessingRefusal::Unblessed` prints the `setcap …+ep` line;
+`BlessingRefusal::NarrowedRoot` deliberately does **not**, because a file capability is masked by the
+process's own bounding set, so telling a container root to run `setcap` is advice that cannot work — it
+names the container runtime's `--cap-add` and the unit's `AmbientCapabilities=` instead. Splitting the
+verdict out as a **pure** function is what makes P1's start-up gate testable at all: the euid-0
+narrowed shape is unreachable on a host the suite runs on. Design §13's named gate for P1 did not
+exist and now does — `blessing_precondition_gate::a_narrowed_root_cannot_start_this_daemon` in
+`crates/vmcelld/src/main.rs`, beside a prose gate on the call site's own comment so the comment cannot
+go on claiming an exemption the code no longer grants. Breaking for a caller: `blessing_remediation`
+takes a `&BlessingRefusal` where it took a `&[Cap]`.
+
+## A destroy-in-progress VM is refused by STATE (409) where it used to 404 (M6)
+
+`Registry::destroy` removed the slot from `self.vms` **before** awaiting the per-VM handle lock, and
+the delete-in-use scan reads pins — kernel, rootfs, extra disks, and the snapshot prefix being written
+right now — only through that table. So for the whole duration of a multi-second guest-RAM snapshot the
+VM was unpinned: a concurrent `DELETE /v1/artifacts/<prefix>` found a pin-free table, returned 204, and
+`remove_dir_all`'d the directory the VMM was still writing into.
+
+The order is now mark `Destroying` in place → take the handle lock → remove from the table, in one
+private `teardown_slot` that `destroy` and `shutdown_all` share (teardown is ownership, through one
+ordered helper — `shutdown_all` clones the slot list instead of draining it, for exactly this reason).
+Lock order is `inner` → `vms`, and no path holds `vms` across an `await` on `inner`.
+
+**The consumer-visible change:** an op racing a teardown used to see the VM *gone* (404 `NotFound`) and
+now sees it *doomed* (409 `Conflict`) until the teardown completes, then 404. That is the better
+answer — a VM whose teardown is still running has not been destroyed — and it is promptly given rather
+than queued behind the teardown, which the gate asserts with a timeout. A teardown **cancelled** while
+parked (an HTTP client that disconnects) leaves the slot in the table as `Destroying` with its handle
+intact: accounted for in `GET /v1/vms`, refusing new ops, and completed by a retried `DELETE` or by
+`shutdown_all` — recovery stays retryable rather than silently dropping a live VM out of the registry.
+Gate: `a_destroy_parked_on_the_handle_lock_keeps_the_snapshot_prefix_pinned`
+(`crates/vmcell-daemon/src/registry.rs:1264`), red on the pre-fix order in two places at once.
+
+## The labelled handler reaches the pack tail, and the stage version moves with every existing key UNMOVED (H1/H2/M10)
+
+The three findings are one wiring hole and its identity consequence.
+
+* **One key, composed once.** `PackOptions::handler_key()` is the single place the rootfs side composes
+  a handler artifact key, read by the two consumers that must agree: the pack tail (which reads the
+  binary) and `RootfsStage::cache_key`'s consumed-artifact fold (which hashes what it consumes). The
+  fold's `consumed` set is `["steward", options.handler_key()]` off the **same** `PackOptions` value the
+  tail packs with, not a hardcoded `["steward", "guest_tools"]` — two spellings of "which handler is
+  this?" is precisely how the identity and the bytes come to disagree.
+* **`OCI_ROOTFS_STAGE_VERSION` 7 → 8, and every key that can exist today is bit-for-bit unmoved.** The
+  default handler's key *is* `guest_tools`, and until this fix a labelled handler never reached the tail
+  at all — so no cache key moves. The bump is the identity-fold discipline applied anyway (the same
+  reasoning delta 6c's conditional arm was bumped under): one re-pack is harmless, and a fold whose
+  inputs changed shape gets a bump whether or not any existing input's value did. The const stays
+  module-level so the bump itself is assertable KVM-free
+  (`rootfs_stage_version_pins_the_identity_fold_bumps`).
+* **`default` is normalized at the one intake.** `PackOptions::with_handler_label` runs the label
+  through `registry::registry_label`, so the reserved `default` spelling collapses to `None` — because
+  §10.5's byte-identity rule is a claim about the *artifact*, and `Some("default")` composed
+  `guest_tools-default`: a different stage name, artifact key, output file and cache key than the
+  omitted spelling. Normalizing at the intake rather than at each composing site is what keeps the two
+  readers from disagreeing about which handler the pack meant. The CLI now normalizes **both** labels
+  (it normalized only the rootfs one), which is M10.
+* **H2 is the one-line change the general tail was created for:** `oci::build_rootfs_with` calls
+  `pack_rootfs_with_injection`, not the erofs-only door, so a registry entry declaring `format: ext4`
+  can be built at all.
+
+The gate is the live leg delta 6b deferred to delta 9 and delta 9 shipped without:
+`crates/vmcell/tests/handler_cell.rs` registers a `handlers` entry, builds the rootfs that bakes it,
+boots it, and asks **that handler's own `xattr` applet** — which answers with a real `listxattr(2)` —
+so one applet proves its own liveness plus the presence of the multicall binary at the dest the
+manifest names. Its sharpest leg is a negative with a control: `/vmcell-tools/curl` must be **absent**,
+because `curl` is in `GUEST_TOOLS_APPLETS` but not in this entry's declared roster, which is what proves
+the emitted symlinks came from the registry entry (data) rather than from vmcell's const.
+
+## The ext4 battery's absent-facility answer is ONE law, CI obtains the facility — and the discovery behind both (G3)
+
+**The discovery first, because it is the lesson.** The delta-8 commit's ext4 legs `panic!`ed on an
+absent producer, on the argument that `e2fsprogs` is `Priority: required` everywhere vmcell builds. The
+*package* is; the *version* is not. `mkfs.ext4 -d <tarball>` — the form the whole producer is built on
+— landed in e2fsprogs 1.47.1, GitHub's `ubuntu-24.04` image ships **1.47.0**, and this workstation
+ships **1.47.2**. So the review pass that introduced the panic validated every suite locally, green,
+while — as recorded at the fix — `test-unit` and `test-integration` were red on the runner for four
+commits (four failing tests, each retried four times by the integration profile).
+**Validating only where you are is not validating**:
+the tree's own preflight discipline is about probing the host you run on, and this is its complement —
+a host-facility premise needs the *other* host's version, not just a passing local run. A permanently
+red job is a job nobody reads, which is a worse outcome than a recorded skip.
+
+**One law, three call sites.** The three delta-8 files answered "this host cannot pack ext4" three
+different ways and two were wrong: `ext4_producer.rs` panicked (above), and
+`repack_outside_checkout.rs` printed a bare `println!("SKIP")` and returned — the green PASS AGENTS.md
+names — under a doc comment claiming to record a skip, with no `record_capability_skip` call anywhere in
+the file. `common::probe_ext4_or_record_skip` is now the one answer for all three
+(`crates/vmcell/tests/common/mod.rs`): `Some(producer)` is the product's own unforgeable receipt (the
+type's fields are private to `vmcell`, so only a probe mints one), `None` **after** appending
+`SKIP cloud-hypervisor ext4_producer` to the run's manifest when the probe classifies the facility as
+*absent*, and a **panic** when it classifies it as *broken* — §7.2 rule 3, and skipping on that would
+be the green-PASS defect wearing the probe's clothes. `every_ext4_battery_asks_the_one_law` is the
+call-site scan that keeps a fourth answer from appearing, and
+`the_one_skip_law_records_the_gap_rather_than_only_printing_it` is the law's own gate — which needed
+two seams (the probe verdict and the manifest sink as parameters) because the arm that matters is
+unreachable on any host that can run the battery. The scratch sink is not fastidiousness: appending a
+synthetic `SKIP` to the run's own manifest would put a capability gap that does not exist in front of
+the next reviewer.
+
+**A recorded skip is not coverage, so CI obtains the facility instead.** Both jobs that run these legs
+build a **pinned** e2fsprogs 1.47.2 from source ahead of the suites — checksum-verified against
+upstream's published digest, cached on a key that includes the digest (so a re-pin can never be served
+the tree built from the bytes it replaced), `libarchive-dev` first because `mke2fs` *dlopen*s
+libarchive and `-V` is therefore blind to its absence — and the step is **non-gating**: with the
+facility the battery runs, without it the law above records the skip, and a red job is the outcome that
+was just removed. 1.47.2 rather than the newest release, because every measured constant in
+`vmcell::artifact::ext4` was measured against 1.47.2, so CI agrees with the constants by construction.
+The step's own gate is `ci_obtains_the_ext4_facility_rather_than_living_with_the_skip` in
+`crates/vmcell/tests/ext4_producer.rs`: it asserts the ordering, the pin `>=` the producer's
+`MIN_E2FSPROGS_VERSION`, the checksum, the non-gating flags, and that the two jobs' copies are
+**byte-identical** (a `run:` step cannot be shared between jobs, so the identity assertion is what
+keeps a fix to one copy from missing the other). `test-unit` also gained `VMCELL_SKIP_MANIFEST` plus the
+reset/show steps, because a recorded skip nobody surfaces is the invisible pass one level up.
+
+## Two pre-existing defects the new gates fired on when they arrived
+
+Each gate was written for a *different* instance of its class and reddened on a site nobody had gone
+looking for, which is the argument for gating the class rather than the instance:
+
+* **Another `VMCELL_CH_BIN` resolver, in `vmcell-artifact-validator`'s harness.** docs/90 A2 reported
+  the CLI's copy — the *third* — and named this one among the two §17's consolidation register listed at
+  the time; the CLI's was closed in the same pass and this was not (§17 now records both as delegating).
+  `harness::ch_bin()` now delegates to `vmcell::artifact::ch_binary_path()` — same variable, same
+  default, no behavior change — which matters because a change to the law (a second variable, a
+  fallback list, a `PATH` probe) would otherwise have moved the library and left the **conformance
+  battery** booting whatever the old body resolved. The CLI's in-source gate can only ever see
+  `main.rs` (`include_str!` is its whole universe), which is why the repo-wide scanner exists.
+* **A dangling `§12.12` in `zygote.rs`.** §12 has only 12.1–12.5 in v33. The law it cited — "a clone
+  must never restore from the master" — is invariant S3, with the mechanism in §8.4, and the assertion
+  message now says so. A reader who follows a dead pointer concludes the fact is unwritten and either
+  re-derives it or re-argues a settled reversal.
+
+## Three new grep-bans, and the law each one now states
+
+Each is a scan rather than a type because the drift it catches is not a compile error, and each ships
+its red-on-inverse self-test in the same `just gates` roster (AGENTS rule 3: added to that recipe and
+nowhere else).
+
+* **`ban-ch-binary-resolver-copies.sh` (A2).** The law: `vmcell::artifact::ch_binary_path()` is the one
+  reader of the §10.4 contract variable `$VMCELL_CH_BIN`. It flags the **quoted variable name** anywhere
+  under `crates/` (line comments stripped, so prose naming `$VMCELL_CH_BIN` is not a false positive)
+  against a roster of exact per-file counts **in both directions** — an extra read cannot hide behind an
+  entry, and a count that fell to zero means the entry is stale. A parity assertion was the first draft
+  and cannot fail: with the variable unset both spellings answer `cloud-hypervisor`, and `set_var` is
+  banned here. Scope is stated rather than implied: `VMCELL_FC_BIN`/`_QEMU_BIN`/`_CROSVM_BIN` have no
+  `vmcell`-side law to route through, so banning their spellings would name no home to send the reader
+  to; when one is added this gate grows an arm rather than a sibling script.
+* **`ban-dangling-design-ref.sh` (D2).** The law: every `§<id>` and `Appendix <letter>` under
+  `crates/*/src` names a real heading of the newest design document, discovered by
+  `scripts/design-headings.sh` (one home for "which document is the design and what headings does it
+  have"). It resolves ~2000 references, which is the point — the design is cited in the rustdoc of
+  nearly every law, so a renumbering can invalidate any of them silently, and prose is not compiled.
+  Comments are deliberately **not** stripped (a dangling pointer in rustdoc is the whole defect, and
+  D2's own instance was a string literal in a document the daemon *serves* to clients). Its one escape
+  hatch is self-documenting rather than a roster: a reference into another numbering must say which
+  (`v30 §9.4`, `docs/78 §5`) and is skipped, with the skip count reported. The honest cost, stated at
+  the gate: `Appendix X` is this repo's metavariable and is not resolved, so a citation that *meant*
+  `Appendix A` and typed `X` goes unflagged.
+* **`ban-inline-netns-path.sh` (`net/tap.rs`'s own claim).** The law: the `/var/run/netns/<name>`
+  layout is spelled once, in `NETNS_DIR`, and composed through `netns_path`/`netns_dir`.
+  `netns_path`'s rustdoc claimed "exactly one place" while four production sites spelled the literal —
+  the §6.4 proxy's namespace entry, `build_vmm_cmd`'s pre-fork NUL-terminated C string, and the orphan
+  scanner's two `read_dir`s — and the claim aged into fiction because nothing could see it age. All
+  four now compose from the law, `tap.rs`'s `netns_layout_gate` pins the in-crate roster in both
+  directions, and this script is its **complement, not a second copy**: it scans every *other* crate's
+  `src` (where `pub(crate)` visibility means a netns path has nowhere to come from except a fresh
+  literal) and **delegates** `crates/vmcell/src` to the in-source gate, failing loud if that gate or
+  the const is gone. It bans the alias too — `/var/run` is conventionally a symlink to `/run`, the
+  same alias class F3's reserved-cmdline law names — and derives the alias from the law rather than
+  typing it, so nothing in the gate spells the layout either.
+
+Both of the first two are **parked at the end of the `gates` recipe** with a comment explaining why:
+they were red on arrival (each named the single site it fired on), and a red gate in its thematic
+position would cost the verdicts of every gate below it in a `set -e` recipe. Their sites are now
+fixed, so each is green and belongs back beside its sibling — the note at both homes says so.
+
+## `docs/historical/89-claude-handoff-notes-v5.md` is deliberately NOT edited
+
+The v5 handoff's reproduction sequence omits the `just bless` step, which is how a reviewer reached
+docs/90's 228/228 through a stale runner (G9). The step was added where a reader is *sent* — the
+current rubric — and **not** to the retired handoff. A retired document is the record of what was true
+when it was written; editing it would rewrite the history of the pass that produced the defect, which
+is the same rule that keeps `docs/historical/**` out of the pointer gate's scan while leaving it a
+resolution target. Recorded here so nobody "fixes" it later.
+
+## The public and contract surface this pass moves, and what §10.4 asks of it
+
+Stated here because the ledger is where the *version* fact is produced (§10.4) and this is the list a
+ledger edge has to cover:
+
+* **`vmcell`, additive, on §10.4's named list:** `PackOptions::with_handler_label` /
+  `PackOptions::handler_key` — `PackOptions` is listed surface, and it grows by field/setter by design
+  so the pack tail's signature stops moving.
+* **`vmcell`, additive, public but not on the list:** `RootfsStage::with_handler_label`,
+  `artifact::handler::handler_label_from_artifact_key`,
+  `feature::HostDeclaration::from_host_capabilities` (D5's code fix: the host axis is now derived from
+  the one probed descriptor, so §7.2's one-probe law holds instead of a second nested-virt read), and
+  `vmm::FakeVmm::adopting_baked_vsock` (the seam that makes M9's ancestor-vmid reservation drivable
+  without Firecracker).
+* **`vmcell`, additive, and the one §10.4 cares about most: `pub use hudsucker;` / `pub use hyper;`
+  from `vmcell::proxy::doubles`** (E1). The `Matcher`/`Responder` aliases are `Fn`s over third-party
+  types vmcell neither owns nor versions, so a git-dep consumer writing a test double — the thing
+  §1.3 calls the proxy "the natural home" for — had to add both crates to its own manifest at exactly
+  vmcell's resolved versions and discover those versions by reading vmcell's lockfile. Re-exporting
+  them means the consumer names one version, through vmcell, and a bump moves the aliases and the
+  re-exports together. That bump has already happened once (hudsucker 0.23 → 0.24) and
+  `cargo semver-checks` cannot see it, because the aliases' *shape* does not move — exactly the case a
+  ledger entry exists for, which is why §10.4's list now carries "the proxy doubles seam's `hudsucker`
+  and `hyper` re-exports (§1.3)" as listed surface: a bump inside vmcell is now a ledgered fact rather
+  than a type mismatch a consumer discovers from the lockfile. The documented spelling is a
+  **doctest**, so it is compiled rather than asserted, and `just test-doc` is the gate that now runs it
+  at all (G1).
+* **`vmcell-artifact-validator`, breaking:** `ValidationOptions::run_budget` — which §10.4 already
+  names, along with the ledger entry it owes. The struct is not
+  `#[non_exhaustive]`, so adding a `pub` field breaks every struct-literal construction, and
+  `cargo semver-checks` reports it. `DEFAULT_RUN_BUDGET` is additive beside it.
+
+Neither list is a behavior surprise for a caller who does nothing — the additions are additive and the
+validator's new field defaults to the finite budget — but both are edges §10.4 wants findable in the
+ledger rather than at a consumer's build.

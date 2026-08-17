@@ -4,17 +4,126 @@
 //! It includes abstractions for networking, virtual machine monitors (like Cloud Hypervisor),
 //! and a steward protocol for executing commands inside the guest.
 //!
+//! # Worked examples
+//!
+//! Every example here is a **doctest**, compiled by `just test-doc` (which `just ci` invokes) and
+//! therefore unable to describe an API this crate no longer has. Each is `no_run`: they boot real
+//! guests, so they need a KVM host, a `cloud-hypervisor` binary and built artifacts
+//! (`vmcell build`) — the gate compiles them and does not run them.
+//!
+//! The rest live on the items they document, under the same gate: a
+//! [`Pipeline`](artifact::Pipeline) assembly and the one inject-and-pack tail in [`artifact`], a
+//! `DaemonClient` round trip in `vmcell-daemon-client`, and the two-directional conformance battery
+//! in `vmcell-artifact-validator`.
+//!
+//! ## Boot a cell, run a command in it, tear it down
+//!
+//! ```no_run
+//! use vmcell::artifact::{ch_binary_path, kernel_path, rootfs_path};
+//! use vmcell::{CloudHypervisor, ExecRequest, HostEnv, MicroVm, RootfsSource, VmConfig};
+//!
+//! # #[tokio::main]
+//! # async fn main() -> vmcell::Result<()> {
+//! // ONE seam bundle per process, threaded by reference into every VM-spawning entry point
+//! // (§9.3). A composition root builds `shared()` once; a test builds `HostEnv::hermetic()`.
+//! let env = HostEnv::shared()?;
+//! // `$VMCELL_CH_BIN`, else `cloud-hypervisor` on `PATH` — the one resolver, never a second copy.
+//! let vmm = CloudHypervisor::new(ch_binary_path());
+//! // `kernel_path()` / `rootfs_path()` honor `$VMCELL_KERNEL` / `$VMCELL_ROOTFS`; the kernel must
+//! // be an absolute path, which `build()` enforces rather than resolving against the VMM child's
+//! // working directory.
+//! let cfg = VmConfig::builder(kernel_path(), RootfsSource::Erofs { image: rootfs_path() })
+//!     .vcpus(2)
+//!     .mem_mib(512)
+//!     .build()?;
+//!
+//! let mut vm = MicroVm::start(&vmm, cfg, &env).await?;
+//! // `steward()` connects on first use; its argument is the per-call connect budget, not a seam.
+//! let out = vm
+//!     .steward(None)
+//!     .await?
+//!     .exec(ExecRequest::new(vec!["/bin/echo".into(), "hello".into()]))
+//!     .await?;
+//! assert_eq!(out.code, 0);
+//! assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "hello");
+//! // The graceful path. `Drop` is the panic path, and both run the one ordered teardown helper.
+//! vm.shutdown().await?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ## Pay the boot cost once: suspend a zygote, fan out clones
+//!
+//! Booting to steward-ready is the dominant per-VM cost, so a pool pays it once: [`Zygote`] freezes
+//! one warm cell and each clone restores from its own copy-on-write copy of that image.
+//!
+//! ```no_run
+//! use vmcell::artifact::{ch_binary_path, kernel_path, rootfs_path};
+//! use vmcell::{CloudHypervisor, ExecRequest, HostEnv, MicroVm, RootfsSource, VmConfig, Zygote};
+//!
+//! # #[tokio::main]
+//! # async fn main() -> vmcell::Result<()> {
+//! let env = HostEnv::shared()?;
+//! let vmm = CloudHypervisor::new(ch_binary_path());
+//! // Snapshot eligibility is a property of the CONFIG: a cell carrying a vhost-user device (a
+//! // virtio-fs share, the unprivileged NAT, the external vsock daemon) is refused with a typed
+//! // `Unsupported` rather than half-snapshotted (§8.1). The default `NetConfig::None` carries none.
+//! let cfg = VmConfig::builder(kernel_path(), RootfsSource::Erofs { image: rootfs_path() })
+//!     .snapshotting(true)
+//!     .build()?;
+//!
+//! let mut warm = MicroVm::start(&vmm, cfg.clone(), &env).await?;
+//! warm.steward(None).await?; // the boot cost, paid once
+//! // Create-only: a destination that already holds anything is refused, never written into.
+//! let master = std::env::temp_dir().join("vmcell-doc-zygote-master");
+//! let zygote = Zygote::suspend(&mut warm, cfg, &master).await?;
+//! warm.shutdown().await?;
+//!
+//! // Each clone restores from its OWN copy-on-write copy of the master (so the master is never
+//! // mutated) and draws a FRESH vmid, hence its own IP/MAC/vsock (§8.2). Concurrent fan-out needs a
+//! // backend that rotates host paths on restore; on one that does not — Firecracker — `spawn_clones`
+//! // refuses `count > 1` with a typed error instead of letting the clones collide on one socket.
+//! for mut clone in zygote.spawn_clones(&vmm, 4, &env).await? {
+//!     // The first `steward()` call on a restored VM performs the mandatory resync (clock, entropy,
+//!     // network identity) before it hands the client back.
+//!     let out = clone
+//!         .steward(None)
+//!         .await?
+//!         .exec(ExecRequest::new(vec!["/bin/true".into()]))
+//!         .await?;
+//!     assert_eq!(out.code, 0);
+//!     clone.shutdown().await?;
+//! }
+//! # Ok(())
+//! # }
+//! ```
+//!
 //! # Consuming `vmcell` as a git dependency
 //!
 //! Out-of-repo consumers stand on one **named contract surface** (design §10.4, The downstream
 //! toolkit contract): the pins schema + overlay ([`artifact::ResolvePinsStage`],
 //! [`artifact::resolve_pins`], [`artifact::pins_overlay_path`]), the stage model
 //! ([`artifact::Stage`], [`artifact::Pipeline`], [`artifact::CacheKey`]), the kernel build entry
-//! points and their resolved-config sidecar, [`artifact::rootfs::pack_erofs_with_injection`] and the
+//! points and their resolved-config sidecar, [`artifact::rootfs::pack_rootfs_with_injection`] — with
+//! [`artifact::rootfs::pack_erofs_with_injection`] as its erofs-only door — and the
 //! rootfs-construction contract, the `VMCELL_*` environment contract, and the
-//! `vmcell-artifact-validator` battery. A breaking change to any of it is a deliberate entry in the
-//! comment-changelog at the top of this crate's `Cargo.toml`, gated by `cargo semver-checks` over
-//! both contract crates and by the out-of-tree `examples/downstream-kernel/` consumer workspace.
+//! `vmcell-artifact-validator` battery.
+//!
+//! A change to any of it is a deliberate entry in the comment-changelog at the top of this crate's
+//! `Cargo.toml`. Three gates hold three different halves of that promise, and none of them covers
+//! another's:
+//!
+//! - `cargo semver-checks`, over both contract crates, gates the version **number** against the
+//!   signatures that actually moved. It is silent by construction on an addition, and on any
+//!   behavior change behind an unchanged signature — which is exactly why the ledger is written by
+//!   hand and not derived.
+//! - `tests/contract_ledger.rs` gates the **ledger itself**: that its `# X → Y:` entries form an
+//!   unbroken chain ending at the version the crate publishes. Nothing gated that before, and the
+//!   ledger had a two-version hole at its most breaking release (docs/90 C2).
+//! - the out-of-tree `examples/downstream-kernel/` consumer workspace gates the **guidance**, by
+//!   compiling against it — breaking its CI job is the intended failure mode of contract drift.
+//!
+//! What no gate can supply is the entry's prose. Write it for the consumer who is migrating.
 //!
 //! Two things bite consumers that the compiler cannot catch, both covered in the repository README's
 //! "Consuming vmcell as a dependency" section:
@@ -67,6 +176,19 @@
         clippy::allow_attributes_without_reason  // B11: every suppression states why
     )
 )]
+/// The repository README, pulled in **only** when rustdoc is collecting doctests, so its Rust
+/// examples are compiled by `just test-doc` exactly like the ones above.
+///
+/// `#[cfg(doctest)]` is the whole trick: that cfg is set only by rustdoc's test pass, so this item
+/// is absent from `cargo build`, from `cargo doc`, and from the rustdoc JSON `cargo semver-checks`
+/// reads — the README's setup instructions never become this crate's API documentation, and the item
+/// itself is not public API. What it buys is that the README's worked example cannot rot: an
+/// example on the front door that nothing compiles is the defect this closes (docs/90 D11), and
+/// README examples are exactly where that rot is least visible.
+#[cfg(doctest)]
+#[doc = include_str!("../../../README.md")]
+pub struct ReadmeExamplesAreDoctested;
+
 /// Error and Result types.
 pub mod error;
 /// The feature vocabulary and the one intersection site (§7.4, invariant F6).

@@ -1,5 +1,13 @@
 [package]
 name = "vmcell"
+# THE CONTRACT LEDGER (design §10.4, The downstream toolkit contract). One entry per version edge,
+# headed `# <from> → <to>:`, and the chain is CONTIGUOUS up to `version` below — that shape is gated
+# by `tests/contract_ledger.rs`, which reddens on a gap, a duplicate, or a chain that stops short of
+# the version this crate publishes. The gate exists because the ledger had a two-version hole at
+# exactly its most breaking release (`0.8 → 0.9` and `0.9 → 0.10` were missing, docs/90 C2): a
+# consumer migrating across it read nothing, because `cargo semver-checks` gates the version NUMBER
+# and never the presence of an entry. The chain deliberately STARTS at `0.2 → 0.3`; 0.1 → 0.2
+# predates the convention and no entry was ever written for it.
 # 0.2 → 0.3: intentional breaking change — `AgentClient::connect`/`reconnect` gained a
 # `&Timeouts` param (per-VM tunable connect cadence, design 44 §3). A 0.x minor bump is
 # the SemVer slot for a breaking change on a pre-1.0 crate (cargo-semver-checks gate).
@@ -13,17 +21,87 @@ name = "vmcell"
 # `RootfsBuildSource` was removed), and `PrebuiltKernelStage` + `resolve_builder_base`
 # became `pub` for the builder crates. The CLI moved to the `vmcell-cli` crate.
 # 0.5 → 0.6: one configurable `resource_prefix` for per-VM naming + the sweep (v21 §18.4.1).
-# 0.6 → 0.7: additive privileged-window hardening (design §20) — `VmConfig` gained
+# 0.6 → 0.7: additive privileged-window hardening (design v24 §20) — `VmConfig` gained
 # `vmm_seccomp: VmmSeccomp` and `jail: JailConfig`, plus the `vmm::seccomp` / `vmm::jail`
 # modules and a `JailSpec` param on `build_vmm_cmd`. Additive to the config surface
 # (`#[non_exhaustive]`); the `build_vmm_cmd` signature change is a minor pre-1.0 bump.
-# 0.7 → 0.8: the OverlayStore seam + fork/branch lineage (design §21) — new `overlay`
+# 0.7 → 0.8: the OverlayStore seam + fork/branch lineage (design v25 §21) — new `overlay`
 # (`OverlayStore`, `ReflinkOverlayStore`) and `lineage` (`Lineage`, `LineageId`,
 # `LineageAllocator`) modules; `MicroVm::restore_cow` gained a final
 # `Arc<dyn OverlayStore>` seam param (the one breaking change, a minor pre-1.0 bump);
 # `Zygote` gained `with_overlay_store`.
-# 0.11.0: the Firecracker and QEMU backends were extracted into the `vmcell-firecracker` and
-# `vmcell-qemu` crates, so the `Firecracker`/`Qemu` re-exports left the public API (a breaking
+# 0.8 → 0.9: additive persistent interactive sessions (design 62 §22, the v26 pass). The one-shot
+# exec path is byte-for-byte unchanged and the session layer sits BESIDE it rather than retrofitting
+# a `SessionId` onto `Message::{Exec,Stdout,Stderr,Exit}`, so nothing a 0.8 consumer sends or matches
+# moves.
+#   * ADDITIVE: the `agent::session` module — `SessionMux` (its own connection, one multiplexer per
+#     VM), `Session`, `SessionSpecBuilder`/`SessionSpec`, `SessionEvent` — plus
+#     `MicroVm::connect_sessions`. The wire grew eight append-only variants
+#     (`OpenSession`…`SessionExit`, indices 8–15) in vmcell-protocol 0.3 → 0.4, whose `Message` is
+#     `#[non_exhaustive]`: a minor-compatible addition, and a discriminant-stability test pins the
+#     append-only ORDER so a later insertion cannot silently re-key the older variants.
+#   * BEHAVIOR a consumer should know, because the same field means one thing on two paths:
+#     `ExecRequest.timeout` is "a deadline, or none" on both. The one-shot HOST still fills
+#     `None → DEFAULT_EXEC_TIMEOUT` before the frame leaves (a runaway one-shot child must not
+#     outlive the abandoned host wait); the session path leaves `None` as `None`, because an
+#     interactive session is bounded by `CloseSession`, child exit or connection teardown, not by a
+#     default timeout. This is a policy the host applies before the byte leaves, never a second
+#     interpretation in the guest.
+#   * `cargo semver-checks` reported this edge clean (vmcell 0.8.0 → 0.9.0, vmcell-protocol
+#     0.3.0 → 0.4.0). The entry exists because §10.4 asks for one on every edge, not because a lint
+#     demanded it — which is the whole reason the ledger is a ledger.
+# 0.9 → 0.10: the design v28 §18 delta register — eleven deltas landed as ONE breaking pass, and the
+# largest break this crate has shipped. Every edge is deliberate and named here so a consumer reads
+# it in the ledger instead of discovering it when their build breaks (§10.4):
+#   * BREAKING `function_parameter_count_changed` / `method_parameter_count_changed`, and the one
+#     that touches every call site: the injected seams travel as ONE `HostEnv`
+#     (`{cids, vmids, cgroups, clock, overlay}`, `#[non_exhaustive]`), threaded as a final
+#     `&HostEnv` through `MicroVm::start`/`restore`/`restore_cow`, `Zygote::spawn_clone`/
+#     `spawn_clones`, and `Lineage::fork`/`fork_many`. Tests build `HostEnv::hermetic()`; a
+#     composition root builds `HostEnv::shared()` once. Seams grow by FIELD from here on, which is
+#     the point: the next seam is not another positional parameter and not another break.
+#   * BREAKING `inherent_method_missing` / `function_parameter_count_changed`, the same delta's
+#     other half: the
+#     `OverlayStore` folded INTO that bundle, so `Zygote` lost its `store` field, `overlay_store()`
+#     and the `with_overlay_store` 0.7 → 0.8 had just added; `restore_cow` lost the trailing
+#     `Arc<dyn OverlayStore>` parameter that entry called "the one breaking change" (it takes a
+#     `cow: bool` and materializes through `env.overlay`); and `Lineage::fork_from_vm` /
+#     `from_snapshot_dir` dropped their `store` parameter — a whole lineage now shares one store by
+#     construction (invariant S4: one store per process, no second injection path).
+#   * BREAKING `struct_pub_field_missing`, a rename: `ResourceUsage.limits_enforced` →
+#     `mem_limit_enforced`. The flag only ever reflected the MEMORY controller, and the old name
+#     (kept "for API stability") promised every limit. The wire `ResourceUsageDto` field and the
+#     `vmcell stats` JSON key move with it, for end-to-end honesty in this breaking bump.
+#   * BREAKING `enum_struct_variant_field_missing`: `NetConfig::Privileged` lost
+#     `host_services_port`. The field is meaningful on `Unprivileged` only (the smoltcp NAT
+#     registers the forward); on `Privileged` it was accepted and then rejected by `build()`. Moving
+#     it to the one variant that honors it makes the invalid state UNREPRESENTABLE, so the reject —
+#     and the negative test that verified it — are gone as unreachable.
+#   * BREAKING `enum_variant_missing`: `RootfsSource::VirtioFs` is gone. Every backend rejected it,
+#     virtiofsd cannot enter its sandbox unprivileged, and the erofs root is served over virtio-blk
+#     in BOTH operating modes. The rejection is now compile-enforced rather than tested.
+#   * BREAKING `inherent_method_missing`, a demotion with a replacement: `MicroVm::instance_mut()` is
+#     `pub(crate)`. The premise "no consumer uses it" was empirically false (five in-tree test sites
+#     did), so the legitimate uses got public shapes instead of losing them: `MicroVm::kill()` for a
+#     hard force-kill (the "reclaimed by the daemon's start-up sweep" scenario), and the existing
+#     `instance()` for read-only console access.
+#   * ADDITIVE: `env::HostEnv` + `shared()`/`hermetic()`; `hostcaps::HostCapabilities`, the
+#     start-up-probed host descriptor with its decision methods (`privileged_net_available`,
+#     `memory_limit_enforceable`, `virtio_fs_shares_available`, `can_boot_vm`) — queryable, and NOT
+#     a replacement for the per-write authoritative errno check (§7.2 rule 2); `MicroVm::kill`;
+#     `vmm::FaultMenu` + `FakeVmm::with_faults` (the fault menu the orchestrator's failure paths are
+#     driven through).
+#   * DEVIATION, deliberate and recorded in `docs/implementation-notes.md` — do not re-drop it:
+#     `agent()` keeps its `timeout: Option<Duration>`. The delta removed the CLOCK seam from it (the
+#     "no seam arguments" rule is met); `Timeouts` carries no overall connect budget, and
+#     `vmcell-artifact-validator` legitimately needs 60–180 s connect windows for slow builder-VM
+#     boots, so hardcoding the 10 s floor would reintroduce the boot flakiness the budget fixed.
+#     10 s remains the `None` default.
+#   * The register also landed a daemon SHA-256 digest sidecar and retired four `vmcell` CLI stubs
+#     into typed `vmcelld-ctl` redirects. Neither touches this crate's API; they are named here
+#     because the register was one pass and a reader of this entry is migrating across all of it.
+# 0.10.0 → 0.11.0: the Firecracker and QEMU backends were extracted into the `vmcell-firecracker`
+# and `vmcell-qemu` crates, so the `Firecracker`/`Qemu` re-exports left the public API (a breaking
 # change under the pre-1.0 minor-bump convention).
 # 0.11.0 → 0.12.0: adding the crosvm backend (`vmcell-crosvm`) surfaced a per-backend divergence —
 # crosvm has no disk I/O rate limiter — so `VmmCapabilities` gained a `disk_io_throttle` field. That
@@ -411,7 +489,17 @@ name = "vmcell"
 #     BREAKING `function_missing`: `rootfs_label_from_filename` → `rootfs_artifact_from_filename`,
 #     which returns the format beside the label. The old name promised the filename determined a
 #     label; it determines a (label, format) pair, and `vmcell bundle` reads the inverse.
-#     ADDITIVE: `artifact::ext4` (the producer, `EXT4_TARBALL_XATTRS`); `RootfsFormat`;
+#     ADDITIVE, AND THE ONE A CONSUMER OF §10.4's LIST MUST ACT ON:
+#     `rootfs::pack_rootfs_with_injection` — the format-honoring inject+pack tail, and the entry
+#     point to call from here on. `pack_erofs_with_injection`, the function §10.4 has always named,
+#     is now the EROFS-ONLY DOOR onto it: it refuses any `PackOptions::format` other than `Erofs`,
+#     naming this function. Both are contract surface; a caller packing erofs needs no edit, and a
+#     caller packing `Ext4` through the old name gets a typed refusal rather than an erofs image its
+#     declaration did not ask for. Ledgered late (docs/90 C1): the split shipped AT 0.20.0 with the
+#     new door in no ledger and on no list, so a consumer following the contract to pack ext4 was
+#     sent to a function the contract did not name. The wrapper/tail split itself is right and is
+#     recorded as a justified deviation in `docs/implementation-notes.md`.
+#     ALSO ADDITIVE: `artifact::ext4` (the producer, `EXT4_TARBALL_XATTRS`); `RootfsFormat`;
 #     `artifact::merge_to_tar` — the tar emitter that makes §4.7's "the same merged tail, inherited
 #     for free" true by construction rather than by assertion: the merge happens ONCE and two
 #     emitters consume it; and `config::RootfsSource::root_device_read_only`, the one law for the
@@ -439,7 +527,123 @@ name = "vmcell"
 #     outright. External `mkfs.ext4` ships meanwhile as the validated fallback, recorded as the
 #     external-tool exception it is: e2fsprogs is a GPL-2 **binary**, spawned, never linked — the
 #     QEMU/nft carve-out shape, joining `make` and `cargo` which this pipeline already spawns.
-version = "0.20.0"
+# 0.20.0 → 0.21.0: the docs/90 review pass. `cargo semver-checks check-release -p vmcell` reports
+# NOTHING on this edge — measured with the version held at the baseline, `196 checks: 196 pass`,
+# "no semver update required", because every signature that moved is an ADDITION. That is exactly why
+# this entry is written by hand: the two changes a consumer will actually feel are a set of inputs
+# `build()` now REFUSES and a rootfs cache key that moves, and no lint has a shape for either
+# (§10.4; `tests/contract_ledger.rs` is what gates the chain this line closes).
+# Measuring it required holding all fourteen sibling `version = "0.21.0"` path-dep requirements at the
+# baseline too: a rollback in this manifest alone is a workspace-wide resolution error, not a warning,
+# which is why the bump and every pin land in one change.
+#
+#   * BREAKING BEHAVIOR, SEMVER-CHECKS-BLIND (1 of 2) — `VmConfigBuilder::build()` REJECTS inputs
+#     0.20.0 accepted. One law, `is_cmdline_unsafe_char` (whitespace, control characters, `"`),
+#     applied at every value vmcell splices into the kernel command line: the `init=` override, an
+#     append-only `extra_kernel_args` token, and a share's `tag` and `guest_path`. `"` is new to all
+#     four. `lib/cmdline.c`'s `next_arg` strips ONE leading quote before taking the parameter name,
+#     so the token `"rw` is the parameter `rw`: appended last, after the owned `ro`, it cleared
+#     `MS_RDONLY` under `rootflags=noload` — a dirty image mounted writable with its journal ignored
+#     — and the same trick reached `"init`, `"root` and every other reserved key. It was reachable
+#     from any authenticated REST client, because `CreateVmRequest::extra_kernel_args` threads
+#     straight to `with_kernel_arg` (docs/90 M3). A quote ELSEWHERE in a token toggles `in_quote`, so
+#     whitespace stops separating parameters and everything after it is swallowed into that token's
+#     value — which is how a `"` in a share tag truncated the whole line three tokens before `init=`.
+#     `normalize_cmdline_key` folds a leading quote as well as `-` now, so `is_reserved_cmdline_arg`
+#     keys the token the KERNEL reads even on a caller path that never met the character guard: two
+#     independent layers, deliberately.
+#     Two more refusals of the same honored-or-rejected-at-construction class:
+#       - an EMPTY or RELATIVE `kernel` path. It was the one host path `build()` never checked for
+#         absoluteness, and a relative one resolves against whatever CWD the VMM child inherited —
+#         the daemon's, not the caller's.
+#       - `host_services_port: Some(0)`. Port 0 is `bind`'s wildcard, not a reachable service, and
+#         the unprivileged NAT registers the forward permanently, so it was accepted and armed and
+#         could never be dialed (F1's accepted-then-unhonored shape, the same field's other half).
+#     MIGRATION: a caller passing any of these was already getting something other than what it
+#     asked for, so there is deliberately no way to re-enable them. `VmConfig`'s fields stay public,
+#     so assigning `cfg.net` / `cfg.kernel` directly still bypasses the check, exactly as before.
+#
+#   * BREAKING ARTIFACT, SEMVER-CHECKS-BLIND (2 of 2) — `OCI_ROOTFS_STAGE_VERSION` 7 → 8, so the
+#     first build after this re-packs every warm OCI rootfs once. The identity fold's
+#     consumed-artifact set is `["steward", options.handler_key()]` now, not the hardcoded
+#     `["steward", "guest_tools"]`. Every key that can exist TODAY is bit-for-bit unmoved (the
+#     default handler's key IS `guest_tools`), because until the H1 fix below a labelled handler
+#     never reached the tail at all; the bump is the identity-fold discipline applied anyway, as
+#     delta 6c's conditional arm was.
+#     Independently of it: a version bump anywhere in this workspace rewrites `Cargo.lock`, which
+#     `steward_closure_hash` / `guest_tools_closure_hash` both fold, so the rootfs re-bakes across
+#     this edge whatever the STAGE_VERSION says.
+#
+#   * BEHAVIOR a registry consumer hits — delta 6b's shape was only half-landed, and this is the
+#     other half (docs/90 H1, H2, M10):
+#       - the one inject+pack tail reads its handler binary from
+#         `inputs.artifacts[handler_artifact_key(options.handler_label)]`, never the literal
+#         `"guest_tools"`. `GuestToolsStage` publishes a labelled handler under `guest_tools-<label>`
+#         per its own key law, so the tail read it as ABSENT: the injection manifest emitted neither
+#         the multicall binary nor a single applet symlink, and the build reported SUCCESS.
+#         `mini-init` is one of those applets and is an `init=` target, so a cell pointed at one
+#         panicked the guest kernel.
+#       - and the tail now REFUSES two wiring errors instead of packing an applet-less image: a
+#         declared handler label whose artifact never reached the tail, and a pack declaring NO label
+#         while the only handler artifacts in the pipeline are labelled ones. Both `Error::Artifact`,
+#         naming the keys that did arrive and the flag that selects one.
+#       - `--handler-label default` composes what the OMITTED spelling composes: the reserved
+#         `default` normalizes to `None` through `registry::registry_label` — in `vmcell build`, at
+#         the one intake ABOVE both the publishing stage and the consuming one, and again in
+#         `PackOptions::with_handler_label` so a library caller gets the same law. It previously
+#         composed `guest_tools-default` — a different stage name, artifact key, output file and cache
+#         key for the same registry entry, against §10.5's byte-identity rule for a cell that names no
+#         label. The rootfs label already had this law; the handler label did not.
+#       - `oci::build_rootfs` packs through `pack_rootfs_with_injection`, the GENERAL tail, instead
+#         of `pack_erofs_with_injection`, the erofs-only door that refuses any other format by name.
+#         A `rootfs.<label>` entry declaring `format: "ext4"` therefore BUILDS; it previously
+#         resolved the registry, pulled every layer, and then died on `pack_erofs_with_injection was
+#         handed format: ext4`. The door and the tail are both §10.4 surface, as the 0.19 → 0.20
+#         entry above records.
+#
+#   * ADDITIVE — nothing to act on; ledgered because §10.4 asks for an entry on every edge and no
+#     lint speaks up for an addition:
+#     - `rootfs::PackOptions::handler_label` (the field) with `with_handler_label` (its normalizing
+#       intake) and `handler_key()` (the artifact-map key it composes), plus
+#       `RootfsStage::with_handler_label`: which handler binary the tail bakes, carried as a FIELD.
+#       `PackOptions` is `#[non_exhaustive]` as of 0.16.0 → 0.17.0, so this is exactly the
+#       growth-without-a-break that entry bought — the alternative was one more positional parameter
+#       on that tail, in the same design version that had already added two.
+#     - `artifact::handler::handler_label_from_artifact_key`: the inverse of `handler_artifact_key`,
+#       beside it. NOT the filename inverse — an artifact-map key keeps a label's dots
+#       (`guest_tools-12.4`) while the filename law sanitizes them, so one implementation would have
+#       to be wrong for one of the two. It is what lets the tail tell "this pipeline built no
+#       handler" from "this pipeline built one I was not told to bake".
+#     - `proxy::doubles::hudsucker` and `proxy::doubles::hyper`: the two third-party crates
+#       `doubles::Matcher` / `Responder` are `Fn` aliases over, re-exported so an out-of-repo
+#       consumer names them THROUGH vmcell instead of pinning them in its own manifest at versions it
+#       had to read out of this workspace's `Cargo.lock` (docs/90 E1). Two copies of one crate at
+#       incompatible versions do not unify, so the old failure was a type mismatch on a name that
+#       looked right — and the bump that causes it is not hypothetical (`hudsucker` has already gone
+#       0.23 → 0.24 in this repo) while `cargo semver-checks` sees nothing, because the aliases'
+#       SHAPE does not change across it. A doctest compiles the documented spelling.
+#     - `feature::HostDeclaration::from_host_capabilities`: the §7.4 host axis DERIVED from the one
+#       start-up descriptor. `HostDeclaration::probe()` keeps its signature and its answer — same two
+#       modules in the same order, same "unreadable parameter reads as enabled" arm — and is a
+#       projection of `HostCapabilities::probe()` now instead of a second
+#       `/sys/module/*/parameters/nested` read beside it, which is what makes §7.4's "the host
+#       contributes `HostCapabilities`" true (docs/90 D5). It does perform the descriptor's other
+#       probes as a result; a caller already holding one passes it here rather than re-probing.
+#     - `steward::StewardClient::reconnect_endpoint`: re-dial the endpoint this client is already
+#       bound to, beside the existing rotating-path recovery, through one shared body so the two
+#       cannot diverge on what a successful recovery resets.
+#     - `vmm::FakeVmm::adopting_baked_vsock` plus the `FakeVmm::restored_vsock_path` field (free —
+#       `FakeVmm` is `#[non_exhaustive]`): a fake whose `restore` re-binds the host vsock path its
+#       snapshot baked instead of naming its own, which is Firecracker's shape, so the orchestrator's
+#       ancestor-vmid reservation is drivable with no KVM (docs/90 M9).
+#
+#   * UNCHANGED, and gated so it stays that way: the emitted kernel command line is BYTE-IDENTICAL.
+#     Both guest cadence tokens are composed by `vmcell_protocol::TuningToken::render` and the
+#     `Timeouts` floors read that token's own `floor` (vmcell-protocol 0.7 → 0.8), retiring a pair of
+#     literals this crate and `vmcell-steward` each carried with no shared const between them —
+#     re-spell either and the guest fell back to a compiled cadence that happened to be the same
+#     number, so nothing could go red (docs/90 G7). Same tokens, same values, same order.
+version = "0.21.0"
 edition = "2024"
 # MSRV is the single workspace floor (`[workspace.package] rust-version`, in lockstep with
 # rust-toolchain.toml via the `just ci` sync assertion) — currently the latest stable, 1.96.1.
@@ -550,7 +754,7 @@ name = "zygote"
 path = "tests/zygote.rs"
 required-features = ["cloud-hypervisor"]
 
-# §20.4: the jailer-equivalent hardening gate. KVM-free AND root-free (unprivileged
+# §12.3: the jailer-equivalent hardening gate. KVM-free AND root-free (unprivileged
 # no_new_privs / rlimit / seccomp), so it runs in `just test-unit`, not the privileged suite.
 [[test]]
 name = "jail_hardening"
@@ -565,7 +769,7 @@ thiserror = "2"
 # the framed postcard wire enum, shared with the steward (v15 §10.1). The explicit
 # `version` (alongside `path`) keeps the cargo-deny `wildcards = "deny"` gate happy — a bare
 # path dep reads as a `*` requirement.
-vmcell-protocol = { path = "../vmcell-protocol", version = "0.7.0" }
+vmcell-protocol = { path = "../vmcell-protocol", version = "0.8.0" }
 
 # host common
 tokio = { version = "1", optional = true, features = ["rt-multi-thread", "macros", "io-util", "fs", "net", "process", "sync", "time", "signal"] }
@@ -582,7 +786,8 @@ tokio-util = { version = "0.7", optional = true, features = ["codec"] }
 tokio-vsock = { version = "0.7", optional = true }
 libc = { version = "0.2", optional = true }
 # seccompiler (rust-vmm): the pure-Rust seccomp-BPF compiler Cloud Hypervisor and Firecracker
-# themselves use, for the jailer-equivalent's optional VMM-child deny-list (design §20.4/§20.6).
+# themselves use, for the jailer-equivalent's optional VMM-child deny-list (design §12.3, Layer 2 —
+# the jailer-equivalent; §12.5 is the licensing constraint this dep choice answers).
 # `Apache-2.0 OR BSD-3-Clause` — both allow-listed; NO C-library linkage (unlike the LGPL-2.1
 # `libseccomp` family, banned by name in deny.toml). default-features off to skip the json frontend.
 seccompiler = { version = "0.5", optional = true, default-features = false }
@@ -651,7 +856,7 @@ http = { version = "1", optional = true }
 # validator (design §5.4/§8.5). This is a dev-dependency cycle (`vmcell(dev) →
 # vmcell-artifact-validator → vmcell`), which cargo permits, so `vmcell` itself gains no
 # runtime edge to the validator.
-vmcell-artifact-validator = { path = "../vmcell-artifact-validator", version = "0.5.0" }
+vmcell-artifact-validator = { path = "../vmcell-artifact-validator", version = "0.6.0" }
 # The `vmm_matrix_test!` harness and the FC/QEMU capability/lifecycle/`qemu_*` tests construct the
 # concrete backends, which now live in these crates. Same permitted dev-dependency cycle as the
 # validator above (`vmcell(dev) → vmcell-firecracker/vmcell-qemu → vmcell`), so `vmcell` gains no
@@ -677,7 +882,7 @@ tempfile = "3"
 tracing-test = "0.2"
 proptest = "1"
 env_logger = "0.11"
-# The jailer-equivalent hardening gate (tests/jail_hardening.rs, §20.4) forks a stand-in and
+# The jailer-equivalent hardening gate (tests/jail_hardening.rs, §12.3) forks a stand-in and
 # reads its `/proc/self/status`; it calls raw prctl/syscall/waitpid directly.
 libc = "0.2"
 # The §15.4 xattr battery (tests/xattr_policy.rs, §18 delta 7) synthesizes the one tar layer that
@@ -744,7 +949,7 @@ host-common = [
     # their deps belong here, not only on the CH/FC backend features. This is what
     # lets a qemu- or cli-only host build compile the shared client.
     "dep:serde_json", "dep:hyper", "dep:hyper-util", "dep:http-body-util",
-    # Zygote copy-on-write fan-out (§9.4): the orchestrator reflink-clones a
+    # Zygote copy-on-write fan-out (§8.4): the orchestrator reflink-clones a
     # suspend image (`reflink`) per clone and walks the snapshot dir tree
     # (`walkdir`). These live here, not only on `pipeline`, so the CoW-clone
     # path compiles in any host build (`pipeline` still gets them via this set).
@@ -784,7 +989,7 @@ pipeline = [
     "dep:reqwest", "dep:sha2", "dep:blake3",
     "dep:tar", "dep:flate2", "dep:lzma-rs", "dep:zstd",
     # `reflink-copy`/`walkdir` are declared on `host-common` (zygote CoW fan-out,
-    # §9.4); `pipeline` inherits them through `host-common` above.
+    # §8.4); `pipeline` inherits them through `host-common` above.
     "dep:tempfile",
     "am-fs-erofs", "dep:oci-client",
 ]

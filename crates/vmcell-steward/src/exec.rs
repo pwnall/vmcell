@@ -195,10 +195,17 @@ pub(crate) fn build_command(req: &ExecRequest, tools_dir: &Path) -> Option<Comma
     Some(cmd)
 }
 
+/// Runs one **one-shot** `exec` to completion: spawns the child in its own process group, streams
+/// its output through the single [`Writer`], and returns once the terminal `Exit` frame is sent.
+///
+/// `execs` is the connection's live-child table (§13, law C3). The child is published there for as
+/// long as this call runs, so the two things that outlive this stack frame can reach it: a
+/// service-mode shutdown sweep, and the connection's own teardown.
 pub(crate) fn handle_exec(
     req: ExecRequest,
     writer: &Writer,
     ctx: &Arc<ServeContext>,
+    execs: &crate::serve::OneShotExecs,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let reaper = &ctx.reaper;
     let Some(mut cmd) = build_command(&req, &ctx.tools_dir) else {
@@ -286,6 +293,16 @@ pub(crate) fn handle_exec(
             // reservation and is delivered immediately (AGENT-2).
             reaper.reserve(pid, pre_spawn_epoch);
             let has_exited = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            // Publish the child on the connection's live one-shot table (§13, law C3). Until this
+            // existed, a one-shot child's pgid was known ONLY to this stack frame: a service-mode
+            // shutdown swept sessions and left `sleep 600` running under the real init, and a
+            // connection thread that panicked or failed a `send_msg` mid-output left it running
+            // with nobody at all to kill it. The ticket covers every way out of this frame.
+            let _live_child = crate::serve::OneShotTicket::register(
+                execs,
+                pid,
+                std::sync::Arc::clone(&has_exited),
+            );
             let has_exited_clone = std::sync::Arc::clone(&has_exited);
             let tx_timeout = tx.clone();
 

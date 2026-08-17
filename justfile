@@ -12,7 +12,7 @@ runner-release := ".vmcell-bin/release/vmcell-test-runner"
 # job calls both, so local ≡ CI). An externally-set VMCELL_SKIP_MANIFEST always wins.
 skip-manifest := justfile_directory() + "/target/vmcell-skip-manifest.txt"
 
-# §18.2: `vmcelld` is NOT blessed on the dev hot path. It gets its caps by being LAUNCHED THROUGH the
+# §11.2: `vmcelld` is NOT blessed on the dev hot path. It gets its caps by being LAUNCHED THROUGH the
 # blessed runner (`just daemon`, and integration tests), which raises the three caps into the ambient
 # set and execs `vmcelld` — so the ever-changing daemon rebuilds with no `setcap` churn. Only the runner
 # (which rarely changes) carries file-caps. A standalone/production `vmcelld` is capped by the service
@@ -118,8 +118,8 @@ bless:
     bless_one target/debug/vmcell-test-runner {{runner}}
     bless_one target/release/vmcell-test-runner {{runner-release}}
 
-# Run `vmcelld` for manual poking (§D), LAUNCHED THROUGH the blessed runner so it gets its caps
-# without being blessed itself (§18.2) — so it rebuilds with no `setcap` churn. Requires `just bless`
+# Run `vmcelld` for manual poking (§11), LAUNCHED THROUGH the blessed runner so it gets its caps
+# without being blessed itself (§11.2) — so it rebuilds with no `setcap` churn. Requires `just bless`
 # first (blesses the runner). Uses --allow-unauthenticated for a loopback dev bind ONLY; pass
 # --api-key-file for anything real.
 daemon artifacts_dir="/tmp/vmcell-artifacts" bind="127.0.0.1:8787":
@@ -459,9 +459,9 @@ gates:
     # nothing. Two shipped together — AGENTS.md's "read before changing anything" list sent every
     # agent to `docs/99-claude-fable-automated-quality-v9.md` after that document was retired into
     # `docs/historical/` (the one file every agent reads first, pointing at a file that is not there),
-    # and the daemon's served OpenAPI sent consumers to a `design §D` that renumbering had deleted
-    # (docs/90 D2 — a Rust string literal, so closing that instance means extending the `§` arm over
-    # `crates/*/src`, which is the script's recorded follow-up rather than something it does today).
+    # and the daemon's served OpenAPI sent consumers to a `design §D` (allow-dangling-design-ref: quoted
+    # defect) that renumbering had deleted (docs/90 D2 — a Rust string literal, so closing that instance
+    # meant extending the `§` arm over the code, which `ban-dangling-design-ref.sh` below now does).
     # Prose is not compiled, so this is its compiler: every `docs/…` pointer in the root markdown and
     # the live `docs/*.md` must resolve — honoring the conventions the repo actually uses (the
     # arbitrary-digit `9` glob, extension-less document-NUMBER shorthand resolving live or historical,
@@ -474,6 +474,32 @@ gates:
     # and both directions gated (an exemption nobody names, and one that now resolves, both fail).
     ./scripts/check-docs-pointers.sh
     ./scripts/test-check-docs-pointers.sh
+    # The SAME pointer class everywhere OUTSIDE the markdown — the follow-up the script above records.
+    # docs/90 D2 was `design §D` (allow-dangling-design-ref: quoted defect) in the daemon's served
+    # OpenAPI `description`: a dangling pointer in a document the daemon hands to CLIENTS.
+    # `check-docs-pointers.sh` closed that class for the root markdown; the daemon lane's in-crate gate
+    # was scoped to its own tier so it could not redden another agent's files. There are ~2000 `§`
+    # references under `crates/*/src` alone (the design is cited in the rustdoc of nearly every law), so
+    # a renumbering can invalidate any of them silently. The roster is FIVE kinds, because scanning only
+    # `crates/*/src` left a blind spot between this gate and the markdown one that held fifteen live
+    # dangling references: the crate sources AND tests, every `Cargo.toml` (the contract ledgers cite
+    # the design at every version edge), this justfile, and `scripts/` minus the `test-*.sh` self-tests
+    # — whose red-on-inverse fixtures are references that must NOT resolve, so scanning them would make
+    # the gate and its own self-test mutually unsatisfiable. Each kind's file count is in the verdict
+    # and each has its own vacuity arm, because a roster built out of five globs dies one glob at a
+    # time. Every reference resolves against the DISCOVERED newest design document's real headings. The
+    # first escape hatch is self-documenting rather than a roster: a reference into another numbering
+    # must say which (`v30 §9.4`, `docs/78 §5`, `design 62 §22` — the number must name a document that
+    # exists) and is skipped. The second is a per-line `allow-dangling-design-ref: <reason>` marker for
+    # the few lines that QUOTE a dangling reference as the defect they report (this comment is one),
+    # gated in both directions: a marker whose line's references all resolve excuses nothing and fails.
+    # The heading resolver lives in `scripts/design-headings.sh` — one home for "which document is the
+    # design and what headings does it have", shared with the section arm of `check-docs-pointers.sh`
+    # (whose own copy predates it; collapsing the two is a caller change, recorded as a followup). That
+    # helper is NOT gate-shaped and so is not on this roster and cannot be: it makes no claim about the
+    # tree, and its three misconfiguration arms are driven by the self-test beside it.
+    ./scripts/ban-dangling-design-ref.sh
+    ./scripts/test-ban-dangling-design-ref.sh
     # ONE MSRV FACT, and now ONE place that asserts it: `rust-toolchain.toml`'s pinned channel equals
     # the declared `[workspace.package] rust-version`. This call REPLACES the two inline `sed`
     # comparisons that used to live in the `ci` recipe below and in ci.yml's "toolchain honesty" step —
@@ -497,7 +523,7 @@ gates:
     # workspace (design §10.4).
     ./scripts/check-vendored-vhost.sh
     ./scripts/test-check-vendored-vhost.sh
-    # lean-member invariants (§12.8 #4 / §18.1): the guest PID-1 steward, the privileged-window
+    # lean-member invariants (v15 §12.8 #4 / §15.2): the guest PID-1 steward, the privileged-window
     # test-runner, and the `vmcell-privilege` crate BOTH the runner and the daemon link must omit
     # the host async stack. (Each must also COMPILE standalone; those three `cargo clippy -p …`
     # calls stay in `ci`/ci.yml beside the other compile gates — this roster is scripts only.)
@@ -517,7 +543,7 @@ gates:
     # (it does the netns/tap/nft setup itself), so it is NOT governed by the full lean-tree ban above.
     # Its lean boundary is the network-facing WEB SERVER, which lives in `vmcell-daemon` (axum). Assert
     # the broker links NEITHER `vmcell-daemon` NOR `axum`, so the HTTP surface that parses network
-    # input can never share the cap-holding process (§12.23 / P2). NOTE: `hyper` is deliberately NOT
+    # input can never share the cap-holding process (§13 / P2). NOTE: `hyper` is deliberately NOT
     # asserted absent — it enters transitively and LEGITIMATELY through vmcell's egress proxy
     # (hudsucker) and HTTP clients (reqwest/oci-client), which the broker's net subset needs. The
     # meaningful marker of the *server* stack is axum + the vmcell-daemon crate. (Corrects the
@@ -559,6 +585,19 @@ gates:
     # file, and the stale-exemption check.
     ./scripts/ban-inline-setns.sh
     ./scripts/test-ban-inline-setns.sh
+    # The netns LAYOUT half of the same net law (F2-adjacent): `/var/run/netns/<name>` is composed
+    # only from `net::tap::NETNS_DIR`. `net/tap.rs`'s `netns_layout_gate` pins that roster in both
+    # directions, but it walks `env!("CARGO_MANIFEST_DIR")/src` — so its whole verdict is about
+    # `crates/vmcell/src`, and `netns_path`/`netns_dir` are `pub(crate)`, meaning no other crate can
+    # route through them even if it wanted to. This is the COMPLEMENT, not a second copy: it scans every
+    # other crate's src and DELEGATES that one tree to the in-source gate, failing loud if that gate
+    # (or the const it reads its needle out of) is gone. It also bans the ALIAS — `/var/run` is
+    # conventionally a symlink to `/run`, so `"/run/netns/…"` reaches the same directory while matching
+    # nothing anchored on the law's own text, the alias class AGENTS.md's F3 rule names. The self-test
+    # drives both arms, the three ways the delegation goes stale, and both vacuity arms (including the
+    # one peculiar to a complement gate: a tree that is ONLY the delegated crate).
+    ./scripts/ban-inline-netns-path.sh
+    ./scripts/test-ban-inline-netns-path.sh
     # docs/81 §8/§9 ("one law, one predicate"): the kernel ARTIFACT-KEY (`kernel-<label>`) and
     # PIN-KEY (`kernel_<label>_<sub>`) laws were triplicated and unexported — a private method in
     # `artifact::kernel`, a byte-duplicate in `vmcell-kernel-builder`, and the pin key composed
@@ -599,6 +638,19 @@ gates:
     # sites that COMPARE bytes, which banning would delete the verification F7 exists to enable.
     ./scripts/ban-registry-digest-check.sh
     ./scripts/test-ban-registry-digest-check.sh
+    # docs/90 A2: `vmcell::artifact::ch_binary_path()` is the one resolver for the §10.4 contract
+    # variable `$VMCELL_CH_BIN`. The review found a THIRD byte-identical copy — in `vmcell-cli`, the one
+    # every VM-lifecycle verb went through — while design §17's open-consolidation register, whose job
+    # is to inventory exactly this, named only two of the three. A parity assertion cannot close it
+    # (`ch_bin() == ch_binary_path()` passes with the variable UNSET, which is every test run, and
+    # `set_var` is banned here), so the law is scanned. The CLI now carries an in-source call-site gate,
+    # but `include_str!("main.rs")` is its whole universe; this is the class, repo-wide, where the next
+    # copy will be. The roster names the four files that may spell the variable — the daemon's
+    # flag-then-env precedence, the daemon suite's PATH-searching variant, `bench-vm`'s parity-asserted
+    # table, and the CLI gate's own needle — each with an EXACT count in both directions, so an extra
+    # read cannot hide behind an entry and a stale entry cannot widen the blind spot.
+    ./scripts/ban-ch-binary-resolver-copies.sh
+    ./scripts/test-ban-ch-binary-resolver-copies.sh
     # docs/81 §8 ("one law, one predicate"): the 1 s VMM-control-socket readiness ceiling was six
     # inline `1000`s across CH/FC/QEMU/crosvm. The fix is structural — `register_and_await_ready`
     # and `wait_for_vmm_socket` take NO timeout argument, so a literal there is a compile error —
@@ -679,7 +731,7 @@ ci:
     # copy drifted three times, most recently dropping two whole bans (see `gates`'s header). A
     # recursive `just` is what makes the roster have exactly one home.
     {{just_executable()}} gates
-    # lean-member invariants (§12.8 #4 / §18.1), compile half: the tree-SHAPE assertion is
+    # lean-member invariants (v15 §12.8 #4 / §15.2), compile half: the tree-SHAPE assertion is
     # `check-lean-tree.sh` inside `gates`; graph inspection is not enough, so each of the three
     # members is also clippied standalone here — a broken build (e.g. an un-gated host dep) must be
     # caught in this job, not on a KVM host.

@@ -354,7 +354,14 @@ Reusing the existing capability (rather than a bespoke fan-out flag) keeps one s
 Feature-complete: snapshot/restore via `--restore`+`resume`, virtio-fs shares, vhost-user-net (so the
 unprivileged NAT), and nested virt. Driven over a hand-written thin REST client (`hyper`/`hyperlocal` over
 the Unix `--api-socket`); **every control RPC over the API socket is bounded at 5 s**, so a wedged VMM
-control socket surfaces as a typed `Error::Timeout` before any outer readiness timeout can mask it. Cold
+control socket surfaces as a typed `Error::Timeout` before any outer readiness timeout can mask it.
+**One deliberate exception:** the snapshot RPC's budget is guest-RAM-proportional, sized by the one
+law `vmm::snapshot_request_timeout(mem_mib)` — the flat 5 s ceiling plus the write time a conservative
+floor on sustained throughput implies — because a suspend image tracks guest RAM ~1:1 and a multi-GiB
+guest overruns the flat ceiling by construction, leaving the VM paused with a half-written image. It
+degrades to the flat ceiling for a zero-RAM probe instance, and every backend's snapshot budget routes
+through it rather than carrying its own literal — CH and Firecracker read it directly; QEMU and crosvm
+take the larger of it and their own migration/control floor. Cold
 boot ≈305 ms; warm restore ≈53 ms (§16).
 
 Two lifecycle paths: cold = `vm.create` → `vm.boot`; warm = launch with `--restore` → `vm.resume`
@@ -903,8 +910,11 @@ than "serve the protocol," and missing any of it is painful to debug (law C1 —
   - A guest→host variant received here means the peer desynced: log loud, close the connection.
 
   When the loop ends for any reason (disconnect, transport error, desync), the connection **kills every
-  still-open session's process group and closes its fds before returning** — no interactive session
-  outlives its connection (law C3). Sessions do not survive snapshot/restore either: a restored VM
+  process group it spawned and closes its fds before returning** — its still-open sessions *and* its
+  in-flight one-shot `exec` children, both through the one `teardown_connection` helper, so nothing it
+  started outlives it (law C3). The one-shot table is the sessions table's counterpart and exists for
+  the same reason: a one-shot child used to be known only to the connection thread's own stack frame,
+  so nothing that outlives that frame could reach it. Sessions do not survive snapshot/restore either: a restored VM
   re-binds the listener and the host reconnects on a fresh connection; the "persistent" in the feature
   name is *within a session's life across many frames*, not across a VM restore.
 
@@ -1017,11 +1027,24 @@ skips `verify_control_plane` and its bounded re-spawn loop whenever `cfg.init.is
 rationale that is correct for `None` (re-spawning to exhaustion against a listener that never comes
 up) and wrong for `Service` — a steward *is* coming up, and a wedged `vhost-device-vsock` bring-up is
 precisely what the probe exists to catch — so it re-keys to run whenever `steward_port()` is `Some`.
-One sizing consequence rides the re-key: the gate's per-attempt budget is tuned against `Pid1`
+One sizing consequence rides the re-key, and it is a **branch, not a remark**: the gate's per-attempt
+budget is tuned against `Pid1`
 time-to-ready (~0.7 s p50), and a `Service` steward arrives only after the guest's own init brings
-it up — so under `Service` the gate's overall window derives from the caller's connect budget (the
-10 s default, or the caller-supplied window), never the `Pid1`-tuned constant, or a slow-but-healthy
-systemd cell would be killed and re-booted to exhaustion by its own health check.
+it up — a systemd ordering chain is slow-but-healthy, and the `Pid1`-tuned constant would tear such a
+cell down and re-boot it to exhaustion by its own health check. So the window is **selected on the
+placement**, by one predicate (`control_plane_probe_budget`): `Pid1` keeps the 4 s constant, `Service`
+gets the caller's **default** connect budget (10 s), and `None` — which never reaches the gate, since
+`start` keys it on `steward_port().is_some()` — takes the `Pid1` floor rather than a third policy
+nobody exercises. The match is exhaustive on purpose: a new placement is a compile error there, not a
+silent inheritance of another placement's window. Two narrowings of the wording this sentence used to
+carry, both deliberate: it is the **per-attempt** window, not one overall window — a re-spawn buys a
+fresh one, and the re-spawn loop exists for QEMU's placement-independent vhost-user vsock bring-up
+race, so collapsing the gate into a single window would shrink a `Service` cell's recovery to one
+attempt. And it is the *default* connect budget, spelled once as a const the two connect sites read
+too, not a **caller-supplied** window: `Timeouts` carries no connect-budget field (§9.3) and the
+caller's window is the per-call `steward(timeout)` argument, which `start()` never sees — threading one
+in would change `MicroVm::start`'s signature on a ledgered contract crate to move a bound the default
+already sizes correctly.
 The pre-v33 tree spelled this predicate **three ways** (raw `cfg.init` in `start()`, the retained
 `control_plane_disabled` field, and `cfg.init` again inside the eligibility predicate), all
 accidentally equivalent; law C8 makes the one method the only spelling, with a source-scan gate on
@@ -1097,8 +1120,10 @@ The per-mode differences, each a parameter rather than a fork of the code:
   of placement, which is exactly why placement is a parameter.
 - **SIGTERM policy.** As pid 1, any SIGTERM powers off the guest — exactly right. As a service it
   would mean `systemctl stop vmcell-steward` powers off the machine and `restart` never returns, so
-  `Service` maps SIGTERM to a graceful shutdown: stop accepting, tear down live sessions per law C3,
-  exit — an exit that is legal precisely because the steward is *not* pid 1 there.
+  `Service` maps SIGTERM to a graceful shutdown: stop accepting, sweep every live connection's process
+  groups per law C3 — its sessions **and** its in-flight one-shot `exec` children, since the steward
+  *exits* here and an exit that leaves a `sleep 600` running under the real init is exactly the residue
+  C3 forbids — then exit, an exit that is legal precisely because the steward is *not* pid 1 there.
 - **What does not vary:** the wire protocol (`Ready` stays the first frame of every accepted
   connection; the framing, session, and resync semantics are placement-blind), the credential
   posture (no uid/gid syscalls anywhere in the crate), the single-writer discipline (C4), the
@@ -1114,7 +1139,8 @@ tmpfs `/tmp`), spawn `/usr/sbin/vmcell-steward` as a child, reap everything fore
 real init it stands in for (`Restart=` is what systemd would do) — **restart the steward whenever
 it exits**, with a bounded rapid-failure cap that powers the guest off fail-loud instead of
 crash-looping silently. The restart is what makes the service SIGTERM leg satisfiable at all:
-SIGTERM → the steward tears down live sessions per law C3 (the pgroup-residue assertion runs on
+SIGTERM → the steward sweeps every live connection's process groups per law C3, sessions and
+in-flight one-shot `exec` children alike (the pgroup-residue assertions run on
 this path — the service shutdown's C3 leg, otherwise ungated) → clean exit → mini-init restarts it
 → the guest stays up and the next `exec` works. Against the generality directive this is the `usbhost`-fragment /
 IKCONFIG-example defense (law G1): a placement capability must be live-validated (AGENTS rule 5),
@@ -1388,7 +1414,9 @@ Raw exposure is zero new guest code and zero new cmdline token; if auto-mount is
 - **Cloud Hypervisor:** push one `ChDisk { path, readonly, direct: false }` per extra disk onto
   `ch_cfg.disks` after the rootfs arm; CH assigns `/dev/vd{a,b,c}` purely by array order. Every disk is
   declared `image_type=Raw` **explicitly** — CH v52 auto-detects an unspecified image as raw and disables
-  sector-0 writes, a live-caught bug that also lurked on the writable `Block` rootfs path.
+  sector-0 writes, a live-caught bug that also lurked on the `Block` rootfs path back when that path
+  attached the root read-write; it is read-only on every variant now (`root_device_read_only`, §4.7),
+  so only a *writable extra* disk can still meet it.
 - **QEMU:** a split-form `-drive file=…,format=raw,id=extra{i},if=none[,readonly=on],file.locking=off` +
   `-device virtio-blk-pci,drive=extra{i}` pair per disk, after the rootfs `-drive`. No fixed device cap
   (PCI slots).
@@ -1432,7 +1460,10 @@ same VM.
 xattr today, with the rationale recorded at the strip site: the steward and every in-guest exec
 run as root, so file capabilities are moot — and the erofs `Node`/`XattrSpec` plumbing exists but is
 unused (`xattrs: vec![]` at all ten node-construction sites, pinned by
-`test_pax_xattrs_are_not_preserved` as a recorded limitation). **That premise is true of the pinned
+`tar2erofs::pax_xattrs_are_stripped_under_the_default_policy` — which shipped as
+`test_pax_xattrs_are_not_preserved`, a recorded limitation waiting to be retired, and was renamed by
+delta 7 because it now pins the *default policy's* behavior rather than an unconditional
+drop). **That premise is true of the pinned
 minimal base and false of a full distro image.** The pinned base's single cached layer ships no
 `getcap`/`setcap`/`setfacl`/`getfacl` — nothing in it could even observe a surviving file
 capability, so the strip costs it nothing; a full Debian ships `security.capability` on real
@@ -1454,7 +1485,8 @@ reverse the strip; it **scopes** it:
   the derivation (both desync directions unrepresentable — the `Pid1`+init reject shape, F1), and
   the contradictory-pair reject is a §18 delta-7 red-on-inverse leg.
 - **Both directions are gated** — the cheapest possible instance of §10.6's two-directional shape:
-  `test_pax_xattrs_are_not_preserved` stays green for the default artifact and gains a `Preserve`
+  `pax_xattrs_are_stripped_under_the_default_policy` stays green for the default artifact and gains
+  the `pax_xattrs_are_preserved_under_the_preserve_policy`
   twin asserting the same fixture xattr **survives**; the live leg packs a `Preserve` artifact from
   a base carrying a `security.capability`, boots it, and reads the xattr back **in-guest** — via a
   new read-only `xattr` guest-tools applet (`xattr get <path> <name>` / `xattr list <path>`,
@@ -1475,8 +1507,22 @@ backend since v22 — `rootfstype` selection and `rootflags=noload` are already 
 in-tree ever *produced* an ext4 image; the only packer is tar→erofs. v33 adds a producer behind the
 same `Stage` interface, consuming the same merged-tar tail (injections, `libc6` scan, xattr policy,
 reserved-path law all inherited for free — obligation 3 of §4.3), so `Block` finally has an in-tree
-filler for the workloads that need a writable, POSIX-complete root (a fixture tree that outgrows the
-tmpfs overlay, a workload asserting on ext4 semantics). Implementation avenue, ranked per §9.6 —
+filler for the workloads that need a **POSIX-complete** root — device nodes, xattrs, ACLs, and a
+workload asserting on ext4 semantics, which is exactly what the mount-and-diff gate measures.
+**Not a writable one:** the ext4 root is attached and mounted **read-only**, like the erofs one, and
+`RootfsSource::root_device_read_only` is the one law that says so for every variant. The earlier
+pitch of "a writable, POSIX-complete root" contradicted §5.2's "mounts strictly read-only without
+journal recovery" and §18's *Migration: additive*; writability would have meant rewriting F3's
+reserved-cmdline alias law (`rw` is reserved *because* `rw` + `rootflags=noload` is silent
+corruption), growing the clone-eligibility predicate a `RootfsSource` arm, and dropping `noload` —
+and it would not even have worked under the default `Pid1` placement, where the steward
+unconditionally overlays tmpfs over `/` and every guest write lands in the tmpfs upper. The
+POSIX-completeness motivation is the one that survives, and it needs no write path.
+**The tail the producer sits behind is the general one.** `pack_rootfs_with_injection` is what every
+source calls — the OCI source included — so a registry entry declaring `format: ext4` builds end to
+end; `pack_erofs_with_injection` is the erofs-only *door* onto that tail, kept because §10.4 names it,
+and it refuses any other format by name rather than silently packing erofs (§10.4 lists both).
+Implementation avenue, ranked per §9.6 —
 **a permissive pure-Rust ext4 writer is preferred over the external tool**, and the delta directs
 evaluating the crate route first (an MIT/Apache ext4-writing crate vetted for maturity by a
 mount-and-diff conformance gate: pack, boot, compare the tree in-guest against the tar manifest —
@@ -1657,9 +1703,11 @@ question a custom init no longer decides by itself:
 
 Under `None`, `start()` still boots and returns the handle — the caller drives/observes the VM
 out-of-band: the serial log, a raw `dial_vsock` to its own listener (§3.2), a read-write extra
-virtio-blk device, a share, or networking. A custom init on the read-only erofs root also has no
-writable `/` (the steward's tmpfs-overlay setup runs only under `Pid1`), so a custom-init VM
-typically pairs with a writable `Block` rootfs (§4.7's producer fills it) or a writable extra disk —
+virtio-blk device, a share, or networking. A custom init has no
+writable `/` under **either** root variant — the steward's tmpfs-overlay setup runs only under `Pid1`,
+and the root device is read-only for `Erofs` and `Block` alike (`root_device_read_only`, §4.7: the
+ext4 producer adds a POSIX-complete artifact, not a writable one). So a custom-init VM that needs to
+write mounts its own tmpfs, or pairs with a writable extra disk or a read-write share —
 a caller responsibility, documented on the field. Exposure: the CLI verbs bring the steward up, so
 they don't take `init=`; the daemon exposes `init` + placement over REST **for the `Service`
 placement only** (§11.5, §18 delta 10) — the recorded "no `init=` over REST" rule was scoped by its
@@ -2343,8 +2391,22 @@ VmConfig::builder(kernel, rootfs).require(Feature::SnapshotRestore)
 
 **Where declarations come from, and what an absent declaration means.** The backend contributes its
 `VmmCapabilities` literal unchanged — the descriptor stays the backend's one declaration input, not
-a parallel vocabulary. The host contributes `HostCapabilities` (nested-virt readiness, privileged-net
-facilities). An **artifact** declares through its registry entry (§10.5) and, so the declaration
+a parallel vocabulary. The host contributes the **one start-up `HostCapabilities` descriptor** (§7.2
+rule 1), projected into the intersection by `feature::HostDeclaration::from_host_capabilities` — a
+thin newtype, not a second descriptor, so the host axis has exactly one probe. It speaks about
+exactly the features it can decide, which today is `Feature::NestedVirt` and nothing else (from
+`HostCapabilities::nested_virt`, the KVM modules' `nested` parameter); the descriptor's privileged-net
+fields belong to a different reader — `NetSegment::new`'s fail-loud `privileged_net_available` gate
+(§6.5) and the daemon's boot-time capability log (§11.2) — not to the intersection. Growing the axis
+therefore means growing `HostCapabilities` and that one projection, never adding a read beside it —
+which is what makes the derivation stated here true. It was not, before: `HostDeclaration` ran its own
+`/sys/module/*/parameters/nested` read, so the one axis this section named contributed nothing while
+this rule held for everything else. A caller holding the boot-time descriptor (the daemon logs one,
+§11.2) passes it in; `HostDeclaration::probe()` — which `MicroVm::start`/`restore` still use — is that
+same projection over a fresh `HostCapabilities::probe()`, never a second implementation. Nested-virt
+readiness has one conservative direction of its own, recorded at the field: an unreadable module
+parameter resolves *permissive*, because the host axis removes a feature only when it can positively
+say the facility is off. An **artifact** declares through its registry entry (§10.5) and, so the declaration
 travels with the artifact a path-consuming cell actually reads, through a **feature-manifest
 sidecar** emitted beside it at build time (`rootfs-<label>.features` — the resolved-config sidecar's
 sibling, content-addressed with its artifact). The registry entry is the **one authority**; the
@@ -2924,8 +2986,11 @@ pub struct VmConfig {
     pub init: Option<PathBuf>,          // init= override: replaces PID 1 — init IDENTITY only (§5.3);
                                         //   control-plane availability is the placement's fact, below
     pub steward_placement: StewardPlacement, // Pid1 (default when init is None) | Service{port} | None
-                                        //   (default when init is Some); the ONE C8 predicate is
-                                        //   steward_placement.steward_port() (§3.5); build() rejects
+                                        //   (default when init is Some); law C8's TWO methods live
+                                        //   here — steward_port() answers "is a steward expected,
+                                        //   and where", resync_reachable() answers "may this cell
+                                        //   snapshot/clone", and they differ exactly at Service
+                                        //   (§3.5); build() rejects
                                         //   Pid1 + a custom init, and snapshotting + non-Pid1
     pub resource_prefix: String,        // names AND sweeps every per-VM host resource; default "vmcell",
                                         //   validated [A-Za-z0-9]≤6 at build() (§11.4)
@@ -3357,11 +3422,23 @@ still by gates — retiring "public in the Rust-visibility sense but semi-public
 contract surface: the pins schema + overlay semantics (§10.2) — as of v33 including the **rootfs and
 handler registry namespaces** (§10.5); `Stage`, `Pipeline`, `ResolvePinsStage`,
 `StageInputs`/`StageOutputs`, `CacheKey`, and the hash helpers (§10.2); the kernel build entry points
-and the resolved-config sidecar (§5.6) plus, v33, the labelled rootfs/handler build entry points and
-the **feature-manifest sidecar** (§7.4/§10.5); `pack_erofs_with_injection` + `ExtraFile` + the
-`XattrPolicy` parameter and the rootfs-construction contract (§4.2–§4.3, §4.7); the `VMCELL_*` env
-contract (below); and the `vmcell-artifact-validator` battery + `KconfigValues` (§5.6, §9.1) — whose
-`CheckStatus` grows two variants in v33 (§10.6), a ledgered validator bump. Versioning is the convention the
+and the resolved-config sidecar (§5.6) plus, v33, the **labelled rootfs/handler stage constructors** —
+`RootfsStage::labelled(label)` and `GuestToolsStage::labelled(label, source)`, which a consumer
+composes into its own `Pipeline` beside `ResolvePinsStage`, plus the `vmcell build
+--rootfs-label`/`--handler-label` verbs that drive them — and the **feature-manifest sidecar**
+(§7.4/§10.5); the one inject+pack tail `pack_rootfs_with_injection` **and** its erofs-only door
+`pack_erofs_with_injection`, both contract surface, with `ExtraFile`, `PackOptions`, and the
+`XattrPolicy` and `RootfsFormat` parameters, and the rootfs-construction contract (§4.2–§4.3, §4.7);
+the `VMCELL_*` env
+contract (below); the proxy doubles seam's `hudsucker` and `hyper` re-exports (§1.3) — the seam's
+`Matcher`/`Responder` aliases are built from types vmcell does not own, so the re-exports are how a
+consumer names exactly the versions they resolve to, and a bump in either is a ledgered move rather
+than a type mismatch a consumer discovers from the lockfile; and the `vmcell-artifact-validator`
+battery + `KconfigValues` (§5.6, §9.1) — whose `CheckStatus` grows two variants in v33 (§10.6), a
+ledgered validator bump, and whose `ValidationOptions` grows the `run_budget` field that closes §17's
+`validate()` gap. `ValidationOptions` is an exhaustive struct, so that field is a **breaking** addition
+and takes its own ledger entry by the rule below — `semver-checks` reports the edge, but the rule is
+what puts the reason in front of the consumer. Versioning is the convention the
 crates already follow — pre-1.0 breaking-changes-as-minor-bumps, announced in the comment-changelog at
 the top of `crates/vmcell/Cargo.toml` — so a break is a deliberate, findable ledger entry, never
 discovered by compile failure. Gates: `cargo semver-checks` covers **`-p
@@ -3474,14 +3551,33 @@ never a silent reinterpretation (two accepted shapes for one namespace is parser
 for a third). This is a pins-schema break and rides the pass's ledgered contract bump.
 
 **Naming and keying laws mirror the kernel's exactly, one apiece** — `rootfs_artifact_key`
-(`rootfs-<label>`), a `rootfs-<label>.erofs` filename law and its inverse, the sanitized-label
-collision reject, sorted resolution order, and the handler equivalents — extracted beside
+(`rootfs-<label>`), a `rootfs-<label>.<format>` filename law over the `rootfs-<label>` stem and its
+inverse (which returns the *pair*, since delta 8 made the extension carry the format and the stem is
+what the `.cache_key` and `.features` sidecars are named after), the sanitized-label
+collision reject, sorted resolution order, and the handler equivalents
+(`handler_artifact_key`/`handler_label_from_artifact_key`) — extracted beside
 `kernel_artifact_key`/`kernel_pin_key` (which the docs/81 pass already exported as one-law
 composers precisely because a builder had byte-duplicated them; the new kinds share the merge /
 collision / sort core rather than copying it — one registry resolution law, three kind
 parameterizations). A stale `rootfs-<label>.erofs` is as detectable as a stale `vmlinux-<label>`,
 by the same code shape; each labelled artifact carries its `.cache_key` sidecar and, when it
 declares features, its feature manifest (§7.4), all content-addressed together.
+
+**The pack tail reads the handler through the key law, and an unmatched pair is a refusal.** The one
+inject+pack tail resolves the handler binary at `handler_artifact_key(handler_label)` — not the bare
+`"guest_tools"` literal — and the `cache_key` consumed-artifact fold reads *that same* key, so the
+identity a build publishes cannot describe a different binary than the bytes it baked. Absence is
+legal for exactly one shape: a pipeline that ran no handler stage at all (`oci2-erofs` without
+`--tools`, an in-VM builder pack), where an image with no `/vmcell-tools` is what the caller asked
+for. Every other absence is a wiring error and is **refused, fail-loud, before any layer is read** —
+a declared label with no artifact under its key, and the mirror case of an *orphaned* labelled
+artifact sitting beside a pack that declared no label (the mmdebstrap-source shape, whose stage takes
+no handler label). The alternative is not a failed build but a *successful* one: an image whose every
+applet path is absent, `mini-init` among them, and that one is an `init=` target, so its absence is a
+guest kernel panic rather than a missing test helper. The reserved `default` spelling normalizes to
+"no label" at the one stage intake, so `--handler-label default` and the omitted spelling compose the
+same key, the same output file and the same cache key — the byte-identity rule below, applied to the
+handler kind.
 
 **Registration is a digest; a path is an override (R7 — the rule that had to be settled before the
 registry existed).** Three registration shapes exist, exhaustively: a **digest** (the consumer
@@ -3505,13 +3601,19 @@ wherever provenance is reported, and is **refused by `bundle`**.
 
 **Where selection lives — a recorded shift from the requester's sketch.** The R2 sketch put label
 selection on the config builder (`.rootfs_label(…)`, `.handler_label(…)`); v33 keeps `VmConfig`
-**path-based** and puts selection at the **artifact layer** — the build entry points
-(`build_labelled_rootfs`/`…_handler`, the `vmcell build --rootfs-label/--handler-label` verbs) and
+**path-based** and puts selection at the **artifact layer** — the labelled stage constructors
+`RootfsStage::labelled(label)` / `GuestToolsStage::labelled(label, source)`, the `vmcell build
+--rootfs-label`/`--handler-label` verbs that drive them, and
 the env overrides — for a reason the sketch conventions anticipate (names advisory, behavior
 binds): registry coupling stays out of the VM layer, a cell consumes whatever artifact path it is
 handed exactly as before, and the declarations still reach a path-consuming cell because they
 travel in the feature-manifest sidecar beside the artifact (§7.4). The shift is recorded here so
-it is a decision, not a drift.
+it is a decision, not a drift. A **second** shift rides it, in the same spirit: there is no
+`build_labelled_rootfs`/`…_handler` thin assembler to mirror `build_labelled_kernel`. A kernel build
+is a fixed two-stage assembly with nothing for a caller to vary; a rootfs or handler build composes
+with injections, extra files, a pack format and an xattr policy, so an assembler would either hide
+those or grow a parameter per knob — the shape `PackOptions` exists to avoid. The constructors are
+the entry points; `docs/implementation-notes.md` carries the reasoning.
 
 **Selection is lazy — a registered artifact is not built until something selects it.** This is the
 one place R2 changes the *kernel* registry too: `build-kernels` today builds every label in the
@@ -3694,10 +3796,19 @@ The daemon needs the same three capabilities as privileged operation (§6.1). Tw
 drop-and-exec (law P1).** The runner is a *transient* wrapper — file-caps → **drop to the dev uid** →
 raise ambient → `execvp` (that order, not its inverse: §15.5) — so the caps live only across one `exec`. The daemon's cap-holder is a *long-lived
 server* that must itself perform privileged VM operations (netns/tap/nft) for the whole process life. So
-it runs the **blessing precondition** (the three caps present in the **effective** set, or `euid == 0`)
-and then keeps them: no uid drop, no ambient raise, no bounding-set shrink, no `exec`. If the precondition
-fails it prints the `setcap …+ep` remediation and **refuses to start** — never a daemon that came up
-without `CAP_NET_ADMIN` and fails every privileged create at first use. Which process is the cap-holder
+it runs the **blessing precondition** — the three caps present in the **effective** set, unconditionally,
+with **no euid exemption** — and then keeps them: no uid drop, no ambient raise, no bounding-set shrink,
+no `exec`. There used to be an `or euid == 0` short-circuit, and it was a fail-open: default container
+root holds neither `CAP_NET_ADMIN` nor `CAP_SYS_ADMIN`, and a unit with `User=root` plus a
+`CapabilityBoundingSet=` that omits one of the three looks the same, so both came up clean and then
+failed every privileged create — the degraded server law P1 exists to forbid, reached through the one
+function the daemon and the runner share. A genuine full-authority root process still passes, because it
+holds the caps; only the narrowed shapes now refuse. If the precondition
+fails it **refuses to start** and prints the remediation the *shape* needs, which is why the euid is read
+at all: an unblessed non-root binary gets the `setcap …+ep` line (almost always a rebuilt binary), while
+a narrowed root gets told to grant the capabilities where its own set is configured — the container
+runtime's `--cap-add`, or the unit's `AmbientCapabilities=` — because a file capability is masked by the
+process's own bounding set and `setcap` there is advice that cannot work. Which process is the cap-holder
 depends on the broker: by **default** `vmcelld` forks the setup broker — the broker child is the
 cap-holder and owns the VM `Registry`, while the HTTP-serving parent drops all caps (law P2, §12.4);
 `--no-setup-broker` selects the single-process retain-caps fallback.
@@ -3711,11 +3822,21 @@ logic diverges" trap. So it is extracted, with the runner's pure, already-unit-t
 pub const PRIVILEGED_CAPS: [Cap; 3] = [Cap::NET_ADMIN, Cap::SYS_ADMIN, Cap::DAC_OVERRIDE];
 
 pub fn compute_missing(effective: &CapSet, need: &[Cap]) -> Vec<Cap>;          // pure
-pub fn blessing_remediation(uid: u32, exe: &Path, missing: &[Cap]) -> String;  // pure
 pub fn shell_single_quote(p: &Path) -> String;                                 // pure
 
-/// Effective-set precondition shared by the runner and the daemon. Returns the
-/// remediation string on failure. Does NOT mutate the process.
+/// Why the precondition refused, and therefore which remediation fixes it. BOTH arms refuse:
+/// the verdict never depends on the euid, only the advice does.
+pub enum BlessingRefusal { Unblessed(Vec<Cap>), NarrowedRoot(Vec<Cap>) }
+
+/// The precondition's decision, over in-memory inputs — PURE, so the euid-0-with-a-narrowed-set
+/// shape is unit-testable on any host at any privilege level (law P1's start-up gate).
+pub fn blessing_verdict(euid: u32, effective: &CapSet, need: &[Cap]) -> Result<(), BlessingRefusal>;
+pub fn blessing_remediation(uid: u32, exe: &Path, refusal: &BlessingRefusal) -> String;  // pure
+
+/// Effective-set precondition shared by the runner and the daemon: the thin live edge over
+/// `blessing_verdict` — it reads the cap state and the euid, and on a refusal resolves
+/// `current_exe()` to build the message. Returns that remediation string on failure. Does NOT
+/// mutate the process, and never re-branches on the euid beside the verdict (a source scan says so).
 pub fn ensure_blessed_or_explain(need: &[Cap]) -> Result<(), String>;
 
 // The runner's transient path stays runner-only (it drops uid + execs) but its PURE plan lives here:
@@ -3749,13 +3870,23 @@ pub fn resolve_artifact_path(dir: &Path, name: &str) -> Result<PathBuf, Artifact
 ```
 
 Accept rule (allowlist, not denylist — a denylist of "bad" substrings is the divergence trap): a name is
-valid iff it is non-empty, ≤255 bytes, every byte in `[A-Za-z0-9._-]`, not `.`/`..`, and not leading `-`
+valid iff it is non-empty, within `MAX_ARTIFACT_NAME_LEN`, every byte in `[A-Za-z0-9._-]`, not `.`/`..`,
+and not leading `-`
 or `.` (a leading `-` would be read as a flag by any tool the name is later handed to; a leading `.` hides
-the file and enables the `.`/`..` family). The result is always `dir.join(name)` with `name` a single
+the file and enables the `.`/`..` family). **The ceiling is `NAME_MAX` minus the digest-sidecar suffix**,
+not `NAME_MAX` itself: an accepted name has to fit *twice*, as `<name>` and as `<name>.sha256`, because
+the store writes the sidecar beside the artifact. At a bare-`NAME_MAX` ceiling a long-but-legal name
+persisted the artifact and *then* failed its sidecar write with `ENAMETOOLONG` — a deterministic 500 on a
+well-formed request, and a burned name in a create-only store. The suffix is the one const both the
+validator and the store read, so the two cannot drift; the atomic upload's temp file carries an
+independent random name, so no temp suffix has to fit in the budget.
+The result is always `dir.join(name)` with `name` a single
 component — no `/` in the accepted set, so no subdirectories and no traversal are representable. Callers
 **never** construct `dir.join(client_string)` themselves (grep-able gate: `dir.join(` on a client string
 outside this function is a review-reject). Red-on-inverse tests: `..`, `a/b`, `/abs`, `-rf`, `.hidden`,
-empty, over-255-bytes, and a NUL byte all reject; a positive control (`vmlinux-6.12`, `rootfs.erofs`)
+empty, a NUL byte, and an over-ceiling name all reject — the length leg pins that the longest accepted
+name's sidecar lands exactly **on** `NAME_MAX`, no byte over and none wasted, so it reddens if the
+ceiling is restored to `NAME_MAX`; a positive control (`vmlinux-6.12`, `rootfs.erofs`)
 accepts and joins to exactly `<dir>/<name>`.
 
 **Operations:**
@@ -3880,7 +4011,13 @@ extra device fields:
   a cold boot. The daemon restores via **CoW** (`MicroVm::restore_cow`), so the named snapshot is
   preserved and re-restorable; `create` then drives the mandatory post-restore resync.
 - **`command: Option<Vec<String>>`** — present ⇒ `run` (exec, capture, keep-or-teardown per
-  `ephemeral: bool`); absent ⇒ `create` (boot to steward-ready and register).
+  `ephemeral: bool`); absent ⇒ `create` (boot to steward-ready and register). A **failed** inline exec
+  tears the VM down **regardless of `ephemeral`**: `create` is one operation, and the error reply
+  carries no `CreateVmResponse`, so a kept VM would be a booted, resource-holding cell whose id the
+  caller never received and cannot destroy. A command that *ran* and exited non-zero is an `Ok`
+  outcome and keeps its VM, as `ephemeral: false` asks — the distinction is whether the caller got an
+  id, not whether the guest process succeeded. A teardown error on that path is logged, never masked
+  over the exec outcome the caller asked for.
 - **`extra_disks: Vec<ExtraDiskSpec>`** and **`extra_kernel_args: Vec<String>`** — an `ExtraDiskSpec` is
   an artifact **name** (resolved through `resolve_artifact_path`) plus an optional `io_limit`. Two
   deliberate divergences from the library, both forced by the daemon's model: **daemon extra disks are
@@ -4519,7 +4656,15 @@ These run on every build and fail it, so a whole class of defect never reaches a
   documented) and a lint requiring every `unsafe` block to carry a `// SAFETY:` justification.
 - **`#![forbid(unsafe_code)]` on every I/O-free / logic module** — `net/` (its one irreducible ioctl is
   quarantined in `net_sys.rs`), `config`, `naming`, `artifact`'s pure core, the protocol codec — so unsafe
-  can physically only live in the few modules that have a documented reason for it.
+  can physically only live in the few modules that have a documented reason for it. **This roster is
+  itself the gate's input.** `naming`'s `design_forbid_unsafe_roster` parses the list out of the newest
+  `docs/*.md` §15.2 heading at run time (never `include_str!`, so a reissue is picked up the moment it
+  lands) and asserts each named module carries the attribute, failing loud in both directions: a named
+  module without it, and a roster entry the gate cannot map to a file — because a design that grows a
+  module must not silently grow an unchecked one. An unparseable bullet is a `gate misconfigured`, never
+  a green empty roster. It held only by memory before, and the entry it was false for was `naming`
+  itself — law F2's sole home, and the module whose output the orphan sweep uses to decide what to
+  delete.
 - **`RUSTFLAGS=-D warnings`** applied process-wide in `just ci`, over `clippy --all-targets
   --all-features` and `cargo fmt --check`.
 - **The feature powerset compiles** — a blocking gate that builds every feature combination (§9.7), the
@@ -4658,7 +4803,8 @@ The exemplar suites, each written so its assertions **fail on the inverse**:
   §3.5);
   the **service-steward** set (under `mini-init`: a double-forking payload's `exec` returns its exit
   code — red-on-inverse by removing the `PR_SET_CHILD_SUBREAPER` call, which hangs it; SIGTERM to
-  the service steward tears down live sessions per C3 — the pgroup residue gone — exits cleanly,
+  the service steward sweeps its live sessions **and** its in-flight one-shot `exec` children per C3
+  — both pgroup residues gone — exits cleanly,
   and **mini-init restarts it**, so the guest stays up and a later `exec` works (satisfiable only
   because mini-init restarts on exit — §3.5); the `Pid1` twin
   asserting SIGTERM *does* power off — a SIGTERM policy that never powers off is the same
@@ -4670,7 +4816,8 @@ The exemplar suites, each written so its assertions **fail on the inverse**:
   three levels, the battery budget — §10.6); the **registry** set (same-digest-two-labels
   byte-identity + unmoved default key, the laziness leg red on eager, the corrupt-blob digest
   mismatch, bundle-refuses-unpinned, the legacy-singleton-shape reject — §10.5); the **xattr** set
-  (the `Preserve` twin of `test_pax_xattrs_are_not_preserved`, the in-guest `xattr get` readback
+  (the `pax_xattrs_are_stripped_under_the_default_policy` / `…_preserved_under_the_preserve_policy`
+  unit pair, plus the live in-guest `xattr get` readback
   with the `Strip` negative control — §4.7); the **ext4** set (pack from the merged tar, boot as
   `RootfsSource::Block`, in-guest tree/xattr/device-node diff against the tar manifest; the
   tool-version probe's typed refusal — §4.7); and the opt-in **systemd proof cell**
@@ -4905,7 +5052,22 @@ vhost-vsock is validated in the **privileged** mode; whether `/dev/vhost-vsock` 
 crosvm's `--block` has no bandwidth/iops key, so `disk_io_throttle` is a hard `false` (§2.6); a future
 `blkdebug`-style shim is the only path. (6) **control transport** — the shipped choice re-invokes the crosvm
 binary as a client; linking `libcrosvm_control` (lower latency, a build/link step) is the recorded
-alternative. **Resolved during v29 validation**: (a) crosvm's own multiprocess sandbox is incompatible with
+alternative. (7) **the baked guest CID is held by no allocator across a restore** — the CID-axis sibling
+of the vmid hazard the docs/90 pass closed on Firecracker's vsock path, and it is **open**.
+`restore()` reads the snapshot's baked CID from its sidecar and programs `--vsock cid=<baked>`, because
+crosvm refuses a rotated one; the orchestrator meanwhile allocated a *fresh* CID and its `CidGuard`
+holds that one. Nothing reserves the baked CID, so once the ancestor was torn down it is free for
+same-process reallocation, and crosvm's vsock is **in-kernel** AF_VSOCK — the CID is a host-global
+identity, not a per-scratch-dir path. A later VM drawing it therefore collides with the live restored
+VM on the host's vhost-vsock CID space. The FC fix does not cover this by construction: it keys on the
+host *path* a backend adopted (`adopted_scratch_vmid`), and crosvm spawns into its own scratch dir —
+its non-rotating resource is the CID. *Owner:* `vmcell-crosvm::restore` + `orchestrator::restore_inner`
+(the reservation belongs beside the vmid one, before the resume — a squatting VM must not be brought
+back up). *Fix:* have the backend report the baked CID it adopted and reserve it on the restored VM's
+`CidGuard` for that VM's lifetime, the shape `VmidAllocator::reserve` already gives the vmid axis.
+*Gate:* a `just test-crosvm` snapshot/restore leg asserting `CidAllocator::reserve(baked)` **fails**
+while the restored VM is live, red on the inverse by dropping the reservation.
+**Resolved during v29 validation**: (a) crosvm's own multiprocess sandbox is incompatible with
 the single-process supervision model (`/var/empty` jail failure), so it runs `--disable-sandbox` + the
 Layer-2 jailer deny-list (on for `Enforcing`) — validated to boot, exec, and do tap/netns networking under
 the deny-list (§12.2); (b) snapshot/restore over the virtio device set works (baked-CID reuse). crosvm still
@@ -4953,11 +5115,20 @@ reversal 10).
 kernel pipeline (fragments build `=y`; explicitly not requested — a modules + rootfs-module-tree item
 would be its own design). `vmcell_artifact_validator::validate()` hardcodes the Cloud Hypervisor
 backend even though every check is generic over `Vmm` — a backend knob on `ValidationOptions` is the
-natural extension when a consumer needs it. `validate()` has **no overall wall-clock budget** today —
-each check carries its own deadline, but a `Full` run boots several VMs sequentially, so "fails
-loudly, not by hanging" holds per check and not per battery; **directed closed by §18 delta 3**
-(`ConformanceOptions.battery_budget`, §10.6 — a kit that doubles its check count doubles this gap's
-visibility, so R4 lands with the budget rather than before it). USB-passthrough guest-side coverage
+natural extension when a consumer needs it. **`validate()`'s missing overall wall-clock budget is
+closed** — and by its own field, not by delta 3's. Delta 3 gave the *conformance battery*
+`ConformanceOptions.battery_budget` (§10.6) and this register read as though the older,
+documented downstream route had been fixed with it; it had not — `run_battery` and `validate()` are
+parallel entry points, so a `Level::Full` run kept booting several VMs sequentially bounded only by
+the sum of its per-check deadlines. `ValidationOptions` now carries `run_budget:
+Option<Duration>`, defaulting to `Some(DEFAULT_RUN_BUDGET)`, which bounds the **whole** run — every
+level, every boot, end to end. Per-check deadlines are unchanged and each one still fails loud; this
+bounds their sum. Exceeded is `Error::Timeout` naming the budget, the level that outran it and the
+checks that completed first — never a hang, and never a green report with its tail missing; `None`
+opts out **explicitly**, for a caller that bounds the run itself (a nextest timeout, a CI job
+budget). It is deliberately its own constant rather than a reuse of `DEFAULT_BATTERY_BUDGET`: the two
+bound different rosters, and one const for both would silently re-budget one when the other's roster
+grew. USB-passthrough guest-side coverage
 beyond enumeration + one class smoke (per designated device class) is consumer territory.
 
 **The v33 pass's own residuals, recorded at specification time** (each a deliberate cut the §18
@@ -4983,11 +5154,25 @@ the bare word "agent", which legitimately survives in the agentic-execution doma
 
 **One law, one predicate — the consolidations still open.** Each is a second copy of a rule that has one
 designated home, kept on the register rather than in a comment because every duplicate so far has
-diverged: `bench-vm` hand-rolls the library's `pub(crate)` workspace-root ascent, and
-`harness::ch_bin()` duplicates `vmcell::artifact::ch_binary_path()` (same env var, same default).
+diverged. **One remains:** `bench-vm` hand-rolls the library's `pub(crate)` workspace-root ascent (the
+`crates/vmcell-protocol/Cargo.toml` marker). Collapsing it needs a `vmcell`-side `pub` export and so
+cannot be done from that crate; the coupling to watch is the marker string.
 **Closed since v31:** the integration harness's `computed_cgroup_name` — it now calls the one law
 (`vmcell::naming::vm_slice_name`, made `pub` when the same duplication was found in the artifact
-validator), so there is nothing left to copy.
+validator), so there is nothing left to copy. **Closed in the docs/90 pass:** the Cloud Hypervisor
+binary resolver, which this register had inventoried at two copies when there were three —
+`harness::ch_bin()` *and* `vmcell-cli`'s, the one every VM-lifecycle verb went through. Both now
+delegate to `vmcell::artifact::ch_binary_path()` in one line, and the class is gated repo-wide rather
+than remembered: `scripts/ban-ch-binary-resolver-copies.sh` scans every Rust source under `crates/`
+for the quoted `"VMCELL_CH_BIN"` (line comments stripped, so prose naming the variable is not a hit)
+and pins exact counts **in both directions** — the law's own home, plus a commented roster of the
+files that may still name it, each with its count and the reason it earned the exemption: `vmcelld`'s
+flag-then-env precedence (a different law, an operator flag outranking the variable), its integration
+suite's PATH-searching variant, `bench-vm`'s parity-asserted four-backend table, and the CLI's own
+call-site scan, which has to name what it forbids. A read added inside a rostered file is a second
+resolver wearing that entry's exemption; a count that fell to zero is a stale entry, i.e. a widened
+blind spot. A parity assertion could not have replaced the scan: with the variable unset both
+spellings answer `cloud-hypervisor`, so `ch_bin() == ch_binary_path()` cannot fail.
 
 **Daemon.** Capping the guest **exec capture host-side**: an `exec` reply carries the command's whole
 captured output, so a large enough capture overflows the bridge frame cap. That is now a typed 500
@@ -5201,7 +5386,9 @@ the **gate** that pins it.
    `VmConfig::init` is library-only (no CLI flag; the daemon launcher hardcodes `Erofs` and never
    calls `.init()`, `launcher.rs:208-228`); the connect budget defaults 10 s with 20/100 ms backoff
    under `Timeouts::default()` (presets differ — 5/40 and 10/75). *What:* §3.5's
-   `StewardPlacement` + the one `steward_port()` predicate (C8), the derived default, the
+   `StewardPlacement` + C8's **two** predicates on it — `steward_port()` for availability and
+   `resync_reachable()` for snapshot/clone eligibility, two methods because the two answers differ
+   exactly at `Service` — the derived default, the
    `Pid1`+init reject, the seven-site re-key (health gate included — the site most likely to be
    missed), `snapshotting` ⇒ `Pid1`, `STEWARD_VSOCK_PORT` moved to `vmcell-protocol` with both
    sides re-exporting, and the `vmcell_steward_port=` token. *Why:* seven sites ask "can I reach a
@@ -5248,7 +5435,10 @@ the **gate** that pins it.
    internal reorganization rides delta 1's ledger entry. *Gate:* the service-steward battery
    (§15.4): the double-fork exec leg **red-on-inverse by removing the subreaper call** (the test
    hangs — bounded by its harness timeout — instead of returning the exit code); both SIGTERM
-   legs (service: C3 residue gone, clean exit, mini-init restarts it, guest stays up, next exec
+   legs (service: C3 residue gone for a live session **and** for a live one-shot `exec` child — the
+   second leg drives the real `exec` handler and asserts the swept child's terminal frame carries the
+   128+9 only a SIGKILL produces, red on the inverse by dropping the one-shot registration; clean
+   exit, mini-init restarts it, guest stays up, next exec
    works; Pid1 twin: powers off) plus the rapid-failure-cap leg; the lean-tree gate
    surviving the split; the thin-`main.rs` source-scan pin (red on a planted stray `fn` — the
    split-drift hazard's structural gate, §3.5); the reservation/epoch unit suite green unmoved
@@ -5280,7 +5470,16 @@ the **gate** that pins it.
    verified fetch (F7), the `unpinned` dev override refused by `bundle`, lazy selection
    (`build-kernels <label>…`/`--all`, rootfs/handlers selection-driven from birth, CI passes
    `--all`), handler injection at the tools path with per-entry `applets` rosters, and registry
-   entries carrying `xattrs` (§4.7) + `features` (§7.4) declarations. *Why:* item 6's shape applied
+   entries carrying `xattrs` (§4.7) + `features` (§7.4) declarations. **The handler kind's consumer
+   half is part of *What*, not an implementation detail** (it was the delta's one hole): the pack tail
+   and `cache_key`'s consumed-artifact fold both resolve the handler through
+   `handler_artifact_key(handler_label)`, never the bare `"guest_tools"` literal, and an unmatched
+   pair refuses fail-loud before a layer is read — a declared label with nothing under its key, or an
+   orphaned labelled artifact beside a pack that declared none. The literal made the labelled artifact
+   reach nothing and the build *succeed* anyway, packing an image with no applet symlinks at all,
+   `mini-init` — an `init=` target — among them. The reserved `default` spelling normalizes to "no
+   label" at the one stage intake, so `--handler-label default` is the same request as omitting it,
+   with the same key, output file and cache key (§10.5's byte-identity rule). *Why:* item 6's shape applied
    to item 5's axis — the asymmetry was never a decision; and R7 had to be settled before the
    registry existed, not retrofitted. *Migration:* pins-schema break, ledgered; existing overlays
    carrying `rootfs` keys get the loud migration error; `build-kernels` callers add `--all` (CI
@@ -5296,7 +5495,10 @@ the **gate** that pins it.
    unconditional in `oci2erofs` (`main.rs:1044`) and `--agent-musl` skips only the steward stage
    (`:1040-1042`); the strip rationale comment sits at the Regular-entry arm covering all six
    tar-derived `xattrs: vec![]` sites (ten total); `test_pax_xattrs_are_not_preserved` at
-   `tar2erofs.rs:817` with the recorded-limitation doc and retire-me message; **no ext4 producer
+   `tar2erofs.rs:817` with the recorded-limitation doc and retire-me message (this delta renames it
+   `pax_xattrs_are_stripped_under_the_default_policy` and drops the retire-me: it now pins the
+   default policy, which must stay green forever, and gains the
+   `…_preserved_under_the_preserve_policy` twin — the shift, recorded); **no ext4 producer
    exists anywhere** (grep across crates/scripts/fuzz/examples/justfile: zero `mkfs.ext4`/`mke2fs`/
    `e2fsprogs`/`debugfs` hits); virtiofsd spawns with no xattr flags; the packer buffers wholly in
    memory (recorded on `ExtraFile`'s doc); the example workspace has **never packed a rootfs from
@@ -5324,9 +5526,18 @@ the **gate** that pins it.
    the same Stage — **crate route first** (a permissive pure-Rust ext4 writer, vetted by the
    mount-and-diff conformance gate), external `mkfs.ext4 -d <tarball>` as the validated fallback
    (probed fail-loud, recorded as the external-tool exception; either route swaps later without a
-   contract change). *Why:* `Block` has been a consumable with no producer since v22; the ext4
-   *artifact* serves writable-root workloads without touching the erofs default — an artifact,
-   not a switch. *Migration:* additive. *Gate:* the ext4 battery (§15.4): pack → boot as `Block`
+   contract change). The format has to be honored **through the registry**, not only by calling the
+   producer directly: the OCI rootfs source packs through the general
+   `pack_rootfs_with_injection` tail, so a `format: ext4` entry built by `vmcell build
+   --rootfs-label <label>` reaches the producer. Routed through the erofs-only door instead, the stage
+   pulled every layer and then refused by name — `format` was an accepted input that could not be
+   honored, the F1 shape, and no vmcell-built ext4 rootfs was producible through the registry at all.
+   *Why:* `Block` has been a consumable with no producer since v22; the ext4
+   *artifact* serves **POSIX-completeness** workloads without touching the erofs default — an
+   artifact, not a switch. (The cut's "writable-root" wording was the contradiction §4.7 now
+   resolves: read-only wins, on *Migration: additive*'s own terms, and the four backends' drifted
+   read-write attach was deleted in this delta — see §4.7 and `root_device_read_only`.)
+   *Migration:* additive. *Gate:* the ext4 battery (§15.4): pack → boot as `Block`
    → in-guest tree/xattr/device diff against the tar manifest (the mount-and-diff gate doubles as
    the crate-route qualifier); the version-probe typed refusal; the parent-dirs-present pin; and
    the delta-7 from-outside-a-checkout leg repeated for this producer (R6's capability sentence

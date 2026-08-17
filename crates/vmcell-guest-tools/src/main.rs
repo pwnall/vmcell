@@ -1439,6 +1439,112 @@ struct CurlArgs {
 /// silent empty text.
 const WRITE_OUT_VARS: &[&str] = &["http_code", "size_download"];
 
+/// curl's `CURLE_WRITE_ERROR`: output the transfer produced could not be delivered.
+const CURLE_WRITE_ERROR: i32 = 23;
+
+/// curl's `CURLE_RECV_ERROR`: receiving network data failed.
+///
+/// Real curl distinguishes a short transfer against a declared length (`CURLE_PARTIAL_FILE`, 18)
+/// from a receive failure (56); reqwest surfaces both as one body error, so the shim reports the
+/// receive failure and prints the cause chain rather than inventing a distinction it cannot make.
+const CURLE_RECV_ERROR: i32 = 56;
+
+/// Writes `bytes` to `sink` and flushes, mapping any I/O failure to
+/// [`CURLE_WRITE_ERROR`] — the one place the shim decides that output it could not
+/// deliver is a failure and not a success.
+///
+/// Generic over the sink (production passes `stdout`) so the failure branch is
+/// unit-testable: a discarded `write_all` result is the same accepted-but-ignored
+/// hazard as an accepted-but-ignored flag, one layer down — the shim would report
+/// exit 0 for a body that never reached its reader.
+fn write_output<W: Write>(sink: &mut W, bytes: &[u8], what: &str) -> Result<(), i32> {
+    sink.write_all(bytes)
+        .and_then(|()| sink.flush())
+        .map_err(|e| {
+            eprintln!("curl: cannot write to {what}: {e}");
+            CURLE_WRITE_ERROR
+        })
+}
+
+/// Prints an error and its whole `source()` chain to stderr, curl-style.
+///
+/// One helper for both failure sites (the request and the body read) because
+/// reqwest's top-level `Display` is just "error sending request for url (…)" —
+/// the diagnosis is always in the chain.
+fn eprint_error_chain(what: &str, e: &dyn std::error::Error) {
+    eprint!("curl: {what}: {e}");
+    let mut src = e.source();
+    while let Some(s) = src {
+        eprint!(": {s}");
+        src = s.source();
+    }
+    eprintln!();
+}
+
+/// Which reqwest proxy constructor a curl-style proxy env var means.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum ProxyScope {
+    /// `http_proxy`: `http://` URLs only.
+    Http,
+    /// `https_proxy`: `https://` URLs only.
+    Https,
+    /// `all_proxy`: every scheme — the catch-all.
+    All,
+}
+
+impl ProxyScope {
+    /// The reqwest proxy this scope means for `value`, or reqwest's own parse error.
+    fn proxy(self, value: &str) -> reqwest::Result<reqwest::Proxy> {
+        match self {
+            ProxyScope::Http => reqwest::Proxy::http(value),
+            ProxyScope::Https => reqwest::Proxy::https(value),
+            ProxyScope::All => reqwest::Proxy::all(value),
+        }
+    }
+}
+
+/// The curl-style proxy env vars, by scope, **in the order reqwest must receive them** (PRIV-7).
+///
+/// Order is load-bearing, not cosmetic: reqwest applies proxies first-match and `Proxy::all`
+/// matches *every* scheme, so the scheme-specific `http`/`https` proxies must be added BEFORE the
+/// `all_proxy` catch-all — otherwise `all_proxy` shadows a scheme-specific `https_proxy` for HTTPS
+/// URLs, the opposite of curl's precedence (scheme-specific wins over the catch-all).
+const PROXY_ENV_SCOPES: &[(ProxyScope, &[&str])] = &[
+    (ProxyScope::Http, &["http_proxy", "HTTP_PROXY"]),
+    (ProxyScope::Https, &["https_proxy", "HTTPS_PROXY"]),
+    (ProxyScope::All, &["all_proxy", "ALL_PROXY"]),
+];
+
+/// Every proxy the environment declares, as `(scope, the variable that supplied it, value)`, in
+/// [`PROXY_ENV_SCOPES`] order.
+fn proxy_env_declarations() -> Vec<(ProxyScope, &'static str, String)> {
+    PROXY_ENV_SCOPES
+        .iter()
+        .filter_map(|(scope, keys)| proxy_from_env(keys).map(|(key, value)| (*scope, key, value)))
+        .collect()
+}
+
+/// Applies every declared proxy to `builder`, or returns the message naming the variable that
+/// cannot be honored.
+///
+/// A malformed value is a **rejection**, not a warning. The pre-fix arms printed
+/// `curl: bad http_proxy …` and carried on with a client that goes DIRECT — so a test that steered
+/// traffic at the proxy silently asserted on an unproxied request, and a blocked-egress assertion
+/// would have "passed" by never being filtered at all. That is the accepted-but-ignored-input
+/// hazard this shim exists to refuse (AGENTS.md), one step removed from `-k` on a TLS test.
+fn apply_env_proxies(
+    mut builder: reqwest::blocking::ClientBuilder,
+    declared: &[(ProxyScope, &'static str, String)],
+) -> Result<reqwest::blocking::ClientBuilder, String> {
+    for (scope, key, value) in declared {
+        let proxy = scope
+            .proxy(value)
+            .map_err(|e| format!("{key}={value:?} cannot be honored: {e}"))?;
+        builder = builder.proxy(proxy);
+    }
+    Ok(builder)
+}
+
 /// Renders a `-w`/`--write-out` format. `\n`/`\t`/`\\` are the escapes curl
 /// documents; `%{var}` interpolates a [`WRITE_OUT_VARS`] entry; `%%` is a literal
 /// `%`. Returns `Err` naming the offending variable, so the same predicate both
@@ -1663,31 +1769,16 @@ fn run_curl(args: &[String]) -> i32 {
     // Configure the proxy explicitly from the curl-style env vars, rather than
     // relying on reqwest's auto-detection (which proved unreliable here). The
     // egress tests steer traffic at the transparent proxy via http_proxy /
-    // https_proxy.
-    //
-    // Order matters: reqwest applies proxies first-match, and `Proxy::all` matches
-    // *every* scheme, so the scheme-specific `http`/`https` proxies MUST be added
-    // BEFORE the `all_proxy` catch-all — otherwise `all_proxy` shadows a
-    // scheme-specific `https_proxy` for HTTPS URLs, the opposite of curl's
-    // precedence (scheme-specific wins over the catch-all) (PRIV-7).
-    if let Some(p) = proxy_from_env(&["http_proxy", "HTTP_PROXY"]) {
-        match reqwest::Proxy::http(&p) {
-            Ok(proxy) => builder = builder.proxy(proxy),
-            Err(e) => eprintln!("curl: bad http_proxy {p}: {e}"),
+    // https_proxy. A value this shim cannot honor is REJECTED (see `apply_env_proxies`), never
+    // warned-and-dropped, and it exits with the shim's own un-honorable-input status — the same 2
+    // a flag it cannot honor gets, because an env var is an accepted input like any other.
+    builder = match apply_env_proxies(builder, &proxy_env_declarations()) {
+        Ok(configured) => configured,
+        Err(msg) => {
+            eprintln!("curl: {msg}");
+            return 2;
         }
-    }
-    if let Some(p) = proxy_from_env(&["https_proxy", "HTTPS_PROXY"]) {
-        match reqwest::Proxy::https(&p) {
-            Ok(proxy) => builder = builder.proxy(proxy),
-            Err(e) => eprintln!("curl: bad https_proxy {p}: {e}"),
-        }
-    }
-    if let Some(p) = proxy_from_env(&["all_proxy", "ALL_PROXY"]) {
-        match reqwest::Proxy::all(&p) {
-            Ok(proxy) => builder = builder.proxy(proxy),
-            Err(e) => eprintln!("curl: bad all_proxy {p}: {e}"),
-        }
-    }
+    };
 
     let client = match builder.build() {
         Ok(c) => c,
@@ -1735,23 +1826,41 @@ fn run_curl(args: &[String]) -> i32 {
                 }
                 eprintln!("<");
             }
-            let body = resp.bytes().unwrap_or_default();
+            // A body that could not be read to completion is NOT an empty 200. The pre-fix
+            // `unwrap_or_default()` turned a mid-transfer RST, a short read against a declared
+            // `Content-Length`, and a decode failure alike into an empty body and exit 0 — so a
+            // data-plane assertion on the body (the NAT window-fill digests, the egress bodies)
+            // could pass on a transfer that never finished. Fail loud instead, naming the cause.
+            // Recorded difference from real curl: it prints the partial bytes before exiting
+            // non-zero, while reqwest's `bytes()` does not hand them back — so the shim reports the
+            // failure and prints nothing rather than inventing a body.
+            let body = match resp.bytes() {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    eprint_error_chain("failed reading the response body", &e);
+                    return CURLE_RECV_ERROR;
+                }
+            };
             // `-o` is HONORED, not consumed-and-dropped: the body goes to the file
             // and never to stdout, so a `-w` line is the only thing stdout carries.
             if let Some(path) = &output {
                 if let Err(e) = std::fs::write(path, &body) {
                     eprintln!("curl: cannot write {path}: {e}");
-                    return 23; // CURLE_WRITE_ERROR
+                    return CURLE_WRITE_ERROR;
                 }
-            } else {
-                let _ = std::io::stdout().write_all(&body);
+            } else if let Err(code) = write_output(&mut std::io::stdout(), &body, "stdout") {
+                return code;
             }
             if let Some(fmt) = &write_out {
                 // Validated at parse time, so a render error here is unreachable;
                 // surface it rather than papering over it if that ever changes.
                 match render_write_out(fmt, status.as_u16(), body.len()) {
                     Ok(rendered) => {
-                        let _ = std::io::stdout().write_all(rendered.as_bytes());
+                        if let Err(code) =
+                            write_output(&mut std::io::stdout(), rendered.as_bytes(), "stdout")
+                        {
+                            return code;
+                        }
                     }
                     Err(msg) => {
                         eprintln!("curl: {msg}");
@@ -1759,7 +1868,6 @@ fn run_curl(args: &[String]) -> i32 {
                     }
                 }
             }
-            let _ = std::io::stdout().flush();
             // curl exits 0 once a response is received (no `--fail`), regardless
             // of HTTP status — the blocked-egress test asserts on the 403 in the
             // verbose stderr, not the exit code.
@@ -1773,7 +1881,7 @@ fn run_curl(args: &[String]) -> i32 {
             // asserts on, so on an https-via-proxy failure we redo the CONNECT
             // manually to surface it.
             if url.starts_with("https://")
-                && let Some(proxy) =
+                && let Some((_, proxy)) =
                     proxy_from_env(&["https_proxy", "HTTPS_PROXY", "all_proxy", "ALL_PROXY"])
                 && let Some((host, port)) = url_host_port(&url, 443)
                 && probe_connect(&proxy, &host, port, max_time, verbose)
@@ -1787,13 +1895,7 @@ fn run_curl(args: &[String]) -> i32 {
             }
             // Print the full error source chain — reqwest's top-level Display is
             // just "error sending request for url (...)".
-            eprint!("curl: {e}");
-            let mut src = std::error::Error::source(&e);
-            while let Some(s) = src {
-                eprint!(": {s}");
-                src = s.source();
-            }
-            eprintln!();
+            eprint_error_chain("request failed", &e);
             // Transport failure → curl-style non-zero (CURLE_COULDNT_CONNECT).
             7
         }
@@ -1916,12 +2018,15 @@ fn probe_connect(proxy: &str, host: &str, port: u16, max_time: Option<u64>, verb
     connect_succeeded(&head_str)
 }
 
-fn proxy_from_env(keys: &[&str]) -> Option<String> {
+/// The first non-empty value among `keys`, **with the variable that supplied it** — a rejection has
+/// to name the actual variable (`https_proxy` vs `HTTPS_PROXY`), or the operator is left guessing
+/// which of the two the shim read.
+fn proxy_from_env(keys: &[&'static str]) -> Option<(&'static str, String)> {
     for k in keys {
         if let Ok(v) = std::env::var(k)
             && !v.is_empty()
         {
-            return Some(v);
+            return Some((k, v));
         }
     }
     None
@@ -2828,6 +2933,174 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    /// A one-shot localhost HTTP server: accepts one connection, reads the request head, writes
+    /// `response` verbatim, then closes. Real sockets rather than a mock, because what is under
+    /// test is what the shim does with a body the transport could not finish delivering.
+    fn one_shot_http(response: &'static [u8]) -> std::net::SocketAddr {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a loopback server");
+        let addr = listener.local_addr().expect("local addr");
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                // The shim's request head is one small write, so one read releases the client.
+                let mut scratch = [0u8; 4096];
+                let _ = std::io::Read::read(&mut stream, &mut scratch);
+                let _ = stream.write_all(response);
+                let _ = stream.flush();
+            }
+            // Dropping the stream closes the connection — which is exactly the truncation the
+            // short-body leg below asserts on.
+        });
+        addr
+    }
+
+    // A body the transport could not finish delivering must NOT be reported as a successful empty
+    // one. The pre-fix `resp.bytes().unwrap_or_default()` turned a mid-transfer close, a short read
+    // against a declared `Content-Length`, and a decode failure alike into an empty body and exit 0
+    // — so an in-guest assertion on the body (the NAT window-fill digests, the egress bodies) could
+    // pass on a transfer that never completed. The declared length is 100 and 10 bytes arrive.
+    //
+    // RED on the inverse (restore `unwrap_or_default()`): the shim returns 0 with an empty body.
+    //
+    // Assumes an unproxied host, as every other real-socket leg in this module does: a `http_proxy`
+    // in the test environment would route 127.0.0.1 through it.
+    #[test]
+    fn a_truncated_response_body_is_not_reported_as_a_successful_empty_body() {
+        let short = one_shot_http(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n0123456789");
+        assert_eq!(
+            run_curl(&argv(&["-s", &format!("http://{short}/short")])),
+            CURLE_RECV_ERROR,
+            "a truncated body must fail loud (curl 56), not become an empty body with exit 0"
+        );
+
+        // The positive control: a complete body IS exit 0 and the bytes actually land, so the leg
+        // above is about the truncation and not about a shim that fails every request.
+        let dir = std::env::temp_dir().join(format!("vmcell-curl-body-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let out = dir.join("body.bin");
+        let whole = one_shot_http(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello");
+        assert_eq!(
+            run_curl(&argv(&[
+                "-s",
+                "-o",
+                &out.display().to_string(),
+                &format!("http://{whole}/whole"),
+            ])),
+            0,
+            "a complete body must still be exit 0"
+        );
+        assert_eq!(
+            std::fs::read(&out).expect("the body must have been written"),
+            b"hello"
+        );
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    // Output the shim could not deliver is a failure, not a success: the pre-fix stdout arm was a
+    // bare `let _ = write_all(&body)`, so a closed or full stdout reported exit 0 for a body that
+    // reached nobody — the same accepted-but-ignored hazard as an accepted-but-ignored flag, one
+    // layer down. The `-o` arm already returned 23; now both do, through one helper.
+    //
+    // RED on the inverse (`let _ = sink.write_all(bytes)` / dropping the `map_err`): the failing
+    // sink returns `Ok(())` and the assertion below fires.
+    #[test]
+    fn undeliverable_output_is_curle_write_error_not_success() {
+        /// A sink that always fails, standing in for a closed stdout (EPIPE) or a full one (ENOSPC).
+        struct DeadSink;
+        impl Write for DeadSink {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        assert_eq!(
+            write_output(&mut DeadSink, b"body", "stdout"),
+            Err(CURLE_WRITE_ERROR),
+            "a body that could not be written must be curl's CURLE_WRITE_ERROR, not a success"
+        );
+        // Positive control: an ordinary sink gets every byte, and says so.
+        let mut sink = Vec::new();
+        assert_eq!(write_output(&mut sink, b"body", "stdout"), Ok(()));
+        assert_eq!(sink, b"body");
+    }
+
+    // A proxy env var the shim cannot honor is REJECTED naming the variable, never warned-and-
+    // dropped: the pre-fix arms printed `curl: bad http_proxy …` and then built a client that goes
+    // DIRECT, so a test steering traffic at the proxy silently asserted on an unproxied request —
+    // and a blocked-egress assertion would "pass" by never being filtered at all.
+    //
+    // RED on the inverse (the `Err(e) => eprintln!(…)` arms): `apply_env_proxies` returns Ok and the
+    // rejection never happens.
+    #[test]
+    fn a_proxy_env_var_that_cannot_be_honored_is_rejected_naming_the_variable() {
+        for (scope, key, bad) in [
+            (ProxyScope::Http, "http_proxy", "not a url"),
+            (ProxyScope::Https, "HTTPS_PROXY", "http://host:notaport"),
+            (ProxyScope::All, "all_proxy", "://"),
+        ] {
+            let err = apply_env_proxies(
+                reqwest::blocking::Client::builder(),
+                &[(scope, key, bad.to_string())],
+            )
+            .err()
+            .unwrap_or_else(|| {
+                panic!("{key}={bad:?} must be rejected, not dropped with a warning")
+            });
+            assert!(
+                err.contains(key) && err.contains(bad),
+                "the rejection must name the variable and its value: {err}"
+            );
+        }
+
+        // Positive control: a well-formed proxy is applied and the client still builds — the arm
+        // above is about the malformed value, not about a shim that refuses every proxy.
+        let ok = apply_env_proxies(
+            reqwest::blocking::Client::builder(),
+            &[
+                (
+                    ProxyScope::Http,
+                    "http_proxy",
+                    "http://127.0.0.1:8080".into(),
+                ),
+                (
+                    ProxyScope::All,
+                    "all_proxy",
+                    "http://127.0.0.1:8081".to_string(),
+                ),
+            ],
+        )
+        .expect("a well-formed proxy must be honored");
+        ok.build().expect("the configured client must build");
+    }
+
+    // PRIV-7, pinned instead of merely commented: reqwest applies proxies first-match and
+    // `Proxy::all` matches every scheme, so the scheme-specific vars must be handed over BEFORE the
+    // catch-all — otherwise `all_proxy` shadows `https_proxy` for an HTTPS URL, inverting curl's
+    // precedence. RED on reordering the table (which is how the shadowing bug arrives).
+    #[test]
+    fn scheme_specific_proxies_precede_the_catch_all() {
+        let order: Vec<ProxyScope> = PROXY_ENV_SCOPES.iter().map(|(scope, _)| *scope).collect();
+        assert_eq!(
+            order,
+            vec![ProxyScope::Http, ProxyScope::Https, ProxyScope::All],
+            "all_proxy must be applied LAST or it shadows the scheme-specific proxies"
+        );
+        // Both spellings of each variable are read, lowercase first (curl's own precedence).
+        assert_eq!(
+            PROXY_ENV_SCOPES
+                .iter()
+                .map(|(_, keys)| *keys)
+                .collect::<Vec<_>>(),
+            vec![
+                &["http_proxy", "HTTP_PROXY"][..],
+                &["https_proxy", "HTTPS_PROXY"][..],
+                &["all_proxy", "ALL_PROXY"][..],
+            ]
+        );
     }
 
     // The `-w` renderer is the half the M13 upload gate reads (`%{http_code}`

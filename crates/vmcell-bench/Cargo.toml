@@ -13,7 +13,7 @@ publish = false
 # `firecracker`/`qemu`/`crosvm` features gate the three secondary backends the same way the in-tree
 # bin used to.
 [dependencies]
-vmcell = { path = "../vmcell", version = "0.20.0", default-features = false, features = ["cloud-hypervisor", "metrics", "cli", "proxy"] }
+vmcell = { path = "../vmcell", version = "0.21.0", default-features = false, features = ["cloud-hypervisor", "metrics", "cli", "proxy"] }
 vmcell-firecracker = { path = "../vmcell-firecracker", version = "0.1.0", optional = true }
 vmcell-qemu = { path = "../vmcell-qemu", version = "0.1.0", optional = true }
 vmcell-crosvm = { path = "../vmcell-crosvm", version = "0.1.0", optional = true }
@@ -50,7 +50,7 @@ predicates = "3"
 # The `#[ignore]`d KVM benchmark tests re-export the rootfs/kernel getters from the validator
 # harness (the single source of truth) so they trigger the same at-most-once artifact build the
 # rest of the suite uses. Dev-only: no production edge (vmcell-bench → validator → vmcell).
-vmcell-artifact-validator = { path = "../vmcell-artifact-validator", version = "0.5.0" }
+vmcell-artifact-validator = { path = "../vmcell-artifact-validator", version = "0.6.0" }
 
 [[bin]]
 name = "bench-vm"

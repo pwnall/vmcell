@@ -76,7 +76,43 @@ name = "vmcell-artifact-validator"
 #     `Unverified`, and the verdict REPORTS the cap rather than implying completeness.
 #     Driven live both ways: `Works` against a `Preserve` image, and `DoesNotWork` against the
 #     canonical `Strip` artifacts after walking 3276 paths.
-version = "0.5.0"
+# 0.5.0 → 0.6.0: the docs/90 review pass — one signature edge `cargo semver-checks` reports, and one
+# behavior change it structurally cannot (there is no lint for a verdict that changes which status it
+# renders).
+#   * BREAKING `constructible_struct_adds_field`: `ValidationOptions.run_budget: Option<Duration>`.
+#     The one edge `cargo semver-checks` reports, and the only one — measured with the version held at
+#     the baseline: `196 checks: 195 pass, 1 fail`, naming this field.
+#     The struct is deliberately exhaustive, so a caller building it with a struct literal adds a
+#     field — the intended compile-time fail-loud. Both constructors carry
+#     `Some(DEFAULT_RUN_BUDGET)`: `ValidationOptions::default()` and `::level(l)`, the latter through
+#     a functional update rather than a re-spelled literal, so a later field cannot silently arrive
+#     as `None` for every `level()` caller.
+#   * ADDITIVE: `DEFAULT_RUN_BUDGET` (20 minutes). Its own const rather than a reuse of
+#     `conformance::DEFAULT_BATTERY_BUDGET`, because the two bound different rosters — the three
+#     levels here, a declared feature roster there — and one const for both would re-budget one
+#     silently when the other's roster grew.
+#   * BEHAVIOR, and the point of the field: `validate()` is bounded END TO END now. Per-check
+#     deadlines are unchanged and each still fails loud; this bounds their SUM. A `Level::Full` run
+#     boots several VMs sequentially and was bounded only by whatever those deadlines happened to add
+#     up to — the gap `ConformanceOptions.battery_budget` closed for the battery and not for this,
+#     older, entry point, which design §17 nonetheless read as closed (docs/90 C5). Exceeded is
+#     `vmcell::Error::Timeout` naming the budget, the level that outran it and the checks that
+#     completed first — never a hang, and never a green report with its tail missing. `None` opts out
+#     EXPLICITLY, for a caller that bounds the run itself (a nextest timeout, a CI job budget).
+#   * BEHAVIOR a downstream battery can observe, and the one to act on: the conformance kit's
+#     snapshot absence-probe now distinguishes SETUP failure from MEASUREMENT. A candidate that could
+#     not be configured, could not start, never booted, or had no tempdir comes back
+#     `ProbeOutcome::NotRun` → `CheckStatus::Unverified` (with why, never counted as a pass), where
+#     0.5.0 answered `DoesNotWork` — which `judge` reads as a measured absence and therefore as a
+#     `Pass`. So an artifact declaring `snapshot_restore: false` that could not boot AT ALL was
+#     certified as a verified absence while the healthy positive control kept the run green (docs/90
+#     M8). A consumer diffing reports against a stored baseline sees some former passes become
+#     `Unverified`: those are exactly the ones that never measured anything. The inverse is held too
+#     — a snapshot and restore that both SUCCEEDED and then failed the guest handshake stays
+#     `DoesNotWork`, so a broken restore cannot hide behind `Unverified`.
+#     `checks::snapshot_restore_roundtrip`, the `Level::Full` check, is unchanged; this is the
+#     conformance probe beside it.
+version = "0.6.0"
 edition = "2024"
 rust-version.workspace = true
 license = "MIT OR Apache-2.0"
@@ -91,13 +127,13 @@ path = "src/lib.rs"
 # The validator boots real vmcell micro-VMs and drives the steward, and reuses vmcell's
 # capability descriptors + net math. It needs the host stack: a backend, metrics, pipeline
 # (for artifact_path helpers). `vmcell` has no dependency on this crate.
-vmcell = { path = "../vmcell", version = "0.20.0", features = ["cloud-hypervisor", "metrics", "pipeline"] }
+vmcell = { path = "../vmcell", version = "0.21.0", features = ["cloud-hypervisor", "metrics", "pipeline"] }
 # The applet roster (`GUEST_TOOLS_APPLETS`) only — the validator speaks no wire protocol of its
 # own. `rootfs_guest_tools` composes its PATH probe from that const instead of re-typing the
 # names, so growing the roster extends what the contract battery checks with no edit here. It is
 # the same const the guest binary's dispatch table and the rootfs symlink manifest derive from
 # (design §4.4, docs/81 m22). `vmcell` links it too, but does not re-export it.
-vmcell-protocol = { path = "../vmcell-protocol", version = "0.7.0" }
+vmcell-protocol = { path = "../vmcell-protocol", version = "0.8.0" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "fs"] }
 futures = "0.3"
 tracing = "0.1"
@@ -112,4 +148,4 @@ tempfile = "3"
 # The feature list mirrors the `[dependencies]` entry above, plus `test-support`.
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
-vmcell = { path = "../vmcell", version = "0.20.0", features = ["cloud-hypervisor", "metrics", "pipeline", "test-support"] }
+vmcell = { path = "../vmcell", version = "0.21.0", features = ["cloud-hypervisor", "metrics", "pipeline", "test-support"] }

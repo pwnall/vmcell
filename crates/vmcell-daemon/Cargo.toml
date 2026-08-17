@@ -6,17 +6,51 @@ name = "vmcell-daemon"
 # out-of-tree Rust caller building `CreateVmRequest` or `LaunchSpec` with a struct literal — neither
 # is `#[non_exhaustive]` nor `Default`, this crate is `publish = false`, and `cargo semver-checks`
 # does not cover it, so nothing would tell such a caller but this line.
-version = "0.3.0"
+# 0.3.0 → 0.4.0: the docs/90 review pass. `cargo semver-checks` does not cover this crate (§10.4
+# lists neither it nor its wire), and nothing here moved a signature anyway — every edge below is a
+# REPLY a client sees change, so this line is the only thing that will tell them.
+#   * `name::MAX_ARTIFACT_NAME_LEN` DROPS to `NAME_MAX - SHA256_SIDECAR_SUFFIX.len()` (248) from a
+#     bare 255. A 249..=255-byte name is refused at the boundary now — `InvalidName::TooLong`, a 400
+#     naming the suffix — where it used to be accepted, persist the artifact, and then fail its
+#     sidecar write with `ENAMETOOLONG`: a deterministic 500 on a well-formed request, and a burned
+#     name in a create-only store. An accepted name has to fit TWICE, as `<name>` and as
+#     `<name>.sha256`. A client minting names at the old ceiling shortens them by seven bytes; the
+#     predicate is the same one it already links (`default-features = false` compiles `name`), so it
+#     can pre-check without a round trip.
+#   * A `create` whose digest-sidecar write fails now ROLLS THE ARTIFACT BACK, so the reply's error
+#     describes the state on disk. It previously left the blob in place, bootable by a later `create`
+#     and holding a name that could never be re-created.
+#   * An op racing a teardown gets a prompt 409 `Conflict` ("vm <id> is Destroying, not Ready"),
+#     where it used to get a 404. `destroy` marks the slot `Destroying` IN PLACE, takes the handle
+#     lock — which is where a teardown waits, for as long as an in-flight snapshot's multi-second
+#     guest-RAM write holds it — and removes the slot from the table LAST. Removing it first unpinned
+#     the VM for the whole of that wait: the delete-in-use scan reads pins only through that table,
+#     so a `DELETE /v1/artifacts/<prefix>` landing in the window found a pin-free table, returned 204
+#     and `remove_dir_all`'d the directory the VMM was still writing into (docs/90 M6). A client that
+#     treated 404 as "already gone, stop retrying" must handle 409 as "not yet". `Destroying` is a
+#     one-way door: a snapshot completing behind a parked teardown no longer restores `Ready` over it.
+#   * `POST /v1/vms` carrying an inline `command` tears the VM down when the exec FAILS, not only
+#     when `ephemeral` asked for it. `create` is one operation and its error reply carries no
+#     `CreateVmResponse`, so the VM it left behind was a booted, resource-holding cell whose id the
+#     caller never received and could not destroy. A command that RAN and exited non-zero is
+#     unchanged — that is an `Ok` outcome and keeps its VM, as `ephemeral: false` asks.
+#   * COMPANION, in `vmcell-daemon-client` (0.1.0, unbumped — it has no ledger and no signature
+#     moved): every verb that names a resource validates the segment BEFORE joining it into the
+#     request path, through one predicate, instead of `format!`-ing a caller string into a URL.
+#     `Url::join` resolves a relative reference, so an unvalidated `../vms/vm-1` did not 404 — it
+#     retargeted the request at another endpoint. `upload_artifact` validated and the other seven did
+#     not.
+version = "0.4.0"
 edition = "2024"
 rust-version.workspace = true
 license = "MIT OR Apache-2.0"
-description = "vmcell control-plane daemon library: artifact store, cross-process VM registry, and the HTTP REST API (§D)"
+description = "vmcell control-plane daemon library: artifact store, cross-process VM registry, and the HTTP REST API (§11)"
 publish = false
 
 # The daemon library carries the well-tested logic; `vmcelld` is the thin blessed binary wrapper
-# (§18.1). The `client` consumer (`vmcell-daemon-client`) sets `default-features = false` to link
+# (§11.1). The `client` consumer (`vmcell-daemon-client`) sets `default-features = false` to link
 # ONLY the wire DTOs + the artifact-name predicate (serde + std), never the axum/vmcell server stack —
-# so the wire schema is single-sourced without the client pulling the whole server (§18.1).
+# so the wire schema is single-sourced without the client pulling the whole server (§11.1).
 [lib]
 name = "vmcell_daemon"
 path = "src/lib.rs"
@@ -24,7 +58,7 @@ path = "src/lib.rs"
 [features]
 default = ["server"]
 # The full daemon: axum router + handlers, VM registry, auth, the vmcell host stack, and the
-# setup-broker bridge (the privilege-separated `vmcelld` cutover, §20.5 — the broker child owns the
+# setup-broker bridge (the privilege-separated `vmcelld` cutover, §12.4 — the broker child owns the
 # registry, the cap-dropped parent serves HTTP over the `VmEngine` RPC).
 server = [
     "dep:axum",
@@ -67,7 +101,7 @@ subtle = { version = "2", optional = true }
 sha2 = { version = "0.11", optional = true }
 tempfile = { version = "3", optional = true }
 tracing = { version = "0.1", optional = true }
-vmcell = { path = "../vmcell", version = "0.20.0", features = ["cloud-hypervisor", "metrics", "pipeline", "cli"], optional = true }
+vmcell = { path = "../vmcell", version = "0.21.0", features = ["cloud-hypervisor", "metrics", "pipeline", "cli"], optional = true }
 
 [package.metadata.cargo-machete]
 # False positive: async-trait is a proc-macro used via #[async_trait]

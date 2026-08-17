@@ -321,12 +321,26 @@ impl Firecracker {
     /// Probes the host once for T2 CPU-template support, caching the result on
     /// this instance instead of in a process-global, so a later `Firecracker`
     /// with a different binary/config probes independently.
-    async fn detect_cpu_template(&self, cfg: &VmConfig) -> Option<String> {
+    ///
+    /// Takes `res` because the probe VM is launched through the same composed
+    /// [`t2_probe_launch`]/[`firecracker_launch_plan`] every real boot uses, which needs this VM's
+    /// netns and scratch dir (docs/90 `vmcell-firecracker:789`).
+    ///
+    /// # Errors
+    /// Propagates the probe's launch-composition refusal (a `VmmSeccomp::Log` config, a deny-list
+    /// that will not compile) — a deterministic refusal `spawn_fc` would make one step later
+    /// anyway. A *transient* probe failure is not an error here: it is warned about and left
+    /// uncached (VMM-4).
+    async fn detect_cpu_template(
+        &self,
+        cfg: &VmConfig,
+        res: &PerVmResources,
+    ) -> Result<Option<String>> {
         if let Some(val) = self.cpu_template.get() {
-            return val.clone();
+            return Ok(val.clone());
         }
 
-        let probe = probe_t2_template(self, cfg).await;
+        let probe = probe_t2_template(self, cfg, res).await?;
         // VMM-4: only a DEFINITE outcome (T2 supported or firmly unsupported) is
         // cached. A transient probe failure is warned about and left uncached so the
         // next `create()` re-probes — a one-off host hiccup must not permanently
@@ -343,7 +357,7 @@ impl Firecracker {
         if let Some(to_cache) = cache_decision(probe) {
             let _ = self.cpu_template.set(to_cache);
         }
-        self.cpu_template.get().cloned().flatten()
+        Ok(self.cpu_template.get().cloned().flatten())
     }
 }
 
@@ -767,38 +781,72 @@ fn build_fc_snapshot_load(snapshot_dir: &Path, tap: Option<&str>) -> SnapshotLoa
 /// `wait_for_socket`-failure branch no `FcInstance` owns the socket yet (the instance
 /// is built only after a successful wait), so its `Drop` never runs — without this,
 /// firecracker that created its socket then exited early orphans a
-/// `vmcell-fc-probe-*.socket` in the temp dir. Reap first (VMM process group before
+/// [`T2_PROBE_SOCKET`] in the VM's scratch dir. Reap first (VMM process group before
 /// sockets), then unlink, mirroring `FcInstance::drop`.
 fn reap_and_unlink_probe(process: &mut tokio::process::Child, pgid: Option<u32>, socket: &Path) {
     vmcell::vmm::reap_process_group(process, pgid);
     let _ = std::fs::remove_file(socket);
 }
 
-async fn probe_t2_template(vmm: &Firecracker, cfg: &VmConfig) -> T2Probe {
-    let tmp_dir = std::env::temp_dir();
-    let counter = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let api_socket = tmp_dir.join(format!(
-        "vmcell-fc-probe-{}-{}.socket",
-        std::process::id(),
-        counter
-    ));
+/// The T2-probe VM's API socket, inside the VM's own scratch dir.
+///
+/// A distinct basename from `spawn_fc`'s `api.sock`, so the probe and the real VM never collide;
+/// inside `res.tmp_dir` rather than bare `/tmp` so the orchestrator's `VmTempDir` guard reclaims it
+/// even if this process is killed between spawn and reap (AGENTS.md, "Runtime files under
+/// `XDG_RUNTIME_DIR` (or the artifacts dir), never bare `/tmp`"). It replaces a
+/// `vmcell-fc-probe-<pid>-<nanos>.socket` in `std::env::temp_dir()`, whose uniqueness came from a
+/// clock read rather than from an owned directory.
+const T2_PROBE_SOCKET: &str = "t2-probe.sock";
 
-    let mut std_cmd = std::process::Command::new(&vmm.binary_path);
-    std_cmd.arg("--api-sock").arg(&api_socket);
-    use std::os::unix::process::CommandExt;
-    std_cmd.process_group(0);
+/// Composes the T2 probe's launch: its API socket, plus the **same** [`LaunchPlan`] every real
+/// Firecracker boot gets (M11).
+///
+/// The probe boots a real Firecracker VM. It used to spawn it from a hand-rolled
+/// `std::process::Command::new(&vmm.binary_path)` — outside `firecracker_launch_plan`, so with no
+/// Layer-2 jail, no `--no-seccomp`/`--seccomp-filter` flag and no netns join, while every other
+/// Firecracker process on the host carried all three. The M11 source gate could not see it either:
+/// it bans a *second* `jail_spec_from_config`/`build_vmm_cmd` call, and this path made neither
+/// (docs/90 `vmcell-firecracker:789`). Routing it through the one composer is the fix; the gate's
+/// new `Command::new` ban is what keeps a fourth spawn route from re-opening it.
+///
+/// Performs no I/O, so a KVM-free test asserts both halves — the shipped posture and the socket's
+/// location — without spawning anything.
+///
+/// # Errors
+/// Propagates [`firecracker_launch_plan`]'s errors: the [`VmmSeccomp::Log`] typed refusal (the
+/// probe is a Firecracker process too, so it cannot honor an observe-only mode either) and a
+/// deny-list that fails to compile. Both are deterministic config refusals, never a transient probe
+/// failure — which is why they propagate instead of becoming [`T2Probe::Failed`] (VMM-4).
+fn t2_probe_launch(
+    binary_path: &Path,
+    cfg: &VmConfig,
+    res: &PerVmResources,
+) -> Result<(PathBuf, vmcell::vmm::LaunchPlan)> {
+    let api_socket = res.tmp_dir.join(T2_PROBE_SOCKET);
+    let plan = firecracker_launch_plan(binary_path, cfg, res, &api_socket)?;
+    Ok((api_socket, plan))
+}
 
-    let mut process = match tokio::process::Command::from(std_cmd)
+async fn probe_t2_template(
+    vmm: &Firecracker,
+    cfg: &VmConfig,
+    res: &PerVmResources,
+) -> Result<T2Probe> {
+    // The whole launch — jail, seccomp flag, netns, `--api-sock` — from the one composer, so the
+    // probe VM is confined exactly like the VM it is probing for.
+    let (api_socket, plan) = t2_probe_launch(&vmm.binary_path, cfg, res)?;
+
+    let mut process = match plan
+        .into_command()
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
     {
         Ok(p) => p,
-        Err(_) => return T2Probe::Failed,
+        // A spawn failure is transient host trouble (a missing binary, a fork limit), not evidence
+        // about T2 — VMM-4 keeps it uncached.
+        Err(_) => return Ok(T2Probe::Failed),
     };
 
     // The probe child is its own process-group leader (`process_group(0)`), so its
@@ -820,7 +868,7 @@ async fn probe_t2_template(vmm: &Firecracker, cfg: &VmConfig) -> T2Probe {
     .is_err()
     {
         reap_and_unlink_probe(&mut process, pgid, &api_socket);
-        return T2Probe::Failed;
+        return Ok(T2Probe::Failed);
     }
 
     let instance = FcInstance {
@@ -857,7 +905,7 @@ async fn probe_t2_template(vmm: &Firecracker, cfg: &VmConfig) -> T2Probe {
         .await;
 
     if mc_res.is_err() {
-        return T2Probe::Failed;
+        return Ok(T2Probe::Failed);
     }
 
     #[derive(Serialize)]
@@ -878,7 +926,7 @@ async fn probe_t2_template(vmm: &Firecracker, cfg: &VmConfig) -> T2Probe {
         .await;
 
     if bs_res.is_err() {
-        return T2Probe::Failed;
+        return Ok(T2Probe::Failed);
     }
 
     #[derive(Serialize)]
@@ -896,7 +944,7 @@ async fn probe_t2_template(vmm: &Firecracker, cfg: &VmConfig) -> T2Probe {
         )
         .await;
 
-    classify_t2_boot(&boot_res)
+    Ok(classify_t2_boot(&boot_res))
 }
 
 impl Vmm for Firecracker {
@@ -949,7 +997,7 @@ impl Vmm for Firecracker {
             ));
         }
 
-        let template = self.detect_cpu_template(cfg).await;
+        let template = self.detect_cpu_template(cfg, res).await?;
         // `noxsave` is the extended-FPU restore-guard *fallback*, applied only when no
         // CPU template was chosen (see `noxsave_fallback`); capture the decision now,
         // before `template` is moved into the machine-config request below.
@@ -1138,6 +1186,12 @@ impl Vmm for Firecracker {
             // (`res.tmp_dir/serial.log`), NOT the snapshot's baked serial path — so
             // `serial_log()`/panic detection must point at the fresh path, or it reads
             // an empty/stale file FC never writes (VMM-6).
+            //
+            // That baked path is a pure function of (prefix, pid, ANCESTOR vmid), so this VM lives
+            // in the ancestor's scratch dir while holding a freshly allocated vmid. Reporting it
+            // through `vsock_path()` is what lets the orchestrator reserve the ancestor's vmid for
+            // this VM's lifetime (M9, `vmcell::vmm::adopted_scratch_vmid`) — without which a later
+            // VM draws that id and deletes this VM's directory out from under it.
             vsock_path: host_paths.vsock,
             serial_path,
             // A restored guest keeps the CID baked into its snapshot (the vsock device
@@ -2764,6 +2818,81 @@ mod tests {
             "expected a seccomp_log Unsupported, got {err:?}"
         );
     }
+
+    // The T2 probe boots a REAL Firecracker VM, and used to do it from a hand-rolled
+    // `std::process::Command` — no Layer-2 jail, no seccomp flag, no netns join, and a socket in
+    // bare `/tmp` — while every other Firecracker process on the host carried all four
+    // (docs/90 `vmcell-firecracker:789`). Both halves of the fix are assertable KVM-free because
+    // `t2_probe_launch` performs no I/O.
+    //
+    // Red on the inverse: hand the plan anything but `cfg.jail` (e.g. `JailConfig::disabled()`) and
+    // the posture assert reddens; go back to `std::env::temp_dir()` for the socket and the
+    // scratch-dir assert reddens; drop the plan entirely for a raw `Command::new` and this stops
+    // compiling — with `jail_composition_gate`'s `Command::new` ban as the source-level backstop.
+    #[test]
+    fn the_t2_probe_launches_through_the_same_composed_plan_as_a_real_boot() {
+        use vmcell::config::{JailConfig, VmmSeccomp};
+
+        let res = reject_test_resources("t2-probe");
+        let cfg = erofs_builder()
+            .vmm_seccomp(VmmSeccomp::Disabled)
+            .jail(JailConfig::hardened())
+            .build()
+            .expect("build config");
+
+        let (socket, plan) = t2_probe_launch(Path::new("/usr/bin/firecracker"), &cfg, &res)
+            .expect("compose the probe launch");
+
+        // The probe VM is confined by the very posture the VM it probes for will be.
+        assert_eq!(
+            plan.jail(),
+            cfg.jail,
+            "the probe must ship `cfg.jail` — an unjailed probe is a Firecracker process on the \
+             host with no Layer-2 confinement at all"
+        );
+        // …and it is a real posture, not the empty one (the control the sibling plan gate makes
+        // explicit).
+        assert!(
+            !vmcell::vmm::jail::jail_spec_from_config(&plan.jail())
+                .expect("compile the shipped spec")
+                .is_noop(),
+            "the shipped hardened posture must compile to real hardening"
+        );
+
+        // The socket lives in THIS VM's scratch dir (reclaimed by the orchestrator's guard even if
+        // we are killed between spawn and reap), not in bare `/tmp`, and never collides with
+        // `spawn_fc`'s own `api.sock`.
+        assert_eq!(socket, res.tmp_dir.join(T2_PROBE_SOCKET));
+        assert_ne!(socket, res.tmp_dir.join("api.sock"));
+        assert!(
+            !socket.starts_with(std::env::temp_dir().join("vmcell-fc-probe")),
+            "the probe socket must not be a clock-named file in the shared temp dir"
+        );
+
+        // The composed argv is the real one — the seccomp flag AND the probe's own `--api-sock`,
+        // asserted whole rather than by fragment (docs/78 M11).
+        assert_eq!(
+            plan.argv(),
+            [
+                "--no-seccomp".to_string(),
+                "--api-sock".to_string(),
+                socket.display().to_string(),
+            ],
+            "the probe's argv must be the composed launch, seccomp posture included"
+        );
+
+        // The netns join is a `pre_exec` property of the same composer, so it is invisible here and
+        // in every other KVM-free test — the argv of a netns member is byte-identical. That half is
+        // structural: `firecracker_launch_plan` is handed `res.netns_name`, and
+        // `jail_composition_gate` is what forbids a spawn route that skips it.
+        let mut member = reject_test_resources("t2-probe");
+        member.netns_name = Some("vmcell-net-1".to_string());
+        let (netns_socket, netns_plan) =
+            t2_probe_launch(Path::new("/usr/bin/firecracker"), &cfg, &member)
+                .expect("compose the probe launch in a netns");
+        assert_eq!(netns_socket, socket);
+        assert_eq!(netns_plan.argv(), plan.argv());
+    }
 }
 
 /// Source-level gate for docs/81 d6: the Firecracker interface id lives in exactly one place,
@@ -2877,9 +3006,18 @@ mod fc_iface_id_single_source_gate {
 /// scanned — the same shape as the sibling [`fc_iface_id_single_source_gate`], whose
 /// `production_code` normalizer this reuses rather than copies.
 ///
+/// It also catches the route it MISSED: the T2 CPU-template probe spawned firecracker from its own
+/// `std::process::Command::new(&vmm.binary_path)`, so it made neither banned call and shipped a real
+/// Firecracker VM with no jail, no seccomp flag and no netns — invisible here, and invisible to
+/// every behavioral test because a probe VM has no data plane to assert on (docs/90
+/// `vmcell-firecracker:789`). The ban is therefore on *building a command at all*: in production
+/// text this backend constructs no `Command`, because the only VMM it may spawn is the one the plan
+/// composed.
+///
 /// It catches: a raw `jail_spec_from_config` call in this backend, a second launch-plan
-/// construction, and a deleted one. It cannot catch: the wrong `JailConfig` handed to the plan —
-/// that is behavioral, and the KVM-free plan gate asserts it directly.
+/// construction, a deleted one, and any `Command::new`/`Command::from` spawn route beside the plan.
+/// It cannot catch: the wrong `JailConfig` handed to the plan — that is behavioral, and the KVM-free
+/// plan gate asserts it directly.
 #[cfg(test)]
 mod jail_composition_gate {
     use super::fc_iface_id_single_source_gate::production_code;
@@ -2921,6 +3059,20 @@ mod jail_composition_gate {
             "M11: this backend must not build a VMM command outside the launch plan. Found \
              {raw_cmd:?}"
         );
+        // The route the two bans above could not see: a hand-rolled `Command`. The T2 probe used
+        // one, so it called neither banned helper and still spawned an unjailed, netns-less
+        // Firecracker VM. In production text there is no `Command` construction at all — the plan
+        // owns the only one.
+        for spawner in ["Command::new(", "Command::from("] {
+            let hand_rolled = calls(&code, spawner);
+            assert!(
+                hand_rolled.is_empty(),
+                "M11: this backend must spawn nothing it did not compose — `{spawner}` in \
+                 production text bypasses the jail, the seccomp flag and the netns join the way \
+                 the T2 probe did. Route it through `firecracker_launch_plan` (see \
+                 `t2_probe_launch`). Found {hand_rolled:?}"
+            );
+        }
 
         // The anti-vacuity half: the two assertions above are satisfied by a file with no launch
         // at all, so the launch must be here, exactly once.
@@ -2952,5 +3104,14 @@ mod jail_composition_gate {
         let code = production_code(composed);
         assert!(calls(&code, "jail_spec_from_config(").is_empty());
         assert_eq!(calls(&code, "LaunchPlan::build(").len(), 1);
+
+        // The hand-rolled-spawner leg: the exact probe shape is seen, a `#[cfg(test)]` stand-in
+        // spawner is not (the tests below DO spawn `sleep`/`true` on purpose), and prose is not.
+        let probe = "// spawns firecracker with Command::new for the T2 probe\n\
+             let mut std_cmd =\n    std::process::Command::new(\n    &vmm.binary_path);\n\
+             #[cfg(test)]\nmod tests { Command::new(\"sleep\"); }";
+        let code = production_code(probe);
+        assert_eq!(calls(&code, "Command::new(").len(), 1);
+        assert!(calls(&code, "Command::from(").is_empty());
     }
 }

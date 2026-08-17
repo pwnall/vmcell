@@ -3,8 +3,8 @@
 # `design §…` sections it sends them to inside the design document.
 #
 # WHY THIS EXISTS. Two dangling pointers were found by a human in one review pass:
-#   * the daemon's served OpenAPI `description` sent consumers to "design §D", a section that has not
-#     existed since the design was renumbered (docs/90 D2);
+#   * the served OpenAPI `description` sent consumers to "design §D" (allow-dangling-design-ref: quoted
+#     defect), a section that has not existed since the design was renumbered (docs/90 D2);
 #   * AGENTS.md's "read before changing anything" list pointed at
 #     `docs/99-claude-fable-automated-quality-v9.md`, which resolved to NOTHING after that document was
 #     retired into `docs/historical/` — the one file every agent is told to read first, sending them to
@@ -44,9 +44,11 @@
 #   sections of its own, and README.md's own numbered sections are excluded by requiring the reference
 #   to be qualified (`design §11`) in any file that numbers its own headings. A reference qualified
 #   with a DIFFERENT design version (`v15 §12.8`) names that version's numbering and is skipped.
-#   Deliberately NOT extended over `docs/*.md`: those legitimately cite other documents' numbering (a
-#   retired perf-config design's `§1b`) and quote defects verbatim (docs/90's D2 finding quotes the
-#   wrong `design §D` it is reporting), so they need a per-document resolver this check does not have.
+#   Deliberately NOT extended over `docs/*.md`: those legitimately cite other documents' numbering (the
+#   retired perf-config design's `docs/44 §1b`) and quote defects verbatim — docs/90's D2 finding quotes
+#   the wrong `design §D` it reports (allow-dangling-design-ref: quoted defect) — so they need a
+#   per-document resolver this check does not have. The `§` references OUTSIDE the markdown (the code,
+#   the manifests, the justfile, the gate scripts) are `scripts/ban-dangling-design-ref.sh`'s roster.
 #
 #   ARM 3 — NON-VACUITY, BOTH DIRECTIONS. A roster that opens no file, an extractor that finds no
 #   pointer, a design document that is missing or yields no headings: each is a gate MISCONFIGURATION

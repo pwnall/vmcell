@@ -155,13 +155,14 @@ impl Stage for MmdebstrapRootfsStage {
         hasher.update(builder_image.as_bytes());
         hasher.update(b"\0");
         hasher.update(builder_digest.as_bytes());
-        // Consumed upstream artifacts: the seed `kernel` (boots the builder VM) plus the
-        // injected `steward`/`guest_tools`, content-hashed in sorted order.
-        let consumed: &[&str] = &["kernel", "steward", "guest_tools"];
+        // Consumed upstream artifacts, content-hashed in sorted order — read off the very
+        // `PackOptions` folded above, so this stage's identity and the tail's lookups name one
+        // handler.
+        let consumed = Self::consumed_artifact_keys(&options);
         let filtered: std::collections::HashMap<String, std::path::PathBuf> = inputs
             .artifacts
             .iter()
-            .filter(|(k, _)| consumed.contains(&k.as_str()))
+            .filter(|(k, _)| consumed.iter().any(|c| c == k.as_str()))
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         vmcell::artifact::hash_artifacts_sorted(&mut hasher, &filtered);
@@ -292,6 +293,27 @@ impl Stage for MmdebstrapRootfsStage {
 }
 
 impl MmdebstrapRootfsStage {
+    /// The upstream artifacts this stage's identity folds: the seed `kernel` (it boots the builder
+    /// VM, so a different seed is a different build — the OCI source consumes no kernel and folds
+    /// none), plus the two binaries the shared inject+pack tail bakes.
+    ///
+    /// The handler entry is the key the **tail** reads — [`PackOptions::handler_key`], the one law —
+    /// never the `"guest_tools"` literal it used to be. That literal is the H1 shape: it is correct
+    /// only for the default handler, which is the only one this source can carry today, and a fold
+    /// that agrees with the tail by coincidence stops agreeing the moment the coincidence ends. H1
+    /// hid for a release exactly this way — a second spelling of "which handler is this?" that was
+    /// right until a label appeared, at which point the identity keyed off one binary while the
+    /// image baked another.
+    ///
+    /// Owned `String`s rather than `&str`, because the handler key is composed, not a literal.
+    fn consumed_artifact_keys(options: &vmcell::artifact::rootfs::PackOptions) -> [String; 3] {
+        [
+            "kernel".to_string(),
+            "steward".to_string(),
+            options.handler_key(),
+        ]
+    }
+
     /// What this source tells the one inject+pack tail — read by `cache_key` AND by `run`, the
     /// way [`vmcell::artifact::rootfs::RootfsStage::pack_options`] is, so the identity this stage
     /// folds and the options it actually packs with cannot drift into agreeing by accident.
@@ -299,9 +321,13 @@ impl MmdebstrapRootfsStage {
         vmcell::artifact::rootfs::PackOptions::new()
             .with_extra(self.extra.clone())
             // `Strip`, stated rather than defaulted: this source BUILDS its base with mmdebstrap
-            // instead of resolving a registry entry, so there is no `xattrs` declaration to honor
-            // (§4.7 puts the policy on the artifact, and this artifact has no entry). The day an
-            // mmdebstrap-built rootfs becomes registrable, this is the one line that moves.
+            // instead of resolving a registry entry, so it reads no `xattrs` declaration — §4.7 puts
+            // the policy on the artifact, and this stage carries no field for one. That is a
+            // *refusal*, not a silent drop: the composition root refuses a `rootfs` entry declaring
+            // a non-default `xattrs` (or `format`) against this source
+            // (`vmcell-cli`'s `reject_unproducible_rootfs_entry_for_mmdebstrap`), because the default
+            // entry does describe the `rootfs.erofs` this stage writes. The day this source honors a
+            // declaration, this is the one line that moves — and that refusal is what goes with it.
             .with_xattrs(vmcell::artifact::rootfs::XattrPolicy::Strip)
     }
 }
@@ -455,6 +481,82 @@ mod tests {
             ka,
             s.cache_key(&c),
             "dedicated builder-base pins must fold into the key"
+        );
+    }
+
+    // docs/90 H1, this crate's copy of it: the consumed-artifact set names the handler through the
+    // ONE key law (`PackOptions::handler_key`), never a `"guest_tools"` literal. The literal was
+    // right here — this source carries no handler label, so the default key IS `guest_tools` — and
+    // that is precisely how H1 hid in `vmcell` for a release: a fold that agrees with the pack tail
+    // by coincidence.
+    //
+    // Driven with a LABEL, which the shipped stage cannot produce today, because the coincidence is
+    // what has to be tested: with the literal restored, the labelled case folds the default
+    // handler's binary into the identity of an image packed from a different one.
+    //
+    // RED on the inverse: put `["kernel", "steward", "guest_tools"]` back in
+    // `consumed_artifact_keys` — the labelled assertion fails naming `guest_tools`.
+    #[test]
+    fn the_consumed_set_names_the_handler_through_the_one_key_law() {
+        use vmcell::artifact::handler::handler_artifact_key;
+        use vmcell::artifact::rootfs::PackOptions;
+
+        // The shipped shape: no label ⇒ the default handler's key, bit-for-bit what this stage has
+        // always folded (so no existing artifact re-keys).
+        assert_eq!(
+            MmdebstrapRootfsStage::consumed_artifact_keys(&stage().pack_options()),
+            [
+                "kernel".to_string(),
+                "steward".to_string(),
+                handler_artifact_key(None)
+            ],
+        );
+
+        // The discriminating shape: a labelled handler is published under `guest_tools-<label>`, and
+        // that is the key the tail looks up — so it must be the key folded here.
+        let labelled = PackOptions::new().with_handler_label(Some("acme"));
+        assert_eq!(
+            MmdebstrapRootfsStage::consumed_artifact_keys(&labelled)[2],
+            handler_artifact_key(Some("acme")),
+            "the fold must name the handler the tail reads, or the identity describes a binary the \
+             image does not contain (H1)"
+        );
+        // …and the two are genuinely different keys, so the assertion above is not a tautology about
+        // one string.
+        assert_ne!(
+            handler_artifact_key(Some("acme")),
+            handler_artifact_key(None)
+        );
+    }
+
+    // The consumed set is not just composed correctly, it is what `cache_key` actually filters on:
+    // the default handler's binary content moves this stage's key. Without this leg the composer
+    // above could be correct and unused (the H1 failure was a correct law with an unchanged call
+    // site).
+    //
+    // RED on the inverse: drop the handler entry from `consumed_artifact_keys` — the key stops
+    // moving and the two digests collapse.
+    #[test]
+    fn the_cache_key_folds_the_handler_binary_it_consumes() {
+        use vmcell::artifact::handler::handler_artifact_key;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tools = dir.path().join("guest-tools");
+        let s = stage();
+
+        let key_of = |content: &[u8]| {
+            std::fs::write(&tools, content).expect("write handler binary");
+            let mut i = inputs();
+            i.artifacts
+                .insert(handler_artifact_key(None), tools.clone());
+            s.cache_key(&i)
+        };
+
+        assert_ne!(
+            key_of(b"handler v1"),
+            key_of(b"handler v2"),
+            "rebuilding the handler binary must invalidate this stage's key — the tail bakes it into \
+             the image"
         );
     }
 

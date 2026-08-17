@@ -8,13 +8,16 @@
 //! half with no other proof: that registration is a **digest** (F7), that the default entry means
 //! exactly the pre-v33 workspace build, and that a consumer's roster is data rather than a const.
 //!
-//! KVM-free, network-free, toolchain-free.
+//! KVM-free, network-free, toolchain-free. One leg — `a_registered_handler_is_baked_into_the_rootfs`
+//! — additionally runs the real inject+pack tail (still no network: the pack is fed no base layers
+//! and a static-musl steward stand-in), because "the registration reaches the IMAGE" is the half
+//! parse tests structurally cannot see. Its live twin is `handler_cell.rs`.
 
 use std::path::{Path, PathBuf};
 
 use vmcell::artifact::handler::{
-    HandlerSource, handler_artifact_key, handler_filename, handler_label_from_filename,
-    handler_pin_key,
+    HandlerSource, handler_artifact_key, handler_filename, handler_label_from_artifact_key,
+    handler_label_from_filename, handler_pin_key,
 };
 use vmcell::artifact::registry::{DEFAULT_LABEL, UNPINNED_PATH_KEY};
 use vmcell::artifact::{resolve_handler_labels, resolve_handler_registry, resolve_pins};
@@ -400,6 +403,21 @@ fn the_workspace_build_shape_is_strict() {
 fn the_filename_and_artifact_key_laws_round_trip() {
     assert_eq!(handler_artifact_key(None), "guest_tools");
     assert_eq!(handler_artifact_key(Some("acme")), "guest_tools-acme");
+    // The artifact key's own inverse, which the pack tail reads to see whether the pipeline
+    // published a handler it was not told to bake. It round-trips over the KEY form, dots and all
+    // (`guest_tools-12.4`) — where `handler_label_from_filename` must answer `None`, because the
+    // FILENAME law sanitizes `.`→`-` and so a dotted remainder there can only be a sidecar. That
+    // divergence is the whole reason the two inverses are two functions.
+    for label in [None, Some("acme"), Some("12.4")] {
+        assert_eq!(
+            handler_label_from_artifact_key(&handler_artifact_key(label)),
+            label,
+            "the artifact-key law must round-trip through its own inverse for {label:?}"
+        );
+    }
+    assert_eq!(handler_label_from_artifact_key("guest_tools-"), None);
+    assert_eq!(handler_label_from_artifact_key("rootfs-acme"), None);
+    assert_eq!(handler_label_from_filename("guest_tools-12.4"), None);
     assert_eq!(handler_filename(None), "guest_tools");
     assert_eq!(handler_filename(Some("12.4")), "guest_tools-12-4");
     assert_eq!(handler_label_from_filename("guest_tools"), None);
@@ -505,6 +523,163 @@ fn no_registry_shape_resolves_to_the_per_run_override() {
         assert!(
             msg.contains(key),
             "an override spelled as a registry key must be refused NAMING it, got: {msg}"
+        );
+    }
+}
+
+/// Closes the shared proxy CA's publish window before a pack, from the consumer position.
+///
+/// The pack tail materializes `<artifacts-dir>/ca.pem` through `CaManager::new()`, which publishes
+/// the (cert, key) pair as TWO renames; a process that looks between them gets the deliberate
+/// `partial CA in …` refusal. nextest gives every test its own process, so on a cold artifacts dir
+/// several of them can race. One successful call closes the window for the rest of this process.
+/// The in-crate twin of this loop (`rootfs::stabilize_ca`) guards the same window for the unit
+/// tests; it is `#[cfg(test)]`, which does not reach an integration binary.
+#[cfg(all(feature = "pipeline", feature = "am-fs-erofs", feature = "proxy"))]
+fn stabilize_ca() {
+    let mut last = String::new();
+    for _ in 0..50 {
+        match vmcell::proxy::tls::CaManager::new() {
+            Ok(_) => return,
+            Err(e) => {
+                last = e.to_string();
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+    }
+    panic!("the shared proxy CA never materialized; last error: {last}");
+}
+
+/// Without the `proxy` feature the tail bakes no CA, so there is nothing to stabilize.
+#[cfg(all(feature = "pipeline", feature = "am-fs-erofs", not(feature = "proxy")))]
+fn stabilize_ca() {}
+
+// §10.5 / §18 delta 6b's end-to-end claim, from the position a consumer registers a handler from: a
+// REGISTERED handler's binary is what the rootfs bakes, with the applet symlinks that make it
+// reachable. Delta 6b's own notes deferred this to delta 9, and delta 9 shipped without it — which
+// is how `--handler-label <any>` came to build a rootfs carrying no guest tools and no applet
+// symlinks at all, and report success.
+//
+// The whole chain runs: overlay → `resolve_handler_registry` → `GuestToolsStage::labelled` (which
+// publishes under `guest_tools-<label>`) → the artifact map → the one inject+pack tail. Nothing is
+// stubbed between them, because every link but the last was already green while the image shipped
+// empty.
+//
+// Three claims:
+//   1. the REGISTERED binary's bytes are in the image (asserted on content, not on "the pack
+//      succeeded", which the defect also did);
+//   2. every `GUEST_TOOLS_APPLETS` name is in the image — a handler that declares no roster gets
+//      vmcell's own, and `mini-init` being one of them is why a dropped roster is a guest kernel
+//      panic rather than a missing test helper;
+//   3. the mirror image: the SAME artifact map packed *without* declaring the label is REFUSED,
+//      naming the handler the pipeline published. That is the state the defect packed silently, and
+//      it is also the shape a mis-wired downstream pipeline (or the mmdebstrap source, whose stage
+//      takes no handler label) produces.
+//
+// RED on the inverse (read `inputs.artifacts["guest_tools"]` at the tail again): claim 1 fails — the
+// image carries neither the handler nor a symlink — and claim 3's refusal never happens.
+#[cfg(all(feature = "pipeline", feature = "am-fs-erofs"))]
+#[tokio::test]
+async fn a_registered_handler_is_baked_into_the_rootfs() {
+    use vmcell::artifact::guest_tools::GuestToolsStage;
+    use vmcell::artifact::rootfs::{PackOptions, pack_rootfs_with_injection};
+    use vmcell::artifact::{Stage, StageInputs};
+
+    stabilize_ca();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    // The consumer's own helper binary. Its bytes are the assertion: nothing else in the image can
+    // contain them.
+    const HANDLER_BYTES: &[u8] = b"#!/bin/sh\n# the acme handler, delta 6b\n";
+    let handler_src = tmp.path().join("acme-handler");
+    std::fs::write(&handler_src, HANDLER_BYTES).expect("write the consumer's handler");
+
+    // Registered through the F7 dev override, which is the one registration shape that needs no
+    // network: a digest entry would have to be fetched, and this leg is about what happens AFTER the
+    // handler is published, which is identical for all three shapes.
+    let overlay = write_overlay(
+        tmp.path(),
+        &format!(
+            r#"{{ "handlers": {{ "acme": {{ "{UNPINNED_PATH_KEY}": "{}" }} }} }}"#,
+            handler_src.display()
+        ),
+    );
+    let entry = resolve_handler_registry(Some(&overlay))
+        .expect("the overlay resolves")
+        .into_iter()
+        .find(|e| e.label == "acme")
+        .expect("the acme entry");
+
+    // The real stage, publishing under its own one key law.
+    let stage = GuestToolsStage::labelled(Some("acme"), Some(entry.source.clone()));
+    let published = stage.out_path(tmp.path());
+    let outputs = stage
+        .run(&StageInputs::default(), &published)
+        .await
+        .expect("the handler stage must publish the registered binary");
+    let handler_key = handler_artifact_key(Some("acme"));
+    assert_eq!(
+        outputs.artifacts.get(&handler_key).map(PathBuf::as_path),
+        Some(published.as_path()),
+        "the stage must register the labelled handler under `{handler_key}`: {outputs:?}"
+    );
+
+    let musl = tmp.path().join("steward-musl");
+    std::fs::write(&musl, b"#!static-steward").expect("write the steward stand-in");
+    let mut inputs = StageInputs::default();
+    inputs.artifacts.extend(outputs.artifacts.clone());
+
+    let pack = async |handler_label: Option<&str>, name: &str| {
+        let out = tmp.path().join(name);
+        pack_rootfs_with_injection(
+            vec![],
+            &inputs,
+            &out,
+            &PackOptions::new()
+                .with_steward_musl(Some(musl.clone()))
+                .with_applets(entry.applet_roster())
+                .with_handler_label(handler_label),
+        )
+        .await
+        .map(|_| std::fs::read(&out).expect("read the packed image"))
+    };
+    let occurrences = |image: &[u8], needle: &[u8]| -> usize {
+        image.windows(needle.len()).filter(|w| *w == needle).count()
+    };
+
+    // 1 + 2.
+    let image = pack(Some("acme"), "rootfs-acme.erofs")
+        .await
+        .expect("the pack must succeed");
+    assert_eq!(
+        occurrences(&image, HANDLER_BYTES),
+        1,
+        "the REGISTERED handler's bytes must be baked into the rootfs — the whole point of \
+         registering one"
+    );
+    assert!(
+        !vmcell_protocol::GUEST_TOOLS_APPLETS.is_empty(),
+        "an empty roster would make the loop below vacuous"
+    );
+    for applet in vmcell_protocol::GUEST_TOOLS_APPLETS {
+        assert!(
+            occurrences(&image, applet.as_bytes()) >= 1,
+            "the image must carry a `/vmcell-tools/{applet}` entry: a handler that declares no \
+             roster gets vmcell's own (`GUEST_TOOLS_APPLETS`), and `mini-init` is an `init=` target"
+        );
+    }
+
+    // 3. The mirror image: the same map, the label undeclared, refused naming what WAS published.
+    let err = pack(None, "rootfs-undeclared.erofs")
+        .await
+        .expect_err("a pipeline that published only a labelled handler must not pack silently");
+    let msg = err.to_string();
+    // The orphaned LABEL (what an operator types as `--handler-label`) and the key this pack went
+    // looking for instead — the two facts that turn "no applets in the image" into an action.
+    for named in ["acme", &handler_artifact_key(None)] {
+        assert!(
+            msg.contains(named),
+            "the refusal must name {named} so the operator can see which handler was orphaned: \
+             {msg}"
         );
     }
 }

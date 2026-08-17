@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ONE predicate for the broker's lean boundary (design §12.23 / invariant P2; AGENTS.md "the broker,
+# ONE predicate for the broker's lean boundary (design §13 / invariant P2; AGENTS.md "the broker,
 # and the jailer"). The broker OWNS the engine, so tokio and rtnetlink are LEGITIMATE there — it
 # does netns/tap/nft setup. Its boundary is the network-facing WEB SERVER: the HTTP surface that
 # parses untrusted network input must never share the cap-holding process. That surface is

@@ -2,6 +2,101 @@
 //!
 //! This module coordinates the building of artifacts required to boot and run
 //! virtual machines, such as the kernel, root filesystem, and snapshots.
+//!
+//! Both examples below are doctests, compiled by `just test-doc`, and both are `no_run`: one pulls a
+//! digest-pinned OCI base and packs an image, the other reads real layers and writes a real one.
+//!
+//! # Assembling a [`Pipeline`](crate::artifact::Pipeline)
+//!
+//! Stage 0 is always [`ResolvePinsStage`](crate::artifact::ResolvePinsStage): it merges the
+//! `$VMCELL_PINS` overlay over the committed baseline and flattens the result into the `pins` map
+//! every later stage reads from memory (§10.2). A **labelled** build is a stage *constructor* —
+//! [`RootfsStage::labelled`](crate::artifact::rootfs::RootfsStage::labelled),
+//! [`GuestToolsStage::labelled`](crate::artifact::guest_tools::GuestToolsStage::labelled),
+//! [`RootfsFeaturesStage::labelled`](crate::artifact::rootfs::RootfsFeaturesStage::labelled) — not a
+//! free `build_labelled_rootfs` function, because a label has to move the stage's name, output path,
+//! artifact key and cache key together or not at all (§10.5).
+//!
+//! ```no_run
+//! use vmcell::artifact::guest_tools::GuestToolsStage;
+//! use vmcell::artifact::rootfs::{
+//!     RootfsFeaturesStage, RootfsStage, rootfs_artifact_key, rootfs_filename,
+//! };
+//! use vmcell::artifact::steward::StewardStage;
+//! use vmcell::artifact::{
+//!     Cache, Pipeline, ResolvePinsStage, RootfsFormat, artifacts_dir, pins_overlay_path,
+//! };
+//!
+//! # #[tokio::main]
+//! # async fn main() -> vmcell::Result<()> {
+//! let artifacts = Pipeline::new(artifacts_dir())
+//!     .add_stage(Box::new(ResolvePinsStage { overlay_file: pins_overlay_path() }))
+//!     .add_stage(Box::new(StewardStage {}))
+//!     // The handler — the guest binary a rootfs bakes at the tools path — before the rootfs that
+//!     // bakes it. `GuestToolsStage::labelled` is the registered-handler form.
+//!     .add_stage(Box::new(GuestToolsStage::new()))
+//!     // A labelled image. The label has to exist in the `rootfs` registry — the committed
+//!     // baseline, or an overlay entry — or the stage refuses naming it. `with_handler_label(None)`
+//!     // names the default handler the stage above published; a rootfs told about a handler its
+//!     // pipeline never built is refused, not packed without applets.
+//!     .add_stage(Box::new(RootfsStage::labelled(Some("acme")).with_handler_label(None)))
+//!     // §7.4's feature-declaration sidecar, which travels beside the image it describes.
+//!     .add_stage(Box::new(RootfsFeaturesStage::labelled(Some("acme"))))
+//!     // `Cache` is an inert placeholder — it holds nothing, and two `build` calls with two
+//!     // different values behave identically. The real cache is the `.cache_key` sidecar beside
+//!     // each stage's payload.
+//!     .build(&Cache::default())
+//!     .await?;
+//!
+//! // Both names come from their one composer, never from a local `format!`.
+//! let image = &artifacts.paths[&rootfs_artifact_key(Some("acme"))];
+//! assert!(image.ends_with(rootfs_filename(Some("acme"), RootfsFormat::Erofs)));
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! # Repacking through the one inject-and-pack tail
+//!
+//! [`pack_rootfs_with_injection`](crate::artifact::rootfs::pack_rootfs_with_injection) is the tail
+//! every rootfs source routes through, so the `libc6` scan, the steward and CA injection, the applet
+//! symlinks, the reserved-dest law and the [`XattrPolicy`](crate::artifact::XattrPolicy) apply to all
+//! of them once (§4.2, §4.7). [`RootfsFormat`](crate::artifact::RootfsFormat) chooses the emitter and
+//! nothing else — the merge above it is identical for both.
+//! [`pack_erofs_with_injection`](crate::artifact::rootfs::pack_erofs_with_injection) is its
+//! erofs-only door and refuses any other format by name. Calling the tail directly is how an
+//! external repacker composes an image with no vmcell checkout and no cargo.
+//!
+//! ```no_run
+//! use std::io::Read;
+//! use std::path::Path;
+//! use vmcell::artifact::rootfs::{
+//!     ExtraFile, PackOptions, pack_rootfs_with_injection, rootfs_artifact_key,
+//! };
+//! use vmcell::artifact::{RootfsFormat, StageInputs, XattrPolicy};
+//!
+//! # #[tokio::main]
+//! # async fn main() -> vmcell::Result<()> {
+//! // The tail bakes the steward it is handed: a pipeline publishes it under the `steward` artifact
+//! // key, and an external repacker inserts the binary it already has. A prebuilt static-musl
+//! // steward goes through `PackOptions::with_steward_musl`, which also waives the libc6 guard.
+//! let mut inputs = StageInputs::default();
+//! inputs.artifacts.insert("steward".into(), "/artifacts/vmcell-steward".into());
+//!
+//! let layers: Vec<Box<dyn Read + Send>> = vec![Box::new(std::fs::File::open("/base.tar")?)];
+//! // `PackOptions` is `#[non_exhaustive]` and grows by FIELD, so the tail takes one `&PackOptions`
+//! // and its signature stops moving. A caller reproducing the pre-0.17 two-argument call writes
+//! // `PackOptions::new().with_steward_musl(m).with_extra(e)`.
+//! let options = PackOptions::new()
+//!     .with_extra(vec![ExtraFile::new("/opt/fixture.json", "/host/fixture.json", 0o644)])
+//!     .with_xattrs(XattrPolicy::Preserve)
+//!     .with_format(RootfsFormat::Erofs);
+//!
+//! let out = Path::new("/artifacts/rootfs.erofs");
+//! let published = pack_rootfs_with_injection(layers, &inputs, out, &options).await?;
+//! assert_eq!(published.artifacts[&rootfs_artifact_key(None)], out.to_path_buf());
+//! # Ok(())
+//! # }
+//! ```
 
 #![forbid(unsafe_code)]
 
@@ -442,7 +537,22 @@ pub trait Stage: Send + Sync {
     async fn run(&self, inputs: &StageInputs, out: &Path) -> Result<StageOutputs>;
 }
 
-/// Cache for previously built artifacts.
+/// A **placeholder**: caching is per-stage and sidecar-driven, and this argument is ignored.
+///
+/// It holds nothing and does nothing — no fields, no methods, no inherent `impl`. The real cache is
+/// the `.cache_key` sidecar beside each stage's payload: [`Stage::cache_key`] computes the key,
+/// [`Stage::cache_sidecar_path`] says where it lives, and [`Pipeline::build`] is the only reader and
+/// writer. Nothing about a hit or a miss travels through this handle, so two `build` calls with two
+/// different `Cache` values behave identically, and `Cache::default()` is the only value worth
+/// constructing.
+///
+/// It survives as a parameter because [`Pipeline`] is named contract surface (§10.4, The downstream
+/// toolkit contract): dropping the argument is a breaking change out-of-repo consumers must be
+/// **versioned** through, not surprised by, and the rustdoc it used to carry ("Cache for previously
+/// built artifacts") promised shared cache state that never existed — which is the half of docs/90 A1
+/// that was a real defect. `cache_handle_is_the_inert_placeholder_its_rustdoc_promises` keeps this
+/// paragraph honest: the moment the handle starts carrying anything, that gate reddens and this
+/// rustdoc has to be rewritten with it.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Cache {}
 /// Artifacts resulting from a pipeline build.
@@ -2956,6 +3066,83 @@ async fn resolve_pins_into(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// docs/90 A1: [`Cache`]'s rustdoc says "placeholder … this argument is ignored", and this is
+    /// what makes that a checked statement rather than a claim.
+    ///
+    /// The defect A1 reported was a **promise**: "Cache for previously built artifacts" on a type
+    /// with no fields, no methods and no `impl`, which every `Pipeline` caller must construct and
+    /// both consumers bind as `_cache`. The honest rustdoc is only honest while it stays true, so the
+    /// gate binds the three things the paragraph asserts:
+    ///
+    /// * the handle is zero-sized, so it cannot hold cache state;
+    /// * it has no inherent `impl`, so it cannot answer a question about one;
+    /// * every `&Cache` parameter is `_`-prefixed, i.e. ignored *by construction* — a consumer that
+    ///   starts reading the handle loses the underscore and reddens this gate, which is the signal to
+    ///   rewrite the rustdoc (and to reconsider the drop-the-parameter half of A1) rather than to
+    ///   leave a stale promise standing.
+    ///
+    /// Scanning this module's own source is the only way to see the second and third points: no type
+    /// system check distinguishes an ignored parameter from a used one.
+    #[test]
+    fn cache_handle_is_the_inert_placeholder_its_rustdoc_promises() {
+        assert_eq!(
+            std::mem::size_of::<Cache>(),
+            0,
+            "a placeholder that is ignored cannot carry bytes; if `Cache` grew state, `build` and \
+             `reset_to` are ignoring it and the rustdoc is lying"
+        );
+
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/artifact/mod.rs"),
+        )
+        .expect("gate misconfigured: this module's own source must be readable");
+        // Non-vacuity: the scan must be looking at the file that defines the type.
+        assert!(
+            source.contains("pub struct Cache {}"),
+            "gate misconfigured: `Cache`'s definition is not in the scanned file"
+        );
+
+        // Both needles are composed rather than written out, or this scan's own two lines would be
+        // its first two findings — and both are boundary-checked, because `CacheKey` and
+        // `CacheMetadata` are neighbours whose names start with this one's.
+        let name = "Cache";
+        let impl_needle = format!("impl {name}");
+        let param_needle = format!(": &{name}");
+        let ends_the_name =
+            |rest: &str| !rest.starts_with(|c: char| c.is_alphanumeric() || c == '_');
+
+        let mut used: Vec<(usize, String)> = Vec::new();
+        let mut impls: Vec<usize> = Vec::new();
+        for (i, line) in source.lines().enumerate() {
+            let code = line.split("//").next().unwrap_or("");
+            if let Some((_, rest)) = code.split_once(impl_needle.as_str())
+                && ends_the_name(rest)
+            {
+                impls.push(i + 1);
+            }
+            // A parameter of type `&Cache` whose name does not start with `_` is a READ.
+            if let Some((before, rest)) = code.split_once(param_needle.as_str())
+                && ends_the_name(rest)
+                && let Some(param) = before.rsplit(['(', ',', ' ']).next()
+                && !param.is_empty()
+                && !param.starts_with('_')
+            {
+                used.push((i + 1, param.to_string()));
+            }
+        }
+        assert!(
+            impls.is_empty(),
+            "`Cache` must have no inherent `impl` (its rustdoc promises an inert placeholder); \
+             found one at line(s) {impls:?}"
+        );
+        assert!(
+            used.is_empty(),
+            "a `&Cache` parameter is READ at {used:?} — the handle is no longer ignored, so \
+             `Cache`'s rustdoc (\"a placeholder … this argument is ignored\") is now false. Rewrite \
+             it, and revisit docs/90 A1's other half (drop the parameter, ledger the bump)."
+        );
+    }
 
     /// [`RootfsFormat::ALL`] really is every variant, and every one of them parses back from what
     /// it spells (§18 delta 8).

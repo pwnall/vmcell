@@ -12,6 +12,14 @@
 //! That leg is therefore `#[ignore]`d and runs in the privileged suite, where the blessed runner
 //! has raised `CAP_NET_ADMIN` into the ambient set (§11.2) and the assertion has teeth
 //! (docs/78 `jail-gate-narrower-than-design-claims`).
+//!
+//! **What a stand-in cannot reach** (docs/90 T6): every gate here asserts about `/bin/cat`, whose
+//! whole life is `execve` → read → exit. It says nothing about a real VMM that goes on to install
+//! its own filters, re-arm its own signal handlers and spawn vcpu threads *after* the last
+//! observation this file can make. That link — the confinement state of a **running** Cloud
+//! Hypervisor — is `tests/vmm_confinement.rs`, which boots one, resolves its pid, and reads
+//! `/proc/<pid>/status` back with a `VmmSeccomp::Disabled` + `JailConfig::disabled()` boot as its
+//! control. The two files are halves of one claim: the mechanism here, the outcome there.
 
 use std::process::Stdio;
 use std::sync::Arc;

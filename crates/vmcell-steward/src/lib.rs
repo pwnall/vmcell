@@ -99,7 +99,8 @@ pub(crate) struct ServeContext {
     pub(crate) reaper: Arc<ReaperCoordinator>,
     /// The handler mount point prepended to every child's `PATH` (§10.5).
     pub(crate) tools_dir: PathBuf,
-    /// Every live connection's session table, for law C3 on a service-mode shutdown.
+    /// Every live connection's teardown state — its sessions and its in-flight one-shot `exec`
+    /// children — for law C3 on a service-mode shutdown.
     pub(crate) connections: Arc<crate::serve::ConnectionRegistry>,
     /// Set once, by a service-mode SIGTERM: stop accepting and let the listener thread return.
     pub(crate) shutdown: Arc<std::sync::atomic::AtomicBool>,

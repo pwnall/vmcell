@@ -108,11 +108,32 @@ struct ChCpus {
     max_vcpus: u8,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug, PartialEq, Eq)]
 struct ChMemory {
     size: u64,
     shared: bool,
     mergeable: bool,
+}
+
+/// Builds CH's `memory` payload from the config, holding §8.3's **mandatory** KSM coupling.
+///
+/// KSM merges only private-anonymous pages, so with `shared=on` `mergeable` deduplicates *zero* of
+/// guest RAM — the caller asks for a density lever and gets a measured no-op. The coupling is
+/// therefore not a preference: `mergeable: true` ⇒ `shared: false`. Sharing stays the default
+/// because the vhost-user paths (virtio-fs, the unprivileged NAT) need it; only the opt-in §8.3
+/// (Density levers) KSM-density benchmark flips both.
+///
+/// Extracted (like [`build_ch_disks`] and [`build_ch_net`]) so the coupling is a *returned value* a
+/// KVM-free test asserts on. While it rode inline in `create()`, the string `ksm` appeared nowhere
+/// in this file outside one comment and nothing anywhere asserted the payload — a refactor to
+/// `mergeable: true, shared: true` compiled, passed every test, and silently deduplicated nothing
+/// (docs/90 G6).
+fn ch_memory(cfg: &VmConfig) -> ChMemory {
+    ChMemory {
+        size: u64::from(cfg.mem_mib) << 20,
+        shared: !cfg.ksm_mergeable,
+        mergeable: cfg.ksm_mergeable,
+    }
 }
 
 #[derive(Serialize)]
@@ -710,15 +731,8 @@ impl Vmm for CloudHypervisor {
                 boot_vcpus: cfg.vcpus,
                 max_vcpus: cfg.vcpus,
             },
-            memory: ChMemory {
-                size: (cfg.mem_mib as u64) << 20,
-                // KSM only deduplicates private-anonymous guest memory, so the
-                // `mergeable` (KSM) lever requires `shared=off`. Default keeps
-                // shared memory (the vhost-user paths need it); only the opt-in
-                // §8.3 (Density levers) KSM-density benchmark flips both.
-                shared: !cfg.ksm_mergeable,
-                mergeable: cfg.ksm_mergeable,
-            },
+            // Size and §8.3's mandatory KSM coupling, from the one `ch_memory` law.
+            memory: ch_memory(cfg),
             payload: ChPayload {
                 kernel: cfg.kernel.clone(),
                 cmdline: crate::config::build_kernel_cmdline(cfg, res, "")?,
@@ -923,29 +937,44 @@ impl VmInstance for ChInstance {
         let req = SnapshotReq {
             destination_url: format!("file://{}", dir.display()),
         };
-        self.api_request("PUT", "/api/v1/vm.pause", None::<&()>)
-            .await?;
+        // NOT `?`: a `vm.pause` that TIMED OUT may still have taken effect on the VMM side (the
+        // budget bounds our wait, not CH's work), so an early return here left exactly the wedged,
+        // paused VM the resume below exists to prevent — while the comment on that resume claimed
+        // "EVERY exit path" (docs/90 `cloud_hypervisor.rs:926`). Hold the result and let the tail
+        // run.
+        let paused = self
+            .api_request("PUT", "/api/v1/vm.pause", None::<&()>)
+            .await;
         // M6: `vm.snapshot` writes a dense memory file that tracks guest RAM ~1:1, so it
         // is budgeted against `mem_mib` — the flat control ceiling is a guaranteed
         // spurious timeout on a multi-GiB guest.
-        let res = self
-            .api_request_with(
+        //
+        // Skipped when the pause did not report success: a snapshot of a guest that may still be
+        // running is an inconsistent image, and writing one would be worse than failing.
+        let res = if paused.is_ok() {
+            self.api_request_with(
                 "PUT",
                 "/api/v1/vm.snapshot",
                 Some(&req),
                 crate::vmm::snapshot_request_timeout(self.mem_mib),
             )
-            .await;
-        // Resume on EVERY exit path, timeout included: a paused VM left behind by a
-        // failed snapshot is a wedged VM, so the resume is attempted unconditionally and
-        // only its own failure is warn-and-continue.
+            .await
+        } else {
+            Ok(())
+        };
+        // Resume on EVERY exit path — the snapshot's timeout AND the pause's own failure: a paused
+        // VM left behind by a failed snapshot is a wedged VM, so the resume is attempted
+        // unconditionally and only its own failure is warn-and-continue. On the pause-failure path
+        // the guest may never have paused, in which case CH refuses this resume and the warning is
+        // the expected outcome — cheap, versus a guest wedged for the rest of the run.
         if let Err(e) = self
             .api_request("PUT", "/api/v1/vm.resume", None::<&()>)
             .await
         {
             tracing::warn!("Failed to resume VM after snapshot: {}", e);
         }
-        res
+        // The pause failure is the one the caller must see: it is why no snapshot was taken.
+        paused.and(res)
     }
 
     fn vsock_path(&self) -> &Path {
@@ -1140,6 +1169,102 @@ mod tests {
             "a timed-out snapshot must still issue vm.resume, or the VM stays paused"
         );
         inst.kill().await.expect("reap the stand-in VMM");
+    }
+
+    // The third exit path of the same law (docs/90 `cloud_hypervisor.rs:926`): `vm.pause` itself
+    // never answers. Its budget bounds OUR wait, not CH's work, so the guest may well be paused —
+    // and the pre-fix `?` returned before the resume, leaving it that way for the rest of the run
+    // while the comment beside it said "resume on EVERY exit path". The fake never answers
+    // `vm.pause`, so the wait is the flat control ceiling in real time.
+    // Inverse (`?` on the pause request): only `vm.pause` is ever requested and the ordered-paths
+    // assert reddens on the missing `vm.resume`.
+    #[tokio::test]
+    async fn a_timed_out_pause_still_resumes_and_takes_no_snapshot() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let sock = dir.path().join("api.sock");
+        let seen = spawn_fake_ch_api(&sock, "/api/v1/vm.pause", None);
+        let mut inst = ch_instance_on(sock, 64);
+
+        let err = inst
+            .snapshot(dir.path())
+            .await
+            .expect_err("a never-answered vm.pause must time out");
+        assert!(
+            matches!(&err, Error::Timeout(m) if m.contains("vm.pause")),
+            "the pause failure must be the error the caller sees, got {err:?}"
+        );
+
+        let paths = seen.lock().expect("fake API log").clone();
+        assert_eq!(
+            paths,
+            vec![
+                "/api/v1/vm.pause".to_string(),
+                "/api/v1/vm.resume".to_string(),
+            ],
+            "a timed-out vm.pause must still issue vm.resume, and must NOT snapshot a guest that \
+             may still be running"
+        );
+        inst.kill().await.expect("reap the stand-in VMM");
+    }
+
+    // G6: §8.3's KSM coupling is MANDATORY, not a preference — KSM merges only private-anonymous
+    // pages, so `mergeable` with `shared=on` deduplicates ZERO of guest RAM and the density lever
+    // is a measured no-op. Asserted on the serialized payload CH is actually handed, for BOTH
+    // values of the lever, because that is the only place the coupling is observable without KVM.
+    // Inverse (`shared: cfg.ksm_mergeable`, or any refactor to `mergeable: true, shared: true`):
+    // the opt-in leg's `"shared":false` assert reddens.
+    #[test]
+    fn ch_memory_payload_couples_ksm_mergeable_to_unshared_memory() {
+        use crate::config::{RootfsSource, VmConfig};
+
+        let cfg = |ksm: bool| {
+            VmConfig::builder(
+                PathBuf::from("/vmlinux"),
+                RootfsSource::Erofs {
+                    image: PathBuf::from("/rootfs.erofs"),
+                },
+            )
+            .mem_mib(512)
+            .ksm_mergeable(ksm)
+            .build()
+            .expect("valid config")
+        };
+
+        // Default: shared memory on (the vhost-user paths need it), KSM off.
+        let off = ch_memory(&cfg(false));
+        assert_eq!(
+            off,
+            ChMemory {
+                size: 512 << 20,
+                shared: true,
+                mergeable: false,
+            },
+            "the default arm must keep shared memory and leave KSM off"
+        );
+        assert_eq!(
+            serde_json::to_string(&off).expect("serialize memory"),
+            "{\"size\":536870912,\"shared\":true,\"mergeable\":false}"
+        );
+
+        // Opt-in: KSM on REQUIRES shared=off, or it deduplicates nothing.
+        let on = ch_memory(&cfg(true));
+        assert_eq!(
+            on,
+            ChMemory {
+                size: 512 << 20,
+                shared: false,
+                mergeable: true,
+            },
+            "`ksm_mergeable` must turn sharing OFF — with shared=on, KSM merges nothing (§8.3)"
+        );
+        assert_eq!(
+            serde_json::to_string(&on).expect("serialize memory"),
+            "{\"size\":536870912,\"shared\":false,\"mergeable\":true}"
+        );
+        assert!(
+            !(on.mergeable && on.shared),
+            "mergeable with shared memory is the §8.3 no-op this coupling exists to prevent"
+        );
     }
 
     #[test]

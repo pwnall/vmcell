@@ -34,7 +34,30 @@ name = "vmcell-protocol"
 # `Preserve` artifact's xattrs survive into the guest, and that is only assertable by reading one
 # back IN-guest. There is deliberately no `set` — a write primitive in a test guest with no gate
 # behind it is surface for nothing.
-version = "0.7.0"
+# 0.7 → 0.8: additive, and NOT wire vocabulary — the two host→guest kernel-cmdline TUNING TOKENS join
+# `GUEST_TOOLS_APPLETS` and `STEWARD_VSOCK_PORT` as agreements kept here because this is the one crate
+# both sides link (docs/90 G7).
+#   * ADDITIVE: `TuningToken` (`token` / `default` / `floor` / `ceiling`, plus `render` and the three
+#     `*_ms` accessors) and the two consts `STEWARD_ACCEPT_POLL` (`vmcell_accept_poll_ms=`) and
+#     `STEWARD_REBIND_IDLE` (`vmcell_rebind_idle_ms=`). Each token's spelling, the value BOTH sides
+#     fall back to, and the window the guest clamps an arriving value into are one agreement, so they
+#     travel as one value.
+#   * WHY, because the defect is invisible by construction: the two tokens were hand-spelled on both
+#     sides of the process boundary — one literal in `vmcell`'s cmdline builder, a second copy in
+#     `vmcell-steward`'s parser — with no shared const, since `vmcell` does not depend on the steward.
+#     Re-spell either and nothing goes red: the guest falls back to its compiled cadence, which was
+#     *coincidentally* the number the host meant to send. Renaming is a compile error on both sides at
+#     once now.
+#   * NOTHING MOVES for either side: same token spellings (pinned as literals — the parser is baked
+#     into `rootfs.erofs`, so re-spelling one silently loses the channel against every already-packed
+#     image), same defaults (20 ms / 250 ms), same floors (1 ms / 20 ms). `vmcell`'s emitted kernel
+#     command line is byte-identical and `vmcell-steward`'s `ACCEPT_POLL` / `REBIND_IDLE` keep their
+#     names, types and values, derived from `.default` instead of re-typed.
+#   * The applet roster is UNCHANGED on this edge, so — unlike 0.4 → 0.5, 0.5 → 0.6 and 0.6 → 0.7 —
+#     no rootfs FAILS the validator's `rootfs.guest_tools` check. It does re-bake once: this
+#     manifest and `Cargo.lock` are both folded into `steward_closure_hash` /
+#     `guest_tools_closure_hash`, which any version bump in the workspace moves.
+version = "0.8.0"
 edition = "2024"
 rust-version.workspace = true
 license = "MIT OR Apache-2.0"

@@ -30,13 +30,19 @@ fn exec_request(secs: u64) -> EngineRequest {
 // that call must strictly EXCEED it — an outer deadline smaller than a legitimate inner one 500s
 // the request while the guest command keeps running, which is an accepted input silently not
 // honored. Asserted as the invariant (budget > timeout, with the margin), not as a constant, across
-// timeouts on both sides of the fixed VM ceiling.
+// timeouts on both sides of the fixed VM ceiling — 840 and 841 straddle the crossover exactly
+// (840 + the 60 s margin IS the 900 s floor), so both branches of the `max` are driven.
 //
 // RED on the fixed `BROKER_VM_CALL_BUDGET` for every exec: with a 900 s ceiling the 3600 s case
-// yields 900 s, which is *less* than the guest timeout it forwards.
+// yields 900 s, which is *less* than the guest timeout it forwards. RED on a dropped
+// `EXEC_BUDGET_MARGIN` (`Duration::from_secs(secs).max(BROKER_VM_CALL_BUDGET)`): the 899 s case
+// yields exactly the 900 s floor, which clears the guest timeout by 1 s instead of the margin the
+// vsock round-trip and the output capture need. That second inverse used to be invisible: the margin
+// assertion carried an `|| budget >= BROKER_VM_CALL_BUDGET` escape clause, and the floor assertion
+// below asserts precisely that disjunct unconditionally — so the margin clause could never fail.
 #[test]
 fn an_execs_budget_strictly_exceeds_the_guest_timeout_it_forwards() {
-    for secs in [1_u64, 60, 899, 900, 901, 3_600, 86_400] {
+    for secs in [1_u64, 60, 840, 841, 899, 900, 901, 3_600, 86_400] {
         let budget = call_budget(&exec_request(secs));
         let guest = Duration::from_secs(secs);
         assert!(
@@ -44,9 +50,12 @@ fn an_execs_budget_strictly_exceeds_the_guest_timeout_it_forwards() {
             "an exec's bridge budget ({budget:?}) must outlive the guest timeout it forwards \
              ({guest:?}), or the bridge fails the call while the guest command still runs"
         );
+        // Unconditional: where the floor wins, the floor is itself ≥ timeout + margin, so this holds
+        // on both branches of the `max` and there is no case for an escape clause to excuse.
         assert!(
-            budget >= guest + EXEC_BUDGET_MARGIN || budget >= BROKER_VM_CALL_BUDGET,
-            "the budget must clear the guest timeout by the margin (got {budget:?} for {guest:?})"
+            budget >= guest + EXEC_BUDGET_MARGIN,
+            "the budget must clear the guest timeout by the {EXEC_BUDGET_MARGIN:?} margin \
+             (got {budget:?} for {guest:?})"
         );
         assert!(
             budget >= BROKER_VM_CALL_BUDGET,

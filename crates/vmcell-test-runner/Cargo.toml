@@ -4,13 +4,13 @@ version = "0.3.0"
 edition = "2024"
 rust-version.workspace = true
 license = "MIT OR Apache-2.0"
-description = "vmcell privileged-test capability runner: file-caps -> ambient caps -> exec as dev uid (§12.8)"
+description = "vmcell privileged-test capability runner: file-caps -> ambient caps -> exec as dev uid (§15.5)"
 publish = false
 
 # Deliberately dependency-thin: `vmcell-privilege` (itself rustix + capctl + libc only) plus
 # rustix — never the vmcell library and no async/host stack. Every dep here runs inside the
 # privileged window. The blessing/transition predicates live in `vmcell-privilege` so the daemon
-# shares one copy (§18.2); this crate keeps only the exec-target confinement, which the daemon
+# shares one copy (§11.2); this crate keeps only the exec-target confinement, which the daemon
 # has no analogue for. The CI lean-test-runner assertion enforces the ban structurally (v15 §12.8 #4).
 [[bin]]
 name = "vmcell-test-runner"

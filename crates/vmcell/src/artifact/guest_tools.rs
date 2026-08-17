@@ -58,8 +58,21 @@ impl GuestToolsStage {
     }
 
     /// A stage producing the named registry label from `source`; `None`/`None` is the default.
+    ///
+    /// **The reserved `default` spelling normalizes to `None`** — through
+    /// [`crate::artifact::registry::registry_label`], the one predicate that says the default label
+    /// contributes no suffix. §10.5's "canonical artifacts stay byte-identical for a cell that names
+    /// no label" is a claim about the artifact, and `Some("default")` composed `guest_tools-default`:
+    /// a different stage name, artifact key, output file and cache key than the omitted spelling, for
+    /// the one entry both spell. `vmcell build --handler-label default` — committed pins, no overlay
+    /// — was that build, and it packed a rootfs the labelled artifact never reached.
+    ///
+    /// Normalized here, at the one intake, because every observable this stage has (`name`,
+    /// `out_path`, `cache_key`, the published artifact key) derives from the stored label: a caller
+    /// that normalized at its own composition root would fix its own path and leave the next one.
     #[must_use]
     pub fn labelled(label: Option<&str>, source: Option<HandlerSource>) -> Self {
+        let label = label.and_then(crate::artifact::registry::registry_label);
         GuestToolsStage {
             label: label.map(str::to_string),
             source,
@@ -783,5 +796,72 @@ mod tests {
         let acme = GuestToolsStage::labelled(Some("acme"), None);
         assert_eq!(acme.name(), "guest_tools-acme");
         assert_eq!(acme.out_path(dir), dir.join("guest_tools-acme"));
+    }
+
+    // §10.5's reserved default label, at the handler kind's one intake: `--handler-label default`
+    // and no `--handler-label` are the SAME request, so they must compose the same artifact — every
+    // observable, not merely the same registry entry.
+    //
+    // The defect this pins built a *different* artifact under the explicit spelling —
+    // `guest_tools-default`, its own stage name, output file and cache key — while the rootfs pack
+    // tail went looking for the handler the operator had named. So the assertion is over all four
+    // observables at once: a normalization applied to the stage name but not to the cache key would
+    // still split the warm cache.
+    //
+    // RED on the inverse (drop the `registry_label` call from `labelled`): the name, the out_path,
+    // the cache key and the published artifact key all come back with the `-default` suffix. The
+    // `acme` legs are what keep it non-vacuous — a `labelled` that ignored its label entirely would
+    // pass every equality above and fail those.
+    #[tokio::test]
+    async fn the_explicit_default_handler_label_is_the_omitted_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = dir.path().join("prebuilt-guest-tools");
+        std::fs::write(&src, b"#!/bin/sh\necho default-spelling\n")
+            .expect("seed the --tools target");
+        let prebuilt = || {
+            Some(HandlerSource::Prebuilt {
+                path: src.to_path_buf(),
+            })
+        };
+        let target = std::path::Path::new("/artifacts");
+        let inputs = StageInputs::default();
+
+        let omitted = GuestToolsStage::labelled(None, prebuilt());
+        let explicit =
+            GuestToolsStage::labelled(Some(crate::artifact::registry::DEFAULT_LABEL), prebuilt());
+        assert_eq!(
+            explicit.label(),
+            None,
+            "the reserved label IS the absent one"
+        );
+        assert_eq!(explicit.name(), omitted.name());
+        assert_eq!(explicit.out_path(target), omitted.out_path(target));
+        assert_eq!(
+            explicit.cache_key(&inputs),
+            omitted.cache_key(&inputs),
+            "the two spellings must share one cache entry, or a warm artifacts dir re-fetches and \
+             re-publishes the same bytes under a second name"
+        );
+
+        // …and the key the ROOTFS pack tail reads the binary from, which is the one that mattered:
+        // the tail looks up `handler_artifact_key(label)`, so an artifact published under
+        // `guest_tools-default` reached no image at all.
+        let out = dir.path().join(handler_filename(explicit.label()));
+        let published = explicit
+            .run(&inputs, &out)
+            .await
+            .expect("the prebuilt override publishes");
+        assert_eq!(
+            published.artifacts.keys().collect::<Vec<_>>(),
+            vec![&handler_artifact_key(None)],
+            "`--handler-label default` must publish under the DEFAULT key and no other: {published:?}"
+        );
+
+        // Non-vacuity: a label that is NOT the reserved one keeps every one of those apart.
+        let acme = GuestToolsStage::labelled(Some("acme"), prebuilt());
+        assert_eq!(acme.label(), Some("acme"));
+        assert_ne!(acme.name(), omitted.name());
+        assert_ne!(acme.out_path(target), omitted.out_path(target));
+        assert_ne!(acme.cache_key(&inputs), omitted.cache_key(&inputs));
     }
 }

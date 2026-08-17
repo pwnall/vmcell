@@ -113,7 +113,12 @@ one breaking release; 1 lands first and alone. These conventions bind:
    flows, defaults, window-filling payloads **in both directions**, security inverses, **and the
    effect classes your fakes are blind to** (`FakeVmm` never touches the filesystem — the lineage
    `create_dir_all` was invisible to every fake-driven test; no test moved bulk data *guest→host*
-   through the NAT, which is why a ring-wrap panic shipped). Cover it or record it.
+   through the NAT, which is why a ring-wrap panic shipped). **A knob nobody boots is a claim nobody
+   makes**: docs/90 found three of four `ResourceLimits` fields, four `VmConfig` knobs and a
+   `ConsoleMode` variant with no live boot behind them. And a channel whose two ends default to the
+   *same* value is unfalsifiable by construction — the guest's compiled cadence fallbacks equalled the
+   host's emitted defaults, so deleting the guest's parser changed nothing any test could see. Cover
+   it or record it.
 5. Host-facing claims are validated by executing the suites. KVM capability is **probed**
    (preflight), never presumed absent — the box you are on usually qualifies, and the blessed runner
    lets you run the privileged suite unprivileged. Green static review proves little; a
@@ -187,10 +192,40 @@ one breaking release; 1 lands first and alone. These conventions bind:
   path is an override, `bundle` refuses unpinned); the one registry merge/collision/sort core
   shared by the kernel/rootfs/handler kinds; `XattrPolicy` as a parameter of the one inject+pack
   tail; and `STEWARD_VSOCK_PORT` single-sourced in `vmcell-protocol` (retiring the mirrored
-  host/guest 5000s). Never write a second copy — every duplicate so far has diverged. Where a law's drift is
+  host/guest 5000s). The docs/90 pass adds seven more: `PackOptions::handler_key` /
+  `artifact::handler::handler_artifact_key`, the one answer to "which handler artifact does this
+  rootfs bake?" — the pack tail spelled the default key as a literal, so a labelled handler was
+  published under `guest_tools-<label>`, read as absent, and the image shipped with **no** multicall
+  binary and no applet symlinks at all while the build reported success (H1);
+  `config::is_cmdline_unsafe_char`, the character law for every cmdline-encoded input (`init=`
+  override, append-only arg, share tag, share `guest_path`) beside `is_reserved_cmdline_arg`, whose
+  `normalize_cmdline_key` now folds the kernel's leading `"` as well as `-`, because one quote
+  defeated every reserved key and was reachable from any authenticated REST client (M3);
+  `net::tap::netns_path` / `netns_dir` over the one `NETNS_DIR`, now the only spelling of the
+  `/var/run/netns` layout — the rustdoc claimed "exactly one place" while four production sites
+  composed it inline, and nothing could see that claim age; `vmcell::artifact::ch_binary_path`, the
+  one `VMCELL_CH_BIN` resolver (two byte-identical copies closed this pass, one of them in the CLI
+  every VM-lifecycle verb went through — and §17's own consolidation register had named only two of
+  the three);
+  `orchestrator::control_plane_probe_budget`, where the **placement** picks the health-gate window
+  (`Pid1` keeps the tuned constant, `Service` gets the caller's default connect budget, because that
+  constant re-boots a slow-but-healthy systemd cell to exhaustion by its own health check — M2); in
+  each backend that reports its own endpoint, the one `steward_endpoint` composer, so the endpoint
+  baked at spawn carries the **declared** port (the trait default bakes `STEWARD_VSOCK_PORT` and only
+  `MicroVm::steward` re-keys it, so QEMU's gate probed 5000 at a cell listening on 5100 and killed a
+  healthy cell four times — M1); and `vmcell_protocol::STEWARD_ACCEPT_POLL` / `STEWARD_REBIND_IDLE`,
+  the two kernel-cmdline cadence tokens each side reads — the host's emitted defaults and the guest's
+  compiled fallbacks were four literals in two crates, so deleting the guest's parse block left every
+  test in the tree green (G7). Never write a second copy — every duplicate so far has diverged. Where a law's drift is
   **not** a compile error it carries a grep-ban plus a red-on-inverse self-test —
-  `ban-inline-setns.sh`, `ban-kernel-key-composers.sh`, `ban-readiness-timeout-literal.sh`,
-  `ban-artifact-path-join.sh`; `just gates` is the full roster. A new law of that shape earns one.
+  `ban-inline-setns.sh`, `ban-inline-netns-path.sh`, `ban-kernel-key-composers.sh`,
+  `ban-handler-key-composers.sh`, `ban-readiness-timeout-literal.sh`, `ban-artifact-path-join.sh`,
+  `ban-ch-binary-resolver-copies.sh`; `just gates` is the full roster — read it, never count from
+  here. A new law of that shape earns one. Where an in-source scan already owns one crate, the shell
+  gate is its **complement** rather than a second copy: it scans the other crates, **names its
+  delegate**, and fails loud if that gate or the const it reads its needle out of is gone — and it
+  bans the layout's **alias** (`/run/netns` reaches the same directory as `/var/run/netns`), F3's
+  alias class one level out.
   A source-scanning ban treats a **zero-file scan** as `gate misconfigured` and exits non-zero, never
   a green `ok:` — the only way to open nothing is to have been pointed at nothing — and its self-test
   carries the empty-tree leg proving that arm. Write both with the script: eight bans wore a green
@@ -292,15 +327,32 @@ one breaking release; 1 lands first and alone. These conventions bind:
 vmcell has out-of-repo consumers; the contract surface is **one named list** (design §10.4): the
 pins schema + overlay — v33 adds the rootfs/handler registry namespaces (§10.5) —
 `Stage`/`Pipeline`/`ResolvePinsStage`, the kernel/rootfs/handler build entry points + the
-resolved-config and feature-manifest sidecars, `pack_erofs_with_injection` + `ExtraFile` +
-`XattrPolicy`, the `VMCELL_*` env table, and
-the `vmcell-artifact-validator` battery (whose `CheckStatus` grows `Warn`/`Unverified` in v33 — a
-ledgered validator bump). Rules: a change to listed surface is a **deliberate,
+resolved-config and feature-manifest sidecars, `pack_rootfs_with_injection` (the format-selecting
+tail, with `pack_erofs_with_injection` as its erofs-only door) + `ExtraFile` + `XattrPolicy` +
+`RootfsFormat`, the labelled pack surface (`PackOptions`' `with_label` / `with_handler_label` /
+`with_applets` / `with_xattrs` / `with_format`, beside `rootfs_filename` / `rootfs_artifact_key` /
+`handler_artifact_key`), the `VMCELL_*` env table, and
+the `vmcell-artifact-validator` battery (whose `CheckStatus` grows `Warn`/`Unverified` in v33 and
+whose `ValidationOptions::run_budget` bounds a whole run — ledgered validator bumps). `Cache` survives
+as a parameter of listed surface, a **documented inert placeholder**: dropping the argument is a break
+a consumer is versioned through, not a tidy-up, and its gate reddens the moment the handle starts
+carrying anything. Rules: a change to listed surface is a **deliberate,
 ledgered version bump** (the `Cargo.toml` comment changelog), never discovered by a consumer's
-build breaking; `semver-checks` covers `vmcell` *and* the validator; the out-of-tree
-`examples/downstream-kernel/` workspace is the living consumer gate — **breaking its CI job is the
-intended failure mode of contract drift**, and "fixing" the example to stay green instead of
-versioning the contract inverts the gate. The `VMCELL_*` semantics are specified (`VMCELL_ROOTFS`
+build breaking. Three gates hold three different halves and none covers another's: `semver-checks`
+covers `vmcell` *and* the validator and gates the version **number** against the signatures that
+moved — silent by construction on an addition, and on any behavior change behind an unchanged
+signature; `crates/vmcell/tests/contract_ledger.rs` gates the ledger's own **shape** (an unbroken
+`# <from> → <to>:` chain ending at the version that crate publishes; it had a two-version hole at
+its most breaking release, because no lint sees a missing comment); and the out-of-tree
+`examples/downstream-kernel/` workspace gates the **guidance** by compiling against it —
+**breaking its CI job is the intended failure mode of contract drift**, and "fixing" the example to
+stay green instead of versioning the contract inverts the gate. What no gate supplies is the entry's
+prose; write it for the consumer who is migrating, and read the edge in the manifest rather than a
+version quoted here. Design §1.3's *other* designed-in extension point is deliberately **not** on
+this list and needs its own care: `proxy::doubles`' `Matcher`/`Responder` are aliases over
+third-party types, so that module re-exports `hudsucker` and `hyper` at the exact versions the
+aliases are built from — a consumer names them through vmcell instead of pinning them out of
+vmcell's `Cargo.lock`, and a doctest compiles the documented spelling. The `VMCELL_*` semantics are specified (`VMCELL_ROOTFS`
 = full ensure no-op; `VMCELL_KERNEL` = path redirect that still requires existence; `VMCELL_PINS`
 = the overlay; the `VMCELL_*_BIN` resolvers are the one way any harness finds a VMM binary —
 `bench-vm` included; downstream getters fail loud naming the two-step route — a recorded deviation
@@ -377,19 +429,48 @@ fragment is the one defended exception shape and never carries a consumer's usbi
   subreaper call — **not** the design's sketched double-fork *hang*, which does not reproduce
   because the steward only ever waits on its own direct child, see implementation-notes; both
   SIGTERM legs — service: C3 residue gone, clean exit, mini-init restarts it,
-  guest stays up; `Pid1` powers off — plus the declared-port and rapid-failure-cap legs. Its serial
+  guest stays up; `Pid1` powers off — plus the declared-port and rapid-failure-cap legs, and this
+  otherwise-CH-only file's one **QEMU** member: the declared-port *health-gate* leg on the external
+  `vhost-device-vsock` transport, the only shape `verify_control_plane` probes, whose whole assertion
+  is that `start()` returns. Its serial
   assertions must be on `mini-init`'s `println!` output or on the kernel's own lines: the steward
   logs at `info` and the guest has no `RUST_LOG`, so `tracing_subscriber` keeps everything below
-  `error` off the console); the **feature** set
+  `error` off the console); the **steward shutdown** set, KVM-free and in-crate (the service sweep
+  kills a live one-shot `exec` child — its pgid used to live only in the connection thread's stack
+  frame, so a `systemctl stop` mid-`exec` orphaned it under the real init; an unwinding connection
+  thread still tears down its sessions' process groups *and* its in-flight one-shot children, C3; and
+  the shutdown flag is checked at **both** `serve_vsock` loop levels, one leg each, since a flag set
+  before the loop has bound anything is answered by the outer check and leaves the inner one
+  unfailable); the **feature** set
   (two-sided provenance — the same artifact's removal names the rootfs on one backend and the
   backend on the other; misspelled-token hard error; `require()` refuses pre-boot); the
   **conformance** set (the four-leg present/absent × capable/incapable matrix, paired
   positive-control ids, the `Warn` lifecycle, roster gates on all three levels, the battery
-  budget); the **registry** set (same-digest-two-labels byte-identity + unmoved default key,
+  budget bounding the **whole** run typed, and the setup-failure leg: an absence-declaring artifact
+  that cannot boot is `Unverified` — never the `Pass` a *verified* absence earns — with a source scan
+  keeping the setup/measurement line where the shipped probe draws it, plus the KVM-free scan that
+  each live leg's stated fake-blind axis is still what its probe answers); the **registry** set
+  (same-digest-two-labels byte-identity + unmoved default key,
   laziness red on eager, corrupt-blob digest mismatch, bundle-refuses-unpinned, legacy-shape
-  reject); the **xattr** set (the `Preserve` twin + in-guest `xattr get` readback with the `Strip`
-  negative control); and the **ext4** set (pack → boot as `Block` → in-guest tree/xattr/device
-  diff; version-probe typed refusal).
+  reject, the registered-`format: ext4` leg end to end — entry → the one inject+pack tail → the
+  external producer, asserted on the ext4 superblock **bytes**, since an erofs image under an `.ext4`
+  name satisfies every filename assertion — with the KVM-free seam twin in `oci::tests`, and the live
+  handler leg: a registered handler's own `xattr` applet answers in-guest while an applet in vmcell's
+  const but *not* in the entry's roster is absent, which is what proves the symlinks came from the
+  registry entry); the **xattr** set (the `Preserve` twin + in-guest `xattr get` readback with the
+  `Strip` negative control); the **ext4** set (pack → boot as `Block` → in-guest tree/xattr/device
+  diff; version-probe typed refusal); the **limits** set (`cpu_max_pct` read back off `cpu.max` *and*
+  measured under the un-throttled leg's own floor, `pids_max` proven by `pids.events`' `max` counter
+  against a host co-tenant load, `io_max` refused loud with the same config minus the limit as the
+  positive control); the **console** set (`VirtioConsole`: the active console pinned *and* a marker
+  through `/dev/console` landing in the host `serial.log`); the **iops** set (two disks in one VM,
+  `iflag=direct` so the cap binds operations rather than a coalesced readahead); the **confinement**
+  set (a *running* CH's `NoNewPrivs` and loaded seccomp filter, with `JailConfig::disabled()` +
+  `VmmSeccomp::Disabled` booted seconds later on the same host as the control, plus the ambient-set
+  leg that asserts — never skips — that it runs blessed); and the **guest-tuning** set (a declared
+  `rebind_idle` measured from the distinct `/proc/1/fd` socket inodes PID 1's re-bind loop creates,
+  against a default-window twin differing in exactly that one variable, because the steward's own
+  resolved-cadence log sits below the console's `error` filter).
 
 ## Running the privileged suites — probe, don't presume
 
@@ -419,7 +500,22 @@ fragment is the one defended exception shape and never carries a consumer's usbi
   always run. `just test-usb-passthrough` is opt-in for the same reason: it needs a designated
   device (`VMCELL_TEST_USB_DEVICE`), and without one `test-privileged` records a capability skip.
   v33's `just test-systemd` (the R1+R2+R5+R6+R7 proof cell) is opt-in for the same class of
-  reason: it pulls a full-Debian image; its KVM-free halves run everywhere. `just test-bench` is the
+  reason: it pulls a full-Debian image; its KVM-free halves run everywhere. The **ext4** batteries
+  need no opt-in — `test-privileged` selects them — but they do need a `mkfs.ext4` new enough for the
+  `-d <tarball>` form, so they ask `common::probe_ext4_or_record_skip`, the one law shared by
+  `ext4_cell` / `ext4_producer` / `repack_outside_checkout`: it records
+  `SKIP cloud-hypervisor ext4_producer` when the facility is genuinely absent or below
+  `MIN_E2FSPROGS_VERSION`, and **panics** when the product's probe calls it broken rather than absent.
+  `rootfs_registry`'s `format: ext4` leg reaches those same two outcomes from the other side — it asks
+  the pack call and reads its typed `CapabilityUnavailable` as the absence, recording the same skip
+  token and panicking on anything else — because pre-probing would skip past the erofs-only door that
+  leg exists to assert.
+  A green privileged run is therefore not by itself evidence the ext4 claim was verified — the skip
+  manifest is the only thing that answers that. CI obtains the facility instead of living with the
+  skip: `ci.yml` builds a pinned, checksum-verified e2fsprogs ahead of the suites, non-gating, so a
+  failed install degrades to that recorded skip rather than a red job, and
+  `ci_obtains_the_ext4_facility_rather_than_living_with_the_skip` is that step's gate.
+  `just test-bench` is the
   one invocation that selects `vmcell-bench`'s three `#[ignore]`d live legs (fc, qemu, crosvm) — the
   composition root wiring every backend had no can-it-go-red proof anywhere before it. Its argument
   is a **features list** defaulting to `cloud-hypervisor,firecracker,qemu`, so the crosvm leg is
@@ -449,12 +545,17 @@ fragment is the one defended exception shape and never carries a consumer's usbi
   feature, the registry byte-identity/unmoved-key gates for changes touching artifact identity,
   `just test-systemd` for changes touching the placement/registry composition (opt-in, the crosvm
   rule), and the skip manifest reviewed (`just skip-manifest-reset` before the
-  sequence, `just skip-manifest-show` after, so the skips belong to this run).
+  sequence, `just skip-manifest-show` after, so the skips belong to this run) — that manifest is the
+  only place an `ext4_producer` skip shows up, so an ext4 claim is unverified until it is read.
 - New public API: rustdoc complete (`missing_docs` denies), `cargo semver-checks` clean (both contract
   crates — the toolkit section above). A change implementing a delta-register item ships that item's
   named gate and reconciles `docs/implementation-notes.md`.
 - The privileged runner is re-blessed after rebuilds (`just bless`; blessing is stripped on rewrite
-  by design).
+  by design). The recipe re-dates the blessed copy even when the rebuild is byte-identical, so
+  running it actually clears the preflight's stale verdict instead of leaving the documented reviewer
+  path wedged at BLOCKED-ON-BLESS; `scripts/test-bless-redates-blessed-copy.sh` is that behavioural
+  gate — it drives the real recipe against the real preflight in a throwaway fixture tree, with no
+  cargo, no sudo and no KVM.
 
 ## Performance claims
 
@@ -472,6 +573,16 @@ fragment is the one defended exception shape and never carries a consumer's usbi
   rosters quoted in docs (capability flags, crate lists, suite tallies) are checked against the
   tree, never from memory — stale counts were a recurring v5-era defect. Prefer a **pointer** to the
   recipe that produces a number over an embedded figure that goes stale silently.
+- Every pointer resolves, and two gates say so: `scripts/check-docs-pointers.sh` over the root
+  markdown plus `docs/*.md`, and `scripts/ban-dangling-design-ref.sh` over `crates/*/src`, where
+  ~2000 `§`/`Appendix` references cite the design because nearly every law's rustdoc does. Both
+  resolve against the **discovered newest** design document's real headings (one resolver,
+  `scripts/design-headings.sh` — it makes no claim about the tree, so it is not gate-shaped and is
+  not on the `gates` roster). So **do not renumber or delete a design heading**: those references
+  are its call sites, and a renumbering is a change to all of them. A reference into another
+  numbering must say which (`v30 §9.4`, `docs/78 §5`) and is skipped. The class shipped in a document
+  the daemon hands to *clients* — the served OpenAPI's own description pointed consumers at a design
+  section that does not exist.
 - Dependencies: permissive licenses only (cargo-deny allow-list enforces); the libseccomp-wrapper
   crates are `[bans]`-denied by name (LGPL-2.1 C link invisible to the scan); `cargo deny` ignores
   carry a per-crate rationale; vendored patches (`vendor/vhost*`) keep exact `=` pins — a caret
@@ -479,7 +590,9 @@ fragment is the one defended exception shape and never carries a consumer's usbi
   `[patch.crates-io]` stanza** (design §10.4; `scripts/check-vendored-vhost.sh` is the
   consumer-runnable check, and it distinguishes not-applicable from not-patched).
 - Toolchain: `rust-toolchain.toml` pins 1.96.1 and the declared `rust-version` **equals** it (one
-  `[workspace.package]` fact, sync-asserted). An understated MSRV lets MSRV-aware resolvers
+  `[workspace.package]` fact, asserted in one place — `scripts/check-msrv-sync.sh`, which replaced the
+  mirrored inline `sed` comparisons in the `ci` recipe and in ci.yml, a pair that could have drifted in
+  *strictness* silently). An understated MSRV lets MSRV-aware resolvers
   re-resolve older consumers onto vulnerable dependency versions (the `time 0.3.45` class). Build
   `--locked`; never `cargo update` on an older toolchain. A dep bump's **compiler-invisible
   behavior changes** (a TLS trust-anchor swap, a default-feature rename) are named in the bump's

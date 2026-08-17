@@ -24,7 +24,8 @@ use std::time::Duration;
 use url::Url;
 use vmcell_daemon_client::DaemonClient;
 use vmcell_daemon_client::dto::{
-    CreateVmRequest, ErrorKind, ExecRequestDto, NetMode, StewardPlacementDto,
+    CreateVmRequest, DiskIoLimitDto, ErrorKind, ExecRequestDto, ExtraDiskSpec, NetMode,
+    StewardPlacementDto,
 };
 
 // ---- environment discovery ----
@@ -494,6 +495,95 @@ async fn extra_disk_over_api_data_plane_and_delete_in_use() {
         .expect("delete after the VM is gone");
 }
 
+// docs/90 T4, the daemon half: `ExtraDiskSpec.io_limit` translated end to end. The DTO parses in a
+// `dto.rs` unit test and `registry.rs` turns it into a `vmcell::DiskIoLimit` — and nothing ever
+// checked that the resulting VM's disk is actually slow. A translation that dropped the limit (or
+// swapped `bandwidth_bytes_per_sec` onto `iops`, the two `DiskIoLimit::new` positional arguments)
+// would keep every gate green while the daemon quietly handed out an un-throttled disk to a caller
+// who asked for a pressured one.
+//
+// Self-calibrating, and the baseline is IN THE SAME VM — the shape `tests/extra_block.rs`'s
+// bandwidth leg uses, for the same reason: two identical 4 MiB store artifacts are attached,
+// `/dev/vdb` un-throttled and `/dev/vdc` capped at 1 MiB/s, so "both reads were fast" reddens
+// regardless of how quick this host's disk is.
+//
+// RED ON THE INVERSE: drop the `if let Some(limit)` translation in `registry.rs`'s extra-disk loop
+// and the capped read finishes as fast as the baseline — the floor and the ratio both go red.
+#[tokio::test]
+#[ignore = "boots a real VM; needs KVM + blessed runner + artifacts (run via `just test-daemon`)"]
+async fn extra_disk_io_limit_over_api_throttles_the_guest_read() {
+    const MIB: usize = 1 << 20;
+    let d = Daemon::start(Auth::Open).await;
+    let c = d.client("");
+
+    // Two identical blank images: one attached un-throttled, one capped.
+    for name in ["fast.img", "slow.img"] {
+        c.upload_artifact(name, vec![0u8; 4 * MIB])
+            .await
+            .unwrap_or_else(|e| panic!("upload {name}: {e}"));
+    }
+
+    let created = c
+        .create_vm(CreateVmRequest {
+            extra_disks: vec![
+                ExtraDiskSpec {
+                    name: "fast.img".to_string(),
+                    io_limit: None,
+                },
+                ExtraDiskSpec {
+                    name: "slow.img".to_string(),
+                    io_limit: Some(DiskIoLimitDto {
+                        bandwidth_bytes_per_sec: Some(MIB as u64),
+                        iops: None,
+                    }),
+                },
+            ],
+            ..CreateVmRequest::create("vmlinux", "rootfs.erofs")
+        })
+        .await
+        .expect("create with a throttled extra disk");
+    let vm = created.vm;
+
+    // Read 4 MiB off each disk, timing the exec host-side. Both reads pay the same HTTP + vsock
+    // overhead, so the ratio below is about the disks and not about the transport.
+    async fn timed_read(c: &DaemonClient, id: &vmcell_daemon_client::dto::VmId, dev: &str) -> u128 {
+        let start = std::time::Instant::now();
+        let out = c
+            .exec(
+                id,
+                ExecRequestDto::new(vec![
+                    "dd".into(),
+                    format!("if={dev}"),
+                    "of=/dev/null".into(),
+                    "bs=1M".into(),
+                    "count=4".into(),
+                ]),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("dd read of {dev}: {e}"));
+        assert_eq!(out.code, 0, "dd read of {dev} failed: {out:?}");
+        start.elapsed().as_millis()
+    }
+
+    let fast_ms = timed_read(&c, &vm.id, "/dev/vdb").await;
+    let slow_ms = timed_read(&c, &vm.id, "/dev/vdc").await;
+    println!("daemon io_limit: vdb {fast_ms}ms (un-throttled), vdc {slow_ms}ms (1 MiB/s)");
+
+    assert!(
+        slow_ms >= 1500,
+        "a 4 MiB read off a disk the API capped at 1 MiB/s must take >= 1.5s (a 4 MiB read is \
+         <0.2s un-throttled); got {slow_ms}ms — the ExtraDiskSpec.io_limit never reached the \
+         backend's rate limiter"
+    );
+    assert!(
+        slow_ms > fast_ms.saturating_mul(3),
+        "the capped read ({slow_ms}ms) must be far slower than the un-throttled baseline \
+         ({fast_ms}ms) attached to the same VM"
+    );
+
+    c.destroy(&vm.id).await.expect("destroy");
+}
+
 #[tokio::test]
 #[ignore = "boots a real VM; needs KVM + blessed runner + artifacts (run via `just test-daemon`)"]
 async fn full_lifecycle_create_exec_stats_destroy() {
@@ -635,7 +725,7 @@ async fn startup_sweep_reclaims_orphan_netns() {
     let _ = &d; // keep it alive through the assertion
     assert!(
         !netns_exists(orphan),
-        "start-up sweep must have reclaimed the orphan netns {orphan} (§18.4)"
+        "start-up sweep must have reclaimed the orphan netns {orphan} (§11.4)"
     );
     // Belt-and-suspenders cleanup in case the assertion path changed.
     let _ = Command::new("ip")

@@ -14,8 +14,8 @@
 //! (`crosvm resume|suspend|powerbtn|stop <socket>`) — the socket protocol is unstable binary and is
 //! never hand-rolled, so this crate needs no serde/JSON; (2) its vsock is the in-kernel vhost-vsock
 //! device exposed on the host AF_VSOCK namespace (like a snapshot-eligible QEMU), so
-//! [`CrosvmInstance::vsock_endpoint`] returns [`VsockEndpoint::Vsock`] and there is no external vsock
-//! daemon to own.
+//! [`CrosvmInstance::vsock_endpoint`] returns the [`VsockEndpoint::Vsock`] `steward_endpoint`
+//! composed at spawn and there is no external vsock daemon to own.
 //!
 //! **Scope (validated live on a KVM host).** Boot, tap networking, block devices, in-kernel vsock,
 //! sessions, and **snapshot/restore** are the shipped, matrix-validated data path. snapshot/restore
@@ -160,6 +160,37 @@ pub struct CrosvmInstance {
     // Whether the backend advertises snapshot/restore, captured from `capabilities()` at spawn so
     // `snapshot()` can self-guard without a handle to the backend (M-RESTORE-3, the CH shape).
     snapshot_restore_capable: bool,
+    // How the host reaches this VM's steward, composed ONCE at spawn by `steward_endpoint` from the
+    // config's own placement — so the port an instance reports is the DECLARED one and no reader has
+    // to re-derive it. A field, like `cid`, because `vsock_endpoint()` is handed no config.
+    endpoint: VsockEndpoint,
+}
+
+/// How the host reaches this VM's steward: the **transport** (crosvm's vsock is the in-kernel
+/// vhost-vsock device on every path, so the guest is always addressed by CID on the host AF_VSOCK
+/// namespace — never the AF_UNIX hybrid the trait defaults to) and — law C8's FIRST question — the
+/// **port**, which is [`StewardPlacement::steward_port`](vmcell::config::StewardPlacement::steward_port).
+///
+/// The port used to be the hardcoded protocol default here. That is not a live defect on this
+/// backend — `MicroVm::steward`/`connect_sessions` re-key the port per call (`with_port`), and
+/// `verify_control_plane` is the trait-default no-op for crosvm because its vsock terminates inside
+/// the VMM process — but it is M1's shape sitting in wait: it was exactly this spelling that, on the
+/// one backend which *does* probe the endpoint verbatim (QEMU on the external-daemon transport),
+/// dialed 5000 at a `Service { port: 5100 }` guest and re-spawned a healthy cell to exhaustion. An
+/// instance that reports a port its cell never declared is a wrong answer whether or not today's
+/// callers happen to overwrite it, so it is composed from the declaration.
+///
+/// [`StewardPlacement::None`](vmcell::config::StewardPlacement::None) has no steward and never
+/// reaches a dial (the orchestrator keys every control-plane path on `steward_port().is_some()`), so
+/// the protocol default stands in as an unused placeholder there — not as a silent fallback for a
+/// declared port, of which there is none.
+fn steward_endpoint(cid: u32, placement: vmcell::config::StewardPlacement) -> VsockEndpoint {
+    VsockEndpoint::Vsock {
+        cid,
+        port: placement
+            .steward_port()
+            .unwrap_or(vmcell::vmm::STEWARD_VSOCK_PORT),
+    }
 }
 
 /// Pre-flight self-checks for the [`CrosvmInstance::snapshot`] path.
@@ -278,6 +309,54 @@ const SNAPSHOT_FILE: &str = "crosvm-snapshot";
 /// the snapshot/restore boundary (the crosvm analogue of Firecracker's `HOST_PATHS_SIDECAR`, but
 /// AF_VSOCK needs only the CID, not a host UDS path). Decimal text; no serde (this crate carries none).
 const HOST_CID_SIDECAR: &str = "crosvm-host-cid.txt";
+
+/// Writes the baked-CID sidecar for a snapshot in `dir`.
+///
+/// The **write** half of the sidecar's format contract; [`read_baked_cid`] is the read half, and the
+/// two live beside each other so the format is spelled once — a writer emitting anything the reader
+/// does not parse produces snapshots that only fail at restore, on a live boot.
+///
+/// # Errors
+/// [`Error::Io`] if the sidecar cannot be written. Never logged-and-swallowed: restore reprograms
+/// this exact CID, so a snapshot without it is unrestorable (M-RESTORE-2).
+async fn write_baked_cid(dir: &Path, cid: u32) -> Result<()> {
+    tokio::fs::write(dir.join(HOST_CID_SIDECAR), cid.to_string())
+        .await
+        .map_err(Error::Io)
+}
+
+/// Reads the baked guest CID back out of a snapshot dir's sidecar.
+///
+/// crosvm requires the restored `--vsock cid=` to match the snapshot's baked CID exactly, so this is
+/// what `restore()` reprograms — never `res.guest_cid`. Both failure arms are fail-loud typed
+/// [`Error::Vmm`]s naming the sidecar, on purpose: they run BEFORE any spawn, so a foreign or
+/// corrupt snapshot dir surfaces here instead of as an opaque `crosvm run --restore` exit.
+///
+/// Extracted from `restore()` so the format contract and both error arms are drivable without KVM —
+/// while it rode inline, nothing anywhere exercised either (docs/90 `vmcell-crosvm:833`).
+///
+/// # Errors
+/// [`Error::Vmm`] if the sidecar is missing/unreadable, or if its contents are not a CID.
+async fn read_baked_cid(snapshot_dir: &Path) -> Result<u32> {
+    let path = snapshot_dir.join(HOST_CID_SIDECAR);
+    tokio::fs::read_to_string(&path)
+        .await
+        .map_err(|e| {
+            Error::Vmm(format!(
+                "crosvm snapshot CID sidecar {} is missing/unreadable: {e}",
+                path.display()
+            ))
+        })?
+        // A trailing newline is not corruption: the sidecar is decimal TEXT, and a human or an
+        // external tool that rewrites it will terminate the line.
+        .trim()
+        .parse()
+        .map_err(|e| {
+            Error::Vmm(format!(
+                "crosvm snapshot CID sidecar is not a valid CID: {e}"
+            ))
+        })
+}
 
 /// The crosvm capability descriptor, exposed as a free function so [`Crosvm::capabilities`], the
 /// `restore()` self-guard (which reads it through `capabilities()`), and the instance-level
@@ -408,9 +487,11 @@ fn build_crosvm_run_args(
     args.push("--serial".to_string());
     args.push(serial_arg(cfg.console_mode, serial_path));
 
-    // In-kernel vhost-vsock on the host AF_VSOCK namespace at `(guest_cid, STEWARD_VSOCK_PORT)`
-    // (realized against `/dev/vhost-vsock`). No external daemon and no AF_UNIX bridge — the host
-    // dials the CID directly (`vsock_endpoint` returns `VsockEndpoint::Vsock`).
+    // In-kernel vhost-vsock on the host AF_VSOCK namespace at `(guest_cid, the declared steward
+    // port)` (realized against `/dev/vhost-vsock`). No external daemon and no AF_UNIX bridge — the
+    // host dials the CID directly (`vsock_endpoint` returns `steward_endpoint`'s `VsockEndpoint::
+    // Vsock`). The port is not in this argv: the guest learns it from the `vmcell_steward_port=`
+    // cmdline token the shared composer emits, so both sides read one declaration.
     args.push("--vsock".to_string());
     args.push(format!("cid={guest_cid}"));
 
@@ -719,6 +800,9 @@ impl Crosvm {
             // Captured from the ONE descriptor so `snapshot()` self-guards on the same source of
             // truth `capabilities()` reports (M-RESTORE-3).
             snapshot_restore_capable: self.capabilities().snapshot_restore,
+            // C8's first question, answered once here from the cell's own declaration — the `cid`
+            // above is the same one the argv programs (`--vsock cid=`), baked on restore.
+            endpoint: steward_endpoint(guest_cid, cfg.steward_placement),
         })
     }
 }
@@ -829,22 +913,9 @@ impl Vmm for Crosvm {
         // crosvm requires the restored `--vsock cid=` to match the snapshot's baked CID exactly, so
         // read it from the sidecar and reprogram it (NOT `res.guest_cid`). The guest keeps the baked
         // CID (`restore_rotates_host_paths: false`); the vmid/MAC/IP still rotate to `res.vmid` via the
-        // orchestrator's post-restore resync. A missing/garbled sidecar is a fail-loud pre-spawn error.
-        let baked_cid: u32 = tokio::fs::read_to_string(snapshot_dir.join(HOST_CID_SIDECAR))
-            .await
-            .map_err(|e| {
-                Error::Vmm(format!(
-                    "crosvm snapshot CID sidecar {} is missing/unreadable: {e}",
-                    snapshot_dir.join(HOST_CID_SIDECAR).display()
-                ))
-            })?
-            .trim()
-            .parse()
-            .map_err(|e| {
-                Error::Vmm(format!(
-                    "crosvm snapshot CID sidecar is not a valid CID: {e}"
-                ))
-            })?;
+        // orchestrator's post-restore resync. A missing/garbled sidecar is a fail-loud pre-spawn
+        // error, from the one reader that owns the format `snapshot()` writes.
+        let baked_cid = read_baked_cid(snapshot_dir).await?;
 
         // The instance is returned paused (`restored: true`); the orchestrator continues with
         // `resume()` — never `boot()` — which issues the completing `crosvm resume --full`.
@@ -1035,10 +1106,9 @@ impl VmInstance for CrosvmInstance {
         self.run_control("suspend", &["--full"]).await?;
         let result = match self.snapshot_take(&dir.join(SNAPSHOT_FILE)).await {
             // Restore reprograms this exact CID; a snapshot without its CID is unrestorable, so a
-            // write failure is surfaced, never logged-and-swallowed (M-RESTORE-2).
-            Ok(()) => tokio::fs::write(dir.join(HOST_CID_SIDECAR), self.cid.to_string())
-                .await
-                .map_err(Error::Io),
+            // write failure is surfaced, never logged-and-swallowed (M-RESTORE-2). Through the one
+            // writer that pairs with `read_baked_cid`.
+            Ok(()) => write_baked_cid(dir, self.cid).await,
             Err(e) => Err(e),
         };
         if let Err(e) = self.run_control("resume", &["--full"]).await {
@@ -1052,13 +1122,10 @@ impl VmInstance for CrosvmInstance {
     }
 
     fn vsock_endpoint(&self) -> VsockEndpoint {
-        // crosvm's in-kernel vhost-vsock exposes the guest on the host AF_VSOCK namespace at
-        // `(cid, STEWARD_VSOCK_PORT)` — NOT the AF_UNIX hybrid default. Override accordingly (the
-        // steward transport branches only its connect prologue on this).
-        VsockEndpoint::Vsock {
-            cid: self.cid,
-            port: vmcell::vmm::STEWARD_VSOCK_PORT,
-        }
+        // AF_VSOCK by CID, at the DECLARED steward port — NOT the AF_UNIX hybrid default (the
+        // steward transport branches only its connect prologue on this). Composed once at spawn by
+        // `steward_endpoint`, so this reader cannot pick a different port than the cell declared.
+        self.endpoint.clone()
     }
 
     fn guest_cid(&self) -> u32 {
@@ -1484,6 +1551,69 @@ mod tests {
         assert!(
             matches!(&err, Error::Vmm(msg) if msg.contains("snapshot artifact") && msg.contains("missing")),
             "expected a missing-snapshot-artifact Vmm error, got {err:?}"
+        );
+    }
+
+    // The baked-CID sidecar IS the crosvm snapshot/restore contract: crosvm bakes the CID into the
+    // vsock device state and rejects a mismatched `--vsock cid=` on restore, so a writer and a reader
+    // that disagree produce snapshots that only fail on a live boot. Nothing drove either half — not
+    // the format, not either error arm (docs/90 `vmcell-crosvm:833`). KVM-free: both halves are file
+    // I/O in the pre-spawn prologue.
+    // Inverse: emit anything but bare decimal from the writer (`format!("cid={cid}")`) and the
+    // round-trip + on-disk-bytes asserts redden; drop the `.trim()` and the newline leg reddens;
+    // downgrade either arm to `Error::Io` and its typed assert reddens.
+    #[tokio::test]
+    async fn the_baked_cid_sidecar_round_trips_and_both_error_arms_are_typed() {
+        let dir = tempfile::tempdir().expect("create snapshot dir");
+
+        // The format contract, both directions: bare decimal text, byte-for-byte.
+        write_baked_cid(dir.path(), 42)
+            .await
+            .expect("write sidecar");
+        assert_eq!(
+            tokio::fs::read_to_string(dir.path().join(HOST_CID_SIDECAR))
+                .await
+                .expect("read sidecar back"),
+            "42",
+            "the sidecar is bare decimal text: a key=value or JSON spelling breaks every restore"
+        );
+        assert_eq!(
+            read_baked_cid(dir.path()).await.expect("parse sidecar"),
+            42,
+            "restore must reprogram the CID `snapshot()` baked, not the fresh allocation"
+        );
+
+        // A line-terminated sidecar (a human or an external tool rewrote it) still parses.
+        tokio::fs::write(dir.path().join(HOST_CID_SIDECAR), "7\n")
+            .await
+            .expect("rewrite sidecar with a trailing newline");
+        assert_eq!(
+            read_baked_cid(dir.path()).await.expect("parse trimmed"),
+            7,
+            "a trailing newline is not corruption"
+        );
+
+        // Arm 1: garbled contents — a typed, fail-loud pre-spawn refusal.
+        tokio::fs::write(dir.path().join(HOST_CID_SIDECAR), "cid=3")
+            .await
+            .expect("corrupt the sidecar");
+        let err = read_baked_cid(dir.path())
+            .await
+            .expect_err("a non-numeric sidecar must be refused");
+        assert!(
+            matches!(&err, Error::Vmm(msg) if msg.contains("not a valid CID")),
+            "expected a typed not-a-CID Vmm error, got {err:?}"
+        );
+
+        // Arm 2: absent sidecar — names the path, so the operator sees WHICH dir is not a snapshot.
+        let empty = tempfile::tempdir().expect("create empty dir");
+        let err = read_baked_cid(empty.path())
+            .await
+            .expect_err("a missing sidecar must be refused");
+        assert!(
+            matches!(&err, Error::Vmm(msg)
+                if msg.contains(HOST_CID_SIDECAR) && msg.contains("missing/unreadable")),
+            "expected a typed missing-sidecar Vmm error naming the path, got {err:?}"
         );
     }
 
@@ -1972,6 +2102,9 @@ mod tests {
             restored: false,
             has_vhost_user_device: false,
             snapshot_restore_capable: true,
+            // Through the composer, not a hand-written literal, for the reason every `naming` call
+            // in a test goes through the library: a second spelling of the law is a second law.
+            endpoint: steward_endpoint(3, vmcell::config::StewardPlacement::Pid1),
         };
         drop(inst);
 
@@ -2039,6 +2172,7 @@ mod tests {
             restored: false,
             has_vhost_user_device: false,
             snapshot_restore_capable: true,
+            endpoint: steward_endpoint(3, vmcell::config::StewardPlacement::Pid1),
         };
         inst.kill().await.expect("kill");
         assert!(
@@ -2372,5 +2506,124 @@ mod tests {
         let builds = plan_build_calls(&code);
         assert_eq!(builds.len(), 1, "got {builds:?}");
         assert!(build_site_names_the_effective_config(builds[0]));
+    }
+
+    /// Production mentions of the protocol default: one, the placement-`None` placeholder inside
+    /// [`steward_endpoint`]. Asserted exactly, so the scan below cannot pass over an empty set — and
+    /// so a SECOND site spelling the constant reddens even when the composer is still there.
+    const EXPECTED_DEFAULT_PORT_MENTIONS: usize = 1;
+
+    // M1's shape on this backend, the KVM-free half (its live half is the `Service{5100}` leg of the
+    // placement set, which runs on the primary backend; `just test-crosvm` is opt-in because CI has
+    // no crosvm binary): the endpoint an instance reports carries the DECLARED steward port, law C8's
+    // first question, never the protocol default.
+    //
+    // crosvm's own callers survive the hardcoded form — `MicroVm::steward` re-keys the port per call
+    // and `verify_control_plane` is a no-op here — which is exactly why it needs a gate rather than a
+    // functional leg: nothing on this backend goes red until some future reader trusts the port it is
+    // handed, the way QEMU's probe did.
+    //
+    // RED on the inverse: put `port: vmcell::vmm::STEWARD_VSOCK_PORT` back in `steward_endpoint`'s
+    // `VsockEndpoint::Vsock` and the `Service { port: 5100 }` assertion fires.
+    #[test]
+    fn the_reported_endpoint_carries_the_declared_steward_port() {
+        use vmcell::config::StewardPlacement;
+
+        let port_of = |e: &VsockEndpoint| match e {
+            VsockEndpoint::Unix { port, .. } | VsockEndpoint::Vsock { port, .. } => *port,
+        };
+
+        // A NON-default declared port: the whole point of `Service { port }` is that the guest binds
+        // it, so an endpoint reporting anything else describes a listener that is not there.
+        assert_eq!(
+            port_of(&steward_endpoint(
+                42,
+                StewardPlacement::Service { port: 5100 }
+            )),
+            5100,
+            "the reported endpoint must carry the declared port, not the protocol default"
+        );
+
+        // The default placement is byte-identical to every release before v33 — the
+        // pay-for-what-you-use floor — so a `Pid1` cell's endpoint must be unchanged.
+        assert_eq!(
+            port_of(&steward_endpoint(42, StewardPlacement::Pid1)),
+            vmcell::vmm::STEWARD_VSOCK_PORT,
+        );
+        // `None` never reaches a dial, so its port is an unused placeholder — pinned so a future
+        // reader does not mistake it for a dialable answer.
+        assert_eq!(
+            port_of(&steward_endpoint(42, StewardPlacement::None)),
+            vmcell::vmm::STEWARD_VSOCK_PORT,
+        );
+
+        // …and the transport half is unconditional on this backend (in-kernel vhost-vsock on every
+        // path), carrying the CID the argv programs — which the port change must not have disturbed.
+        for placement in [
+            StewardPlacement::Pid1,
+            StewardPlacement::Service { port: 5100 },
+            StewardPlacement::None,
+        ] {
+            assert!(
+                matches!(
+                    steward_endpoint(42, placement),
+                    VsockEndpoint::Vsock { cid: 42, .. }
+                ),
+                "crosvm's transport is AF_VSOCK by CID on every path ({placement:?})"
+            );
+        }
+    }
+
+    // The CALL-SITE half of the gate above (AGENTS.md: a gate binds the call sites, not just the
+    // extracted predicate). The composer's unit test cannot see the defect this scan is about — a
+    // second, inlined `VsockEndpoint` carrying the constant beside it, which is precisely the shape
+    // the defect shipped as on QEMU, twice.
+    //
+    // RED on the inverse: re-inline `port: vmcell::vmm::STEWARD_VSOCK_PORT` in `vsock_endpoint` (the
+    // spelling this backend shipped) and the mention count goes to 2; delete the composer and the
+    // `steward_port()` assertion fires.
+    #[test]
+    fn the_dialed_port_is_composed_once_from_the_declared_placement() {
+        let code = production_code(SOURCE);
+        let mentions = code.matches("STEWARD_VSOCK_PORT").count();
+        assert_eq!(
+            mentions, EXPECTED_DEFAULT_PORT_MENTIONS,
+            "the protocol default may be spelled only as `steward_endpoint`'s placement-`None` \
+             placeholder; every other mention is a site hardcoding a port the caller may have \
+             re-declared (M1). Found {mentions}."
+        );
+        assert!(
+            code.contains("placement .steward_port()") || code.contains("placement.steward_port()"),
+            "the composed port must come from `StewardPlacement::steward_port()` — C8's first \
+             question — not from a constant"
+        );
+        // Non-vacuity: the composer is actually the spawned instance's endpoint, not dead code.
+        assert!(
+            code.contains("steward_endpoint(guest_cid, cfg.steward_placement)"),
+            "`spawn` must compose the instance's endpoint through `steward_endpoint` from the \
+             config's own placement"
+        );
+    }
+
+    // The scanner's own controls: prose is not code, and the regression shape is genuinely detected
+    // — so the scan above is not a test that can only ever pass (AGENTS.md rule 2).
+    #[test]
+    fn the_port_scanner_ignores_comments_and_sees_a_re_inlined_port() {
+        let clean = "// port: vmcell::vmm::STEWARD_VSOCK_PORT in a comment is not a dial site\n\
+             port: placement.steward_port().unwrap_or(vmcell::vmm::STEWARD_VSOCK_PORT),\n\
+             #[cfg(test)]\nmod tests { STEWARD_VSOCK_PORT }";
+        assert_eq!(
+            production_code(clean).matches("STEWARD_VSOCK_PORT").count(),
+            EXPECTED_DEFAULT_PORT_MENTIONS,
+        );
+        let regressed = "port: placement.steward_port().unwrap_or(vmcell::vmm::STEWARD_VSOCK_PORT), \
+             VsockEndpoint::Vsock { cid: self.cid, port: vmcell::vmm::STEWARD_VSOCK_PORT }";
+        assert!(
+            production_code(regressed)
+                .matches("STEWARD_VSOCK_PORT")
+                .count()
+                > EXPECTED_DEFAULT_PORT_MENTIONS,
+            "a re-inlined default port must be visible to the scan"
+        );
     }
 }

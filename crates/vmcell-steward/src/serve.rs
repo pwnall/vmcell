@@ -1,16 +1,20 @@
 //! The vsock control plane: the listener, the accept loop, one thread per accepted connection,
-//! the frame router, and law C3's session teardown.
+//! the frame router, and law C3's teardown.
 //!
 //! Placement-blind by construction (design §3.5): `Ready` is still the first frame of every
 //! accepted connection, the framing/session/resync semantics do not vary, and the single-writer
 //! discipline (law C4) holds in both modes. What v33 added here is a **shutdown seam** — a
 //! service-mode steward must be able to stop accepting and exit, which the pre-v33 unconditional
-//! `loop {}` had no hook for — and the [`ConnectionRegistry`], without which "tear down live
-//! sessions on SIGTERM" had no way to reach a table that is created per connection.
+//! `loop {}` had no hook for — and the [`ConnectionRegistry`], without which "tear down what is
+//! still live on SIGTERM" had no way to reach state that is created per connection.
+//!
+//! Teardown is **ownership**, through one helper ([`teardown_connection`]) reached from one place
+//! ([`ConnectionTicket`]'s drop) plus the shutdown sweep: sessions and in-flight one-shot `exec`
+//! children alike, on the normal end, the error path, and the unwind.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -39,6 +43,29 @@ pub(crate) type Writer = Arc<Mutex<VsockStream>>;
 /// entry on exit; connection teardown drains and kills whatever is left (§13, Cross-cutting invariants).
 pub(crate) type Sessions = Arc<Mutex<HashMap<SessionId, SessionHandle>>>;
 
+/// The per-connection table of live **one-shot** `exec` children: pgid (== the child's pid) → the
+/// waiter's `has_exited` flag.
+///
+/// The sessions table's counterpart for the synchronous path, and it exists for the same reason:
+/// a one-shot child used to be known only to the connection thread's own stack frame, so nothing
+/// that outlives that frame could kill it. A `Service` steward *exits* on SIGTERM, and an exit
+/// that leaves a `sleep 600` running under the real init is exactly the residue law C3 forbids.
+pub(crate) type OneShotExecs = Arc<Mutex<HashMap<u32, Arc<AtomicBool>>>>;
+
+/// Everything one accepted connection owns and must release when it ends (§13, Cross-cutting invariants,
+/// law C3): its interactive sessions and its live one-shot `exec` children.
+///
+/// One struct rather than two threaded arguments, for the `HostEnv` reason (AGENTS.md): the next
+/// per-connection resource is a field here, not a fourth positional parameter that one call site
+/// forgets.
+#[derive(Debug, Default)]
+pub(crate) struct ConnectionState {
+    /// This connection's interactive-session table.
+    pub(crate) sessions: Sessions,
+    /// Its live one-shot `exec` children.
+    pub(crate) one_shot: OneShotExecs,
+}
+
 /// Binds the `CID_ANY:port` listener in non-blocking mode.
 ///
 /// Returns `None` on failure so the caller can retry — PID 1 must never give up
@@ -53,6 +80,9 @@ fn bind_vsock_listener(port: u32) -> Option<VsockListener> {
                     e
                 );
             }
+            // Logged here, beside the bind that earned it, because the accept loop below is
+            // written against a listener *factory* and no longer knows the port.
+            tracing::info!("vmcell-steward: listening on vsock port {}", port);
             Some(listener)
         }
         Err(e) => {
@@ -273,6 +303,21 @@ pub(crate) fn dispatch_connection(
 /// refuses a connection thread costs that one connection, not the loop
 /// ([`dispatch_connection`]). PID 1 must never give up the control plane.
 pub(crate) fn serve_vsock(ctx: &Arc<ServeContext>, port: u32, tuning: Tuning) {
+    serve_vsock_with(ctx, || bind_vsock_listener(port), tuning);
+}
+
+/// [`serve_vsock`]'s loop, over a listener **factory** instead of a port.
+///
+/// `bind` is the seam, for exactly the reason [`dispatch_connection`] takes a
+/// `std::thread::Builder`: the shutdown flag is checked at *both* loop levels, and the only way a
+/// test can tell those two checks apart is by deciding whether a bind succeeds — an AF_VSOCK
+/// `CID_ANY` bind is unavailable in a host-side test process, so a port-only signature makes the
+/// inner check unreachable and its gate vacuous (the shipped path still carries no `#[cfg(test)]`
+/// branch).
+pub(crate) fn serve_vsock_with<B>(ctx: &Arc<ServeContext>, mut bind: B, tuning: Tuning)
+where
+    B: FnMut() -> Option<VsockListener>,
+{
     let Tuning {
         accept_poll,
         rebind_idle,
@@ -289,13 +334,12 @@ pub(crate) fn serve_vsock(ctx: &Arc<ServeContext>, port: u32, tuning: Tuning) {
             tracing::info!("vmcell-steward: vsock listener stopping (shutdown requested)");
             return;
         }
-        let Some(listener) = bind_vsock_listener(port) else {
+        let Some(listener) = bind() else {
             // Bind-failure retry cadence, still floor-clamped by `parse_ms` so a
             // cmdline `0` cannot busy-spin PID 1.
             std::thread::sleep(accept_poll);
             continue;
         };
-        tracing::info!("vmcell-steward: listening on vsock port {}", port);
 
         // Idle window starts at the (re)bind; only a successful accept restarts
         // it. Once it elapses with no accepted connection — or an arm below
@@ -414,50 +458,51 @@ fn serve_connection(
     ctx: &Arc<ServeContext>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let writer: Writer = Arc::new(Mutex::new(stream.try_clone()?));
-    let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));
+    let state = Arc::new(ConnectionState::default());
     let mut read_stream = stream;
 
-    // Publish this connection's table for the duration of the connection, so a service-mode
-    // shutdown can honor law C3 on it. The ticket deregisters on drop, including on the `?` below
-    // and on a panic — the registry must never outlive the connections it names, or a shutdown
-    // would iterate freed tables.
-    let _ticket = ctx.connections.register(Arc::clone(&sessions));
+    // Publish this connection's state for the duration of the connection, so a service-mode
+    // shutdown can honor law C3 on it — and so that law's teardown has ONE owner: the ticket's
+    // drop runs it, which covers the normal end, the `?` below, and (the shape this replaced) a
+    // panicking connection thread. The pre-fix explicit `teardown_sessions` call sat *after* the
+    // dispatch loop, so an unwind skipped it while this same ticket still deregistered the table —
+    // leaving live sessions with nothing left in the guest that knew their pgids.
+    let _ticket = ctx.connections.register(Arc::clone(&state));
 
     send_msg(&writer, &Message::Ready)?;
-    let result = serve_loop(&mut read_stream, &writer, &sessions, ctx);
-    // Connection owns its sessions (§13, Cross-cutting invariants): before returning, kill every
-    // still-open session's process group so no interactive session outlives the
-    // connection that opened it. Draining the table also drops each handle,
-    // closing its stdin pipe / PTY master fds.
-    teardown_sessions(&sessions);
-    result
+    serve_loop(&mut read_stream, &writer, &state, ctx)
 }
 
-/// Every live connection's session table, so a service-mode shutdown can honor law C3 on tables
+/// Every live connection's teardown state, so a service-mode shutdown can honor law C3 on tables
 /// that are created **per connection** and reachable from nowhere else (design §3.5).
 ///
 /// Before v33 this had no reason to exist: the only SIGTERM policy was `power_off_never_returns`,
 /// which reaches no session at all — teardown happened solely on the connection's own exit path.
-/// A `Service` steward exits instead, and an exit that leaves a session's process group alive is
-/// exactly the residue law C3 forbids.
+/// A `Service` steward exits instead, and an exit that leaves a session's process group (or a
+/// one-shot `exec` child's) alive is exactly the residue law C3 forbids.
 #[derive(Debug, Default)]
 pub(crate) struct ConnectionRegistry {
-    live: Mutex<HashMap<u64, Sessions>>,
+    live: Mutex<HashMap<u64, Arc<ConnectionState>>>,
     next_id: std::sync::atomic::AtomicU64,
 }
 
-/// Deregisters one connection's session table when it drops.
+/// Tears one connection's state down and deregisters it when it drops.
 ///
 /// RAII rather than a paired call, for the same reason the rest of the crate prefers it: the
-/// register/deregister pair spans a `?`, a panic, and three `return`s, and the one form that
-/// cannot be forgotten on any of them is a guard.
+/// register/teardown/deregister sequence spans a `?`, a panic, and three `return`s, and the one
+/// form that cannot be forgotten on any of them is a guard.
 pub(crate) struct ConnectionTicket {
     registry: Arc<ConnectionRegistry>,
+    state: Arc<ConnectionState>,
     id: u64,
 }
 
 impl Drop for ConnectionTicket {
     fn drop(&mut self) {
+        // Tear down FIRST, deregister second, so the registry never names a connection whose
+        // teardown has not run. A shutdown sweep that raced us simply re-runs the same idempotent
+        // drain and finds both tables empty.
+        teardown_connection(&self.state);
         self.registry
             .live
             .lock()
@@ -472,34 +517,36 @@ impl ConnectionRegistry {
         Self::default()
     }
 
-    /// Publishes `sessions` until the returned ticket drops.
-    pub(crate) fn register(self: &Arc<Self>, sessions: Sessions) -> ConnectionTicket {
+    /// Publishes `state` until the returned ticket drops.
+    pub(crate) fn register(self: &Arc<Self>, state: Arc<ConnectionState>) -> ConnectionTicket {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         self.live
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(id, sessions);
+            .insert(id, Arc::clone(&state));
         ConnectionTicket {
             registry: Arc::clone(self),
+            state,
             id,
         }
     }
 
-    /// Tears down every registered connection's sessions, returning how many tables were swept.
+    /// Tears down every registered connection — sessions and live one-shot `exec` children alike —
+    /// returning how many connections were swept.
     ///
-    /// The tables are collected under the lock and torn down **outside** it, mirroring
+    /// The states are collected under the lock and torn down **outside** it, mirroring
     /// [`teardown_sessions`]'s own discipline: `kill_group` is a syscall, and holding the registry
     /// lock across it would serialize shutdown behind the slowest process group. Racing a
-    /// connection's own teardown is harmless — the second drain finds an empty table.
+    /// connection's own teardown is harmless — the second drain finds empty tables.
     pub(crate) fn teardown_all(&self) -> usize {
-        let tables: Vec<Sessions> = {
+        let states: Vec<Arc<ConnectionState>> = {
             let live = self.live.lock().unwrap_or_else(|e| e.into_inner());
             live.values().map(Arc::clone).collect()
         };
-        for sessions in &tables {
-            teardown_sessions(sessions);
+        for state in &states {
+            teardown_connection(state);
         }
-        tables.len()
+        states.len()
     }
 
     /// How many connections are currently registered. Diagnostics and tests only.
@@ -538,15 +585,16 @@ pub(crate) fn unexpected_frame_warning(frame_bytes: usize, msg: &Message) -> Str
 fn serve_loop(
     read_stream: &mut VsockStream,
     writer: &Writer,
-    sessions: &Sessions,
+    state: &Arc<ConnectionState>,
     ctx: &Arc<ServeContext>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let sessions = &state.sessions;
     loop {
         let req_bytes = read_framed(read_stream)?;
         let msg: Message = postcard::from_bytes(&req_bytes)?;
 
         match msg {
-            Message::Exec(req) => handle_exec(req, writer, ctx)?,
+            Message::Exec(req) => handle_exec(req, writer, ctx, &state.one_shot)?,
             Message::PutFile { dst, bytes } => handle_put_file(&dst, &bytes, writer)?,
             Message::Resync {
                 unix_secs,
@@ -582,8 +630,101 @@ fn serve_loop(
     }
 }
 
+/// Releases everything one connection owns, in one order, from one place (§13, Cross-cutting
+/// invariants, law C3): first its live one-shot `exec` children, then its interactive sessions.
+///
+/// The **one** teardown helper both exit paths use — [`ConnectionTicket`]'s drop (the connection's
+/// own end, its `?` error path, and a panicking connection thread) and
+/// [`ConnectionRegistry::teardown_all`] (a service-mode shutdown). Idempotent by construction:
+/// each half drains its table, so whoever gets there second finds nothing to do.
+pub(crate) fn teardown_connection(state: &ConnectionState) {
+    teardown_one_shot_execs(&state.one_shot);
+    teardown_sessions(&state.sessions);
+}
+
+/// `SIGKILL`s the process group of every one-shot `exec` child this connection still has in
+/// flight (§13, Cross-cutting invariants).
+///
+/// Whoever drains an entry owns its kill — see [`OneShotTicket`] — so a child is signalled exactly
+/// once even when a shutdown sweep races the `exec` call's own return.
+fn teardown_one_shot_execs(execs: &OneShotExecs) {
+    let drained: Vec<(u32, Arc<AtomicBool>)> = {
+        let mut table = execs.lock().unwrap_or_else(|e| e.into_inner());
+        table.drain().collect()
+    };
+    for (pid, has_exited) in drained {
+        tracing::info!(
+            "vmcell-steward: connection ending; killing one-shot exec child (pid {})",
+            pid
+        );
+        kill_unexited(pid, &has_exited);
+    }
+}
+
+/// `SIGKILL`s one one-shot `exec` child's process group **unless** its waiter already observed the
+/// exit — the one predicate both [`OneShotTicket`]'s drop and [`teardown_one_shot_execs`] use.
+///
+/// The flag check is not an optimization: it is the same guard the exec path's timeout thread
+/// applies, and for the same reason — signalling a pgid whose child has already been reaped can
+/// land on a process group the kernel recycled the pid into.
+fn kill_unexited(pid: u32, has_exited: &AtomicBool) {
+    if has_exited.load(Ordering::Relaxed) {
+        return;
+    }
+    kill_group(pid);
+}
+
+/// Publishes one live one-shot `exec` child on its connection's table for as long as the `exec`
+/// call is running, and kills its group on the way out if it is still alive.
+///
+/// The guard shape is what makes both halves true on *every* path out of [`crate::exec::handle_exec`]:
+/// the normal return (where `has_exited` is already set, so nothing is signalled), a failed
+/// `send_msg` mid-output, and a panic — the last two meaning the connection itself is finished, so
+/// its child must not outlive it.
+pub(crate) struct OneShotTicket {
+    table: OneShotExecs,
+    pid: u32,
+    has_exited: Arc<AtomicBool>,
+}
+
+impl OneShotTicket {
+    /// Publishes `pid` (its own process-group leader) with the waiter's `has_exited` flag.
+    pub(crate) fn register(
+        table: &OneShotExecs,
+        pid: u32,
+        has_exited: Arc<AtomicBool>,
+    ) -> OneShotTicket {
+        table
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(pid, Arc::clone(&has_exited));
+        OneShotTicket {
+            table: Arc::clone(table),
+            pid,
+            has_exited,
+        }
+    }
+}
+
+impl Drop for OneShotTicket {
+    fn drop(&mut self) {
+        // Only the holder that actually removes the entry may signal: if a shutdown sweep already
+        // drained it, that sweep owns the kill, and a second `kill(-pgid)` from here could land on
+        // a pid the kernel recycled in between.
+        let claimed = self
+            .table
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.pid)
+            .is_some();
+        if claimed {
+            kill_unexited(self.pid, &self.has_exited);
+        }
+    }
+}
+
 /// Kills every still-open session's process group and drops its fds (§13, Cross-cutting invariants),
-/// invoked once the connection's dispatch loop has ended for any reason.
+/// invoked through [`teardown_connection`] once the connection has ended for any reason.
 pub(crate) fn teardown_sessions(sessions: &Sessions) {
     // Drain under the lock, then kill and join OUTSIDE it: joining a stdin writer
     // thread while holding the table lock would block every still-running waiter

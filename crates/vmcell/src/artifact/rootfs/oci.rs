@@ -180,7 +180,12 @@ async fn build_rootfs_with(
     options: &super::PackOptions,
 ) -> Result<StageOutputs> {
     let streams = layer_tar_streams_with(puller, image, digest).await?;
-    super::pack_erofs_with_injection(streams, inputs, out, options).await
+    // The GENERAL tail, never `pack_erofs_with_injection`: that door refuses by name anything but
+    // `RootfsFormat::Erofs` (§4.7), so a `rootfs` registry entry declaring `format: ext4` pulled its
+    // layers and then died on the door — the format was an accepted input no registry-driven build
+    // could honor, and delta 8's producer was reachable only through the `unpinned_path` dev
+    // registration, which `bundle` refuses by design. `options.format` chooses the emitter here.
+    super::pack_rootfs_with_injection(streams, inputs, out, options).await
 }
 
 /// The pull→cache→re-verify→decode half, parameterized over the same injectable [`OciPuller`]
@@ -697,6 +702,140 @@ mod tests {
         assert!(
             matches!(res, Err(crate::error::Error::Artifact(_))),
             "a tampered cached blob must be rejected on the hit path, got {res:?}"
+        );
+    }
+
+    // §4.7 / §18 delta 8, at the seam every registry-driven rootfs build packs through: this
+    // function must call the GENERAL tail, so a `rootfs` entry declaring `format: ext4` builds.
+    //
+    // It called `pack_erofs_with_injection`, the erofs-only door, which refuses any other format BY
+    // NAME — so `vmcell build --rootfs-label <an ext4 label>` resolved the entry, missed the cache,
+    // pulled every layer, and then died on `pack_erofs_with_injection was handed format: ext4`. The
+    // `format` key was an accepted input no registry-driven build could honor, and delta 8's
+    // producer was reachable only through the `unpinned_path` dev registration, which `bundle`
+    // refuses by design.
+    //
+    // The assertion discriminates on EVERY host, which is what keeps this out of the skip manifest:
+    // where the producer is available the pack must write a real ext4 superblock, and where it is
+    // absent (or the `ext4-producer` feature is off) the refusal must be §4.7's own TYPED
+    // `CapabilityUnavailable`. The door's refusal is an `Error::Artifact` naming itself, so it is
+    // neither — the buggy call site reddens both ways.
+    //
+    // RED on the inverse (call `pack_erofs_with_injection` again): the `other` arm panics quoting
+    // the door. The erofs leg at the end is the positive control — the same layers, the same fake,
+    // the default format — so a pack that failed for a reason unrelated to the format cannot pass.
+    #[cfg(feature = "am-fs-erofs")]
+    #[tokio::test]
+    async fn the_oci_stage_packs_through_the_general_tail_so_an_ext4_label_builds() {
+        crate::artifact::rootfs::stabilize_ca();
+        // Per-run nonce, for the same reason the chain test above carries one: the blob cache is
+        // shared, so this layer's digest — and therefore its cache filename — must be this run's.
+        let nonce = format!("{}-{}", std::process::id(), uuid::Uuid::new_v4());
+        let (gz, gz_dig, gz_mt) = gzip_layer(&[
+            ("lib/x86_64-linux-gnu/libc.so.6", b"ELF-libc"),
+            ("etc/vmcell-test-nonce", nonce.as_bytes()),
+        ]);
+        let mut blobs = HashMap::new();
+        blobs.insert(gz_dig.clone(), gz);
+        let fake = FakeOciPuller {
+            layers: vec![OciLayerDesc {
+                media_type: gz_mt,
+                digest: gz_dig.clone(),
+            }],
+            blobs,
+            resolve_calls: AtomicUsize::new(0),
+            blob_calls: AtomicUsize::new(0),
+        };
+        let _residue = CachedBlobGuard(vec![
+            crate::artifact::oci_cache_dir().join(gz_dig.replace(':', "-")),
+        ]);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let steward = dir.path().join("steward");
+        std::fs::write(&steward, b"#!steward").expect("write the steward stand-in");
+        let mut inputs = crate::artifact::StageInputs::default();
+        inputs.artifacts.insert("steward".to_string(), steward);
+        let digest = sha256_hex(b"ext4-manifest-bytes");
+
+        // The filename is composed through the one law, so it carries the declared format's
+        // extension exactly as `RootfsStage::out_path` would.
+        let out = dir.path().join(crate::artifact::rootfs::rootfs_filename(
+            Some("acme"),
+            crate::artifact::RootfsFormat::Ext4,
+        ));
+        let res = build_rootfs_with(
+            &fake,
+            "example.com/img",
+            &digest,
+            &inputs,
+            &out,
+            &crate::artifact::rootfs::PackOptions::new()
+                .with_label(Some("acme"))
+                .with_format(crate::artifact::RootfsFormat::Ext4),
+        )
+        .await;
+        match res {
+            Ok(outputs) => {
+                // The ext4 superblock magic (`0xEF53`, little-endian, at byte 0x438 — offset 56 of
+                // the superblock, which starts at 1024). Asserted on the BYTES rather than on
+                // "the file exists", which an erofs image at an `.ext4` name would also satisfy.
+                let image = std::fs::read(&out).expect("read the packed image");
+                assert!(
+                    image.len() > 0x43a,
+                    "the packed image is too small to hold a superblock: {} bytes",
+                    image.len()
+                );
+                assert_eq!(
+                    &image[0x438..0x43a],
+                    &[0x53, 0xef],
+                    "the declared format must reach the emitter: no ext4 superblock magic at 0x438"
+                );
+                assert_eq!(
+                    outputs
+                        .artifacts
+                        .get(&crate::artifact::rootfs::rootfs_artifact_key(Some("acme")))
+                        .map(std::path::PathBuf::as_path),
+                    Some(out.as_path()),
+                    "the ext4 pack must register under its own label's key: {outputs:?}"
+                );
+            }
+            // §4.7's own probe classifying an absent facility (no `mkfs.ext4`, too old, no
+            // libarchive) or the `ext4-producer` feature compiled out. Honest either way — and it
+            // still proves the request reached the FORMAT gate instead of the erofs door.
+            Err(crate::error::Error::CapabilityUnavailable { op, needed }) => {
+                assert!(op.contains("ext4"), "the op names the operation: {op}");
+                assert!(
+                    needed.contains("e2fsprogs")
+                        || needed.contains("libarchive")
+                        || needed.contains("ext4-producer"),
+                    "the refusal must name the absent facility: {needed}"
+                );
+            }
+            other => panic!(
+                "an ext4 registry entry must pack (or be typed-refused by §4.7's probe), never die \
+                 on the erofs-only door: {other:?}"
+            ),
+        }
+
+        // Positive control: the same layers through the same fake at the DEFAULT format pack an
+        // erofs image, so nothing above can pass because the pull or the merge was broken.
+        let erofs_out = dir.path().join(crate::artifact::rootfs::rootfs_filename(
+            Some("acme"),
+            crate::artifact::RootfsFormat::Erofs,
+        ));
+        build_rootfs_with(
+            &fake,
+            "example.com/img",
+            &digest,
+            &inputs,
+            &erofs_out,
+            &crate::artifact::rootfs::PackOptions::new().with_label(Some("acme")),
+        )
+        .await
+        .expect("the default format must still pack through the same seam");
+        assert!(
+            erofs_out.metadata().expect("stat the erofs image").len() > 0,
+            "the erofs control must produce a non-empty image"
         );
     }
 

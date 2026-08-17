@@ -24,15 +24,20 @@ use vmcell::vmm::PerVmResources;
 //
 // PROPERTY: no ACCEPTED argument may carry the kernel-normalized key of a token vmcell emits. The
 // owned key set is not restated in the harness — it is DERIVED by composing the very same config
-// with no extra args, so it tracks whatever the builder actually emits. The kernel's own parser
-// folds `-` to `_` inside a parameter name (`kernel/params.c`'s `dash2underscore`), so the
-// reference key is "text before the first `=`, with `-` folded to `_`", applied to the OUTPUT
-// rather than restated as the predicate. It is red on the real historical defect (finding `m1`):
-// drop the normalization from the predicate and `kvm_intel.nested=1` is accepted beside the owned
-// `kvm-intel.nested=0`. It is likewise red if the `vmcell_` prefix rule is dropped. A second
-// assertion pins the splice itself — the composed line is exactly the owned line with each accepted
-// arg appended as ONE unmodified token, which is red if an arg carrying whitespace is ever accepted
-// (it would forge a second boot token).
+// with no extra args, so it tracks whatever the builder actually emits. The reference key is the
+// name the KERNEL would read, applied to the OUTPUT rather than restated as the predicate: see
+// `cmdline_key` for the two folds and the two `lib/cmdline.c`/`kernel/params.c` clauses behind them.
+// It is red on the real historical defects: drop the dash fold from the predicate and
+// `kvm_intel.nested=1` is accepted beside the owned `kvm-intel.nested=0` (finding `m1`); accept a
+// token carrying `"` and `"init=/evil` is accepted beside the owned `init=` (finding `m3`). It is
+// likewise red if the `vmcell_` prefix rule is dropped. A second assertion pins the splice itself —
+// the composed line is exactly the owned line with each accepted arg appended as ONE unmodified
+// token, which is red if an arg carrying whitespace is ever accepted (it would forge a second boot
+// token). A third bans the quoting metacharacter from every accepted token, which is what the key
+// comparison alone cannot state: a `"` in the MIDDLE of a token collides with no key at all (it
+// toggles `in_quote`, so whitespace stops separating parameters and everything after it is swallowed
+// into this token's value), and a leading one on an ALIAS — `"rw`, the very token `m3` reports —
+// re-keys to `rw`, which vmcell reserves but does not emit, so no duplicate-key oracle can see it.
 //
 // A caller arg colliding with ANOTHER CALLER ARG is deliberately not a finding: `extra_kernel_args`
 // is the caller's own list and repeating a key in it is their business, not an override of a token
@@ -42,13 +47,31 @@ use vmcell::vmm::PerVmResources;
 // ALIAS. `rw` inverting the owned `ro`, or `quiet` overriding `loglevel=`, share no key with the
 // token they override, so no duplicate-key oracle sees them — that is why the alias block in
 // `RESERVED_CMDLINE_KEYS` is hand-maintained with its own negative test. Finding a missing alias
-// needs a model of the kernel's semantics, which no byte-oriented fuzzer has.
+// needs a model of the kernel's semantics, which no byte-oriented fuzzer has. (The `"`-prefixed form
+// of an alias is caught anyway, by the metacharacter assertion rather than by the key oracle — that
+// is a property of the character, not knowledge of the alias.)
 //
 // The configs built here carry NO shares, deliberately: `vmcell_share=` legitimately repeats once
 // per share, so a shared-directory config would make the duplicate-key property false by design.
 
-/// The kernel's own parameter-name normal form: the text before the first `=`, `-` folded to `_`.
+/// The kernel's own parameter-name normal form, in the two folds its parser applies before it has a
+/// name to compare: a leading `"` stripped, the text before the first `=` taken, `-` folded to `_`.
+///
+/// Both folds are the kernel's, and the oracle has to model BOTH or it shares the predicate's blind
+/// spot rather than checking it:
+///
+/// * `lib/cmdline.c`'s `next_arg` strips one leading quote before the parameter name begins
+///   (`if (*args == '"') { args++; in_quote = 1; }`), so the token `"rw` IS the parameter `rw`. The
+///   oracle keyed it as `"rw`, which collides with nothing — the exact hole finding `m3` names in its
+///   own text, and the reason a fuzzer running against the pre-fix predicate would have reported
+///   nothing while `"rw` cleared `MS_RDONLY` under the owned `ro`.
+/// * `kernel/params.c`'s `dash2underscore` folds `-` to `_` inside the name for every `parameq`
+///   comparison, which is finding `m1`.
+///
+/// Written as the kernel's parse, deliberately, not as a copy of `normalize_cmdline_key`: an oracle
+/// that mirrors the predicate can only ever agree with it.
 fn cmdline_key(token: &str) -> String {
+    let token = token.strip_prefix('"').unwrap_or(token);
     token.split('=').next().unwrap_or(token).replace('-', "_")
 }
 
@@ -147,6 +170,20 @@ fuzz_target!(|input: (u8, Vec<&str>)| {
              emits as {:?}; caller args go LAST and the kernel applies duplicates in order, so it \
              overrides the token vmcell owns — cmdline {cmdline:?}",
             owned.get(&key)
+        );
+    }
+
+    // The kernel's quoting metacharacter never survives acceptance. Stated separately from the key
+    // comparison above because it is a different failure: a leading `"` re-keys the token (caught
+    // above, via `cmdline_key`), while a `"` anywhere else toggles `in_quote` so whitespace stops
+    // separating parameters and every token emitted after it is swallowed into this one's value —
+    // which collides with no key and would pass the whole oracle above.
+    for arg in &args {
+        assert!(
+            !arg.contains('"'),
+            "accepted extra kernel arg {arg:?} carries the kernel's quoting metacharacter; \
+             `lib/cmdline.c`'s `next_arg` strips a leading one (re-keying the token) and toggles \
+             `in_quote` on any other (swallowing the tokens after it) — cmdline {cmdline:?}"
         );
     }
 

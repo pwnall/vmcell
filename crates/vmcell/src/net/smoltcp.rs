@@ -149,6 +149,35 @@ pub mod backend {
         }
     }
 
+    /// Depth bound on the guest→host frame queue ([`SharedState::tx_queue`]), in frames.
+    ///
+    /// The queue's only consumer is `run_network`'s poll tick, and that tick legitimately stalls:
+    /// one mapping's host dial owns the single datapath task for up to [`HOST_DIAL_BUDGET`]. An
+    /// unbounded queue hands a guest that keeps kicking its TX ring during such a stall unbounded
+    /// *host* memory — the same hostile-guest surface as the [`MAX_FRAME_LEN`] cap, one level up
+    /// (per-frame bytes were bounded; the frame count was not).
+    ///
+    /// Sized at four ring-depths (≈6 MB at the 1512-byte frame cap) so a legitimately bursty guest
+    /// is never dropped: the vhost worker can drain the guest's whole 1024-descriptor ring several
+    /// times between two 5 ms poll ticks, and only a genuinely stalled consumer reaches the bound.
+    const MAX_TX_QUEUE_FRAMES: usize = 4 * QUEUE_SIZE;
+
+    /// Queues one guest→host frame for the smoltcp poll loop, honoring [`MAX_TX_QUEUE_FRAMES`].
+    /// Returns whether the frame was queued (`false` = tail-dropped).
+    ///
+    /// A full queue tail-drops, the way a NIC does under overload, rather than growing: the
+    /// descriptor is still returned to the guest (so its ring never stalls), and TCP retransmits
+    /// what was dropped. Dropping is the *only* correct answer here — the alternative, blocking the
+    /// vhost worker until the net thread catches up, would hold the state mutex the net thread
+    /// itself needs to drain the queue.
+    fn push_tx_frame(tx_queue: &mut VecDeque<Vec<u8>>, payload: &[u8]) -> bool {
+        if tx_queue.len() >= MAX_TX_QUEUE_FRAMES {
+            return false;
+        }
+        tx_queue.push_back(payload.to_vec());
+        true
+    }
+
     /// Computes the smoltcp interface addresses for `vmid` from the shared
     /// `crate::net::ip_math` /30 host-IP math (M-NET-2/NET-4): the host gateway
     /// (`10.200.n.1`, assigned to the NAT interface) and the guest address
@@ -198,10 +227,16 @@ pub mod backend {
     /// memory (NET-5).
     const MAX_DYNAMIC_SOCKETS: usize = 256;
 
-    /// Number of listening sockets pre-armed per newly-seen destination port when
-    /// admitting a guest SYN (a small burst absorbs quick reconnects without a
-    /// per-connection round trip). Growth is refused once the pool would exceed
-    /// [`MAX_DYNAMIC_SOCKETS`]; `MAX_DYNAMIC_SOCKETS` is a multiple of this.
+    /// Number of listening sockets pre-armed each time a guest SYN finds **no unclaimed listener**
+    /// for its destination port (a small burst absorbs quick reconnects without a per-connection
+    /// round trip). Growth is refused once the pool would exceed [`MAX_DYNAMIC_SOCKETS`];
+    /// `MAX_DYNAMIC_SOCKETS` is a multiple of this.
+    ///
+    /// Not "per newly-seen port": an accepted connection stops being a listener, so a port whose
+    /// burst is fully claimed earns another one (see [`syn_already_served`]) — otherwise concurrency
+    /// per destination is capped at this constant. Since the TX scan runs before the poll that
+    /// claims listeners, more than `SYN_BURST` simultaneous SYNs to one port converge over
+    /// consecutive ticks (the guest's own SYN retry), rather than being refused forever.
     const SYN_BURST: usize = 4;
 
     /// Number of listening sockets pre-armed per **forwarded** port (invariant #4,
@@ -423,30 +458,93 @@ pub mod backend {
         }
     }
 
+    /// What one guest→host (transmitq) pass did, and whether the caller may poll the ring again.
+    ///
+    /// The reason this is a value rather than an `io::Result` is M7: an `Err` out of
+    /// [`VhostUserBackendMut::handle_event`] is **terminal** in the vendored framework —
+    /// `VringEpollHandler::run` propagates it out of the epoll loop, the vring worker thread
+    /// returns, and `VhostUserHandler::drop` discards that return value at `join` (it only reports a
+    /// *panic*). The vhost-user device stays attached throughout, so the guest keeps seeing a live
+    /// link that never drains again: the same silent wedge as the B1 ring-wrap panic, one error path
+    /// over. A ring the guest broke must cost one pass, never the link.
+    #[derive(Debug, PartialEq, Eq)]
+    enum TxPass {
+        /// The available chains were drained (there may have been none). The ring is healthy, so
+        /// with `VIRTIO_RING_F_EVENT_IDX` the caller may re-arm notifications and poll again.
+        Drained,
+        /// The ring could not be read at all: `virtio-queue` refused the guest's avail ring, or no
+        /// guest memory table is installed yet. Nothing was drained and the caller must stop polling
+        /// this tick — re-polling a refused ring spins on the state mutex the net thread needs.
+        Unreadable,
+    }
+
     struct VhostUserNetBackend {
         event_idx: bool,
         kill_evt: (EventConsumer, EventNotifier),
+        /// The exit-event pair the next daemon's vring worker will be handed, reserved by
+        /// [`VhostUserNetBackend::arm_exit_event`] before that daemon exists. Interior mutability
+        /// because [`VhostUserBackendMut::exit_event`] takes `&self` (the framework calls it through
+        /// a *read* guard on the `RwLock` around this backend).
+        exit_evt: Mutex<Option<(EventConsumer, EventNotifier)>>,
         state: Arc<Mutex<SharedState>>,
     }
 
     impl VhostUserNetBackend {
+        /// Reserves the exit-event pair the next [`VhostUserDaemon`]'s vring worker will be handed,
+        /// so [`VhostUserBackendMut::exit_event`] itself cannot fail.
+        ///
+        /// `exit_event` returns an `Option` with no error channel, and `None` is not a graceful
+        /// degradation: the framework then registers **no** exit fd, `send_exit_event` becomes a
+        /// no-op, `VringEpollHandler::run` never breaks out of `epoll_wait`, and
+        /// `VhostUserHandler::drop` — reached by `drop(vu_daemon)` — joins that worker *forever*.
+        /// So the fallible half (two fd clones, which fail exactly when the host is out of
+        /// descriptors) runs here, at bring-up, where the caller can refuse to serve the connection
+        /// at all instead of building one that can never be torn down.
+        ///
+        /// # Errors
+        /// The underlying `try_clone` error when the host cannot hand out two more descriptors.
+        fn arm_exit_event(&mut self) -> std::io::Result<()> {
+            let pair = (self.kill_evt.0.try_clone()?, self.kill_evt.1.try_clone()?);
+            *self.exit_evt.lock().unwrap_or_else(|e| e.into_inner()) = Some(pair);
+            Ok(())
+        }
+
         fn process_tx_queue(
             state: &mut SharedState,
             vring_state: &mut VringState<GuestMemoryAtomic<GuestMemoryMmap>>,
-        ) -> std::io::Result<bool> {
+        ) -> TxPass {
             let mut used_any = false;
             let guest_mem = match &state.mem {
                 Some(m) => m,
-                None => return Ok(false),
+                None => {
+                    // A kick before SET_MEM_TABLE: normal during bring-up, and nothing can be read
+                    // until the table arrives — so this is not an error, but it is not a drain
+                    // either (re-polling would spin).
+                    tracing::trace!("process_tx_queue: kick before the guest memory table arrived");
+                    return TxPass::Unreadable;
+                }
             };
 
             let mem_obj = guest_mem.memory();
+            let iter = match vring_state.get_queue_mut().iter(mem_obj.clone()) {
+                Ok(iter) => iter,
+                Err(e) => {
+                    // M7: guest-driven and NOT fatal. `virtio-queue` refuses the avail ring when
+                    // the guest advances `avail.idx` more than a queue's worth past what the backend
+                    // has consumed (its documented misbehaviour detection), when the queue is not
+                    // ready, and when the ring address does not map — all reachable from inside the
+                    // guest, whose hostility this NAT exists to survive. Log it and give up on this
+                    // pass; the caller re-arms the kick, so a guest that re-initializes its ring is
+                    // served again.
+                    tracing::error!(
+                        "process_tx_queue: the guest's transmitq avail ring was refused ({e:?}); \
+                         skipping this pass rather than killing the vring worker"
+                    );
+                    return TxPass::Unreadable;
+                }
+            };
             let avail_chains: Vec<DescriptorChain<GuestMemoryLoadGuard<GuestMemoryMmap>>> =
-                vring_state
-                    .get_queue_mut()
-                    .iter(mem_obj.clone())
-                    .map_err(|_| std::io::Error::other("IterateQueue"))?
-                    .collect();
+                iter.collect();
 
             for chain in avail_chains {
                 used_any = true;
@@ -497,7 +595,13 @@ pub mod backend {
                         packet.len(),
                         payload
                     );
-                    state.tx_queue.push_back(payload.to_vec());
+                    if !push_tx_frame(&mut state.tx_queue, payload) {
+                        tracing::trace!(
+                            "process_tx_queue: guest→host queue at its {} frame bound; \
+                             tail-dropping this frame",
+                            MAX_TX_QUEUE_FRAMES
+                        );
+                    }
                 } else {
                     tracing::trace!("process_tx_queue: packet too short: {}", packet.len());
                 }
@@ -514,7 +618,7 @@ pub mod backend {
                 let _ = vring_state.signal_used_queue();
             }
 
-            Ok(used_any)
+            TxPass::Drained
         }
     }
 
@@ -551,17 +655,30 @@ pub mod backend {
         }
 
         fn exit_event(&self, _thread_index: usize) -> Option<(EventConsumer, EventNotifier)> {
-            // Called by the vhost-user framework during setup (VMM-driven). A
-            // clone failure (e.g. fd exhaustion) must not panic the worker
-            // thread; log and report "no exit event", which only forgoes the
-            // prompt-wakeup optimization — `Drop` still sets the stop flag and
-            // connects the socket to unblock `accept()`, so teardown completes.
+            // Called by the framework while it builds this connection's vring worker. It hands back
+            // the pair `arm_exit_event` reserved *before* the daemon was constructed, because
+            // returning `None` here does not degrade gracefully — it wedges teardown (see
+            // `arm_exit_event`). Both handles are clones of the shared kill event, which is what
+            // lets `SmoltcpProcess::Drop`'s `notify()` reach this worker and `drain_exit_event`
+            // clear the counter between connections.
+            if let Some(pair) = self
+                .exit_evt
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+            {
+                return Some(pair);
+            }
+            // Unreachable while this backend keeps the default `queues_per_thread` (one worker
+            // thread per connection, so one `exit_event` call): a second thread would find the
+            // reservation already taken. Clone live rather than hand the framework a `None`.
             match (self.kill_evt.0.try_clone(), self.kill_evt.1.try_clone()) {
                 (Ok(consumer), Ok(notifier)) => Some((consumer, notifier)),
                 _ => {
                     tracing::error!(
-                        "smoltcp exit_event: failed to clone kill event fd; \
-                         teardown will rely on the stop flag and socket wakeup"
+                        "smoltcp exit_event: no armed exit event and the kill-event clone failed; \
+                         this connection's vring worker has no exit fd, so the daemon's own drop \
+                         will not be able to join it"
                     );
                     None
                 }
@@ -579,9 +696,16 @@ pub mod backend {
                 return Err(std::io::Error::other("NotEpollIn"));
             }
 
-            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            if state.vrings.is_none() {
-                state.vrings = Some(vrings.to_vec());
+            {
+                // Latch this connection's vrings under a SHORT-LIVED lock. Sibling 20: the pre-fix
+                // handler took one guard here and held it across the whole drain loop below, and the
+                // net thread — the only consumer of `tx_queue` — needs that same mutex to poll. A
+                // guest that kept the loop fed therefore starved the very drain the loop was
+                // filling for, on top of growing the queue without bound.
+                let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                if state.vrings.is_none() {
+                    state.vrings = Some(vrings.to_vec());
+                }
             }
 
             if device_event == 1 {
@@ -591,23 +715,53 @@ pub mod backend {
                     // protocol error, not a reason to panic the worker thread.
                     return Err(std::io::Error::other("transmitq vring missing"));
                 };
-                let mut vring_state = vring1.get_mut();
-                if self.event_idx {
-                    loop {
-                        // Masking notifications is a throughput hint; a failure only
-                        // costs an extra wakeup, so the result is deliberately ignored.
-                        let _ = vring_state.disable_notification();
-                        Self::process_tx_queue(&mut state, &mut vring_state)?;
-                        if !vring_state.enable_notification().unwrap_or(false) {
-                            break;
-                        }
+                loop {
+                    {
+                        // Notification masking touches the ring only, so it is taken alone — the
+                        // state mutex is not held across it. A failure is a throughput hint at
+                        // worst (one extra wakeup), so the result is deliberately ignored.
+                        let _ = vring1.get_mut().disable_notification();
                     }
-                } else {
-                    // As above: notification masking is advisory; a failure is
-                    // non-fatal (at worst an extra wakeup), so the result is ignored.
-                    let _ = vring_state.disable_notification();
-                    Self::process_tx_queue(&mut state, &mut vring_state)?;
-                    vring_state.enable_notification().unwrap_or(false);
+                    let pass = {
+                        // Sibling 20: ONE state lock per pass, taken in the net thread's own order
+                        // (state, then ring) so the two can never deadlock, and released before the
+                        // next pass so the drain this queue is being filled for actually gets to
+                        // run. The pre-fix handler held a single guard across this whole loop, which
+                        // starved that drain exactly while a guest hammered the ring — and grew
+                        // `tx_queue` without bound in the meantime. A pass is bounded by the ring
+                        // size, so this hold is bounded too.
+                        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                        let mut vring_state = vring1.get_mut();
+                        Self::process_tx_queue(&mut state, &mut vring_state)
+                    };
+                    let keep_polling = {
+                        let mut vring_state = vring1.get_mut();
+                        match pass {
+                            // M7: a ring the guest broke ends this tick and nothing more. Re-arm the
+                            // kick on the way out so the refusal costs one pass rather than the link
+                            // — and never turn it into an `Err`, which the framework's epoll loop
+                            // treats as terminal (see [`TxPass`]).
+                            TxPass::Unreadable => {
+                                let _ = vring_state.enable_notification();
+                                false
+                            }
+                            // Without EVENT_IDX there is nothing to re-poll: one pass per kick. As
+                            // above, notification masking is advisory, so the result is ignored.
+                            TxPass::Drained if !self.event_idx => {
+                                vring_state.enable_notification().unwrap_or(false);
+                                false
+                            }
+                            // With EVENT_IDX, keep draining while the guest keeps supplying.
+                            TxPass::Drained => vring_state.enable_notification().unwrap_or(false),
+                        }
+                    };
+                    if !keep_polling {
+                        break;
+                    }
+                    // The unlocked window between passes is short, and `std::sync::Mutex` is not
+                    // fair: hand the drain thread the CPU explicitly rather than trusting it to win
+                    // a race against this loop's immediate re-lock.
+                    std::thread::yield_now();
                 }
             }
 
@@ -742,17 +896,44 @@ pub mod backend {
         dynamic_count + additional <= MAX_DYNAMIC_SOCKETS
     }
 
+    /// Whether a SYN to `dst_port` is already served by an existing mapping — the one question
+    /// [`admit_syn`] asks before growing the dynamic pool.
+    ///
+    /// Two mapping kinds answer it differently:
+    ///
+    /// * A **permanent** forward-port mapping (index below `permanent_count`) ends the question
+    ///   whatever state its socket is in: that port's pool is sized by [`FORWARD_PORT_POOL`] and
+    ///   re-armed every tick by [`rearm_or_release_closed`], and a *dynamic* mapping for the same
+    ///   port would dial the proxy port instead of the configured target.
+    /// * A **dynamic** mapping only serves the SYN while its socket is still `Listen`ing.
+    ///   `is_listening()`, not `is_open()`: an accepted connection is open but no longer accepting,
+    ///   so the `is_open()` form capped transparent interception at [`SYN_BURST`] *concurrent*
+    ///   connections per destination — the `SYN_BURST + 1`-th guest connection to a port found the
+    ///   first burst "open", grew nothing, and its SYN went unanswered until the guest gave up.
+    fn syn_already_served(
+        sockets: &SocketSet<'_>,
+        port_mappings: &[NatPortMapping],
+        permanent_count: usize,
+        dst_port: u16,
+    ) -> bool {
+        port_mappings.iter().enumerate().any(|(idx, mapping)| {
+            let (listen_port, _, handle, _) = mapping;
+            *listen_port == dst_port
+                && (idx < permanent_count || sockets.get::<TcpSocket>(*handle).is_listening())
+        })
+    }
+
     /// Admits a guest SYN to `dst_port` into the dynamic NAT socket pool.
     ///
     /// Extracted from the `run_network` TX scan so the per-SYN admission decision
-    /// is unit-testable without a live vhost device (NET-3). For a SYN whose
-    /// destination port has no already-open mapping, it first reclaims closed
-    /// dynamic mappings and then — **only if the pool has room for the whole
-    /// `burst`** — creates `burst` listening sockets mapped to `pxy_port`. When
-    /// the pool is full the SYN is dropped without any growth; that refusal is
+    /// is unit-testable without a live vhost device (NET-3). For a SYN no existing
+    /// mapping serves ([`syn_already_served`]), it first reclaims closed dynamic
+    /// mappings and then — **only if the pool has room for the whole `burst`** —
+    /// creates `burst` listening sockets mapped to `pxy_port`.
+    /// When the pool is full the SYN is dropped without any growth; that refusal is
     /// the guard that keeps `port_mappings` bounded at
-    /// `permanent_count + MAX_DYNAMIC_SOCKETS` under a SYN spray to many distinct
-    /// destination ports.
+    /// `permanent_count + MAX_DYNAMIC_SOCKETS` under a SYN spray, whether the spray
+    /// hits many distinct destination ports or one port many times over.
     fn admit_syn(
         sockets: &mut SocketSet<'_>,
         port_mappings: &mut Vec<NatPortMapping>,
@@ -761,13 +942,11 @@ pub mod backend {
         pxy_port: u16,
         burst: usize,
     ) {
-        let has_open = port_mappings
-            .iter()
-            .any(|(p, _, h, _)| *p == dst_port && sockets.get::<TcpSocket>(*h).is_open());
         // Short-circuit: `reclaim_and_has_room` (with its reclamation side effect)
-        // only runs when there is no already-open mapping for this port, matching
-        // the original inline guard.
-        if has_open || !reclaim_and_has_room(sockets, port_mappings, permanent_count, burst) {
+        // only runs when nothing already serves this SYN.
+        if syn_already_served(sockets, port_mappings, permanent_count, dst_port)
+            || !reclaim_and_has_room(sockets, port_mappings, permanent_count, burst)
+        {
             return;
         }
         for _ in 0..burst {
@@ -875,6 +1054,8 @@ pub mod backend {
             let backend = std::sync::Arc::new(std::sync::RwLock::new(VhostUserNetBackend {
                 event_idx: false,
                 kill_evt,
+                // Armed per connection by the worker loop, before each daemon is constructed.
+                exit_evt: Mutex::new(None),
                 state: state_clone,
             }));
 
@@ -967,6 +1148,26 @@ pub mod backend {
                     },
                 };
 
+                // Arm this connection's exit event BEFORE the daemon that will consume it exists:
+                // `exit_event` cannot report a failure, and the `None` it used to fall back to
+                // leaves the vring worker with no exit fd — `drop(vu_daemon)` below then joins a
+                // thread that never breaks out of `epoll_wait`. A NAT that cannot be torn down is
+                // worse than one that never came up, so a failed arming is terminal for this
+                // worker, exactly like a failed re-bind.
+                if let Err(e) = backend
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .arm_exit_event()
+                {
+                    tracing::error!(
+                        "vhost-user-net: cannot arm the exit event for {:?}: {}; refusing to serve \
+                         a connection whose vring worker could never be joined",
+                        socket_path,
+                        e
+                    );
+                    return;
+                }
+
                 let mut vu_daemon = match VhostUserDaemon::new(
                     String::from("vhost-user-net"),
                     backend.clone(),
@@ -1018,6 +1219,8 @@ pub mod backend {
 
                 // Drop the daemon FIRST: its handler's `Drop` signals the exit event and joins the
                 // vring worker threads, so nothing is still touching the device state we reset.
+                // That join only terminates because the worker was given an exit fd above — hence
+                // the arming, and hence its failure being terminal.
                 drop(vu_daemon);
                 // …then the listener, unlinking the path this iteration bound.
                 drop(listener);
@@ -1431,6 +1634,8 @@ pub mod backend {
         use std::sync::atomic::{AtomicBool, Ordering};
         // Shadow the glob-imported `smoltcp::time::Instant` with the std clock.
         use std::time::{Duration, Instant};
+        // The queue setters `TxRing` needs to stand in for a guest driver's SET_VRING_* messages.
+        use virtio_queue::QueueT;
 
         // C-NET-1: the host→guest pump must read only as many bytes as the socket
         // can enqueue this tick. With a nearly-full 64 KiB TX buffer (one byte
@@ -2009,6 +2214,8 @@ pub mod backend {
             let backend = Arc::new(std::sync::RwLock::new(VhostUserNetBackend {
                 event_idx: false,
                 kill_evt: (consumer, notifier),
+                // The worker arms this itself, per connection.
+                exit_evt: Mutex::new(None),
                 state: state.clone(),
             }));
             // Never set: the worker must stop because bring-up failed, not because it was told to.
@@ -2214,6 +2421,785 @@ pub mod backend {
             assert_eq!(rx_used_len(1512, 1512, true), None);
             // Zero-length edge is not a truncation.
             assert_eq!(rx_used_len(0, 0, false), Some(0));
+        }
+
+        // Sibling 20, the pure half: the guest→host queue must stop growing at its bound.
+        // Buggy impl guarded: an unconditional `push_back` accepts frame `MAX_TX_QUEUE_FRAMES + 1`,
+        // reddening the `false` assertion and the length that follows it.
+        #[test]
+        fn push_tx_frame_bounds_the_queue_depth() {
+            let mut q: VecDeque<Vec<u8>> = VecDeque::new();
+            for _ in 0..MAX_TX_QUEUE_FRAMES {
+                assert!(push_tx_frame(&mut q, &[0xAB, 0xCD]));
+            }
+            assert_eq!(q.len(), MAX_TX_QUEUE_FRAMES);
+            assert!(
+                !push_tx_frame(&mut q, &[0xAB, 0xCD]),
+                "a full queue must tail-drop, not grow"
+            );
+            assert_eq!(q.len(), MAX_TX_QUEUE_FRAMES, "the bound must hold");
+            // Draining makes room again: the bound is a depth, not a lifetime quota.
+            q.pop_front();
+            assert!(push_tx_frame(&mut q, &[0xAB, 0xCD]));
+            // The frame is queued verbatim (the virtio-net header is already stripped upstream).
+            assert_eq!(q.back().map(Vec::as_slice), Some(&[0xAB, 0xCD][..]));
+            // The bound is four ring-depths, so a bursty guest is never dropped between polls.
+            assert_eq!(MAX_TX_QUEUE_FRAMES, 4 * QUEUE_SIZE);
+        }
+
+        /// Guest-memory layout of [`TxRing`]: a descriptor table, an avail ring, a used ring, and
+        /// one small data buffer per ring slot. Sparse on purpose — each region starts on its own
+        /// 64 KiB boundary so an off-by-one write is a wrong assertion, not silent corruption of a
+        /// neighbour.
+        const DESC_TABLE: u64 = 0x1_0000;
+        const AVAIL_RING: u64 = 0x2_0000;
+        const USED_RING: u64 = 0x3_0000;
+        const DATA_BASE: u64 = 0x4_0000;
+        const DATA_STRIDE: u64 = 128;
+        /// Size of one split-virtqueue descriptor (addr, len, flags, next).
+        const DESC_SIZE: u64 = 16;
+
+        /// A hand-built split virtqueue in real guest memory: enough of a transmitq to drive the
+        /// **real** [`VhostUserNetBackend::process_tx_queue`] and `handle_event`, KVM-free.
+        ///
+        /// Rule 4, the effect class the fakes are blind to: `FakeVmm` has no vring at all, so
+        /// nothing in the suite had ever driven the TX path — which is where the B1 ring-wrap panic,
+        /// M7's worker-killing iterate error and sibling 20's unbounded queue all shipped.
+        ///
+        /// Slot `i` of the avail ring permanently refers to descriptor `i`, which points at data
+        /// buffer `i`; publishing frames is then a memory write plus an `avail.idx` bump, exactly
+        /// what a guest driver does.
+        struct TxRing {
+            mem: GuestMemoryAtomic<GuestMemoryMmap>,
+            vring: VringMutex,
+            size: u16,
+        }
+
+        impl TxRing {
+            fn new(size: u16) -> Self {
+                let bytes = DATA_BASE as usize + (size as usize) * (DATA_STRIDE as usize);
+                let mem = GuestMemoryAtomic::new(
+                    GuestMemoryMmap::from_ranges(&[(vm_memory::GuestAddress(0), bytes)])
+                        .expect("guest memory"),
+                );
+                let vring: VringMutex = VringT::new(mem.clone(), size).expect("vring");
+                {
+                    let mut state = vring.get_mut();
+                    state
+                        .set_queue_info(DESC_TABLE, AVAIL_RING, USED_RING)
+                        .expect("queue addresses");
+                    let queue = state.get_queue_mut();
+                    queue.set_size(size);
+                    // `iter()` refuses a queue that is not ready, so a real driver's
+                    // SET_VRING_ENABLE is part of the fixture.
+                    queue.set_ready(true);
+                }
+                let ring = TxRing { mem, vring, size };
+                for slot in 0..size {
+                    ring.write_desc(slot, 0);
+                }
+                ring
+            }
+
+            /// Points descriptor `slot` at its data buffer with `len` readable bytes, and pins the
+            /// avail entry that refers to it.
+            fn write_desc(&self, slot: u16, len: u32) {
+                let mem = self.mem.memory();
+                let at = DESC_TABLE + u64::from(slot) * DESC_SIZE;
+                mem.write_obj(
+                    DATA_BASE + u64::from(slot) * DATA_STRIDE,
+                    vm_memory::GuestAddress(at),
+                )
+                .expect("desc addr");
+                mem.write_obj(len, vm_memory::GuestAddress(at + 8))
+                    .expect("desc len");
+                // flags = 0: readable (guest → host) and no NEXT, i.e. a one-descriptor chain.
+                mem.write_obj(0u16, vm_memory::GuestAddress(at + 12))
+                    .expect("desc flags");
+                mem.write_obj(0u16, vm_memory::GuestAddress(at + 14))
+                    .expect("desc next");
+                mem.write_obj(
+                    slot,
+                    vm_memory::GuestAddress(AVAIL_RING + 4 + u64::from(slot) * 2),
+                )
+                .expect("avail entry");
+            }
+
+            /// Publishes `count` frames carrying `payload` (with the 12-byte virtio-net header the
+            /// backend strips), advancing `avail.idx` the way a guest driver does.
+            fn publish(&self, count: u16, payload: &[u8]) {
+                let mut frame = vec![0u8; VIRTIO_NET_HDR_SIZE];
+                frame.extend_from_slice(payload);
+                assert!(
+                    frame.len() as u64 <= DATA_STRIDE,
+                    "the fixture's data buffers hold {DATA_STRIDE} bytes"
+                );
+                let start = self.avail_idx();
+                for n in 0..count {
+                    let slot = start.wrapping_add(n) % self.size;
+                    self.mem
+                        .memory()
+                        .write_slice(
+                            &frame,
+                            vm_memory::GuestAddress(DATA_BASE + u64::from(slot) * DATA_STRIDE),
+                        )
+                        .expect("frame bytes");
+                    self.write_desc(slot, frame.len() as u32);
+                }
+                self.set_avail_idx(start.wrapping_add(count));
+            }
+
+            fn avail_idx(&self) -> u16 {
+                self.mem
+                    .memory()
+                    .read_obj(vm_memory::GuestAddress(AVAIL_RING + 2))
+                    .expect("avail idx")
+            }
+
+            fn set_avail_idx(&self, idx: u16) {
+                self.mem
+                    .memory()
+                    .write_obj(idx, vm_memory::GuestAddress(AVAIL_RING + 2))
+                    .expect("avail idx");
+            }
+
+            fn used_idx(&self) -> u16 {
+                self.mem
+                    .memory()
+                    .read_obj(vm_memory::GuestAddress(USED_RING + 2))
+                    .expect("used idx")
+            }
+        }
+
+        fn empty_state(mem: Option<GuestMemoryAtomic<GuestMemoryMmap>>) -> SharedState {
+            SharedState {
+                tx_queue: VecDeque::new(),
+                rx_queue: VecDeque::new(),
+                mem,
+                vrings: None,
+            }
+        }
+
+        /// A backend over `state`, with its own kill event and its exit event armed — the shape
+        /// `serve_vhost_connections` hands to `VhostUserDaemon::new`.
+        fn armed_backend(state: Arc<Mutex<SharedState>>) -> VhostUserNetBackend {
+            let (consumer, notifier) = vmm_sys_util::event::new_event_consumer_and_notifier(
+                vmm_sys_util::event::EventFlag::NONBLOCK,
+            )
+            .expect("event pair");
+            let mut backend = VhostUserNetBackend {
+                event_idx: false,
+                kill_evt: (consumer, notifier),
+                exit_evt: Mutex::new(None),
+                state,
+            };
+            backend.arm_exit_event().expect("arming");
+            backend
+        }
+
+        // Sibling 20, at the call site: a guest that keeps kicking a ring nobody is draining must
+        // not grow host memory without bound — and the frames that are dropped must still have
+        // their descriptors returned, or the guest's own ring stalls instead.
+        //
+        // Buggy impl guarded: the shipped-until-now `state.tx_queue.push_back(payload.to_vec())`
+        // queues all five ring-fulls (5120 frames ≈ 7.5 MB for a 1024-entry ring, and unbounded for
+        // a guest that keeps going), reddening the length assertion. This drives the real
+        // `process_tx_queue` over a real vring, so a bound applied only inside the helper — and not
+        // at the enqueue site — is still red.
+        #[test]
+        fn the_guest_to_host_queue_is_depth_bounded_and_still_returns_descriptors() {
+            let ring = TxRing::new(QUEUE_SIZE as u16);
+            let mut state = empty_state(Some(ring.mem.clone()));
+
+            let fulls = 5u32;
+            for _ in 0..fulls {
+                ring.publish(ring.size, &[0xAB, 0xCD, 0xEF]);
+                let mut vring_state = ring.vring.get_mut();
+                assert_eq!(
+                    VhostUserNetBackend::process_tx_queue(&mut state, &mut vring_state),
+                    TxPass::Drained,
+                    "a healthy ring must drain"
+                );
+            }
+
+            let published = fulls * (QUEUE_SIZE as u32);
+            assert_eq!(
+                state.tx_queue.len(),
+                MAX_TX_QUEUE_FRAMES,
+                "the queue must stop at its depth bound under a kick flood ({published} frames \
+                 published with nothing draining)"
+            );
+            assert_eq!(
+                u32::from(ring.used_idx()),
+                published % 65_536,
+                "every descriptor must be returned to the guest, dropped frames included, or its \
+                 ring stalls"
+            );
+            // The frames that WERE queued are the payload, header stripped — a drop must not
+            // corrupt the ones it drops around.
+            assert!(
+                state
+                    .tx_queue
+                    .iter()
+                    .all(|f| f.as_slice() == [0xAB, 0xCD, 0xEF]),
+                "queued frames must be the guest payload with the virtio-net header stripped"
+            );
+        }
+
+        // M7: a refused avail ring — `virtio-queue`'s own guest-misbehaviour detection — must cost
+        // ONE pass, not the link. The pre-fix `process_tx_queue` mapped it to an `io::Error` and
+        // `handle_event` propagated it with `?`; `VringEpollHandler::run` then returns, the vring
+        // worker thread exits, `VhostUserHandler::drop` discards that return value at `join`, and
+        // the device stays attached — a guest looking at a live link that never drains again.
+        //
+        // RED on the inverse in two ways: restoring the `?` makes `handle_event` return `Err` (the
+        // `is_ok` assertion), and swallowing the error *without* breaking the EVENT_IDX loop spins
+        // forever on a ring that can never be read (the bounded wait below reports it instead of
+        // hanging the suite).
+        #[test]
+        fn a_refused_avail_ring_costs_one_pass_not_the_vring_worker() {
+            let ring = TxRing::new(64);
+            let state = Arc::new(Mutex::new(empty_state(Some(ring.mem.clone()))));
+
+            // One legitimate frame first, so the fixture is proven able to drain at all — otherwise
+            // "nothing was queued" below would be vacuous.
+            ring.publish(1, &[0x11, 0x22]);
+            {
+                let mut vring_state = ring.vring.get_mut();
+                let mut guard = state.lock().expect("state");
+                assert_eq!(
+                    VhostUserNetBackend::process_tx_queue(&mut guard, &mut vring_state),
+                    TxPass::Drained
+                );
+                assert_eq!(guard.tx_queue.len(), 1, "the fixture must be able to drain");
+                guard.tx_queue.clear();
+            }
+
+            // The guest advances `avail.idx` more than a queue's worth past what the backend has
+            // consumed: `AvailIter::new` refuses the ring with `InvalidAvailRingIndex`.
+            ring.set_avail_idx(ring.avail_idx().wrapping_add(ring.size + 1));
+            {
+                let mut vring_state = ring.vring.get_mut();
+                let mut guard = state.lock().expect("state");
+                assert_eq!(
+                    VhostUserNetBackend::process_tx_queue(&mut guard, &mut vring_state),
+                    TxPass::Unreadable,
+                    "a refused ring is not a drain"
+                );
+                assert!(
+                    guard.tx_queue.is_empty(),
+                    "a refused ring must queue nothing"
+                );
+            }
+
+            // The call site: `handle_event` must return `Ok` — and terminate — on that same ring,
+            // in the EVENT_IDX mode whose loop would otherwise re-poll it forever.
+            let mut backend = armed_backend(state.clone());
+            backend.set_event_idx(true);
+            let rx_vring: VringMutex = VringT::new(ring.mem.clone(), ring.size).expect("rx vring");
+            let vrings = vec![rx_vring, ring.vring.clone()];
+            let worker =
+                std::thread::spawn(move || backend.handle_event(1, EventSet::IN, &vrings, 0));
+            let until = Instant::now() + Duration::from_secs(5);
+            while !worker.is_finished() && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(
+                worker.is_finished(),
+                "handle_event must give up on a refused ring, not re-poll it forever while holding \
+                 the state mutex the net thread needs"
+            );
+            let outcome = worker.join().expect("the handler must not panic");
+            assert!(
+                outcome.is_ok(),
+                "a guest-refused ring must not become an Err out of handle_event, which the \
+                 framework's epoll loop treats as terminal: {outcome:?}"
+            );
+        }
+
+        // `smoltcp.rs:553`: the exit-event pair is reserved at bring-up, and what `exit_event` hands
+        // the framework is a handle on the SHARED kill event — which is what lets
+        // `SmoltcpProcess::Drop`'s `notify()` wake this connection's vring worker and
+        // `drain_exit_event` clear the counter between connections.
+        //
+        // RED on the inverse: an `arm_exit_event` that reserves nothing leaves the slot `None`
+        // (second assertion), and an `exit_event` that returns a FRESH eventfd pair instead of a
+        // clone leaves the shared observer unreadable (fourth assertion).
+        #[test]
+        fn exit_event_hands_out_a_handle_on_the_armed_shared_kill_event() {
+            let (consumer, notifier) = vmm_sys_util::event::new_event_consumer_and_notifier(
+                vmm_sys_util::event::EventFlag::NONBLOCK,
+            )
+            .expect("event pair");
+            // The worker loop's own third handle (`kill_evt_drain`), standing in as the observer.
+            let observer = consumer.try_clone().expect("clone consumer");
+            let mut backend = VhostUserNetBackend {
+                event_idx: false,
+                kill_evt: (consumer, notifier),
+                exit_evt: Mutex::new(None),
+                state: Arc::new(Mutex::new(empty_state(None))),
+            };
+
+            assert!(
+                backend.exit_evt.lock().expect("exit slot").is_none(),
+                "nothing is armed before bring-up"
+            );
+            backend.arm_exit_event().expect("arming must succeed");
+            assert!(
+                backend.exit_evt.lock().expect("exit slot").is_some(),
+                "arming must reserve the pair BEFORE the daemon exists — `exit_event` has no error \
+                 channel and its `None` wedges the daemon's own drop"
+            );
+
+            let (armed_consumer, armed_notifier) = backend
+                .exit_event(0)
+                .expect("an armed backend must hand out its pair");
+            armed_notifier.notify().expect("notify");
+            assert!(
+                observer.consume().is_ok(),
+                "the handed-out pair must be a handle on the shared kill event, not a fresh eventfd"
+            );
+            assert!(
+                armed_consumer.consume().is_err(),
+                "…and share its counter, which the observer just drained"
+            );
+
+            // The reservation is consumed once. A second worker thread (not this backend's shape
+            // today) falls back to a live clone rather than the `None` that cannot be recovered.
+            assert!(
+                backend.exit_event(0).is_some(),
+                "exit_event must never hand the framework a None"
+            );
+        }
+
+        /// A minimal backend for driving the vendored framework's own exit-event semantics, with
+        /// `exit_event` switchable. Not a fake of vmcell's backend: the claim under test is about
+        /// `vhost-user-backend`, so the probe must be as small as the trait allows.
+        struct ExitProbeBackend {
+            exit: Mutex<Option<(EventConsumer, EventNotifier)>>,
+        }
+
+        impl VhostUserBackendMut for ExitProbeBackend {
+            type Bitmap = ();
+            type Vring = VringMutex;
+
+            fn num_queues(&self) -> usize {
+                1
+            }
+
+            fn max_queue_size(&self) -> usize {
+                64
+            }
+
+            fn features(&self) -> u64 {
+                1 << VIRTIO_F_VERSION_1
+            }
+
+            fn protocol_features(&self) -> VhostUserProtocolFeatures {
+                VhostUserProtocolFeatures::empty()
+            }
+
+            fn set_event_idx(&mut self, _enabled: bool) {}
+
+            fn update_memory(
+                &mut self,
+                _mem: GuestMemoryAtomic<GuestMemoryMmap>,
+            ) -> std::io::Result<()> {
+                Ok(())
+            }
+
+            fn exit_event(&self, _thread_index: usize) -> Option<(EventConsumer, EventNotifier)> {
+                self.exit.lock().expect("exit slot").take()
+            }
+
+            fn handle_event(
+                &mut self,
+                _device_event: u16,
+                _evset: EventSet,
+                _vrings: &[VringMutex],
+                _thread_id: usize,
+            ) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        // The premise `arm_exit_event` rests on, pinned against the vendored framework instead of
+        // asserted in a comment — the pre-fix rustdoc claimed the opposite ("only forgoes the
+        // prompt-wakeup optimization … so teardown completes") and was wrong: with no exit event,
+        // `VringEpollHandler::new` registers no exit fd, `send_exit_event` is a no-op, `run` never
+        // breaks out of `epoll_wait`, and `VhostUserHandler::drop` joins that worker forever.
+        //
+        // This goes red the day the framework grows a fallback — at which point the arming's
+        // rationale (and its terminal-on-failure treatment) must be revisited, not silently kept.
+        // The absent-exit-event leg deliberately leaks its wedged worker: the drop cannot return,
+        // which is the whole point, and nextest runs each test in its own process.
+        #[test]
+        fn a_daemon_without_an_exit_event_cannot_join_its_vring_worker() {
+            fn drop_daemon_on_a_thread(
+                exit: Option<(EventConsumer, EventNotifier)>,
+            ) -> std::thread::JoinHandle<()> {
+                let backend = Arc::new(std::sync::RwLock::new(ExitProbeBackend {
+                    exit: Mutex::new(exit),
+                }));
+                let daemon = VhostUserDaemon::new(
+                    String::from("exit-probe"),
+                    backend,
+                    GuestMemoryAtomic::new(GuestMemoryMmap::new()),
+                )
+                .expect("daemon");
+                std::thread::spawn(move || drop(daemon))
+            }
+
+            // Positive control first: a daemon whose backend hands out an exit event is joinable.
+            let (consumer, notifier) = vmm_sys_util::event::new_event_consumer_and_notifier(
+                vmm_sys_util::event::EventFlag::NONBLOCK,
+            )
+            .expect("event pair");
+            let armed = drop_daemon_on_a_thread(Some((consumer, notifier)));
+            let until = Instant::now() + Duration::from_secs(5);
+            while !armed.is_finished() && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(
+                armed.is_finished(),
+                "a daemon whose worker has an exit fd must be droppable"
+            );
+            armed.join().expect("the armed drop must not panic");
+
+            // The inverse: `None` is not a graceful degradation, it is a teardown that never ends.
+            let wedged = drop_daemon_on_a_thread(None);
+            std::thread::sleep(Duration::from_millis(500));
+            assert!(
+                !wedged.is_finished(),
+                "the framework grew a fallback for a backend with no exit event; `arm_exit_event`'s \
+                 rationale must be re-derived rather than kept on a stale premise"
+            );
+        }
+
+        /// A scratch smoltcp interface, only for the `Context` [`TcpSocket::connect`] needs.
+        fn scratch_iface() -> Interface {
+            let state = Arc::new(Mutex::new(empty_state(None)));
+            let mut device = SmoltcpDevice {
+                state: state.lock().unwrap_or_else(|e| e.into_inner()),
+            };
+            Interface::new(
+                Config::new(HardwareAddress::Ethernet(EthernetAddress(HOST_NAT_MAC))),
+                &mut device,
+                // The glob-imported smoltcp clock, not the `std::time::Instant` shadowing it above.
+                smoltcp::time::Instant::now(),
+            )
+        }
+
+        /// Drives `handle`'s socket into the state an **accepted** connection leaves it in: open,
+        /// but no longer able to answer a SYN.
+        ///
+        /// A real claim is an inbound handshake, which would need a hand-built SYN frame through the
+        /// device; `connect` reaches the equivalent open-and-not-listening state (SYN-SENT), and the
+        /// question [`syn_already_served`] asks — `is_listening()` — is answered identically by
+        /// every claimed state. `abort` first, because `connect` refuses an already-open socket.
+        fn claim_socket(iface: &mut Interface, sockets: &mut SocketSet<'_>, handle: SocketHandle) {
+            let socket = sockets.get_mut::<TcpSocket>(handle);
+            socket.abort();
+            socket
+                .connect(
+                    iface.context(),
+                    (IpAddress::Ipv4(Ipv4Address::new(10, 200, 8, 2)), 80),
+                    smoltcp::wire::IpListenEndpoint {
+                        addr: Some(IpAddress::Ipv4(Ipv4Address::new(10, 200, 8, 1))),
+                        port: 49_152,
+                    },
+                )
+                .expect("a claimed socket");
+            assert!(socket.is_open(), "a claimed socket is still open");
+            assert!(!socket.is_listening(), "a claimed socket cannot accept");
+        }
+
+        /// Claims every still-listening mapping for `dst_port`, i.e. one full round of concurrent
+        /// guest connections landing on that destination.
+        fn claim_all_listeners(
+            iface: &mut Interface,
+            sockets: &mut SocketSet<'_>,
+            port_mappings: &[NatPortMapping],
+            dst_port: u16,
+        ) {
+            let handles: Vec<SocketHandle> = port_mappings
+                .iter()
+                .filter(|(p, _, h, _)| {
+                    *p == dst_port && sockets.get::<TcpSocket>(*h).is_listening()
+                })
+                .map(|(_, _, h, _)| *h)
+                .collect();
+            for handle in handles {
+                claim_socket(iface, sockets, handle);
+            }
+        }
+
+        // `smoltcp.rs:764`: transparent interception must not cap at SYN_BURST *concurrent*
+        // connections per destination.
+        //
+        // RED on the inverse (the shipped-until-now `is_open()` predicate): a claimed burst reads as
+        // "already handled", nothing grows, the pool stays at SYN_BURST — and in production the
+        // SYN_BURST+1-th connection's SYN is never answered at all.
+        #[test]
+        fn admit_syn_grows_when_a_destinations_whole_burst_is_claimed() {
+            let mut iface = scratch_iface();
+            let mut sockets = SocketSet::new(vec![]);
+            let mut port_mappings: Vec<NatPortMapping> = Vec::new();
+            let (dst, pxy) = (80u16, 6_000u16);
+
+            // A newly-seen destination arms one burst.
+            admit_syn(&mut sockets, &mut port_mappings, 0, dst, pxy, SYN_BURST);
+            assert_eq!(port_mappings.len(), SYN_BURST);
+            // While a listener is free, another SYN must NOT grow the pool — that is what the burst
+            // is for, and it is what keeps a SYN spray bounded.
+            admit_syn(&mut sockets, &mut port_mappings, 0, dst, pxy, SYN_BURST);
+            assert_eq!(
+                port_mappings.len(),
+                SYN_BURST,
+                "an unclaimed listener already serves the next SYN"
+            );
+
+            // Now every listener for that destination is claimed by a connection.
+            claim_all_listeners(&mut iface, &mut sockets, &port_mappings, dst);
+            admit_syn(&mut sockets, &mut port_mappings, 0, dst, pxy, SYN_BURST);
+            assert_eq!(
+                port_mappings.len(),
+                2 * SYN_BURST,
+                "the SYN_BURST+1-th concurrent connection to one destination must earn a listener"
+            );
+
+            // …and the NET-5 cap still binds when the spray is one destination rather than many:
+            // every round claims what it got, so growth is the only way out.
+            for _ in 0..(MAX_DYNAMIC_SOCKETS / SYN_BURST + 8) {
+                claim_all_listeners(&mut iface, &mut sockets, &port_mappings, dst);
+                admit_syn(&mut sockets, &mut port_mappings, 0, dst, pxy, SYN_BURST);
+            }
+            assert_eq!(
+                port_mappings.len(),
+                MAX_DYNAMIC_SOCKETS,
+                "per-destination growth must still stop at the dynamic pool cap"
+            );
+        }
+
+        // The other half of `syn_already_served`: a *permanent* forward-port mapping ends the
+        // question whatever state its socket is in. Buggy impl guarded: dropping the
+        // `idx < permanent_count` clause grows a dynamic mapping for a forwarded port, and that
+        // mapping dials the PROXY port instead of the port the configuration forwards to.
+        #[test]
+        fn a_forwarded_port_is_never_intercepted_even_when_its_pool_is_busy() {
+            let mut iface = scratch_iface();
+            let mut sockets = SocketSet::new(vec![]);
+            let mut port_mappings: Vec<NatPortMapping> = Vec::new();
+            let (fwd, pxy) = (8_080u16, 6_000u16);
+
+            // One permanent forward-port mapping, claimed (its whole pool busy).
+            let handle = sockets.add(new_tcp_socket());
+            port_mappings.push((fwd, fwd, handle, None));
+            let permanent_count = port_mappings.len();
+            claim_socket(&mut iface, &mut sockets, handle);
+            assert!(syn_already_served(
+                &sockets,
+                &port_mappings,
+                permanent_count,
+                fwd
+            ));
+
+            admit_syn(
+                &mut sockets,
+                &mut port_mappings,
+                permanent_count,
+                fwd,
+                pxy,
+                SYN_BURST,
+            );
+            assert_eq!(
+                port_mappings.len(),
+                permanent_count,
+                "a forwarded port must not grow a dynamic mapping that would dial the proxy \
+                 instead of its configured target"
+            );
+
+            // Positive control: a *different*, un-forwarded destination is still intercepted.
+            admit_syn(
+                &mut sockets,
+                &mut port_mappings,
+                permanent_count,
+                81,
+                pxy,
+                SYN_BURST,
+            );
+            assert_eq!(port_mappings.len(), permanent_count + SYN_BURST);
+        }
+    }
+
+    /// Call-site gates for the two NAT-worker claims no signature can force and no live daemon
+    /// makes observable — both about **where** a statement sits:
+    ///
+    /// * `smoltcp.rs:553`: the worker arms its exit event *before* it constructs the daemon that
+    ///   consumes it. By the time `VhostUserDaemon::new` has called `exit_event`, an unarmed backend
+    ///   has already fallen back to a live clone and looks identical — until the day that clone
+    ///   fails, which is the whole defect.
+    /// * Sibling 20: `handle_event` takes its state lock *inside* the drain loop, one per pass. A
+    ///   guard hoisted back out is invisible to every unit test (the drain it starves lives on
+    ///   another thread) and to any timing assertion worth shipping (`std::sync::Mutex` is unfair,
+    ///   so "the other thread got in" is a race, not a property).
+    ///
+    /// Both read this file's own production text, the shape `orchestrator.rs`'s `nat_plan_gate`
+    /// established, and share its limit: a scan sees spellings, not values.
+    #[cfg(test)]
+    mod exit_event_arming_gate {
+        const SOURCE: &str = include_str!("smoltcp.rs");
+
+        /// This file's production text: everything before the unit-test module, comment lines
+        /// dropped and whitespace collapsed (so a call split across rustfmt lines is still seen
+        /// whole, and a rustdoc mention of a spelling is not a call site).
+        fn production_code(source: &str) -> String {
+            let (production, _) = source
+                .split_once("mod tests {")
+                .expect("smoltcp.rs must carry its unit-test module marker");
+            production
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.starts_with("//"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+
+        /// Checks that `code` arms the exit event exactly once, before the one daemon construction.
+        /// `Err` names the specific violation — factored out so the test below can drive it against
+        /// buggy inputs (AGENTS.md rule 2).
+        fn arming_precedes_the_daemon(code: &str) -> Result<(), String> {
+            let daemon = code
+                .find("VhostUserDaemon::new(")
+                .ok_or("no `VhostUserDaemon::new(` call site")?;
+            let arms: Vec<usize> = code
+                .match_indices("arm_exit_event(")
+                // The definition is not a call site.
+                .filter(|&(at, _)| !code[..at].ends_with("fn "))
+                .map(|(at, _)| at)
+                .collect();
+            match arms.as_slice() {
+                [] => Err("the worker never arms an exit event".to_string()),
+                [at] if *at < daemon => Ok(()),
+                [_] => Err(
+                    "the arming follows the daemon construction; by then the framework has already \
+                     called `exit_event`"
+                        .to_string(),
+                ),
+                many => Err(format!(
+                    "expected exactly one arming call site; found {}",
+                    many.len()
+                )),
+            }
+        }
+
+        #[test]
+        fn the_shipped_worker_arms_before_it_constructs_a_daemon() {
+            let code = production_code(SOURCE);
+            assert!(
+                code.contains("VhostUserDaemon::new("),
+                "the gate must not pass vacuously on text it failed to find"
+            );
+            arming_precedes_the_daemon(&code).expect("the shipped worker must arm first");
+        }
+
+        /// Checks that `handle_event`'s body locks the shared state **inside** its drain loop: once
+        /// to latch the vrings, once per pass. Pre-fix there was a single lock, before the loop.
+        fn the_pass_takes_its_own_lock(handler_body: &str) -> Result<(), String> {
+            let drain_loop = handler_body
+                .find("loop {")
+                .ok_or("no drain loop in handle_event")?;
+            let locks: Vec<usize> = handler_body
+                .match_indices("self.state.lock()")
+                .map(|(at, _)| at)
+                .collect();
+            if !locks.iter().any(|at| *at > drain_loop) {
+                return Err(
+                    "the drain loop reuses a state guard taken outside it, so one kick can hold the \
+                     mutex the net thread needs for as long as the guest keeps feeding the ring"
+                        .to_string(),
+                );
+            }
+            if locks.len() != 2 {
+                return Err(format!(
+                    "expected exactly 2 state locks in handle_event (the vrings latch and the \
+                     per-pass one); found {}",
+                    locks.len()
+                ));
+            }
+            Ok(())
+        }
+
+        /// `handle_event`'s production body, from its signature to the end of the `impl` block.
+        fn handle_event_body(code: &str) -> String {
+            let at = code
+                .find("fn handle_event(")
+                .expect("smoltcp.rs must carry the backend's handle_event");
+            code[at..].to_string()
+        }
+
+        #[test]
+        fn the_drain_loop_locks_the_state_once_per_pass() {
+            let code = production_code(SOURCE);
+            let body = handle_event_body(&code);
+            assert!(
+                body.contains("process_tx_queue("),
+                "the gate must not pass vacuously on text it failed to find"
+            );
+            the_pass_takes_its_own_lock(&body).expect("the shipped handler locks per pass");
+        }
+
+        #[test]
+        fn the_gate_reddens_on_a_guard_hoisted_out_of_the_drain_loop() {
+            // The pre-fix shape: one guard, taken before the loop and used inside it.
+            assert!(
+                the_pass_takes_its_own_lock(
+                    "fn handle_event() { let mut state = self.state.lock(); loop { \
+                     Self::process_tx_queue(&mut state, &mut vring_state); } }"
+                )
+                .is_err(),
+                "a guard held across the drain loop must be caught"
+            );
+            // A latch plus a per-pass lock is the shipped shape.
+            assert!(
+                the_pass_takes_its_own_lock(
+                    "fn handle_event() { { let mut state = self.state.lock(); } loop { let pass = \
+                     { let mut state = self.state.lock(); Self::process_tx_queue(&mut state); }; } }"
+                )
+                .is_ok(),
+                "the correct shape must pass, or the gate is vacuous"
+            );
+            // A third lock is a shape nobody reviewed: fail loud rather than guess.
+            assert!(
+                the_pass_takes_its_own_lock(
+                    "fn handle_event() { let a = self.state.lock(); loop { let b = \
+                     self.state.lock(); let c = self.state.lock(); } }"
+                )
+                .is_err(),
+                "an unreviewed number of state locks must be caught"
+            );
+        }
+
+        #[test]
+        fn the_gate_reddens_on_a_worker_that_arms_late_or_not_at_all() {
+            assert!(
+                arming_precedes_the_daemon("let d = VhostUserDaemon::new( backend );").is_err(),
+                "a worker that never arms must be caught"
+            );
+            assert!(
+                arming_precedes_the_daemon(
+                    "let d = VhostUserDaemon::new( backend ); backend.arm_exit_event();"
+                )
+                .is_err(),
+                "arming after the daemon is constructed must be caught"
+            );
+            assert!(
+                arming_precedes_the_daemon(
+                    "backend.arm_exit_event(); let d = VhostUserDaemon::new( backend );"
+                )
+                .is_ok(),
+                "the correct order must pass, or the gate is vacuous"
+            );
         }
     }
 }

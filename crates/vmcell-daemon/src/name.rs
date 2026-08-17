@@ -12,11 +12,21 @@
 
 use std::path::{Path, PathBuf};
 
-/// The maximum artifact-name length in bytes — `NAME_MAX` (255 on most Linux filesystems), the
-/// ceiling for a single filename component `<name>` under the store dir (design §11.3, The artifact store). The store's
-/// atomic upload creates its temp file with an independent random name (`NamedTempFile::new_in`), so
-/// the artifact name may use the whole component budget without a temp-suffix overflow.
-pub const MAX_ARTIFACT_NAME_LEN: usize = 255;
+/// `NAME_MAX`: the kernel's ceiling on **one filename component** (255 bytes on every filesystem the
+/// store runs on). The budget every file the store writes for an artifact has to fit inside — which
+/// is why it is not itself the name ceiling; see [`MAX_ARTIFACT_NAME_LEN`].
+const NAME_MAX: usize = 255;
+
+/// The maximum artifact-name length in bytes: `NAME_MAX` **minus the digest-sidecar suffix**, because
+/// an accepted name has to fit twice — as `<name>` and as `<name>`[`SHA256_SIDECAR_SUFFIX`] (design
+/// §11.3, The artifact store).
+///
+/// A bare-`NAME_MAX` ceiling accepted a 249-byte name, persisted the artifact, and *then* failed its
+/// sidecar write with `ENAMETOOLONG` — a deterministic 500 on a well-formed request, and (before the
+/// rollback in `ArtifactStore::create`) a burned name in a create-only store (finding
+/// `sidecar-suffix-overruns-name-max`). The atomic upload's temp file carries an independent random
+/// name (`NamedTempFile::new_in`), so no *temp* suffix has to fit in this budget.
+pub const MAX_ARTIFACT_NAME_LEN: usize = NAME_MAX - SHA256_SIDECAR_SUFFIX.len();
 
 /// Why an artifact name was rejected. Carries the offending name for a clear operator message.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,7 +55,9 @@ impl std::fmt::Display for InvalidName {
             Self::Empty => write!(f, "artifact name must not be empty"),
             Self::TooLong => write!(
                 f,
-                "artifact name must be at most {MAX_ARTIFACT_NAME_LEN} bytes"
+                "artifact name must be at most {MAX_ARTIFACT_NAME_LEN} bytes \
+                 (NAME_MAX less the `{SHA256_SIDECAR_SUFFIX}` sidecar suffix, which the store writes \
+                  beside the artifact)"
             ),
             Self::DotOrDotDot => write!(f, "artifact name must not be `.` or `..`"),
             Self::LeadingDashOrDot => {
@@ -204,6 +216,38 @@ mod tests {
         let dir = Path::new("/store");
         assert!(resolve_artifact_path(dir, "../escape").is_err());
         assert!(resolve_artifact_path(dir, "ok").is_ok());
+    }
+
+    // The length ceiling leaves room for the digest sidecar: an accepted name has to fit as `<name>`
+    // AND as `<name>.sha256`, or a well-formed upload persists and then fails its sidecar write with
+    // ENAMETOOLONG — deterministic for 249–255 bytes (finding `sidecar-suffix-overruns-name-max`).
+    // RED on the inverse (`MAX_ARTIFACT_NAME_LEN = NAME_MAX`): the 249-byte name is accepted here and
+    // the store 500s on it (the store-side leg of this gate is
+    // `create_rejects_a_name_whose_sidecar_would_not_fit`).
+    #[test]
+    fn the_length_ceiling_leaves_room_for_the_digest_sidecar() {
+        let longest = "a".repeat(MAX_ARTIFACT_NAME_LEN);
+        assert!(
+            validate_artifact_name(&longest).is_ok(),
+            "the ceiling itself is accepted"
+        );
+        assert_eq!(
+            longest.len() + SHA256_SIDECAR_SUFFIX.len(),
+            NAME_MAX,
+            "the longest accepted name's sidecar lands exactly ON NAME_MAX — no byte over, none wasted"
+        );
+        // The first over-length name is the shortest one whose sidecar would not fit.
+        assert_eq!(
+            validate_artifact_name(&"a".repeat(MAX_ARTIFACT_NAME_LEN + 1)),
+            Err(InvalidName::TooLong)
+        );
+        assert!(
+            InvalidName::TooLong
+                .to_string()
+                .contains(SHA256_SIDECAR_SUFFIX),
+            "the operator message must say WHY the ceiling is short of NAME_MAX: {}",
+            InvalidName::TooLong
+        );
     }
 
     // The reserved digest-sidecar suffix is part of THE name law, so a caller cannot pick a weaker

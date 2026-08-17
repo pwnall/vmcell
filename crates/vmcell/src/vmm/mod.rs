@@ -241,6 +241,43 @@ pub(crate) fn per_vm_scratch_dir(prefix: &str, base: &Path, pid: u32, vmid: u32)
     base.join(crate::naming::scratch_dir_name(prefix, pid, vmid))
 }
 
+/// The **ancestor** vmid a restored VM's adopted host path is keyed on — the id whose scratch
+/// directory that path lives in (M9). `None` when the path is inside this VM's own `own_dir`, or is
+/// not a per-VM scratch path at all.
+///
+/// Firecracker's `PUT /snapshot/load` offers no override for the vsock UDS, so its restore re-binds
+/// the host path its snapshot baked, verbatim — and that path is a pure function of
+/// `(prefix, pid, ANCESTOR vmid)`. The restored VM therefore lives in
+/// `<prefix>-vm-<pid>-<ANCESTOR vmid>/` while the orchestrator hands it a *freshly allocated* vmid.
+/// Nothing reserved the ancestor's, so it was free for same-process reallocation — a later VM
+/// drawing it mints the very directory the restored VM is living in and deletes it on teardown
+/// (docs/90 M9). The orchestrator therefore reserves what this returns for the restored VM's
+/// lifetime.
+///
+/// Keyed on the path the backend *actually adopted*, not on the capability descriptor: the hazard is
+/// a live path outside the VM's own directory, whoever produced it. So CH (which rewrites the
+/// snapshot's `config.json` to this VM's own paths), QEMU (which rotates) and crosvm (whose
+/// non-rotating resource is the baked guest *CID*, not a host path — it spawns into its own scratch
+/// dir) all return `None` without a per-backend branch.
+///
+/// The layout is spelled **once**, in [`crate::naming::scratch_dir_name`]: the two trailing numeric
+/// tokens are read as the candidate `(pid, vmid)` and accepted only if the forward composer
+/// reproduces the directory name byte-for-byte, so this inverse cannot drift from it. A foreign pid
+/// still counts — vmids are claimed host-globally, and the pid in a path is no promise about which
+/// process will next hold that id.
+#[must_use]
+pub(crate) fn adopted_scratch_vmid(prefix: &str, own_dir: &Path, adopted: &Path) -> Option<u32> {
+    let dir = adopted.parent()?;
+    if dir == own_dir {
+        return None;
+    }
+    let name = dir.file_name()?.to_str()?;
+    let mut tail = name.rsplitn(3, '-');
+    let vmid: u32 = tail.next()?.parse().ok()?;
+    let pid: u32 = tail.next()?.parse().ok()?;
+    (crate::naming::scratch_dir_name(prefix, pid, vmid) == name).then_some(vmid)
+}
+
 impl VmTempDir {
     /// Creates the per-VM temporary directory `<temp>/<prefix>-vm-{pid}-{vmid}/` and returns a guard
     /// that removes it on drop. `prefix` is the VM's [`resource_prefix`](crate::config::VmConfig).
@@ -287,6 +324,22 @@ pub(crate) fn remove_vm_tmp_dir(dir: &Path) {
     }
 }
 
+/// The NUL-terminated netns path [`build_vmm_cmd`]'s `pre_exec` hands to `open(2)`, composed
+/// **pre-fork**.
+///
+/// A different *shape* of the netns-layout law, not a second copy of it: the post-fork window may not
+/// allocate, so `open` needs a C string, and `crate::net::tap::netns_path` yields a `PathBuf`. This
+/// converts one into the other on the parent side, where allocating is free, so the directory a VMM
+/// is exec'd into is by construction the one the datapath binds its taps in.
+///
+/// Named (rather than inlined in the closure's capture) so the composition has something to be
+/// gate-able from: `netns_open_path_composes_from_the_layout_law` recomputes it through the law, so a
+/// `format!` that re-spells the layout inline reddens even where it produces the same bytes today.
+fn netns_open_path(netns_name: &str) -> String {
+    // `display()` is lossless here: the layout is ASCII and the name comes from `crate::naming`.
+    format!("{}\0", crate::net::tap::netns_path(netns_name).display())
+}
+
 /// Builds a Tokio command for the VMM, handling network namespaces, the jailer-equivalent
 /// pre-exec hardening (design §12.3, Layer 2 — the jailer-equivalent (JailSpec + apply_jail)), and process groups.
 ///
@@ -306,9 +359,10 @@ pub fn build_vmm_cmd(
     use std::os::unix::process::CommandExt;
     std_cmd.process_group(0);
 
-    // Pre-allocate the NUL-terminated netns path (or empty) BEFORE the closure, so nothing
-    // allocates in the post-fork window.
-    let netns_path: Option<String> = netns_name.map(|n| format!("/var/run/netns/{n}\0"));
+    // Pre-allocate the NUL-terminated netns path (or nothing) BEFORE the closure, so nothing
+    // allocates in the post-fork window. Both of `netns_open_path`'s allocations — the `PathBuf` the
+    // layout law composes and this `String` — happen on this side of the fork.
+    let netns_path: Option<String> = netns_name.map(netns_open_path);
     let jail = jail.clone();
 
     let pre_exec = move || -> std::io::Result<()> {
@@ -1318,6 +1372,23 @@ pub trait VmInstance: Send {
     /// [`guest_cid`](VmInstance::guest_cid): a snapshot-eligible QEMU on the in-kernel
     /// `vhost-vsock-pci` device (§2.4, QEMU q35 — the fallback and most-proven nester), and crosvm
     /// on **every** path (its vsock is in-kernel unconditionally, §2.5, crosvm — the fourth backend (v29, boot-first)).
+    ///
+    /// **The default's port is [`STEWARD_VSOCK_PORT`], which is not necessarily the cell's declared
+    /// one** ([`steward_port`](crate::config::StewardPlacement::steward_port), law C8's first
+    /// question). It stands here as a placeholder because the *instance* has no view of the config:
+    /// `MicroVm::steward` and `MicroVm::connect_sessions` re-key the port per call
+    /// (`.with_port(..)`), so on a `Service { port: 5100 }` cell every dial that goes through them is
+    /// correct however this default reads.
+    ///
+    /// The one consumer that does **not** re-key is
+    /// [`verify_control_plane`](VmInstance::verify_control_plane), which probes the endpoint it finds
+    /// verbatim. An implementor overriding that probe must therefore return the **declared** port
+    /// here — carry the placement into the instance, the way `vmcell-qemu`'s `steward_endpoint` does
+    /// — or its health gate dials 5000 at a cell listening on 5100, spends the whole probe budget
+    /// against a bridge that never answers a dead port, and re-spawns a healthy VM to exhaustion
+    /// (docs/90 M1, the shipped defect). Leaving the default in place is safe only while the probe
+    /// stays the no-op default. The workspace-wide baked-port scan in `crate::config`'s C8 gate pins
+    /// this as one of the three sites that may bake the constant at all.
     fn vsock_endpoint(&self) -> VsockEndpoint {
         VsockEndpoint::Unix {
             path: self.vsock_path().to_path_buf(),
@@ -1346,6 +1417,19 @@ pub trait VmInstance: Send {
     ///
     /// `budget` bounds the probe; a healthy transport answers well before it, so a
     /// healthy boot pays only its real connect latency, not the whole budget.
+    ///
+    /// **This probe is handed no port, so an implementor dials
+    /// [`vsock_endpoint`](VmInstance::vsock_endpoint) verbatim — and that endpoint's port is
+    /// whatever the instance put there, which for the trait default is [`STEWARD_VSOCK_PORT`] and
+    /// not the cell's declared
+    /// [`steward_port`](crate::config::StewardPlacement::steward_port).** Unlike `MicroVm::steward`
+    /// and `MicroVm::connect_sessions`, which re-key the port per call (`.with_port(..)`), there is
+    /// nowhere for the declared port to enter here. So an override must probe an endpoint whose port
+    /// is already the declared one: `vmcell-qemu` builds its instance endpoint from the placement for
+    /// exactly this reason, after the baked 5000 killed and re-spawned healthy `Service { port: 5100 }`
+    /// cells to exhaustion (docs/90 M1). Threading the resolved endpoint in as a parameter would make
+    /// the trap unrepresentable, and is a breaking change to this trait — recorded as the structural
+    /// option rather than done silently.
     ///
     /// # Errors
     /// Returns an error if the control plane is not confirmed live within `budget`.
@@ -1393,6 +1477,14 @@ pub struct FakeVmm {
     /// Control-plane probe counter shared with every instance this fake creates, so
     /// [`FaultMenu::wedge_control_plane_for`] spans the respawns that each build a fresh instance.
     pub control_plane_probes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// The host vsock path a **restored** instance reports, modelling a backend that re-binds the
+    /// path its snapshot baked instead of rotating to a fresh one — the Firecracker shape (M9).
+    /// `None` (default) = the fake's own path, i.e. a backend whose restore names this VM's own
+    /// paths, like the CH it otherwise stands in for.
+    ///
+    /// Only `restore` honors it; `create` always reports the fake's own path, because a cold boot
+    /// adopts nothing.
+    pub restored_vsock_path: Option<PathBuf>,
 }
 
 impl FakeVmm {
@@ -1401,6 +1493,16 @@ impl FakeVmm {
     pub fn with_faults(faults: FaultMenu) -> Self {
         Self {
             faults,
+            ..Self::default()
+        }
+    }
+
+    /// A fake backend whose `restore` adopts `path` as its host vsock path instead of naming this
+    /// VM's own — Firecracker's verbatim baked-path rebind (M9).
+    #[must_use]
+    pub fn adopting_baked_vsock(path: impl Into<PathBuf>) -> Self {
+        Self {
+            restored_vsock_path: Some(path.into()),
             ..Self::default()
         }
     }
@@ -1416,6 +1518,16 @@ impl FakeVmm {
             faults: self.faults.clone(),
             control_plane_probes: self.control_plane_probes.clone(),
         }
+    }
+
+    /// The instance a `restore` yields: [`Self::instance`], with the baked host vsock path adopted
+    /// when this fake was built to model a non-rotating backend.
+    fn restored_instance(&self) -> FakeVmInstance {
+        let mut instance = self.instance();
+        if let Some(baked) = &self.restored_vsock_path {
+            instance.vsock_path = baked.clone();
+        }
+        instance
     }
 }
 
@@ -1470,7 +1582,7 @@ impl Vmm for FakeVmm {
                 "scripted restore failure (FakeVmm fault menu)".into(),
             ));
         }
-        Ok(self.instance())
+        Ok(self.restored_instance())
     }
 
     fn capabilities(&self) -> VmmCapabilities {
@@ -1603,6 +1715,295 @@ impl Drop for FakeVmInstance {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    // The netns-layout law's fourth shape (docs/90 `net/tap.rs:27`): `build_vmm_cmd` used to spell
+    // `/var/run/netns/{n}\0` itself, so the directory a VMM was exec'd into and the one the datapath
+    // bound its taps in were two independent facts. The judge is `net::tap::netns_path` — the law —
+    // recomputed here, so re-inlining the literal reddens this even while it still happens to
+    // produce the same bytes; `net::tap::netns_layout_gate` is the other half, scanning for the
+    // literal's return.
+    #[test]
+    fn netns_open_path_composes_from_the_layout_law() {
+        let composed = netns_open_path("vmcell-net-7");
+        assert_eq!(
+            composed.strip_suffix('\0'),
+            Some(
+                crate::net::tap::netns_path("vmcell-net-7")
+                    .to_str()
+                    .expect("the layout and a `naming`-composed netns name are both UTF-8")
+            ),
+            "the pre-fork C string must be the law's path plus a terminator, nothing else"
+        );
+        // Exactly one NUL, at the end: `open(2)` reads to the first one, so a stray earlier
+        // terminator would silently open a PREFIX of the namespace path.
+        assert_eq!(composed.matches('\0').count(), 1);
+        assert!(composed.ends_with('\0'));
+        // A segment namespace is the same composition — the sweep and the members share one layout.
+        assert_eq!(
+            netns_open_path("vmcell-seg-3").strip_suffix('\0'),
+            crate::net::tap::netns_path("vmcell-seg-3").to_str()
+        );
+    }
+
+    // M9, the law's half: which vmid a restored VM's ADOPTED host path is keyed on. A non-rotating
+    // backend re-binds the vsock UDS its snapshot baked, so the restored VM lives in the ancestor
+    // vmid's scratch dir while holding a fresh vmid of its own — and the ancestor's was free for
+    // reallocation. The inverse of each arm below is a real defect: returning `Some` for the VM's
+    // own directory reserves a second id per restore forever, and returning `None` for a foreign
+    // directory is the finding itself.
+    #[test]
+    fn adopted_scratch_vmid_names_the_ancestor_and_only_a_real_scratch_path() {
+        let base = std::path::Path::new("/tmp");
+        let own = per_vm_scratch_dir("vmcell", base, 4242, 9);
+
+        // The FC shape: the snapshot's baked path, in the ANCESTOR's directory.
+        let baked = per_vm_scratch_dir("vmcell", base, 4242, 5).join("vsock.sock");
+        assert_eq!(adopted_scratch_vmid("vmcell", &own, &baked), Some(5));
+
+        // A foreign pid still counts: vmids are claimed host-globally, and the pid in a path is no
+        // promise about which process will next hold that id.
+        let other_pid = per_vm_scratch_dir("vmcell", base, 777, 5).join("vsock.sock");
+        assert_eq!(adopted_scratch_vmid("vmcell", &own, &other_pid), Some(5));
+
+        // This VM's OWN path (CH rewrites the snapshot config to it; QEMU rotates to it) reserves
+        // nothing — it is already covered by the VM's own vmid guard.
+        assert_eq!(
+            adopted_scratch_vmid("vmcell", &own, &own.join("vsock.sock")),
+            None
+        );
+
+        // Not a per-VM scratch path at all: a different prefix's tree, a non-numeric tail, and a
+        // bare file in the temp dir. Reserving an id off any of these would be arbitrary.
+        assert_eq!(
+            adopted_scratch_vmid(
+                "vmcell",
+                &own,
+                &per_vm_scratch_dir("other", base, 4242, 5).join("vsock.sock")
+            ),
+            None
+        );
+        assert_eq!(
+            adopted_scratch_vmid(
+                "vmcell",
+                &own,
+                std::path::Path::new("/tmp/vmcell-vm-a-b/v.sock")
+            ),
+            None
+        );
+        assert_eq!(
+            adopted_scratch_vmid("vmcell", &own, std::path::Path::new("/tmp/fake-vsock")),
+            None
+        );
+
+        // The inverse is the forward composer, so a prefix that itself contains the `-vm-<n>-<n>`
+        // shape cannot be mis-parsed into somebody else's id.
+        let tricky_own = per_vm_scratch_dir("my-vm-9", base, 4242, 9);
+        let tricky = per_vm_scratch_dir("my-vm-9", base, 4242, 5).join("vsock.sock");
+        assert_eq!(
+            adopted_scratch_vmid("my-vm-9", &tricky_own, &tricky),
+            Some(5)
+        );
+        assert_eq!(adopted_scratch_vmid("vmcell", &tricky_own, &tricky), None);
+    }
+
+    // M9, the CALL-SITE half — the one that actually reddens on the shipped defect (AGENTS.md: "a
+    // gate binds the call sites, not just the extracted predicate"). A restore whose backend adopted
+    // the ancestor's baked path must hold that ancestor's vmid for the restored VM's whole lifetime,
+    // or a later VM draws it, `VmTempDir::create`s the very directory the restored VM is living in,
+    // and removes it on teardown. KVM-free: the fake models the verbatim rebind, and `FakeVmm` is
+    // filesystem-blind, so this asserts on the ALLOCATOR — which is exactly where the identity lives.
+    //
+    // Red on the inverse: drop the `adopt_lineage` call from `restore_inner` (or hand it
+    // `res.vmid`) and the "cannot be reallocated" assert fails; drop the release from
+    // `VmidGuard::drop` and the post-drop assert fails.
+    #[tokio::test]
+    async fn a_restore_holds_the_ancestor_vmid_its_adopted_paths_are_keyed_on() {
+        const OWN: u32 = 9;
+        const ANCESTOR: u32 = 5;
+
+        let baked = per_vm_scratch_dir(
+            "vmcell",
+            &std::env::temp_dir(),
+            std::process::id(),
+            ANCESTOR,
+        )
+        .join("vsock.sock");
+        let vmm = FakeVmm::adopting_baked_vsock(&baked);
+        let env = crate::env::HostEnv::for_unit_tests();
+        let cfg = crate::config::VmConfig::builder(
+            PathBuf::from("/vmlinux"),
+            crate::config::RootfsSource::Erofs {
+                image: PathBuf::from("/rootfs.erofs"),
+            },
+        )
+        // Pinned so the fresh vmid is never the ancestor's by luck — that would make every
+        // assertion below vacuously true.
+        .vmid(OWN)
+        .network_disabled()
+        .build()
+        .expect("valid config");
+
+        // Precondition: the ancestor's id is free, so the refusal below is about this restore.
+        env.vmids
+            .reserve(ANCESTOR)
+            .expect("precondition: the ancestor vmid is free");
+        env.vmids.release(ANCESTOR);
+
+        let vm = crate::MicroVm::restore(&vmm, std::path::Path::new("/tmp/fake-snap"), cfg, &env)
+            .await
+            .expect("the fake restore must succeed");
+
+        assert!(
+            env.vmids.reserve(ANCESTOR).is_err(),
+            "the ancestor vmid {ANCESTOR} must not be reallocatable while a restore is living in \
+             its scratch directory"
+        );
+        // Non-vacuity: the restored VM's own id is a DIFFERENT one, so the refusal above is the
+        // lineage reservation and not just the VM's own guard.
+        assert!(
+            env.vmids.reserve(OWN).is_err(),
+            "the restored VM's own vmid is held too"
+        );
+        assert_ne!(OWN, ANCESTOR);
+
+        // …and the reservation is a lease, not a leak: teardown returns BOTH ids.
+        drop(vm);
+        assert_eq!(
+            env.vmids.reserve(ANCESTOR).expect("ancestor released"),
+            ANCESTOR
+        );
+        assert_eq!(env.vmids.reserve(OWN).expect("own vmid released"), OWN);
+    }
+
+    // The boundary case between the two legs above: a snapshot taken by ANOTHER process whose VM
+    // held the very id this restore drew. The adopted directory is a different one (`<prefix>-vm-<other
+    // pid>-<id>`), so the law names an ancestor — but this guard already holds that id, and
+    // `reserve` reports our own claim as a conflict. Left unhandled, one restore in 254 fails with a
+    // spurious "vmid in use".
+    // Red on the inverse: make `adopt_lineage`'s conflict arm a refusal — the shape this fix
+    // deliberately did NOT take, because an already-claimed id already satisfies the invariant — and
+    // the restore below fails with `Exhaustion`.
+    #[tokio::test]
+    async fn a_restore_whose_ancestor_id_is_its_own_is_not_refused() {
+        const OWN: u32 = 13;
+
+        // Same vmid, a foreign pid — the shape a cross-process snapshot restore hits.
+        let baked =
+            per_vm_scratch_dir("vmcell", &std::env::temp_dir(), 424_242, OWN).join("vsock.sock");
+        let vmm = FakeVmm::adopting_baked_vsock(&baked);
+        let env = crate::env::HostEnv::for_unit_tests();
+        let cfg = crate::config::VmConfig::builder(
+            PathBuf::from("/vmlinux"),
+            crate::config::RootfsSource::Erofs {
+                image: PathBuf::from("/rootfs.erofs"),
+            },
+        )
+        .vmid(OWN)
+        .network_disabled()
+        .build()
+        .expect("valid config");
+
+        let vm = crate::MicroVm::restore(&vmm, std::path::Path::new("/tmp/fake-snap"), cfg, &env)
+            .await
+            .expect("a restore whose ancestor id is the id it drew must not be refused");
+
+        // Precondition of the whole test: the law DID name an ancestor here, so this is not passing
+        // because nothing was adopted.
+        let own_dir = per_vm_scratch_dir("vmcell", &std::env::temp_dir(), std::process::id(), OWN);
+        assert_eq!(adopted_scratch_vmid("vmcell", &own_dir, &baked), Some(OWN));
+
+        // And the id is held exactly once, so the single `release` on drop returns it.
+        drop(vm);
+        assert_eq!(env.vmids.reserve(OWN).expect("own vmid released"), OWN);
+    }
+
+    // The shape the LIVE restore suites actually run: the caller holds the source VM's vmid across
+    // the restore on purpose, to force the restored VM onto a different one
+    // (`snapshot_restore.rs`/`extra_block.rs` both do). The ancestor's id is therefore already out of
+    // the pool — which is the whole property M9's reservation buys — so the restore must proceed, and
+    // must NOT take ownership of a claim it did not make.
+    // Red on the inverse, both ways: make the conflict arm a refusal and the restore fails; set
+    // `self.lineage = Some(ancestor)` on it and the post-drop assert fails, because teardown hands
+    // somebody else's identity back to the pool — a worse defect than the one being fixed.
+    #[tokio::test]
+    async fn a_restore_does_not_release_an_ancestor_claim_it_never_took() {
+        const OWN: u32 = 21;
+        const ANCESTOR: u32 = 22;
+
+        let baked = per_vm_scratch_dir(
+            "vmcell",
+            &std::env::temp_dir(),
+            std::process::id(),
+            ANCESTOR,
+        )
+        .join("vsock.sock");
+        let vmm = FakeVmm::adopting_baked_vsock(&baked);
+        let env = crate::env::HostEnv::for_unit_tests();
+        let cfg = crate::config::VmConfig::builder(
+            PathBuf::from("/vmlinux"),
+            crate::config::RootfsSource::Erofs {
+                image: PathBuf::from("/rootfs.erofs"),
+            },
+        )
+        .vmid(OWN)
+        .network_disabled()
+        .build()
+        .expect("valid config");
+
+        // The caller's own hold on the ancestor's id, taken BEFORE the restore.
+        env.vmids
+            .reserve(ANCESTOR)
+            .expect("the caller reserves the source vmid to force rotation");
+
+        let vm = crate::MicroVm::restore(&vmm, std::path::Path::new("/tmp/fake-snap"), cfg, &env)
+            .await
+            .expect("a restore whose ancestor id is already claimed must not be refused");
+
+        // The teardown releases only what this VM took: the caller's claim survives it.
+        drop(vm);
+        assert!(
+            env.vmids.reserve(ANCESTOR).is_err(),
+            "the caller's claim on vmid {ANCESTOR} must survive the restored VM's teardown"
+        );
+        assert_eq!(env.vmids.reserve(OWN).expect("own vmid released"), OWN);
+    }
+
+    // The other half of the same law at the same call site: a ROTATING backend (the default fake,
+    // standing in for CH, whose restore rewrites the snapshot config to this VM's own paths) must
+    // reserve NOTHING extra. Without this, "reserve the ancestor" could be implemented as "reserve
+    // something on every restore", quietly halving the id space.
+    #[tokio::test]
+    async fn a_rotating_backend_restore_holds_only_its_own_vmid() {
+        const OWN: u32 = 11;
+
+        let vmm = FakeVmm::default();
+        let env = crate::env::HostEnv::for_unit_tests();
+        let cfg = crate::config::VmConfig::builder(
+            PathBuf::from("/vmlinux"),
+            crate::config::RootfsSource::Erofs {
+                image: PathBuf::from("/rootfs.erofs"),
+            },
+        )
+        .vmid(OWN)
+        .network_disabled()
+        .build()
+        .expect("valid config");
+
+        let vm = crate::MicroVm::restore(&vmm, std::path::Path::new("/tmp/fake-snap"), cfg, &env)
+            .await
+            .expect("the fake restore must succeed");
+
+        // Every id except this VM's own is still available: 254 ids, one held.
+        let held: Vec<u32> = (1..=254)
+            .filter(|id| env.vmids.reserve(*id).is_err())
+            .collect();
+        assert_eq!(
+            held,
+            vec![OWN],
+            "a rotating backend's restore must hold exactly its own vmid"
+        );
+        drop(vm);
+    }
 
     // Guards E3: the per-VM temp dir (serial.log + lock + stale sockets) must be
     // removed on teardown, not just the vsock socket. The inverse — a teardown
@@ -2458,6 +2859,59 @@ mod tests {
             assert!(
                 comment.contains(&krate),
                 "the manifest's composition-root comment omits `{krate}`: {comment}"
+            );
+        }
+    }
+
+    // GATE (docs/90 `m1`, the trap half) — the seam that produced M1 is a *pair* of items: the
+    // `vsock_endpoint` trait default bakes `STEWARD_VSOCK_PORT`, and `verify_control_plane` is handed
+    // no port and so dials that endpoint verbatim. Every re-keying consumer (`MicroVm::steward`,
+    // `connect_sessions`) hid the mismatch, so the next backend to override the probe walks into it
+    // again unless both docs *say* the baked port is not the declared one. `config`'s
+    // `no_crate_bakes_the_steward_port_outside_the_justified_sites` pins the code side across the
+    // workspace; this pins the warning that makes the pinned site legible.
+    //
+    // Needles are real identifiers, not prose, so a rename of the law reddens this rather than
+    // quietly leaving a doc that names something gone. Red-on-inverse: drop any one needle from
+    // either block (e.g. the `steward_port` mention from `vsock_endpoint`'s doc) and this fails
+    // naming that block and that needle.
+    #[test]
+    fn both_halves_of_the_baked_port_seam_document_that_it_is_not_the_declared_port() {
+        const SOURCE: &str = include_str!("mod.rs");
+
+        // The port the default bakes, the declared-port law it is not, and — per item — the other
+        // half of the seam, so neither doc can describe the hazard without pointing at its partner.
+        let blocks: [(&str, String, [&str; 3]); 2] = [
+            (
+                "`VmInstance::vsock_endpoint`",
+                doc_block_before(SOURCE, "    fn vsock_endpoint(&self) -> VsockEndpoint {"),
+                ["STEWARD_VSOCK_PORT", "steward_port", "verify_control_plane"],
+            ),
+            (
+                "`VmInstance::verify_control_plane`",
+                doc_block_before(SOURCE, "    async fn verify_control_plane("),
+                ["STEWARD_VSOCK_PORT", "steward_port", "vsock_endpoint"],
+            ),
+        ];
+        for (what, doc, needles) in &blocks {
+            for needle in needles {
+                assert!(
+                    doc.contains(needle),
+                    "{what}'s rustdoc must name `{needle}`: the baked default port and the declared \
+                     one are different facts, and a probe that dials the endpoint verbatim is how \
+                     M1 destroyed and re-spawned healthy `Service` cells"
+                );
+            }
+        }
+
+        // Non-vacuity of the needles themselves: `steward_port` is a substring of nothing else here,
+        // but `vsock_endpoint` would also match the *anchor* text if `doc_block_before` ever returned
+        // the item line. It does not — assert the extraction is doc only.
+        for (what, doc, _) in &blocks {
+            assert!(
+                !doc.contains("fn vsock_endpoint(&self)") && !doc.contains("async fn"),
+                "{what}'s extracted block leaked its item signature, so the needles above could \
+                 match code instead of prose"
             );
         }
     }

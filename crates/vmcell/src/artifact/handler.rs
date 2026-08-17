@@ -37,15 +37,44 @@ pub fn handler_pin_key(label: Option<&str>, sub_key: &str) -> String {
 /// The [`crate::artifact::StageOutputs`] **artifact-map key** a handler producer registers its
 /// binary under: `"guest_tools"` for the default, `"guest_tools-<label>"` for a labelled one.
 ///
-/// The default keeps the pre-v33 key on purpose — the rootfs pack tail reads
-/// `inputs.artifacts["guest_tools"]`, and a rename would be a break with no benefit. The kind is
-/// `handler` in the schema and `guest_tools` on the artifact map; that is one fact with two
-/// audiences, not two facts.
+/// The default keeps the pre-v33 key on purpose — every pre-v33 reader of the artifact map spells it
+/// `guest_tools`, and a rename would be a break with no benefit. The kind is `handler` in the schema
+/// and `guest_tools` on the artifact map; that is one fact with two audiences, not two facts.
+///
+/// **Both sides read through this composer**, and that is the whole point: the rootfs pack tail asks
+/// it which binary to bake (via [`crate::artifact::rootfs::PackOptions::handler_key`]) and
+/// `GuestToolsStage` asks it which key to publish under. While the tail spelled the default key as a
+/// literal instead, a labelled handler was published under `guest_tools-<label>` and read as absent —
+/// so the image shipped with no multicall binary and no applet symlinks at all, and the build
+/// reported success.
 #[must_use]
 pub fn handler_artifact_key(label: Option<&str>) -> String {
     match label {
         Some(l) => format!("guest_tools-{l}"),
         None => "guest_tools".to_string(),
+    }
+}
+
+/// The inverse of [`handler_artifact_key`]: the registry label an artifact-map key names, or `None`
+/// when `key` is not a handler artifact at all.
+///
+/// Beside the law it inverts, and for the reason [`handler_label_from_filename`] lives beside
+/// [`handler_filename`]: two functions reading the same string are two laws that drift. The rootfs
+/// pack tail asks it "does this artifact map hold a handler I was not told to bake?", which is the
+/// only way to tell a pipeline that published `guest_tools-acme` for a pack declaring no label from
+/// one that legitimately built no handler at all — a distinction that used to be invisible, and that
+/// silently shipped an image with no applets in it.
+///
+/// **Not** the filename inverse: an artifact-map key keeps the label's dots
+/// (`guest_tools-12.4`) because a key is never a path, while [`handler_filename_suffix`] sanitizes
+/// them — so a shared implementation would have to pick one of the two and be wrong for the other.
+/// The bare `guest_tools` is the default and returns `None`, exactly as `handler_artifact_key`'s
+/// `None` composes it.
+#[must_use]
+pub fn handler_label_from_artifact_key(key: &str) -> Option<&str> {
+    match key.strip_prefix("guest_tools-") {
+        Some(label) if !label.is_empty() => Some(label),
+        _ => None,
     }
 }
 

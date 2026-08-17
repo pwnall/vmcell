@@ -38,6 +38,28 @@ printed **READY**. Every suite was run on this host during the review:
 blessing — which surfaced finding G9. The working tree was clean before and after the review; the
 only files this pass changes are this document and `docs/implementation-notes.md`.
 
+**Post-review correction (2026-08-17).** Two rows of that table have been overtaken, and both were
+*findings* rather than mismeasurements:
+
+- The doctest row's "**no gate runs it**" is closed. `just test-doc`
+  (`cargo test --locked --workspace --all-features --doc`) is invoked by `just ci` and by `ci.yml`'s
+  `test-unit` job, and the count is **7**, not 6 — the seventh is the `proxy::doubles` module example
+  that arrived with E1's re-exports.
+- The `just ci` row's figures (1142 tests, 19 gate self-tests) predate the fix pass and are not
+  restated here, because the recipe is the number's source: `just test-unit` prints the test count and
+  the gate roster is whatever `just gates` invokes. Both moved substantially — the fix pass added four
+  test files, several batteries and six gate scripts.
+
+Every other row stands as measured. It is the record of this review's own run, not a claim about the
+tree today.
+
+**Status: CLOSED (2026-08-17).** Every finding below has been worked; **§11, Resolution** records the
+per-finding outcome — fixed, fixed-with-a-deviation, or partly open — against the tree, and §10's
+closing subsection records the one thing this review's own method could not see. The findings
+themselves are left exactly as written: they are the record of what was found. Where the tree has
+since falsified a statement *inside* a finding, the correction is marked **Post-review correction**
+beside it rather than edited in silently.
+
 **Verdict.** The tree is in strong shape and its disciplines hold where it claims them: all thirty
 one-law predicates `AGENTS.md` names exist, every `VmConfig` field is read on a production path, the
 `Error` enum has no dead variant, the NAT's six silent-wedge invariants are each implemented as
@@ -462,6 +484,10 @@ nextest's own documentation prescribes exactly this pairing. It runs in about a 
 The second-order value is larger than the first: with doctests gated, adding worked examples to the
 public API becomes safe, and the library's front door badly needs them (D11).
 
+**Post-review correction.** The measured six is now **seven**: E1's fix added a `proxy::doubles`
+module example, and `just test-doc` — the recipe `just ci` and `ci.yml` both invoke — runs the set
+workspace-wide, which is what reaches the validator's `kconfig` example as well as `vmcell`'s six.
+
 ### G2 — three `#[ignore]`d live tests in `vmcell-bench` are selected by no recipe and no CI job
 `crates/vmcell-bench/tests/benchmark.rs:101,122,144` · `justfile:152,167,175,200,219,256,285`
 
@@ -541,6 +567,27 @@ scan asserts `out.len() > 500`).
 other four use, and add an empty-tree leg to each self-test so the fix itself can go red. Also worth
 noting: `ban-uncolored-cargo-parse.sh` ignores its directory argument entirely (it scans the
 `justfile` and workflows regardless), which is correct for its job but means its argument is inert.
+
+**Post-review correction.** The finding was right and its table was short. Sweeping it, measured the
+same way (hand each script a directory with no Rust sources), turned up three things this section did
+not say:
+
+- The table lists twelve scripts. A **ninth** vacuously-green one was not on it —
+  `ban-test-support-in-production.sh` — and its roster form was the worst of the set: one real tree
+  plus one mistyped tree scanned only the real one and still printed green.
+- Two of the scripts carried a **second** vacuous arm the empty-directory probe cannot see: an
+  explicitly-passed *missing* directory was also reported `ok`.
+- The closing note's premise about `ban-uncolored-cargo-parse.sh` is inaccurate. That script does not
+  ignore its argument: it takes a roster of **files** and defaults to the repo's gate-bearing ones. The
+  real defect was one step down — a non-regular-file argument (a directory, or a missing path) was
+  swallowed by the per-file `[[ -f ]]` guard and reported as `ok (1 files; …)`, so a caller who
+  believed a tree had been scanned had had nothing opened. That is the accepted-but-ignored (F1) shape,
+  and it is a hard error now.
+
+All nineteen `scripts/ban-*.sh` fail loudly on a zero-file scan today, each with an empty-tree leg in
+its own self-test; `ban-legacy-terms.sh`'s odd `exit 2` folded to 1 after its callers were checked.
+The rule earned a line in `AGENTS.md` under "one law, one predicate", which is where the next
+source-scanning ban will read it.
 
 ### G5 — the C8 gate's second assertion is structurally unfailable
 `crates/vmcell/src/config.rs:4646-4651`
@@ -1100,3 +1147,195 @@ hold:
   certified the older binary.
 - **Multi-host, aarch64 and non-Debian guests** are out of scope by design.
 - **The `Service` post-restore question** stays unmeasured, as §17 records; nothing here changes that.
+
+### The one thing this method missed: CI had been red for three commits, and running every suite locally is why
+
+*Added 2026-08-17, in the review's own voice, because "green locally" is exactly the evidence class
+the method above rests on.*
+
+`ci` on GitHub had been **failing since `3e8d658`** — three commits before this review was written —
+on `test-unit` and `test-integration` (`lint` and `example-downstream` were green throughout). It was
+still failing at `c276da7`, the commit this review reads, and at `aaf5f4c`, the commit this review
+*is*. The §"Live validation" table above says READY and green because every suite in it ran **on this
+host**, and the defect is a property of the *other* host:
+
+- `mkfs.ext4 -d <tarball>` — the form delta 8's ext4 producer is built on — landed in **e2fsprogs
+  1.47.1**. This box has 1.47.2; GitHub's `ubuntu-24.04` image packages **1.47.0**, and apt cannot
+  supply newer at any pin.
+- Delta 8's producer battery treated the tool as `Priority: required` and **panicked** on a failed
+  probe rather than recording a capability skip. The package is required everywhere vmcell builds; the
+  *version* is not — and one patch release is the whole gap.
+- So four tests failed on every CI run, each retried four times by the integration profile, while
+  every local run of the same suites passed. A permanently-red job is a job nobody reads, which is
+  worse than a skip.
+
+Two things follow, and both are corrections to method rather than to a finding:
+
+1. **A locally-executed suite is evidence about this host, not about CI.** AGENTS rule 5 says to
+   execute rather than presume, and this pass did — every row of the table above, all green. What it
+   did not do is look at the last CI run, which is the one observation that costs nothing and was the
+   only one that could have seen this. A review that runs the suites should read the workflow's own
+   history in the same breath; "the suites are green here" and "the gates are green" are different
+   claims.
+2. **A host-facility probe is a capability boundary, and it belongs to §7.2's vocabulary, not to an
+   assumption about package priority.** This is finding G3's class — the delta-8 skip shape — arriving
+   from the opposite direction: G3 found a *silent green* where a skip should have been recorded, and
+   this found a *hard panic* in the same battery for the same missing facility. One `probe()`, three
+   answers, three different call-site policies. The review reported the first and could not see the
+   second, because on this host the probe succeeds.
+
+Closed in the fix pass, both halves, so the normal outcome is that the battery runs:
+`crates/vmcell/tests/{ext4_producer,ext4_cell,repack_outside_checkout}.rs` all ask the one law,
+`common::probe_ext4_or_record_skip`, which records `SKIP cloud-hypervisor ext4_producer` to
+`VMCELL_SKIP_MANIFEST` and returns `None` (a *broken* facility still panics, §7.2 rule 3); and
+`.github/workflows/ci.yml` builds a pinned, checksum-verified e2fsprogs 1.47.2 from source, non-gating,
+in every job that runs those legs — with `ci_obtains_the_ext4_facility_rather_than_living_with_the_skip`
+as that step's gate and `every_ext4_battery_asks_the_one_law` as the call-site scan that keeps a fourth
+answer from appearing.
+
+---
+
+## 11. Resolution (post-review)
+
+*Written 2026-08-17, after the fix pass. Status per finding id, derived from the tree rather than from
+a summary: each row names the file that proves it, so a reader can check the claim without trusting
+this table.* Statuses: **fixed**; **fixed (deviation)** where the shipped fix deliberately departs
+from the finding's own *Fix:* line; **partly open** where a remainder stands; and **design edit** (see
+below). Every
+deviation's reasoning is at its call site and in `docs/implementation-notes.md`; this table names the
+deviation in a clause and does not re-argue it.
+
+A fourth label, **design edit**, marks the findings whose whole fix is a sentence in
+`docs/83-claude-fable-design-v33.md`. That document is not this one's to change and is reissued on its
+own cadence, so those rows deliberately record *what the sentence must say* rather than whether it says
+it yet — a claim that stays checkable against the design at any time, by anyone, with a grep. Every one
+is a **body-sentence** edit inside an existing section; none may be fixed by renumbering a heading,
+because `scripts/ban-dangling-design-ref.sh` resolves 2058 `§`/`Appendix` references under
+`crates/*/src` against those headings and `scripts/check-docs-pointers.sh` does the same for the root
+markdown. The same list is in `docs/todo.md`, per finding id, so it retires as the reissue folds it in.
+
+### 1. Major — correctness
+
+| id | Status | What landed, and where it can be checked |
+|---|---|---|
+| H1 | fixed | The pack tail *and* `cache_key`'s consumed fold read one composer, `PackOptions::handler_key()` = `handler_artifact_key(self.handler_label)` — `crates/vmcell/src/artifact/rootfs/mod.rs`, where the fold is now `let consumed: [&str; 2] = ["steward", handler_key.as_str()]` and `OCI_ROOTFS_STAGE_VERSION` is bumped for the key move. `--handler-label` normalizes through `registry_label` beside the rootfs one, `crates/vmcell-cli/src/main.rs`. Delta 6b's deferred live leg exists: `crates/vmcell/tests/handler_cell.rs` boots a registered handler and has *its own* applet answer in-guest, with `curl`'s `ENOENT` proving the emitted symlinks came from the entry's roster rather than the const. |
+| H2 | fixed | `oci::build_rootfs_with` calls the general tail, `crates/vmcell/src/artifact/rootfs/oci.rs`. Its gate is the registry-driven leg at that seam, `the_oci_stage_packs_through_the_general_tail_so_an_ext4_label_builds`, which discriminates on **every** host — a real ext4 superblock where the producer exists, §4.7's typed `CapabilityUnavailable` where it does not, and the door's `Error::Artifact` is neither — with an erofs positive control on the same layers. |
+| M1 | fixed | QEMU composes one endpoint through `steward_endpoint(params, vsock_path, placement)`, taking `placement.steward_port()`; `crates/vmcell-qemu/src/lib.rs`. The C8 scan's "cannot see a backend crate" blind spot is closed at the workspace instead of per backend: `no_crate_bakes_the_steward_port_outside_the_justified_sites` (`crates/vmcell/src/config.rs`) walks every crate's production text and allows `STEWARD_VSOCK_PORT` only at its justified sites, with non-vacuity anchors; and `crates/vmcell/src/vmm/mod.rs` pins the *pair* of rustdoc blocks (`vsock_endpoint`'s baked default and `verify_control_plane`'s probe) to name each other, so the next backend to override the probe reads the warning. |
+| M2 | fixed (deviation) | `control_plane_probe_budget(placement)` is the one selector and `start()`'s single probe is *scanned* for passing exactly that expression — `crates/vmcell/src/orchestrator.rs`, `mod probe_budget_gate`, which also pins `CONTROL_PLANE_PROBE_BUDGET` to exactly two mentions so a second policy site cannot appear. Two deviations from the *Fix:* line, both argued at the site: `Service` takes `DEFAULT_STEWARD_CONNECT_BUDGET` (the caller's connect-budget **default**, since `Timeouts` carries no connect field and `start()` sees no per-call window), rather than a window threaded through `start()`; and the budget stays **per attempt**, a narrowing of §3.5's "overall window" wording that keeps the re-spawn loop's QEMU bring-up recovery intact. |
+| M3 | fixed | Two independent layers in `crates/vmcell/src/config.rs`: `is_cmdline_unsafe_char` rejects `"` outright at every cmdline-encoded input surface, and `normalize_cmdline_key` strips a leading quote so the predicate answers about the token the *kernel* reads. This closes the `config.rs:1915` sibling (a `"` in a share tag or `guest_path` swallowing every later token) under the same law, and the fuzz oracle moved with the predicate — `fuzz/fuzz_targets/kernel_cmdline_args.rs`. |
+| M4 | fixed | The walk depth is derived, never a literal: `crate::metrics::vm_slice_scan_depth(&self.cgroup.slice_name)` in `HostOrphanScanner::scan_cgroup_slices`, `crates/vmcell/src/orchestrator.rs`, with a systemd-user-session-depth leg and a flat-tree leg (red on restoring the `4`). |
+| M5 | fixed | The euid short-circuit is gone. `blessing_verdict(euid, effective, need)` decides on the **effective** set unconditionally and the euid only selects *which* remediation to print; `crates/vmcell-privilege/src/lib.rs`. |
+| M6 | fixed | `destroy` marks the slot `Destroying` **in place** and removes it from the table only after the handle lock is held, so the delete-in-use scan sees the pin for the whole write; `crates/vmcell-daemon/src/registry.rs`. |
+| M7 | fixed | A ring the guest broke ends the tick and re-arms the kick — `TxPass::Unreadable`, never an `Err` the vendored epoll loop treats as terminal; `crates/vmcell/src/net/smoltcp.rs`. Sibling 20 landed in the same pass: one state lock per pass, released between passes, so the drain the queue is being filled for is no longer starved. |
+| M8 | fixed | Setup failure is `ProbeOutcome::NotRun` → `CheckStatus::Unverified`, never `DoesNotWork`; `crates/vmcell-artifact-validator/src/conformance.rs`, with the unbootable-candidate leg asserting `Unverified` where the pre-fix path earned `Pass`. |
+| M9 | fixed | `adopt_lineage(ancestor)` reserves the ancestor's vmid for the restored VM's lifetime and releases it on drop, keyed off `crate::vmm::adopted_scratch_vmid`; `crates/vmcell/src/orchestrator.rs`. A same-id/different-pid ancestor is handled ahead of the reserve. |
+| M10 | fixed | With H1 — `registry_label` on `--handler-label`, `crates/vmcell-cli/src/main.rs`. |
+
+### The "Remaining confirmed findings" table
+
+| Row | Status | What landed |
+|---|---|---|
+| `orchestrator.rs:2133` | fixed | `teardown_post_instance`'s rustdoc now states the tail order the body executes, `crates/vmcell/src/orchestrator.rs`. |
+| `orchestrator.rs:2217` | fixed | The post-ack-floor comment names the real bound (`vmm::unix_api_request`'s `CONTROL_REQUEST_TIMEOUT`, *longer* than the shipped grace), and a stalled-RPC leg asserts ≥1 post-ack poll. |
+| `config.rs:1915` | fixed | Under M3's one law — `"` is refused at the share-tag and `guest_path` surfaces too. |
+| `config.rs:1888` | fixed | `host_services_port: Some(0)` is refused at `build()` naming the bind wildcard, `crates/vmcell/src/config.rs`. |
+| `config.rs:1719` | fixed | The kernel path is checked for absoluteness like every other host path (`"kernel … must be an absolute path"`), with existence still deliberately unchecked. |
+| `cloud_hypervisor.rs:926` | fixed | A timed-out `vm.pause` still issues `vm.resume` and refuses to snapshot a guest whose pause is unproven; the third exit path has its own ordered-paths leg. |
+| `vmcell-firecracker:789` | fixed | **Post-review correction to the row's own text:** the fix is not just the probe. The T2 probe now composes through `firecracker_launch_plan` — the same `LaunchPlan` every real boot gets — *and* the M11 source gate was **widened**: it grew a third ban on a hand-rolled spawner, the route its two existing bans (no local `JailSpec`, no VMM command outside the plan) structurally could not see. The row said the gate does not see it; the gate now does. |
+| `vmcell-crosvm:833` | fixed | `the_baked_cid_sidecar_round_trips_and_both_error_arms_are_typed` — the bare-decimal format contract, the trailing-newline tolerance, and both error branches, KVM-free. |
+| `vmcell-qemu:1017` | fixed | Both "restore reuses the baked CID" comments are gone; the file's prose matches the shipped rotating-CID behavior. |
+| `smoltcp.rs:553` | fixed | The exit-event pair is reserved at bring-up (`arm_exit_event`) so `exit_event` cannot fail into a `None` that hangs `drop(vu_daemon)` forever, and the framework premise is pinned rather than asserted in prose. |
+| `smoltcp.rs:764` | fixed | `admit_syn` no longer short-circuits on `has_open`; the `SYN_BURST + 1`-th concurrent connection to one destination earns a listener, bounded by `MAX_DYNAMIC_SOCKETS`. |
+| `net/tap.rs:27` | fixed | All four production sites compose from `netns_path`/`netns_dir`, and the claim is gated: `netns_layout_gate` plus the new `scripts/ban-inline-netns-path.sh` and its self-test. |
+| `steward/mod.rs:842` | fixed | `reconnect_endpoint` is the transport-generic recovery (`redial` is the one shared body); `reconnect` stays as the AF_UNIX coordinate wrapper and now **fails loud** on an AF_VSOCK client, naming `reconnect_endpoint`. |
+| `vmcell-steward/serve.rs:432` | fixed | Law C3's teardown has one owner — the registry ticket's own drop — so a panicking connection thread cannot deregister without tearing its sessions down. |
+| `vmcell-steward/run.rs:263` | fixed | Service-mode shutdown sweeps live one-shot `exec` children *then* interactive sessions, through the same ordered helper the other two shutdown paths use. |
+| `vmcell-steward/tests.rs:1005` | fixed | Split into two legs that each fail on their own inverse: `…_between_bind_retries` and `…_parked_in_poll`. |
+| `vmcell-cli:690,738` | fixed | `rootfs_bundle_candidates` composes each candidate through the key/filename laws from the recorded registration (so the declared format wins over whatever is present), and always includes the default artifact the filename walk cannot see. |
+| `vmcell-cli:906` | fixed (deviation) | Honored-or-rejected, resolved as **rejected**: `reject_unbakeable_handler_for_mmdebstrap` refuses an entry declaring its own `applets` beside a workspace build rather than silently dropping the roster. The clause is unreachable today by construction, and its premise carries its own gate (`the default handler must declare no applets`) so it becomes reachable loudly. |
+| `vmcell-cli:80` | fixed | `--release` beside `--rootfs-source oci` is refused naming both, keyed on the **raw** flag so the default is applied at the one arm that consumes it — the omitted spelling and `--release trixie` compose the identical stage and cache key. |
+| `daemon-client:215` | fixed | `validate_path_segment` runs on every verb before any `Url::join`, with a source-scan gate that reddens if a new verb joins a caller string directly; `crates/vmcell-daemon-client/src/lib.rs`. |
+| `artifact_store.rs:114` | fixed (deviation) | A failed sidecar write is now a fail-loud 500 that **keeps the name taken** rather than rolling the artifact back — the rollback the finding implies would delete a payload whose digest is unknown. Stated at the site (`"cannot roll back an artifact whose sidecar write failed; the name stays taken"`); `crates/vmcell-daemon/src/artifact_store.rs`. |
+| `registry.rs:316` | fixed | The VM is torn down whenever the exec itself failed, not only under `ephemeral`, so no running VM is left whose id the caller never received — with a non-ephemeral working-exec positive control. |
+| `conformance.rs:633` | fixed (deviation) | The dead `fill_unrecorded` tail is **deleted** rather than repaired, and the property it claimed is gated where it actually lives: `the_battery_reports_its_whole_roster_whatever_is_declared`, red on a `battery_inner` arm that skips a feature instead of judging it. |
+| `bridge/deadline_tests.rs:47` | fixed | The `|| budget >= BROKER_VM_CALL_BUDGET` escape clause is gone; the margin assertion is unconditional and both branches of the `max` are driven (840/841 straddle the crossover). |
+| `guest-tools:1738,1676` | fixed | A truncated body fails loud as curl 56 rather than becoming an empty body with exit 0, and a malformed proxy env var is a **rejection** naming the variable rather than a warning that sends the request direct; `crates/vmcell-guest-tools/src/main.rs`. |
+| `metrics.rs:222` | fixed | `ENODEV` joins `EINVAL` as a rejected **value**, so a bad `io.max` device is `Error::Cgroup` and not a delegation remediation; `crates/vmcell/src/metrics.rs`. |
+| `fs.rs:380` | fixed | The local `1000` is gone: `socket_wait_budget` reads `crate::vmm::VMM_SOCKET_READY_TIMEOUT_MS`, and the coupling its doc asserts is pinned by a test. |
+| `justfile:577` | fixed | `just ci` invokes `{{just_executable()}} test-unit`, and the class is gated one level in by the new `scripts/ban-recipe-body-handcopy.sh`, which reads bodies back through `just --show` and fails if `ci` or `ci.yml` restates another recipe's lines. |
+
+### 2. Gates that cannot go red
+
+| id | Status | What landed |
+|---|---|---|
+| G1 | fixed | `just test-doc` (`cargo test --locked --workspace --all-features --doc`), invoked by `just ci` and by `ci.yml`'s `test-unit` job as a recipe call rather than a copied cargo line. Seven doctests today. |
+| G2 | fixed | `just test-bench` — `-p vmcell-bench --run-ignored all --no-tests=fail` through the blessed runner, called from `ci.yml`'s kvm job under a delegated scope. Its argument is a features list defaulting to `cloud-hypervisor,firecracker,qemu`, so the crosvm leg is never compiled where there is no binary, and a list omitting `cloud-hypervisor` is refused up front rather than failing inside a test. |
+| G3 | fixed | All three ext4 batteries ask one law, `common::probe_ext4_or_record_skip` in `crates/vmcell/tests/common/mod.rs`, which records the skip to `VMCELL_SKIP_MANIFEST` before returning `None`; `every_ext4_battery_asks_the_one_law` is the call-site scan that keeps a fourth answer from appearing. That scan is why the fix is wider than the finding: `ext4_producer.rs`, the third file in the same delta-8 battery, answered the *same* absent facility with a hard **panic** — which is what had CI red. See §10's closing subsection. |
+| G4 | fixed | Measured the same way the finding was — hand each script a directory with no Rust sources — every one of the nineteen `scripts/ban-*.sh` now refuses a scan it cannot perform: `gate misconfigured`, non-zero exit, and an empty-tree leg in its own self-test. See the post-review correction under the finding for the three things its table did not say. |
+| G5 | fixed | The third assertion reads the **definition**: `fn_body(SELF_SOURCE, "pub const fn resync_reachable(self) -> bool")` is asserted not to mention `steward_port`, with a shape check so a failed extraction cannot pass silently; `crates/vmcell/src/config.rs`. |
+| G6 | fixed | `ch_memory_payload_couples_ksm_mergeable_to_unshared_memory` asserts the composed CH memory payload for both values of `ksm_mergeable`, KVM-free — and the arm was lifted out of `create()` into a named composer so `ksm` appears in the file's test text at all; `crates/vmcell/src/vmm/cloud_hypervisor.rs`. |
+| G7 | fixed | Both halves. The spelling half is compile-time: `vmcell_protocol::STEWARD_ACCEPT_POLL` / `STEWARD_REBIND_IDLE` are one `TuningToken` definition each side reads. The unfalsifiability half is `crates/vmcell/tests/guest_tuning.rs`, which boots a cell with a non-default re-bind window and counts the **distinct socket inodes** PID 1 creates — a measured cadence read out of `/proc/1/fd`, with no guest-side code added, because the steward logs at `info` and the guest has no `RUST_LOG`. |
+| G8 | fixed | The example workspace's overlay now carries `rootfs.acme` (digest-pinned, `"xattrs": "preserve"`, a hand-declared `features` stance) and `handlers.acme` (registered by digest, with its own applet roster), and `tests/contract.rs` exercises `XattrPolicy`, `PackOptions`, `feature_manifest_path`, `run_battery`, `ConformanceOptions`, `DEFAULT_BATTERY_BUDGET` and `CheckStatus`. The README's sweeping claim is now scoped: four rows are consumed only as far as a network-free, KVM-free job reaches, and `src/lib.rs`'s table says which and why. |
+| G9 | fixed | `scripts/review-preflight-priv.sh` decides freshness **cargo-free** — sha256 against the `.blessed` stamp plus `find -newer` over the runner's in-tree source closure — and maps stale onto the existing BLOCKED-ON-BLESS exit. `--check-runner` is the one home of that predicate, shared with `bless`. |
+
+### 3. Contract surface and the ledger
+
+| id | Status | What landed |
+|---|---|---|
+| C1 | fixed + design edit | The ledger line exists — `crates/vmcell/Cargo.toml`'s 0.19 → 0.20 entry names `pack_rootfs_with_injection` as "the one a consumer of §10.4's list must act on", records that it was ledgered late, and points at `docs/implementation-notes.md` for the split's justification. `README.md`'s copy of the list names it too. **Design edit:** §10.4's own list must name the tail beside `pack_erofs_with_injection`, which is now the erofs-only door onto it. |
+| C2 | fixed | The chain is contiguous — `0.8 → 0.9` and `0.9 → 0.10` are written — and the mechanism is gated: `crates/vmcell/tests/contract_ledger.rs` reddens on a gap, a duplicate, or a chain that stops short of `version`, for both contract crates, and its header says plainly what it cannot check (content, not shape). |
+| C3 | design edit | `build_labelled_rootfs` / `build_labelled_handler` do not exist and are not going to; the `RootfsStage::labelled` / `GuestToolsStage::labelled` constructors are the decision, recorded in `docs/implementation-notes.md`. **Design edit:** §10.4's "labelled build entry points" and §10.5's "where selection lives" must name the constructors plus the `vmcell build --rootfs-label / --handler-label` verbs. |
+| C4 | fixed | `README.md`'s list is reconciled with §10.4 and `AGENTS.md`: the registry namespaces, the feature-manifest sidecar, `XattrPolicy`, `CheckStatus`'s five states, and `pack_rootfs_with_injection` beside its erofs-only door — with the shipped `&PackOptions` signature named. |
+| C5 | design edit | The scoping is right — `battery_budget` belongs to `run_battery`, and `ValidationOptions` still carries only `level`. **Design edit:** §17 must scope delta 3's closure to the conformance battery and keep `validate()`'s missing overall wall-clock budget on the register. |
+
+### 4. Documentation
+
+| id | Status | What landed |
+|---|---|---|
+| D1 | fixed | All seven prose sites state the shipped derivation, including the four public rustdoc ones; `crates/vmcell/src/config.rs`'s `VmConfig::init` doc is now explicit that the field decides init **identity only**, and that `Service` beside a custom init *keeps* the control plane. The class is closed, not just the instance: the C8 gate grew a second reader over the same two files — `production_comment_blocks` sees the prose with code stripped, and `no_production_prose_asserts_the_retired_init_derivation` reddens on a comment block that asserts the retired conflation, with its own predicate driven against both the retired and the shipped sentences. |
+| D2 | fixed | The served OpenAPI names `design §11`; `crates/vmcell-daemon/src/openapi.rs`. The class is gated tree-wide by two new scripts, `scripts/ban-dangling-design-ref.sh` (every `§` and `Appendix` under `crates/*/src`) and `scripts/check-docs-pointers.sh` (root markdown + `docs/*.md`), which is a wider fix than the finding asked for. |
+| D3 | fixed | `#![forbid(unsafe_code)]` is on `crates/vmcell/src/naming.rs`, and the §15.2 roster is now **gated against the design that states it** rather than trusted. |
+| D4 | fixed (deviation) | Taken the second way the finding offered: the stale rosters and the 29/29 figure are **deleted**, not corrected — `README.md` points at `vmcell_protocol::GUEST_TOOLS_APPLETS` and the `justfile` comment points at the recipe that produces the number, per AGENTS.md's pointer-over-figure rule. |
+| D5 | fixed | The CODE fix, not the doc one: `HostCapabilities` carries the nested-virt read and `HostDeclaration::probe` derives the host axis from that one descriptor, so §7.4's sentence and §7.2's one-probe law are both true; `crates/vmcell/src/feature.rs`. |
+| D6 | design edit | The code states the two-method law correctly at every site. **Design edit:** §9.3's annotation on `VmConfig::steward_placement` and §18 delta 4's *What* line must name **both** `steward_port()` and `resync_reachable()`, matching §13 and §8.1. |
+| D7 | design edit | **Design edit:** §2.2's "every control RPC over the API socket is bounded at 5 s" needs one clause for the deliberate exception — the snapshot RPC scales with guest RAM through `vmm::snapshot_request_timeout(mem_mib)`. |
+| D8 | open | The `tar2erofs` xattr "accepted limitation" entry in `docs/implementation-notes.md`, past its own retirement condition. Owned by that document's own pass, not rewritten from here. |
+| D9 | design edit | **Design edit:** §15.4, §4.7's two mentions and delta 7's gate line must name the shipped pair, `pax_xattrs_are_stripped_under_the_default_policy` / `pax_xattrs_are_preserved_under_the_preserve_policy`, in place of `test_pax_xattrs_are_not_preserved`. |
+| D10 | design edit | The authority is shipped and stated: `RootfsSource::root_device_read_only` is the one law, and the 0.19 → 0.20 ledger entry records the behavior and the data-plane evidence. **Design edit:** the two sites beyond the one already in `docs/implementation-notes.md` must stop advertising `RootfsSource::Block` as a writable root, and the notes entry must widen so the next reissue does not fix one and leave two. |
+| D11 | partly open | The gate exists (G1) and one example arrived with E1's re-exports, on the `proxy::doubles` seam. Still no Rust code block in `README.md`, none in `crates/vmcell/src/lib.rs`'s crate doc, and none on `Stage`, `Pipeline`, `pack_rootfs_with_injection`, `PackOptions`, `run_battery` or `DaemonClient`. The lowest-cost work available is still available. |
+
+### 5. Testing coverage
+
+| id | Status | What landed |
+|---|---|---|
+| T1 | fixed | `crates/vmcell/tests/metrics_limits.rs` gained the two legs the finding named to close first — a 25 % `cpu_max_pct` quota measured against `cpu.stat` (sharing "the load" with the unthrottled leg) and a `pids_max` leg asserting `pids.events max > 0` — plus the sharp one: `io_max` with a `major:minor` naming no block device must be **refused loudly**, with the same config minus the limit as the positive control. That leg records honestly that its kernel-`ENODEV` arm is dead on a default systemd user session, where `io` is not delegated. |
+| T2 | partly open | Two of four closed: `console_mode` under T3, the tuning channel under G7. `ksm_mergeable` is now covered KVM-free at the composed CH payload (G6) rather than in a boot, which is what G6's own *Fix:* line asked for. Still never live-booted: both non-default `RestoreMode`s, and the `Timeouts::low_latency()` preset as such — `guest_tuning.rs` boots a non-default profile, which is what removes the unfalsifiability, not the preset. |
+| T3 | fixed | `crates/vmcell/tests/nested_virt.rs` boots `ConsoleMode::VirtioConsole` and asserts on the data plane: the guest's active console is `hvc0` and a guest-written marker reaches the file, with `require_cap!` making the Firecracker skip honest and the four-backend descriptor pin beside it. |
+| T4 | fixed | `crates/vmcell/tests/extra_block.rs` gained the `iops` half as a matrix leg — `IOPS_READS` direct 4 K reads against a capped disk and an uncapped baseline in the same VM — with crosvm's absent rate limiter recorded as a capability skip. |
+| T5 | fixed | `snapshot_eligible` has a KVM-free unit test in `crates/vmcell-daemon/src/dto.rs` pinning it to exactly the net modes with no vhost-user device, and the daemon's refusal has its own leg in `crates/vmcell-daemon/src/registry.rs` with both positive controls. |
+| T6 | fixed | `crates/vmcell/tests/vmm_confinement.rs` — a real Cloud Hypervisor process, after `apply_jail` *and* after CH's own start-up, read out of `/proc/<pid>/status`: `NoNewPrivs`, a loaded seccomp filter, the ambient set the backend needs, with a `VmmSeccomp::Disabled` boot as the red-on-inverse control. |
+
+### 6–7. API clarity, extension points
+
+| id | Status | What landed |
+|---|---|---|
+| A1 | fixed (deviation) | The cheaper half, deliberately: `Cache`'s rustdoc now says what the type is — no fields, no methods, nothing about a hit or a miss travelling through the handle, `Cache::default()` the only value worth constructing — and the parameter stays, because `Pipeline` is contract surface. Dropping it remains a ledgerable option, not a defect. |
+| A2 | fixed + design edit | `vmcell-cli::ch_bin()` calls `vmcell::artifact::ch_binary_path()`, and the class is gated by the new `scripts/ban-ch-binary-resolver-copies.sh` plus its self-test — more than the finding asked for, since the review had already found this copy twice. **Design edit:** §17's consolidation entry must re-scope its inventory to what is actually left, now that the CLI copy is gone. |
+| E1 | fixed + design edit | `crates/vmcell/src/proxy/doubles.rs` re-exports `hudsucker` and `hyper`, so a consumer names one version, and the seam gained the worked example that is also a doctest. **Design edit:** §10.4's list must carry both re-exports, so a bump inside vmcell is ledgered rather than discovered — `cargo semver-checks` cannot see it, the aliases' shape being unchanged. The larger fix (vmcell-owned request/response types) stays deferred as the finding recommended. |
+
+### 8. The "recorded as justified rather than fixed" list
+
+Items 1–3 stand: the shipped shapes are still the right ones and what the entries carry is the
+reasoning the design lines (C1, C3, C5) still owe. Three have been overtaken by the fix pass, and the
+entries should be read as the record of a decision rather than as a live limitation:
+
+- **Item 4** (the enumerated live-coverage gap) narrowed: T1's `cpu_max_pct` and `pids_max`, T3's
+  `VirtioConsole`, T4's `iops` and T5's `snapshot_eligible` are covered now. What remains recorded is
+  listed in `docs/todo.md`: both non-default `RestoreMode`s, `Timeouts::low_latency()` as a preset, and
+  the `io_max` leg's kernel-refusal arm, which is dead on a host that does not delegate `io`.
+- **Item 5 no longer applies.** The guest tuning-token channel is falsifiable: one `TuningToken`
+  definition per token in `vmcell-protocol`, and a live leg that measures the honored cadence (G7).
+- **Item 6 no longer applies as scoped.** `review-preflight-priv.sh` decides blessing freshness itself
+  now, cargo-free, and maps stale onto BLOCKED-ON-BLESS (G9). The recorded *scope* of its READY verdict
+  was the thing the fix changed.
+

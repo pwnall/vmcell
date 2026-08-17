@@ -85,16 +85,30 @@ pub struct VmConfig {
     /// key is reserved or starts with `vmcell_`, or that is not a single whitespace-
     /// free token. Default empty.
     pub extra_kernel_args: Vec<String>,
-    /// Optional `init=` override (§5.3, The kernel command line). `None` boots the vmcell steward as
-    /// PID 1 (the vsock control plane). `Some(path)` boots a **custom PID 1**, which
-    /// **replaces the steward** — so the VM has no control plane
-    /// ([`crate::orchestrator::MicroVm::steward`] fails loud) and cannot snapshot
-    /// ([`VmConfigBuilder::build`] rejects
-    /// `snapshotting` + a custom init, since the post-restore resync needs the steward).
-    /// Observe such a VM via the serial log, a writable extra disk/share, or
-    /// networking. A custom init also loses the steward's tmpfs overlay over the RO
-    /// erofs root, so it usually pairs with a writable rootfs or extra disk. Default
-    /// `None`.
+    /// Optional `init=` override — **init identity only** (§5.3, The kernel command line; invariant C8).
+    ///
+    /// `None` boots the vmcell steward as PID 1; `Some(path)` boots that path as PID 1 instead.
+    /// This field decides *which binary is PID 1* and **nothing else**: whether the cell has a
+    /// control plane, and whether it may snapshot, are the two questions [`StewardPlacement`]
+    /// answers ([`steward_port`](StewardPlacement::steward_port) and
+    /// [`resync_reachable`](StewardPlacement::resync_reachable)). So
+    /// [`StewardPlacement::Service`] beside a custom init **keeps** the control plane —
+    /// [`crate::orchestrator::MicroVm::steward`], sessions and `exec` all work, which is the
+    /// composition v33 delta 4 exists to make expressible — while [`StewardPlacement::None`] has
+    /// no control plane whether or not an init is named. Pre-v33 the two facts were one, and a
+    /// custom init cost the whole control plane; the only pair [`VmConfigBuilder::build`] still
+    /// refuses is [`StewardPlacement::Pid1`] beside a custom init, because the kernel cannot start
+    /// the steward as PID 1 if `init=` names something else.
+    ///
+    /// [`Self::steward_placement`] is **derived** from this field when the caller declares none
+    /// (`None` → `Pid1`, `Some` → `StewardPlacement::None`), which is what preserves every pre-v33
+    /// caller's semantics — including snapshot ineligibility, since a derived
+    /// `StewardPlacement::None` is not [`resync_reachable`](StewardPlacement::resync_reachable).
+    ///
+    /// A custom PID 1 also takes over the guest-side assembly the steward would have done: no
+    /// tmpfs overlay over the read-only erofs root (so it usually pairs with a writable rootfs or
+    /// extra disk) and no share mounting. Validated at `build()` as a single absolute cmdline
+    /// token — no whitespace, no control character, no `"`. Default `None`.
     pub init: Option<PathBuf>,
     /// The VMM subprocess's own seccomp-BPF confinement (design §12.2, Layer 1 — the VMM's own seccomp filter). Default
     /// [`VmmSeccomp::Enforcing`] runs each backend under its audited native filter
@@ -339,10 +353,18 @@ pub struct Timeouts {
     /// `has_exited`, so this bounds only a guest that never exits on its own).
     /// The `Drop` force-kill path does not use this.
     pub shutdown_grace: std::time::Duration,
-    /// Guest (emitted on the cmdline): non-blocking accept poll cadence. Floor 1 ms.
+    /// Guest (emitted on the cmdline as [`vmcell_protocol::STEWARD_ACCEPT_POLL`]): the steward's
+    /// failure-recovery cadence. Floor and ceiling are the shared token's.
     pub guest_accept_poll: std::time::Duration,
-    /// Guest (emitted on the cmdline): post-restore listener re-bind idle window.
-    /// Floor 20 ms.
+    /// Guest (emitted on the cmdline as [`vmcell_protocol::STEWARD_REBIND_IDLE`]): post-restore
+    /// listener re-bind idle window — the bound on how long a restored guest stays unreachable.
+    /// Floor and ceiling are the shared token's.
+    ///
+    /// A value outside `[floor, ceiling]` is clamped **by the guest**, not here: the host's own
+    /// clamp enforces the floor (a busy-spin in PID 1 is a correctness matter) and leaves the
+    /// ceiling to the parser that has to survive an untrusted command line. So a caller asking for
+    /// a window past the ceiling gets the ceiling — which is why every shipped profile is pinned
+    /// inside the window by `every_shipped_timeouts_profile_is_honored_by_the_guest_verbatim`.
     pub guest_rebind_idle: std::time::Duration,
 }
 
@@ -355,8 +377,13 @@ impl Default for Timeouts {
             connect_ok_read: std::time::Duration::from_millis(150),
             api_socket_poll: std::time::Duration::from_millis(5),
             shutdown_grace: std::time::Duration::from_millis(250),
-            guest_accept_poll: std::time::Duration::from_millis(20),
-            guest_rebind_idle: std::time::Duration::from_millis(250),
+            // DERIVED from the shared host↔guest tokens, never re-typed (finding G7). These two
+            // numbers are also the steward's compiled fallbacks; they used to be four literals in
+            // two crates that happened to agree, which is exactly what made the channel
+            // unfalsifiable — a guest that ignored the tokens was indistinguishable from one that
+            // honored them.
+            guest_accept_poll: vmcell_protocol::STEWARD_ACCEPT_POLL.default,
+            guest_rebind_idle: vmcell_protocol::STEWARD_REBIND_IDLE.default,
         }
     }
 }
@@ -375,8 +402,16 @@ impl Timeouts {
         self.connect_backoff_cap = max(self.connect_backoff_cap, self.connect_backoff_floor);
         self.connect_ok_read = max(self.connect_ok_read, Duration::from_millis(5));
         self.api_socket_poll = max(self.api_socket_poll, Duration::from_millis(1));
-        self.guest_accept_poll = max(self.guest_accept_poll, Duration::from_millis(1));
-        self.guest_rebind_idle = max(self.guest_rebind_idle, Duration::from_millis(20));
+        // The guest's floors, from the guest's own tokens: the two sides' validity domains are
+        // equal by derivation rather than by two crates carrying the same pair of literals.
+        self.guest_accept_poll = max(
+            self.guest_accept_poll,
+            vmcell_protocol::STEWARD_ACCEPT_POLL.floor,
+        );
+        self.guest_rebind_idle = max(
+            self.guest_rebind_idle,
+            vmcell_protocol::STEWARD_REBIND_IDLE.floor,
+        );
         self
     }
 
@@ -420,15 +455,23 @@ impl Timeouts {
     }
 }
 
-/// Appends the guest-side timing tokens to a kernel `cmdline` (§5.3, The kernel command line). The guest
-/// steward parses `vmcell_accept_poll_ms=` / `vmcell_rebind_idle_ms=` (whole ms,
-/// clamped guest-side) to tune its accept/re-bind cadence per VM without a rootfs
-/// rebuild; absent tokens fall back to the steward's compiled defaults.
+/// Appends the guest-side timing tokens to a kernel `cmdline` (§5.3, The kernel command line), so a
+/// caller can move the steward's cadences per VM without a rootfs rebuild.
+///
+/// Both tokens are composed by [`vmcell_protocol::TuningToken::render`] — the **one** spelling, in
+/// the crate the host and the guest already share. It used to be a `format!` with the two keys typed
+/// out here and a second copy of each typed out in `vmcell-steward`'s parser, which nothing could
+/// hold side by side (`vmcell` does not depend on the steward): re-spell either and the guest simply
+/// falls back to its compiled cadence, which was the same number, so no suite could notice
+/// (finding G7). Renaming is now a compile error on both sides at once.
+///
+/// The tokens are emitted unconditionally — a default profile emits the default numbers rather than
+/// nothing — so the guest's fallback covers only a command line that did not come from here.
 pub(crate) fn push_guest_timeout_args(cmdline: &mut String, timeouts: &Timeouts) {
     cmdline.push_str(&format!(
-        " vmcell_accept_poll_ms={} vmcell_rebind_idle_ms={}",
-        timeouts.guest_accept_poll.as_millis(),
-        timeouts.guest_rebind_idle.as_millis(),
+        " {} {}",
+        vmcell_protocol::STEWARD_ACCEPT_POLL.render(timeouts.guest_accept_poll),
+        vmcell_protocol::STEWARD_REBIND_IDLE.render(timeouts.guest_rebind_idle),
     ));
 }
 
@@ -618,10 +661,37 @@ pub(crate) fn is_reserved_cmdline_arg(arg: &str) -> bool {
 }
 
 /// Folds a kernel-cmdline parameter name to the spelling the kernel compares on
-/// (`kernel/params.c`'s `dash2underscore`). Private to [`is_reserved_cmdline_arg`]'s law so
-/// there is exactly one normalizer.
+/// (`kernel/params.c`'s `dash2underscore`, plus `lib/cmdline.c`'s leading-quote strip). Private
+/// to [`is_reserved_cmdline_arg`]'s law so there is exactly one normalizer.
 fn normalize_cmdline_key(key: &str) -> String {
-    key.replace('-', "_")
+    // `next_arg` strips ONE leading `"` before the parameter name begins
+    // (`if (*args == '"') { args++; in_quote = 1; }`), so the token `"rw` is the parameter `rw`
+    // — and the predicate keyed it as `"rw` and let it through, which is finding `m3`. Fold the
+    // quote here as well as `-`, so the answer is about the token the KERNEL reads. This is the
+    // second of two independent layers: [`is_cmdline_unsafe_char`] rejects `"` outright at every
+    // input surface, and this one holds even for a caller path that never met that guard.
+    key.strip_prefix('"').unwrap_or(key).replace('-', "_")
+}
+
+/// Whether `c` may **not** appear in a value vmcell splices into the kernel command line.
+///
+/// The one law for every cmdline-encoded input — the `init=` override, an append-only caller arg,
+/// and a share's tag and `guest_path` — because all four land in a whitespace-separated token list
+/// that the kernel tokenizes with `lib/cmdline.c`'s `next_arg`:
+///
+/// * **whitespace** forges a second boot token;
+/// * a **control character** corrupts the line and the serial log that persists it;
+/// * **`"`** is the kernel's own quoting metacharacter, and it breaks F3 in two different ways.
+///   `next_arg` strips a leading quote *before* taking the parameter name, so `"rw` runs
+///   `__setup("rw")` and clears `MS_RDONLY` under the owned `ro` + `rootflags=noload` (silent
+///   filesystem corruption), while every reserved key is reachable the same way — and it was
+///   reachable from any authenticated REST client, since `CreateVmRequest::extra_kernel_args`
+///   threads straight to `with_kernel_arg` (finding `m3`). A quote anywhere *else* in a token
+///   toggles `in_quote`, so whitespace stops separating parameters and everything emitted after it
+///   is swallowed into that token's value — which is how a `"` in a share tag or `guest_path`
+///   silently truncated the whole command line, three tokens before `init=`.
+fn is_cmdline_unsafe_char(c: char) -> bool {
+    c.is_whitespace() || c.is_control() || c == '"'
 }
 
 /// Appends the validated append-only caller args to `cmdline`, one whitespace-
@@ -634,12 +704,12 @@ pub(crate) fn push_extra_kernel_args(cmdline: &mut String, args: &[String]) {
 }
 
 /// Validates a caller-supplied `init=` override path (§5.3, The kernel command line): valid UTF-8, absolute,
-/// and a single cmdline token (no whitespace or control characters — a space would
-/// forge a second boot token).
+/// and a single cmdline token ([`is_cmdline_unsafe_char`] — a space would forge a second boot
+/// token, a `"` would re-open every reserved key).
 ///
 /// # Errors
 /// Returns a human-readable reason when the path is empty, not UTF-8, not absolute,
-/// or carries whitespace/control characters.
+/// or carries whitespace/control characters/`"`.
 fn validate_init_path(init: &std::path::Path) -> Result<(), String> {
     let s = init.to_str().ok_or_else(|| {
         format!("init path {init:?} must be valid UTF-8 (it is encoded on the kernel cmdline)")
@@ -650,28 +720,32 @@ fn validate_init_path(init: &std::path::Path) -> Result<(), String> {
     if !init.is_absolute() {
         return Err(format!("init path {s:?} must be an absolute path"));
     }
-    if s.chars().any(|c| c.is_whitespace() || c.is_control()) {
+    if s.chars().any(is_cmdline_unsafe_char) {
         return Err(format!(
-            "init path {s:?} may not contain whitespace or control characters (it is a single kernel cmdline token)"
+            "init path {s:?} may not contain whitespace, control characters or '\"' (it is a single kernel cmdline token)"
         ));
     }
     Ok(())
 }
 
 /// Validates one append-only caller kernel arg (§5.3, The kernel command line): non-empty, a single cmdline
-/// token (no whitespace/control characters), and not colliding with a reserved token
+/// token ([`is_cmdline_unsafe_char`]), and not colliding with a reserved token
 /// vmcell owns ([`is_reserved_cmdline_arg`]).
+///
+/// The single-token guard runs **before** the collision check on purpose: a token carrying `"`
+/// is refused outright rather than keyed, because the kernel would read a different key than the
+/// one this predicate sees (finding `m3`).
 ///
 /// # Errors
 /// Returns a human-readable reason when the arg is empty, carries whitespace/control
-/// characters, or would clobber a reserved boot token.
+/// characters/`"`, or would clobber a reserved boot token.
 fn validate_extra_kernel_arg(arg: &str) -> Result<(), String> {
     if arg.is_empty() {
         return Err("extra kernel argument cannot be empty".to_string());
     }
-    if arg.chars().any(|c| c.is_whitespace() || c.is_control()) {
+    if arg.chars().any(is_cmdline_unsafe_char) {
         return Err(format!(
-            "extra kernel argument {arg:?} may not contain whitespace or control characters (it is a single kernel cmdline token)"
+            "extra kernel argument {arg:?} may not contain whitespace, control characters or '\"' (it is a single kernel cmdline token)"
         ));
     }
     if is_reserved_cmdline_arg(arg) {
@@ -1055,6 +1129,11 @@ pub enum VsockTransport {
 #[non_exhaustive]
 pub struct Share {
     /// The mount tag used by the guest to identify this share.
+    ///
+    /// Caller-defined, and validated by [`VmConfigBuilder::build`] on both of the surfaces it
+    /// reaches: a single normal path component (it names a host socket file inside the per-VM
+    /// scratch dir) with no `:`, `"` or whitespace (it is encoded on the kernel command line,
+    /// §4.5, Shared directories (virtio-fs)).
     pub tag: String,
     /// Path to the directory on the host.
     pub host_path: PathBuf,
@@ -1064,7 +1143,7 @@ pub struct Share {
     pub cache: CachePolicy,
     /// In-guest mount point for this share. Defaults to `/<tag>`; override with
     /// [`Share::with_guest_path`] to decouple the mount path from the virtio-fs
-    /// tag. Must be absolute and free of `:`/whitespace (it is encoded on the
+    /// tag. Must be absolute and free of `:`, `"` and whitespace (it is encoded on the
     /// kernel command line, §4.5, Shared directories (virtio-fs)); [`VmConfigBuilder::build`] rejects violations.
     pub guest_path: PathBuf,
 }
@@ -1096,7 +1175,7 @@ impl Share {
     /// Lets a caller mount a share at an arbitrary absolute path — e.g. tag
     /// `data` mounted at `/srv/data` — decoupling the mount point from the
     /// virtio-fs tag for more generic workloads. The path must be absolute and
-    /// contain neither `:` nor whitespace (it is encoded on the kernel command
+    /// contain no `:`, `"` or whitespace (it is encoded on the kernel command
     /// line, §4.5, Shared directories (virtio-fs)); [`VmConfigBuilder::build`] enforces this.
     #[must_use]
     pub fn with_guest_path(mut self, guest_path: impl Into<PathBuf>) -> Self {
@@ -1114,16 +1193,16 @@ impl Share {
 /// The steward reads `/proc/cmdline`, mounts each `tag` at its `guest_path` over
 /// virtiofs (default `/<tag>`), and uses a read-only mount for `ro` shares. Tags
 /// and guest paths are validated by [`VmConfigBuilder::build`] to be encodable
-/// (no `:` or whitespace), so this token is unambiguous. No shares ⇒ nothing
-/// appended.
+/// (no `:`, and none of [`is_cmdline_unsafe_char`]), so this token is unambiguous and cannot
+/// truncate the line that follows it. No shares ⇒ nothing appended.
 pub(crate) fn push_share_args(cmdline: &mut String, shares: &[Share]) {
     for share in shares {
         let access = match share.access {
             Access::ReadOnly => "ro",
             Access::ReadWrite => "rw",
         };
-        // `build()` validated guest_path as absolute, valid UTF-8, and free of
-        // ':'/whitespace, so the lossy conversion is exact here.
+        // `build()` validated guest_path as absolute, valid UTF-8, and free of ':' and every
+        // `is_cmdline_unsafe_char`, so the lossy conversion is exact here.
         cmdline.push_str(&format!(
             " vmcell_share={}:{}:{}",
             share.tag,
@@ -1472,9 +1551,17 @@ impl VmConfigBuilder {
         self
     }
 
-    /// Overrides the guest `init=` target ([`VmConfig::init`], §5.3, The kernel command line). A custom init
-    /// **replaces** the vmcell steward, forgoing the vsock control plane; validated
-    /// at [`build`](Self::build), which also rejects it combined with `snapshotting`.
+    /// Overrides the guest `init=` target ([`VmConfig::init`], §5.3, The kernel command line) —
+    /// **init identity only** (invariant C8).
+    ///
+    /// A custom init replaces the *binary* the kernel starts as PID 1. It does not by itself
+    /// decide control-plane availability: that is
+    /// [`StewardPlacement::steward_port`], and `Service { port }` beside a custom init keeps the
+    /// control plane. What it does do is move the **derived** placement to
+    /// [`StewardPlacement::None`] when the caller declares none, which is the pre-v33 semantics.
+    /// Validated at [`build`](Self::build), which refuses [`StewardPlacement::Pid1`] beside it and
+    /// refuses `snapshotting` for any placement that is not
+    /// [`resync_reachable`](StewardPlacement::resync_reachable).
     #[must_use]
     pub fn init(mut self, init: impl Into<PathBuf>) -> Self {
         self.init = Some(init.into());
@@ -1643,7 +1730,7 @@ impl VmConfigBuilder {
     /// configuration is internally inconsistent. The validations performed are:
     /// - `vcpus == 0` (at least one vCPU is required);
     /// - `mem_mib` below the 64 MiB floor;
-    /// - an empty kernel path;
+    /// - an empty or relative kernel path (every host path this config names must be absolute);
     /// - an explicit `vmid` outside the `1..=254` window used by the `/30`
     ///   host-IP math;
     /// - a share with an empty mount tag, or two shares sharing a mount tag;
@@ -1658,7 +1745,12 @@ impl VmConfigBuilder {
     ///   `snapshotting` (a passed-through host device is not migratable, §2.4, QEMU q35 — the fallback and most-proven nester);
     /// - [`Egress::Blocked`] combined with a `host_services_port` — the port names a host
     ///   endpoint the guest dials *out* to, which `Blocked` refuses, so honoring both is
-    ///   impossible and the port would be silently unused (F1).
+    ///   impossible and the port would be silently unused (F1);
+    /// - `host_services_port: Some(0)` — port 0 is `bind`'s wildcard, not a reachable service,
+    ///   and the NAT's permanent forward listener cannot be armed on it (F1);
+    /// - an `init` override, share tag or share `guest_path` carrying whitespace, a control
+    ///   character or `"` — each is spliced into the kernel command line, where a quote re-opens
+    ///   every reserved key and truncates the tokens that follow it (§5.3, The kernel command line).
     ///
     /// This validates internal consistency only; it does **not** check that the
     /// kernel, rootfs, or share paths exist on disk.
@@ -1720,6 +1812,18 @@ impl VmConfigBuilder {
             return Err(crate::error::Error::Config(
                 "kernel path cannot be empty".into(),
             ));
+        }
+        // Every other host-path input gets absoluteness at this boundary (the rootfs image and
+        // overlay, extra-disk images, share host paths) — the kernel was the one that did not, so a
+        // relative path resolved against whatever CWD the VMM child inherited: the daemon's, not
+        // the caller's. That surfaced three layers down as a VMM "cannot open kernel", the late
+        // failure the boundary exists to pre-empt. Existence stays unchecked here, as for every
+        // other artifact path (the image may be built after the config).
+        if self.kernel.is_relative() {
+            return Err(crate::error::Error::Config(format!(
+                "kernel {:?} must be an absolute path",
+                self.kernel
+            )));
         }
 
         // M-HOST-4: reject out-of-range resource-limit values at the boundary. A
@@ -1898,6 +2002,25 @@ impl VmConfigBuilder {
             )));
         }
 
+        // F1, the same field's other unhonored value: port 0 is `bind`'s wildcard ("any port"),
+        // never a reachable service, and the NAT registers `host_services_port` as a PERMANENT
+        // forward listener that `rearm_or_release_closed` re-arms with `TcpSocket::listen` —
+        // whose result is deliberately discarded there because "forward ports are non-zero".
+        // That precondition was nobody's job to enforce, so `Some(0)` was accepted and produced a
+        // listener that can never come up, silently. Enforce it here and the discard is honest.
+        if let NetConfig::Unprivileged {
+            host_services_port: Some(0),
+            ..
+        } = &self.net
+        {
+            return Err(crate::error::Error::Config(
+                "host_services_port must be > 0: port 0 is the bind wildcard (\"any port\"), not \
+                 a reachable host service, and the NAT registers this port as a permanent forward \
+                 listener"
+                    .into(),
+            ));
+        }
+
         let mut tags = std::collections::HashSet::new();
         let mut guest_paths = std::collections::HashSet::new();
         for share in &self.shares {
@@ -1912,9 +2035,16 @@ impl VmConfigBuilder {
             // in the tag or the guest path would corrupt that encoding and silently
             // mis-mount (or drop) the share, so reject it at the boundary rather than
             // discover it as a missing mount in-guest.
-            if share.tag.contains(':') || share.tag.chars().any(char::is_whitespace) {
+            //
+            // The rest of the character law is `is_cmdline_unsafe_char`'s, shared with the `init=`
+            // override and the append-only args, and it is what closes M3's sibling: a `"` here
+            // opened a kernel quote in the middle of the line, so `next_arg` stopped treating
+            // whitespace as a separator and swallowed EVERY token emitted after this share —
+            // `panic=1`, `init=`, `vmcell_vmid=` — into this token's value. `:` stays a
+            // share-specific rejection (it is this encoding's own field separator).
+            if share.tag.contains(':') || share.tag.chars().any(is_cmdline_unsafe_char) {
                 return Err(crate::error::Error::Config(format!(
-                    "share tag {:?} may not contain ':' or whitespace (it is encoded on the kernel cmdline)",
+                    "share tag {:?} may not contain ':', '\"' or whitespace/control characters (it is encoded on the kernel cmdline)",
                     share.tag
                 )));
             }
@@ -1960,9 +2090,9 @@ impl VmConfigBuilder {
                     share.tag
                 )));
             }
-            if guest_path.contains(':') || guest_path.chars().any(char::is_whitespace) {
+            if guest_path.contains(':') || guest_path.chars().any(is_cmdline_unsafe_char) {
                 return Err(crate::error::Error::Config(format!(
-                    "share guest_path {guest_path:?} may not contain ':' or whitespace (it is encoded on the kernel cmdline)"
+                    "share guest_path {guest_path:?} may not contain ':', '\"' or whitespace/control characters (it is encoded on the kernel cmdline)"
                 )));
             }
             if !guest_paths.insert(guest_path.to_string()) {
@@ -2383,6 +2513,45 @@ mod tests {
         mk(Egress::Blocked, None).expect("`Blocked` with no port is valid");
     }
 
+    // F1, the same field's other unhonored value: `host_services_port: Some(0)`. Port 0 is
+    // `bind`'s wildcard, so it can never name a reachable host service — and the NAT registers
+    // this port as a PERMANENT forward listener whose re-arm
+    // (`rearm_or_release_closed` → `TcpSocket::listen`) discards its `Result` on the stated
+    // grounds that "forward ports are non-zero". That precondition was nobody's job, so `Some(0)`
+    // built a VM with a listener that can never come up, silently.
+    //
+    // Buggy impl this guards: drop the check and `Some(0)` builds on every egress variant that
+    // can reach the port.
+    #[test]
+    fn a_zero_host_services_port_is_refused() {
+        let mk = |egress: Egress, port: Option<u16>| {
+            VmConfig::builder(
+                PathBuf::from("/vmlinux"),
+                RootfsSource::Erofs {
+                    image: PathBuf::from("/rootfs.erofs"),
+                },
+            )
+            .net(NetConfig::Unprivileged {
+                egress,
+                host_services_port: port,
+            })
+            .build()
+        };
+        for egress in [Egress::Open, Egress::Filtered(ProxyConfig::default())] {
+            let err = mk(egress, Some(0))
+                .expect_err("port 0 is the bind wildcard and must be refused, not armed");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("host_services_port must be > 0"),
+                "the refusal must name the field and the rule: {msg}"
+            );
+        }
+        // Positive controls: a real port on the same variant builds, and `None` is unaffected —
+        // over-rejecting either would break every unprivileged caller.
+        mk(Egress::Open, Some(1)).expect("the lowest real port is valid");
+        mk(Egress::Open, None).expect("no port at all is valid");
+    }
+
     // L-ORCH-7: an empty or relative `host_path` is a boundary config error, not a
     // late virtiofsd-spawn subprocess failure. Buggy impl: `build()` accepts it.
     #[test]
@@ -2602,6 +2771,37 @@ mod tests {
         assert!(err.to_string().contains("kernel path cannot be empty"));
     }
 
+    // The kernel was the ONE host path `build()` never checked for absoluteness, so a relative one
+    // resolved against whatever CWD the VMM child inherited (the daemon's, not the caller's) and
+    // failed three layers down as a VMM "cannot open kernel". Buggy impl this guards: the
+    // emptiness check alone.
+    //
+    // Paired with a positive control on the same shape, because over-rejecting here would break
+    // every caller: the absolute path builds, and existence is still NOT required (the artifact may
+    // be built after the config, as for the rootfs and extra-disk paths).
+    #[test]
+    fn test_reject_relative_kernel_path() {
+        let mk = |kernel: &str| {
+            VmConfig::builder(
+                PathBuf::from(kernel),
+                RootfsSource::Erofs {
+                    image: PathBuf::from("/rootfs.erofs"),
+                },
+            )
+            .build()
+        };
+        for bad in ["vmlinux", "target/vmcell-artifacts/vmlinux", "./vmlinux"] {
+            let err = mk(bad).unwrap_err();
+            assert!(
+                matches!(&err, crate::error::Error::Config(m)
+                    if m.contains("must be an absolute path") && m.contains("kernel")),
+                "relative kernel {bad:?} must be refused naming the field: {err}"
+            );
+        }
+        mk("/does/not/exist/yet/vmlinux")
+            .expect("an absolute kernel path must build — existence is not checked here");
+    }
+
     // Buggy impl: build() does not reject two shares with the same mount tag.
     #[test]
     fn test_reject_duplicate_share_tags() {
@@ -2634,9 +2834,14 @@ mod tests {
     // mis-mount or drop the share, so `build()` must reject it at the boundary.
     // Buggy impl this guards: accepting any non-empty tag, then discovering the
     // breakage as a missing mount in-guest.
+    //
+    // The `"` cases are M3's sibling surface: a quote here opens a kernel quote mid-line, and
+    // `next_arg` then stops splitting on whitespace — so `panic=1`, `init=` and `vmcell_vmid=`
+    // are all swallowed into this share token's value. Buggy impl for those: use
+    // `char::is_whitespace` in place of `is_cmdline_unsafe_char`.
     #[test]
     fn test_reject_share_tag_with_colon_or_whitespace() {
-        for bad in ["a:b", "has space", "tab\tinside"] {
+        for bad in ["a:b", "has space", "tab\tinside", "quo\"te", "\"leading"] {
             let err = VmConfig::builder(
                 PathBuf::from("/vmlinux"),
                 RootfsSource::Erofs {
@@ -2655,8 +2860,9 @@ mod tests {
                 matches!(err, crate::error::Error::Config(_)),
                 "tag {bad:?} should be rejected"
             );
+            let msg = err.to_string();
             assert!(
-                err.to_string().contains("':' or whitespace"),
+                msg.contains("may not contain ':'") && msg.contains("whitespace"),
                 "tag {bad:?} error should explain the cmdline-encoding constraint: {err}"
             );
         }
@@ -2775,12 +2981,15 @@ mod tests {
 
     // A guest_path must be absolute (it is a mount point) and encodable on the
     // cmdline. Buggy impl: accepting a relative or `:`-bearing mount point, which
-    // mis-mounts or corrupts the boot line.
+    // mis-mounts or corrupts the boot line. The `"` case is M3's sibling: it truncates every
+    // token emitted after this share (buggy impl: `char::is_whitespace` here).
     #[test]
     fn test_reject_bad_guest_path() {
-        let cases: [(&str, &str); 2] = [
+        let cases: [(&str, &str); 4] = [
             ("relative/dir", "absolute path"),
-            ("/has:colon", "':' or whitespace"),
+            ("/has:colon", "may not contain ':'"),
+            ("/has\"quote", "may not contain ':'"),
+            ("/has space", "may not contain ':'"),
         ];
         for (bad, needle) in cases {
             let err = VmConfig::builder(
@@ -3130,6 +3339,23 @@ mod tests {
                 c.contains("vmcell_rebind_idle_ms=250"),
                 "missing rebind idle: {c}"
             );
+            // The two literals above pin the WIRE spelling, which is a compatibility surface: the
+            // parser is baked into `rootfs.erofs`, so re-spelling a token silently loses the channel
+            // against every already-packed image. These two pin that the emitter composes them
+            // through the SHARED renderer rather than through a second copy of the format — which is
+            // what makes this line and the guest's parser move together (finding G7).
+            assert!(
+                c.contains(
+                    &vmcell_protocol::STEWARD_ACCEPT_POLL.render(cfg.timeouts.guest_accept_poll)
+                ),
+                "the accept-poll token must be the shared renderer's output: {c}"
+            );
+            assert!(
+                c.contains(
+                    &vmcell_protocol::STEWARD_REBIND_IDLE.render(cfg.timeouts.guest_rebind_idle)
+                ),
+                "the rebind-idle token must be the shared renderer's output: {c}"
+            );
             assert!(
                 c.contains("init=/usr/sbin/vmcell-steward"),
                 "missing init: {c}"
@@ -3183,6 +3409,158 @@ mod tests {
             !hvc.contains("console=ttyS0"),
             "VirtioConsole must not emit ttyS0: {hvc}"
         );
+    }
+
+    // A NON-DEFAULT `Timeouts` profile must emit its OWN numbers on the cmdline — the half of
+    // finding G7 that lives on this side of the boundary. Every other cmdline test above boots the
+    // default profile, where the emitted numbers and the steward's compiled fallbacks are the same
+    // pair, so an emitter that ignored `cfg.timeouts` entirely passed all of them.
+    //
+    // RED on the inverse: emit `Timeouts::default()`'s numbers instead of the config's (or drop
+    // `push_guest_timeout_args`' arguments) and both `low_latency` equalities fail, naming 20/250
+    // against 5/150. The `!contains` legs are what make it non-vacuous: 5 ms is not 20 ms, so the
+    // buggy emitter cannot satisfy them by emitting both.
+    #[test]
+    fn a_non_default_timeouts_profile_emits_its_own_numbers() {
+        let cell = |timeouts: Timeouts| {
+            let cfg = VmConfig::builder(
+                PathBuf::from("/vmlinux"),
+                RootfsSource::Erofs {
+                    image: PathBuf::from("/rootfs.erofs"),
+                },
+            )
+            .timeouts(timeouts)
+            .network_disabled()
+            .build()
+            .unwrap();
+            let line = build_kernel_cmdline(&cfg, &test_res(1), "").unwrap();
+            (cfg, line)
+        };
+
+        let (default_cfg, default_line) = cell(Timeouts::default());
+        for (name, timeouts) in [
+            ("low_latency", Timeouts::low_latency()),
+            ("throughput", Timeouts::throughput()),
+        ] {
+            let (cfg, line) = cell(timeouts);
+            assert!(
+                line.contains(
+                    &vmcell_protocol::STEWARD_ACCEPT_POLL.render(cfg.timeouts.guest_accept_poll)
+                ),
+                "{name}: the emitted accept-poll token must carry the PROFILE's cadence \
+                 ({:?}), not the default: {line}",
+                cfg.timeouts.guest_accept_poll
+            );
+            assert!(
+                line.contains(
+                    &vmcell_protocol::STEWARD_REBIND_IDLE.render(cfg.timeouts.guest_rebind_idle)
+                ),
+                "{name}: the emitted rebind-idle token must carry the PROFILE's window ({:?}), \
+                 not the default: {line}",
+                cfg.timeouts.guest_rebind_idle
+            );
+            // And it must NOT also carry the default's numbers: the guest takes the FIRST matching
+            // token, so an emitter that appended both would hand it the wrong one while satisfying
+            // the `contains` legs above.
+            assert!(
+                !line.contains(
+                    &vmcell_protocol::STEWARD_ACCEPT_POLL
+                        .render(default_cfg.timeouts.guest_accept_poll)
+                ),
+                "{name}: the default accept cadence must not appear at all: {line}"
+            );
+            assert!(
+                !line.contains(
+                    &vmcell_protocol::STEWARD_REBIND_IDLE
+                        .render(default_cfg.timeouts.guest_rebind_idle)
+                ),
+                "{name}: the default re-bind window must not appear at all: {line}"
+            );
+            // Non-vacuity of the two `!contains` legs: this profile really does differ from the
+            // default on both knobs. A future profile that stopped differing would make them pass
+            // for the wrong reason.
+            assert_ne!(
+                cfg.timeouts.guest_accept_poll, default_cfg.timeouts.guest_accept_poll,
+                "{name} must differ from the default accept cadence for this test to mean anything"
+            );
+            assert_ne!(
+                cfg.timeouts.guest_rebind_idle, default_cfg.timeouts.guest_rebind_idle,
+                "{name} must differ from the default re-bind window for this test to mean anything"
+            );
+        }
+        // The default profile still emits the shared defaults verbatim — the guest's fallback and
+        // this line are one fact, so a default cell's cadence is the same whether the tokens arrive
+        // or not (and `default_placement_emits_a_byte_identical_cmdline` pins the bytes).
+        assert!(
+            default_line.contains(
+                &vmcell_protocol::STEWARD_ACCEPT_POLL
+                    .render(vmcell_protocol::STEWARD_ACCEPT_POLL.default)
+            )
+        );
+        assert!(
+            default_line.contains(
+                &vmcell_protocol::STEWARD_REBIND_IDLE
+                    .render(vmcell_protocol::STEWARD_REBIND_IDLE.default)
+            )
+        );
+    }
+
+    // Every SHIPPED profile must land inside the shared clamp window, so the guest honors it
+    // verbatim rather than clamping it into something the host never asked for. The host clamps only
+    // the floors (`clamped`); the ceiling lives in the guest's untrusted-input parse, so a profile
+    // above it would be silently reduced in the guest with nothing red on either side — the same
+    // silent-divergence shape as the token spelling, one field over.
+    //
+    // RED on the inverse, MEASURED — and the two halves are red for different plants, which is
+    // worth stating because one obvious plant does NOT work:
+    //   * ceiling: `throughput`'s `guest_rebind_idle` = 120 s reddens (nothing host-side clamps a
+    //     ceiling, so any profile can drift past it).
+    //   * floor: `Timeouts::default()`'s `guest_rebind_idle` = 10 ms reddens — `default()` is the one
+    //     profile that does not run through `clamped()`.
+    //   * planting 10 ms in `low_latency()` alone does NOT redden, and that is the design working:
+    //     the preset's own `.clamped()` raises it to the shared floor first. So the floor half of
+    //     this test is the gate on `clamped()` keeping that clamp (drop the `guest_rebind_idle` line
+    //     there and the same plant reddens), and the ceiling half is the gate on the profiles.
+    #[test]
+    fn every_shipped_timeouts_profile_is_honored_by_the_guest_verbatim() {
+        for (name, timeouts) in [
+            ("default", Timeouts::default()),
+            ("low_latency", Timeouts::low_latency()),
+            ("throughput", Timeouts::throughput()),
+        ] {
+            for (knob, value, token) in [
+                (
+                    "guest_accept_poll",
+                    timeouts.guest_accept_poll,
+                    vmcell_protocol::STEWARD_ACCEPT_POLL,
+                ),
+                (
+                    "guest_rebind_idle",
+                    timeouts.guest_rebind_idle,
+                    vmcell_protocol::STEWARD_REBIND_IDLE,
+                ),
+            ] {
+                assert!(
+                    value >= token.floor,
+                    "{name}.{knob} = {value:?} is below the shared floor {:?}: the guest would \
+                     clamp UP and run a cadence this profile never asked for",
+                    token.floor
+                );
+                assert!(
+                    value <= token.ceiling,
+                    "{name}.{knob} = {value:?} is above the shared ceiling {:?}: the guest would \
+                     clamp DOWN and the two sides would silently disagree",
+                    token.ceiling
+                );
+                // The emitted token is whole milliseconds, so a sub-millisecond profile value would
+                // arrive as a different number than it left.
+                assert_eq!(
+                    token.render(value),
+                    format!("{}{}", token.token, value.as_millis()),
+                    "{name}.{knob} must survive the ms rendering unchanged"
+                );
+            }
+        }
     }
 
     // §5.3 (The kernel command line) console knob: each mode maps to its `console=` token. Buggy impl this
@@ -3821,6 +4199,75 @@ mod tests {
             is_reserved_cmdline_arg("vmcell-share=x:/x:rw"),
             "the dash respelling of a vmcell_ token is trusted by the steward too"
         );
+        // Finding `m3`, the same class one metacharacter over: the kernel's `next_arg`
+        // (`lib/cmdline.c`) strips a LEADING `"` before the parameter name begins, so `"rw` is the
+        // parameter `rw` — and the predicate keyed it as `"rw`, which is in no reserved set. Both
+        // layers must hold: the key normalizer folds the quote away, and the single-token guard
+        // refuses the arg outright. Buggy impls guarded: drop the `strip_prefix('"')` from
+        // `normalize_cmdline_key` (the predicate half), or use `char::is_whitespace` in
+        // `is_cmdline_unsafe_char` (the boundary half).
+        for reserved in RESERVED_CMDLINE_KEYS {
+            for quoted in [format!("\"{reserved}"), format!("\"{reserved}=1")] {
+                assert!(
+                    is_reserved_cmdline_arg(&quoted),
+                    "{quoted:?} is the kernel's quoted spelling of the reserved key \
+                     {reserved:?} (next_arg strips the leading quote) and must be refused"
+                );
+                let err = VmConfig::builder(
+                    PathBuf::from("/vmlinux"),
+                    RootfsSource::Block {
+                        image: PathBuf::from("/rootfs.img"),
+                        overlay: None,
+                    },
+                )
+                .with_kernel_arg(&quoted)
+                .build()
+                .unwrap_err();
+                // The single-token guard runs before the collision check, so THIS is the message a
+                // quoted arg gets — it must name the offending token and the quote rule.
+                assert!(
+                    matches!(&err, crate::error::Error::Config(m)
+                        if m.contains(&*quoted)
+                            && m.contains("may not contain whitespace, control characters or '\"'")),
+                    "extra arg {quoted:?} must be rejected at the boundary: {err}"
+                );
+            }
+        }
+        // …and a quote anywhere else is refused too (it toggles `in_quote`, so every token after
+        // it stops being a token). The `vmcell_` prefix rule is likewise quote-proof.
+        assert!(is_reserved_cmdline_arg("\"vmcell_steward_port=1"));
+        for bad in ["mitigations=\"off", "foo=\"a b\"", "\"nokaslr"] {
+            let err = VmConfig::builder(
+                PathBuf::from("/vmlinux"),
+                RootfsSource::Erofs {
+                    image: PathBuf::from("/rootfs.erofs"),
+                },
+            )
+            .with_kernel_arg(bad)
+            .build()
+            .unwrap_err();
+            assert!(
+                matches!(&err, crate::error::Error::Config(m)
+                    if m.contains("may not contain whitespace, control characters or '\"'")),
+                "a quoted extra arg {bad:?} must be refused: {err}"
+            );
+        }
+        // The init override is the third surface of the same law (a quoted `init=` path would
+        // truncate the tokens after it just as well).
+        let err = VmConfig::builder(
+            PathBuf::from("/vmlinux"),
+            RootfsSource::Erofs {
+                image: PathBuf::from("/rootfs.erofs"),
+            },
+        )
+        .init("/bin/sh\"x")
+        .build()
+        .unwrap_err();
+        assert!(
+            matches!(&err, crate::error::Error::Config(m)
+                if m.contains("may not contain whitespace, control characters or '\"'")),
+            "a quoted init path must be refused: {err}"
+        );
         // Positive control (over-rejection inverse): keys that are NOT reserved stay
         // acceptable in both spellings — normalization must not swallow the whole namespace.
         for allowed in [
@@ -4190,6 +4637,31 @@ mod tests {
                 "builder token {token:?} is not reserved — an append-only arg with this \
                  key could clobber it. Add its key to RESERVED_CMDLINE_KEYS.\ncmdline: {c}"
             );
+            // Finding `m3`: the kernel's `next_arg` strips a leading `"` BEFORE taking the
+            // parameter name, so the quoted spelling of every emitted token is another way to
+            // override it — and the emitted-token walk is exactly where that must be discovered,
+            // because a new token inherits the hazard the day it lands. Both refusal layers are
+            // asserted: the predicate must key the quoted token, and `build()` must refuse it.
+            let quoted = format!("\"{token}");
+            assert!(
+                is_reserved_cmdline_arg(&quoted),
+                "the quoted spelling {quoted:?} of builder token {token:?} is not keyed as \
+                 reserved — the kernel reads it as {token:?} and applies it LAST.\ncmdline: {c}"
+            );
+            assert!(
+                matches!(
+                    VmConfig::builder(
+                        PathBuf::from("/vmlinux"),
+                        RootfsSource::Erofs {
+                            image: PathBuf::from("/rootfs.erofs"),
+                        },
+                    )
+                    .with_kernel_arg(&quoted)
+                    .build(),
+                    Err(crate::error::Error::Config(_))
+                ),
+                "build() must refuse the quoted spelling {quoted:?} of an emitted token"
+            );
         }
         // Content/placement of the conditional tokens (a token being *reserved* does
         // not prove it is *correct*). The `ip=` autoconfig token must carry the /30
@@ -4208,6 +4680,16 @@ mod tests {
         assert!(
             c.contains("rootflags=noload"),
             "Block rootfs must emit rootflags=noload: {c}"
+        );
+        // M3's sibling, asserted on the composed line rather than on a refusal: the kernel's
+        // quote machinery must never be engaged. One `"` anywhere — a share tag, a guest path, an
+        // extra arg — makes `next_arg` stop splitting on whitespace, so every token after it is
+        // swallowed into that token's value. This config carries a caller-named share, which is
+        // the field that reaches the line as free text.
+        assert!(
+            !c.contains('"'),
+            "no emitted token may carry a `\"`: it opens a kernel quote and truncates the \
+             remaining parameters: {c}"
         );
     }
 
@@ -4544,13 +5026,19 @@ mod placement_battery {
 
 #[cfg(test)]
 mod c8_call_site_gate {
+    /// The two files this gate reads. `production_lines` sees their CODE (comments stripped) and
+    /// [`production_comment_blocks`] sees their PROSE (code stripped) — two readers over one
+    /// roster, because the re-key had to land in both and only one of them was gated (finding
+    /// `d1`: seven prose sites survived a re-key whose call sites were green).
+    const C8_FILES: [(&str, &str); 2] = [
+        ("orchestrator.rs", include_str!("orchestrator.rs")),
+        ("config.rs", include_str!("config.rs")),
+    ];
+
     /// `orchestrator.rs` and `config.rs`, comment-stripped, as `(file, line, code)`.
     fn production_lines() -> Vec<(&'static str, usize, String)> {
         let mut out = Vec::new();
-        for (name, body) in [
-            ("orchestrator.rs", include_str!("orchestrator.rs")),
-            ("config.rs", include_str!("config.rs")),
-        ] {
+        for (name, body) in C8_FILES {
             // Stop at the crate's own `#[cfg(test)]` module: the gate is about PRODUCTION sites,
             // and the tests below legitimately name `cfg.init` and both methods while driving them.
             let prod = body.split("\n#[cfg(test)]\n").next().unwrap_or(body);
@@ -4568,6 +5056,183 @@ mod c8_call_site_gate {
             out.len()
         );
         out
+    }
+
+    /// The same two files' PROSE: every run of consecutive comment lines (`//` and `///` alike),
+    /// joined, as `(file, first line, text)`.
+    ///
+    /// Blocks rather than lines because prose spans lines — the sentence "boots a custom `init=` …
+    /// so there is no vsock control plane" was split across two of them, which is one reason
+    /// per-line reading finds nothing.
+    fn production_comment_blocks() -> Vec<(&'static str, usize, String)> {
+        let mut out = Vec::new();
+        for (name, body) in C8_FILES {
+            let prod = body.split("\n#[cfg(test)]\n").next().unwrap_or(body);
+            let mut current: Vec<&str> = Vec::new();
+            let mut start = 0usize;
+            for (i, l) in prod.lines().enumerate() {
+                let trimmed = l.trim();
+                if trimmed.starts_with("//") {
+                    if current.is_empty() {
+                        start = i + 1;
+                    }
+                    current.push(trimmed);
+                } else if !current.is_empty() {
+                    out.push((name, start, current.join(" ")));
+                    current.clear();
+                }
+            }
+            if !current.is_empty() {
+                out.push((name, start, current.join(" ")));
+            }
+        }
+        assert!(
+            out.len() > 200,
+            "the prose scan found only {} comment blocks — it is not reading the sources",
+            out.len()
+        );
+        out
+    }
+
+    /// Markup-free lowercase form of a comment block, so a needle matches through `**bold**` and
+    /// `` `code` `` (the shipped prose is full of both, and `**no** vsock control plane` is how one
+    /// of the seven sites hid from a literal search).
+    fn prose_text(block: &str) -> String {
+        block
+            .replace(['*', '`', '[', ']'], "")
+            .to_lowercase()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// Prose that names `init` as the thing that *decides* something.
+    const INIT_SPELLINGS: [&str; 5] = [
+        "cfg.init",
+        "self.init",
+        "custom init",
+        "custom pid 1",
+        "custom init=",
+    ];
+
+    /// The consequences that are **not** `init`'s to have: control-plane availability and snapshot
+    /// eligibility. Hand-maintained, in the same spirit as `RESERVED_CMDLINE_KEYS`' alias block —
+    /// a scan sees spellings, not meaning, so a new paraphrase is added here when it appears.
+    const CONFLATED_CONSEQUENCES: [&str; 7] = [
+        "no control plane",
+        "no vsock control plane",
+        "has no control plane",
+        "replaces the steward",
+        "replaces the vmcell steward",
+        "cannot snapshot",
+        "forgoes the control plane",
+    ];
+
+    /// The spellings that anchor such prose on the SHIPPED derivation: the type, either method, or
+    /// the question by its law-and-number.
+    const DERIVATION_ANCHORS: [&str; 5] = [
+        "stewardplacement",
+        "steward_port",
+        "resync_reachable",
+        "c8's first question",
+        "c8's second question",
+    ];
+
+    /// `Err` when a comment block asserts the retired conflation: it says `init` decides control-plane
+    /// availability or snapshot eligibility, and never names the placement the code actually reads.
+    ///
+    /// Factored out so the test below can drive it against the exact sentences the tree shipped
+    /// (AGENTS.md rule 2).
+    fn prose_conflation(block: &str) -> Result<(), String> {
+        let text = prose_text(block);
+        let init = INIT_SPELLINGS.iter().find(|k| text.contains(**k));
+        let consequence = CONFLATED_CONSEQUENCES.iter().find(|k| text.contains(**k));
+        let (Some(init), Some(consequence)) = (init, consequence) else {
+            return Ok(());
+        };
+        if DERIVATION_ANCHORS.iter().any(|a| text.contains(a)) {
+            return Ok(());
+        }
+        Err(format!(
+            "prose ties {init:?} to {consequence:?} without naming the shipped derivation \
+             ({DERIVATION_ANCHORS:?})"
+        ))
+    }
+
+    /// **C8, the prose half (finding `d1`).** The re-key landed in the code and stopped at the
+    /// comments: four of the seven unswept sites were public rustdoc on a contract crate, so
+    /// `Service` cells were documented as having no control plane while the code gave them one.
+    ///
+    /// The reason nothing caught it is mechanical and worth keeping in view: `production_lines`
+    /// reads `l.split("//").next()`, so `//` and `///` alike are *invisible* to every assertion
+    /// above. This one reads exactly what that one throws away.
+    ///
+    /// What it can and cannot do: it recognizes the **entailment** shape — "a custom init ⇒ no
+    /// control plane / cannot snapshot" — and requires such a block to name the placement, the
+    /// method, or the C8 question it is really about. It cannot judge prose that paraphrases around
+    /// the roster above, exactly as the emitted-token gate cannot discover a missing alias; both
+    /// answer that with a hand-maintained list and say so.
+    #[test]
+    fn no_production_prose_asserts_the_retired_init_derivation() {
+        let violations: Vec<String> = production_comment_blocks()
+            .into_iter()
+            .filter_map(|(f, l, block)| {
+                prose_conflation(&block)
+                    .err()
+                    .map(|why| format!("{f}:{l}: {why}\n    {}", prose_text(&block)))
+            })
+            .collect();
+        assert!(
+            violations.is_empty(),
+            "C8: {} production comment block(s) still assert that `init` decides control-plane \
+             availability or snapshot eligibility. Availability is \
+             `StewardPlacement::steward_port()`; eligibility is `resync_reachable()`; `init` decides \
+             init IDENTITY only.\n\n{}",
+            violations.len(),
+            violations.join("\n\n")
+        );
+    }
+
+    /// The prose predicate's own red-on-inverse, driven against the **exact** sentences the tree
+    /// shipped before the sweep (finding `d1`'s table, verbatim) and the ones it ships now.
+    #[test]
+    fn the_prose_predicate_rejects_the_retired_sentences_and_accepts_the_shipped_ones() {
+        for retired in [
+            // orchestrator.rs:674, the `control_plane_disabled` field doc.
+            "/// `true` when the VM boots a custom `init=` (§5.3) that replaces the vmcell \
+             /// steward, so there is **no** vsock control plane. Set from `cfg.init` at construction",
+            // orchestrator.rs:1917, `connect_sessions`' `# Errors`.
+            "/// Returns an [`Error::Steward`] immediately when this VM boots a custom `init=` \
+             /// that replaces the steward (no control plane, §5.3)",
+            // orchestrator.rs:2282, the feature-resolution doc's config bullet.
+            "/// * **config** — the cell's own shape. Today that is one arm: a custom `init=` \
+             /// replaces the steward, so the cell has no control plane.",
+            // config.rs:90, `VmConfig::init`'s rustdoc — the site the config slice found.
+            "/// `Some(path)` boots a **custom PID 1**, which **replaces the steward** — so the VM \
+             /// has no control plane and cannot snapshot.",
+        ] {
+            assert!(
+                prose_conflation(retired).is_err(),
+                "the predicate must reject the retired derivation: {retired}"
+            );
+        }
+        for shipped in [
+            // The same claims, re-anchored: naming the placement is what makes them true.
+            "/// `true` when this cell expects no steward: set from \
+             /// `cfg.steward_placement.steward_port().is_none()`, never from `cfg.init`. A \
+             /// `Service` cell booting a custom init keeps its control plane.",
+            "/// Refused when the placement is not `resync_reachable()` — so a `Service` cell is \
+             /// refused even though it boots no custom init and replaces the steward with nothing.",
+            // Prose that mentions init without claiming a consequence is not this law's business.
+            "// `build()` validated the override is a single safe token.",
+            // …and prose that discusses the consequence without blaming init is not either.
+            "// A cell declaring StewardPlacement::None has no control plane.",
+        ] {
+            assert!(
+                prose_conflation(shipped).is_ok(),
+                "the predicate must accept re-anchored prose: {shipped}"
+            );
+        }
     }
 
     /// **C8: `cfg.init` decides init IDENTITY only.**
@@ -4642,12 +5307,394 @@ mod c8_call_site_gate {
             "eligibility must be read at snapshot()'s guard AND the eligibility predicate; found \
              {resync_sites:#?}"
         );
-        // The definitions themselves live in `config.rs`; every OTHER reader must be a call.
-        for s in &port_sites {
-            assert!(
-                !s.contains("fn resync_reachable"),
-                "the availability method must not be defined in terms of eligibility: {s}"
-            );
+        // …and the two questions must stay two ANSWERS, which is a claim about the definition, not
+        // about the call sites. The shipped form of this assertion scanned `port_sites` — lines
+        // that contain `steward_port()` by construction — for `fn resync_reachable`, a string no
+        // such line can hold, so it held for every possible tree (finding `g5`). Assert on the
+        // eligibility method's own BODY instead: it must not be defined in terms of availability.
+        //
+        // The inverse it names is `resync_reachable() { self.steward_port().is_some() }`, which is
+        // the near-miss design §3.5 records — `Pid1` and `Service { port: 5000 }` are
+        // indistinguishable through the port, so that body would silently make every `Service`
+        // cell snapshot-eligible with an unmeasured post-restore resync.
+        let body = fn_body(SELF_SOURCE, "pub const fn resync_reachable(self) -> bool");
+        assert!(
+            !body.contains("steward_port"),
+            "C8: `resync_reachable` (eligibility) must not be defined in terms of `steward_port` \
+             (availability) — the two answers differ exactly at `Service`. Body:\n{body}"
+        );
+        // Non-vacuity for the extraction itself: the body must be the real one.
+        assert!(
+            body.contains("Pid1"),
+            "the extracted `resync_reachable` body does not look like the shipped one — the \
+             signature must have changed, so this assertion is reading the wrong text:\n{body}"
+        );
+    }
+
+    /// This file's own text, for the assertions that are about a DEFINITION rather than a call.
+    const SELF_SOURCE: &str = include_str!("config.rs");
+
+    /// The `{ … }` body of the function whose signature is `signature`, braces balanced.
+    ///
+    /// A deliberate second copy of `vmcell-daemon`'s `auth::tests::fn_body` (the shipped idiom for
+    /// "gate the production text of one function"): the two assert about different functions in
+    /// different crates and share no law, and the alternative — a `pub` test-support helper — would
+    /// put a source-scanning utility on a contract crate's surface. If a third copy appears, give it
+    /// a home instead.
+    ///
+    /// # Panics
+    /// Panics when `signature` is absent (the signature moved, and a silent miss would make the
+    /// caller's assertion vacuous) or its braces are unbalanced.
+    fn fn_body(src: &str, signature: &str) -> String {
+        let start = src
+            .find(signature)
+            .unwrap_or_else(|| panic!("`{signature}` not found — did the signature change?"));
+        let rest = src.get(start..).expect("in-bounds");
+        let open = rest.find('{').expect("a function body");
+        let mut depth = 0usize;
+        for (i, c) in rest.char_indices().skip(open) {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return rest.get(open..=i).expect("in-bounds").to_string();
+                    }
+                }
+                _ => {}
+            }
         }
+        panic!("unbalanced braces after `{signature}`");
+    }
+
+    // ---- C8 across the workspace: no crate may bake the steward port (finding `m1`) ----
+
+    /// Every crate's production `.rs` text, as `(crates-relative path, text)`.
+    ///
+    /// This scan exists because the two-file view above **structurally cannot** see a backend: QEMU
+    /// baked `STEWARD_VSOCK_PORT` into the endpoint its `verify_control_plane` probes *verbatim*, so
+    /// a `Service { port: 5100 }` cell was dialed at 5000, the probe spent its whole budget, and a
+    /// healthy cell was destroyed and re-spawned to exhaustion — while every gate in `vmcell` stayed
+    /// green (finding `m1`). A directory walk rather than `include_str!` so a NEW backend crate is
+    /// covered the day it appears, which is the shape of the exposure.
+    ///
+    /// "Production" is everything before the file's first `#[cfg(test)]`/`#[cfg(all(test`/
+    /// `#[cfg(any(test` at column 0, and files that are themselves `#[cfg(test)] mod <name>;`
+    /// modules are skipped whole. Both rules err toward reading LESS, so the roster assertion in
+    /// the test below is what keeps a truncated scan from passing vacuously.
+    ///
+    /// # Panics
+    /// Panics when the walk reads nothing — a scan pointed at the wrong directory must be
+    /// `gate misconfigured`, never a green `ok`.
+    fn workspace_production_sources() -> Vec<(String, String)> {
+        let crates_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("this crate lives under `crates/`")
+            .to_path_buf();
+        let mut files: Vec<std::path::PathBuf> = Vec::new();
+        let mut stack = vec![crates_dir.clone()];
+        while let Some(dir) = stack.pop() {
+            let entries = std::fs::read_dir(&dir)
+                .unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()));
+            for entry in entries {
+                let path = entry.unwrap_or_else(|e| panic!("dir entry: {e}")).path();
+                if path.is_dir() {
+                    // `src` trees only: `tests/`, `benches/` and `target/` are not production.
+                    if path.file_name().and_then(|n| n.to_str()) == Some("target")
+                        || (path.parent() == Some(crates_dir.as_path())
+                            && !path.join("src").is_dir())
+                    {
+                        continue;
+                    }
+                    if path.parent() == Some(crates_dir.as_path()) {
+                        stack.push(path.join("src"));
+                    } else {
+                        stack.push(path);
+                    }
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                    files.push(path);
+                }
+            }
+        }
+        assert!(
+            files.len() > 40,
+            "gate misconfigured: the workspace walk found only {} .rs files under {} — it is not \
+             reading the tree, so every assertion below would pass vacuously",
+            files.len(),
+            crates_dir.display()
+        );
+
+        // Files that ARE a `#[cfg(test)]` module (`mod tests;`, `mod main_is_thin_gate;`): their
+        // whole text is test text, and they legitimately spell the port and the literal.
+        let mut test_only: Vec<String> = Vec::new();
+        let texts: Vec<(std::path::PathBuf, String)> = files
+            .into_iter()
+            .map(|p| {
+                let t = std::fs::read_to_string(&p)
+                    .unwrap_or_else(|e| panic!("read {}: {e}", p.display()));
+                (p, t)
+            })
+            .collect();
+        for (_, text) in &texts {
+            let mut rest = text.as_str();
+            while let Some(at) = rest.find("#[cfg(test)]") {
+                rest = rest.get(at + "#[cfg(test)]".len()..).unwrap_or("");
+                let next = rest.trim_start();
+                if let Some(decl) = next.strip_prefix("mod ")
+                    && let Some((name, _)) = decl.split_once(';')
+                    && !name.contains('{')
+                {
+                    test_only.push(name.trim().to_string());
+                }
+            }
+        }
+
+        let mut out = Vec::new();
+        for (path, text) in texts {
+            let stem = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default()
+                .to_string();
+            if test_only.contains(&stem) {
+                continue;
+            }
+            let mut production = String::new();
+            for l in text.lines() {
+                if l.starts_with("#[cfg(test)]")
+                    || l.starts_with("#[cfg(all(test")
+                    || l.starts_with("#[cfg(any(test")
+                {
+                    break;
+                }
+                // Comments are dropped: a rustdoc mention of the constant is not a dial site (the
+                // prose half above is the reader that cares about comments).
+                production.push_str(l.split("//").next().unwrap_or(""));
+                production.push('\n');
+            }
+            let rel = path
+                .strip_prefix(&crates_dir)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .into_owned();
+            out.push((rel, production));
+        }
+        out
+    }
+
+    /// The enclosing statement of the mention at `at`: back to the previous `;`/`{`/`}`, forward to
+    /// the next `;`, whitespace collapsed.
+    fn enclosing_statement(text: &str, at: usize) -> String {
+        let start = text[..at]
+            .rfind([';', '{', '}'])
+            .map_or(0, |i| i.saturating_add(1));
+        let end = text[at..]
+            .find(';')
+            .map_or(text.len(), |i| at.saturating_add(i).saturating_add(1));
+        text[start..end]
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// The justified shapes for reading the shared port constant, each recognized in the mention's
+    /// own statement:
+    /// * the definition and its ledgered re-export;
+    /// * `.unwrap_or(…)` — the fallback *behind* `steward_port()`, i.e. the `None` placement, which
+    ///   never reaches a dial;
+    /// * the `Pid1` arm of `steward_port` itself, which is where the default is decided;
+    /// * `port !=` — `build_kernel_cmdline`'s "emit no token for the default" comparison.
+    const JUSTIFIED_PORT_STATEMENTS: [&str; 4] = [
+        "pub const STEWARD_VSOCK_PORT",
+        ".unwrap_or(",
+        "StewardPlacement::Pid1 =>",
+        "port !=",
+    ];
+
+    /// A log line naming the default is not a dial site. Recognized in the mention's *neighborhood*
+    /// rather than its statement, because a `{}` inside the format string defeats statement
+    /// extraction.
+    const LOG_CONTEXTS: [&str; 3] = ["tracing::warn!(", "tracing::info!(", "tracing::debug!("];
+
+    /// The sites that legitimately **bake** the constant into a port field, `(file suffix, context)`.
+    ///
+    /// Both are `VmInstance::vsock_endpoint` implementations, whose port every caller re-keys per
+    /// call (`MicroVm::steward`/`connect_sessions` apply `.with_port(steward_port())`), plus the
+    /// guest side's own default bind port. QEMU used to be a third — and it was the one backend
+    /// whose `verify_control_plane` probes the baked endpoint *without* re-keying, which is exactly
+    /// why it was the one that broke. A NEW entry here is a review event: prove nothing probes the
+    /// baked value first.
+    const BAKED_PORT_SITES: [(&str, &str); 3] = [
+        ("vmcell/src/vmm/mod.rs", "fn vsock_endpoint"),
+        ("vmcell-crosvm/src/lib.rs", "fn vsock_endpoint"),
+        ("vmcell-steward/src/options.rs", "vsock_port:"),
+    ];
+
+    /// `Err` for a production mention of the shared steward port that matches no justified shape —
+    /// i.e. a crate that decides the port itself instead of taking it from `steward_port()`.
+    ///
+    /// Split out so the test below can drive it against the shape QEMU shipped (AGENTS.md rule 2).
+    fn unjustified_port_mentions(file: &str, production: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut from = 0usize;
+        while let Some(rel) = production[from..].find("STEWARD_VSOCK_PORT") {
+            let at = from + rel;
+            from = at + "STEWARD_VSOCK_PORT".len();
+            let statement = enclosing_statement(production, at);
+            if JUSTIFIED_PORT_STATEMENTS
+                .iter()
+                .any(|k| statement.contains(k))
+            {
+                continue;
+            }
+            let window: String = production[at.saturating_sub(512)..at]
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            if LOG_CONTEXTS.iter().any(|k| window.contains(k)) {
+                continue;
+            }
+            if BAKED_PORT_SITES
+                .iter()
+                .any(|(f, ctx)| file.contains(f) && window.contains(ctx))
+            {
+                continue;
+            }
+            let line = production[..at].matches('\n').count() + 1;
+            out.push(format!("{file}:{line}: {statement}"));
+        }
+        out
+    }
+
+    /// **C8 across the workspace (finding `m1`).** No crate decides the steward port for itself.
+    #[test]
+    fn no_crate_bakes_the_steward_port_outside_the_justified_sites() {
+        let sources = workspace_production_sources();
+        let mut mentions = 0usize;
+        let mut violations: Vec<String> = Vec::new();
+        let mut saw_definition = false;
+        let mut saw_reexport = false;
+        for (file, production) in &sources {
+            mentions += production.matches("STEWARD_VSOCK_PORT").count();
+            if file.contains("vmcell-protocol")
+                && production.contains("pub const STEWARD_VSOCK_PORT: u32 = 5000;")
+            {
+                saw_definition = true;
+            }
+            if file.contains("vmcell/src/vmm/mod.rs")
+                && production.contains("pub const STEWARD_VSOCK_PORT: u32 = vmcell_protocol::")
+            {
+                saw_reexport = true;
+            }
+            violations.extend(unjustified_port_mentions(file, production));
+        }
+        // Non-vacuity: the two anchors must be in the scanned text, or the walk (or the
+        // production-text cut) is reading less than it thinks and a violation could hide behind it.
+        assert!(
+            saw_definition && saw_reexport,
+            "the scan must reach both the `vmcell-protocol` definition ({saw_definition}) and the \
+             `vmcell::vmm` re-export ({saw_reexport}); it read {} files",
+            sources.len()
+        );
+        assert!(
+            mentions >= 8,
+            "only {mentions} production mentions of the port constant were scanned — the shipped \
+             tree has more, so the reader is truncating"
+        );
+        assert!(
+            violations.is_empty(),
+            "C8: {} production site(s) decide the steward port instead of reading it from \
+             `StewardPlacement::steward_port()`. A baked port is what M1 shipped: QEMU's health \
+             gate probed the baked endpoint and dialed 5000 at a guest listening on 5100, then \
+             re-spawned the healthy cell to exhaustion.\n{}",
+            violations.len(),
+            violations.join("\n")
+        );
+    }
+
+    /// The literal is spelled **once** in the workspace, in `vmcell-protocol` — the claim
+    /// `vmcell::vmm::STEWARD_VSOCK_PORT`'s own rustdoc makes ("there is still exactly ONE literal
+    /// `5000`"), which nothing checked. A second one is how the host/guest pair got mirrored in the
+    /// first place, and the mirror can only fail at run time, as an opaque connect timeout.
+    ///
+    /// Scoped to **port-shaped** occurrences (the enclosing statement mentions a port): `5000` is
+    /// also a plausible millisecond budget, and this gate is about the port, not the number.
+    #[test]
+    fn the_port_literal_is_spelled_once_and_only_in_the_protocol_crate() {
+        let mut sites: Vec<String> = Vec::new();
+        for (file, production) in workspace_production_sources() {
+            let bytes = production.as_bytes();
+            let mut from = 0usize;
+            while let Some(rel) = production[from..].find("5000") {
+                let at = from + rel;
+                from = at + 4;
+                let before = at.checked_sub(1).map(|i| bytes[i]);
+                let after = bytes.get(at + 4).copied();
+                // A token boundary on both sides: `50000`, `x5000`, `1.5000` and `PORT_5000` are
+                // other numbers, not this one.
+                let boundary = |b: Option<u8>| {
+                    !b.is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.')
+                };
+                let statement = enclosing_statement(&production, at).to_lowercase();
+                if boundary(before) && boundary(after) && statement.contains("port") {
+                    let line = production[..at].matches('\n').count() + 1;
+                    sites.push(format!("{file}:{line}"));
+                }
+            }
+        }
+        assert_eq!(
+            sites.len(),
+            1,
+            "the steward port literal must be spelled exactly once in production text (a \
+             port-shaped `5000`); found {sites:?}"
+        );
+        assert!(
+            sites[0].starts_with("vmcell-protocol/"),
+            "the one literal must live in the crate the host and the guest share; found {sites:?}"
+        );
+    }
+
+    /// The workspace scan's own red-on-inverse: the shapes it must reject, and the ones it must not.
+    #[test]
+    fn the_port_scan_rejects_a_baked_port_and_accepts_the_derivation() {
+        // The M1 defect verbatim, in a file with no baked-site exemption.
+        let baked = "let endpoint = if params.in_kernel_vsock { VsockEndpoint::Vsock { cid: \
+                     params.guest_cid, port: vmcell::vmm::STEWARD_VSOCK_PORT, } } else { \
+                     VsockEndpoint::Unix { path: p, port: vmcell::vmm::STEWARD_VSOCK_PORT, } };";
+        assert_eq!(
+            unjustified_port_mentions("vmcell-qemu/src/lib.rs", baked).len(),
+            2,
+            "both arms of the shape M1 shipped must be reported: {baked}"
+        );
+        // The fix: one derivation, the constant only as the `None`-placement fallback.
+        let derived = "let port = placement .steward_port() \
+                       .unwrap_or(vmcell::vmm::STEWARD_VSOCK_PORT); if params.in_kernel_vsock { \
+                       VsockEndpoint::Vsock { cid: params.guest_cid, port, } } else { \
+                       VsockEndpoint::Unix { path: p, port, } };";
+        assert!(
+            unjustified_port_mentions("vmcell-qemu/src/lib.rs", derived).is_empty(),
+            "the shipped derivation must pass"
+        );
+        // A backend hiding the port behind its own constant is the same defect one name over.
+        let aliased = "const MY_PORT: u32 = vmcell::vmm::STEWARD_VSOCK_PORT;";
+        assert_eq!(
+            unjustified_port_mentions("vmcell-newbackend/src/lib.rs", aliased).len(),
+            1,
+            "a per-backend alias of the constant must be reported"
+        );
+        // …and the exemptions are file-scoped: the SAME text in another crate is a violation.
+        let trait_default = "fn vsock_endpoint(&self) -> VsockEndpoint { VsockEndpoint::Unix { \
+                             path: self.vsock_path().to_path_buf(), port: STEWARD_VSOCK_PORT, } }";
+        assert!(
+            unjustified_port_mentions("vmcell/src/vmm/mod.rs", trait_default).is_empty(),
+            "the trait default is the named exemption"
+        );
+        assert_eq!(
+            unjustified_port_mentions("vmcell-newbackend/src/lib.rs", trait_default).len(),
+            1,
+            "the exemption must not travel to another crate"
+        );
     }
 }

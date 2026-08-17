@@ -1,4 +1,4 @@
-//! The one daemon error type and its single HTTP-status mapping (design §11.5.3, The HTTP REST API and its OpenAPI document / §13, Cross-cutting invariants).
+//! The one daemon error type and its single HTTP-status mapping (design §11.5, The HTTP REST API and its OpenAPI document / §13, Cross-cutting invariants).
 //!
 //! Mirrors the `vmcell` error discipline (design §9.5, The error type): no `Error::Other(String)` catch-all —
 //! the caller-relevant conditions are typed and matchable. Exactly one `IntoResponse` impl maps a

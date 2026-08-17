@@ -8,5 +8,20 @@
       "source_sha256": "e998a232b9418db3301cb58468e291a4f41d6ab8306029b30d991f56251dc8d2",
       "fragments": ["IKCONFIG"]
     }
+  },
+  "rootfs": {
+    "acme": {
+      "image": "docker.io/library/debian",
+      "digest": "sha256:a617c1cdde36a7e0194b2f07dff669e1753c03c3205356b94f9f350b0f9a57d1",
+      "xattrs": "preserve",
+      "features": { "snapshot_restore": false }
+    }
+  },
+  "handlers": {
+    "acme": {
+      "digest": "sha256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+      "source": { "url": "https://artifacts.acme.invalid/acme-handler-0.1.0" },
+      "applets": ["acme-probe", "acme-load"]
+    }
   }
 }

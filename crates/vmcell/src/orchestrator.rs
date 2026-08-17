@@ -11,11 +11,50 @@ use crate::vmm::{PerVmResources, VmInstance, Vmm};
 use std::sync::{Arc, Mutex};
 use tracing::info;
 
-/// Bounded budget for the post-boot control-plane health-gate (`start`). A healthy
-/// transport answers well within this, so only a wedged one spends the whole budget
-/// before triggering a re-spawn. Sized above a healthy QEMU cold time-to-ready
-/// (~0.7 s p50) with margin, well under the 10 s steward deadline it prevents.
+/// Bounded budget for the post-boot control-plane health-gate (`start`) under the `Pid1`
+/// placement. A healthy transport answers well within this, so only a wedged one spends the whole
+/// budget before triggering a re-spawn. Sized above a healthy QEMU cold time-to-ready
+/// (~0.7 s p50) with margin, well under the [`DEFAULT_STEWARD_CONNECT_BUDGET`] steward deadline it
+/// prevents. Read only through [`control_plane_probe_budget`], which is where the placement chooses.
 const CONTROL_PLANE_PROBE_BUDGET: std::time::Duration = std::time::Duration::from_secs(4);
+
+/// The **caller's default connect budget**: what [`MicroVm::steward`] and
+/// [`MicroVm::connect_sessions`] grant a caller who passes `None`.
+///
+/// Named because the `Service` health-gate window is that budget (§3.5) — `Timeouts` deliberately
+/// carries no connect-budget field (§9.3), so the per-call argument's default is the only
+/// "caller's window" `start()` can see. Spelled once: the two connect sites and the gate read this
+/// const, so a change to the default cannot move the gate out from under it.
+const DEFAULT_STEWARD_CONNECT_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The control-plane health gate's per-attempt window for a declared `placement` (§3.5).
+///
+/// `Pid1` keeps [`CONTROL_PLANE_PROBE_BUDGET`]: that constant is tuned against a steward the
+/// **kernel** starts, whose time-to-ready is ~0.7 s p50, so 4 s is generous and a wedged transport
+/// is re-spawned promptly.
+///
+/// `Service` gets [`DEFAULT_STEWARD_CONNECT_BUDGET`], because there the steward arrives only after
+/// the guest's **own** init brings it up: a systemd ordering chain is slow-but-healthy, and the
+/// `Pid1`-tuned constant would tear such a cell down and re-boot it to exhaustion by its own health
+/// check — the outcome §3.5 says this sizing exists to prevent. Before the fix the comment at the
+/// call site said exactly that and the code passed the constant unconditionally (M2).
+///
+/// `None` never reaches the gate at all (`start` keys it on `steward_port().is_some()`), so it takes
+/// the `Pid1` floor rather than a third policy nobody exercises. The match is exhaustive on purpose:
+/// a new placement is a compile error here, not a silent inheritance of another placement's window.
+///
+/// Per **attempt**, not overall: the budget bounds one probe, and a re-spawn buys a fresh one. The
+/// re-spawn loop exists for QEMU's vhost-user vsock bring-up race, which is placement-independent,
+/// so collapsing the whole gate into a single window would shrink a `Service` cell's recovery to one
+/// attempt (a recorded narrowing of §3.5's "overall window" wording).
+fn control_plane_probe_budget(placement: crate::config::StewardPlacement) -> std::time::Duration {
+    match placement {
+        crate::config::StewardPlacement::Pid1 | crate::config::StewardPlacement::None => {
+            CONTROL_PLANE_PROBE_BUDGET
+        }
+        crate::config::StewardPlacement::Service { .. } => DEFAULT_STEWARD_CONNECT_BUDGET,
+    }
+}
 
 /// Max control-plane re-spawns in `start` before failing loud. QEMU's vhost-user
 /// vsock bring-up wedges ~11% of boots *independently*, so N re-spawns cut the
@@ -438,10 +477,73 @@ pub struct VmidGuard {
     /// The unique virtual machine ID.
     pub vmid: u32,
     allocator: VmidAllocator,
+    /// The **ancestor** vmid a restored VM's adopted host paths are keyed on (finding `M9`) —
+    /// `Some` only when [`Self::adopt_lineage`] claimed it, so it is released here exactly once and
+    /// never on behalf of another holder.
+    ///
+    /// One guard for both ids rather than a second guard beside it, because this is the same
+    /// ownership with the same lifetime: a restored VM whose backend re-binds the baked host path
+    /// *is* living in the ancestor's scratch directory ([`crate::vmm::adopted_scratch_vmid`]), so
+    /// both ids must stay out of the pool until it is gone. Releasing here also keeps the `m2` order
+    /// intact for free: this `Drop` runs after the instance whose sockets live in that directory has
+    /// been reaped.
+    lineage: Option<u32>,
+}
+
+impl VmidGuard {
+    /// Takes the ancestor's vmid out of the allocatable pool for this guard's lifetime (finding
+    /// `M9`) — `ancestor` being the id this restored VM's adopted host paths are keyed on.
+    ///
+    /// The property wanted is **"no other VM may draw `ancestor` while we live in its scratch
+    /// directory"**, not exclusive ownership of the claim. So an id that is *already* claimed
+    /// satisfies it and is accepted: the two live restore suites deliberately hold the source's vmid
+    /// across the restore precisely to force rotation, and refusing a restore for being in the state
+    /// the reservation exists to create would be backwards. The residual — that claim is somebody
+    /// else's to release — is warned about, and its destructive shape (a *live* VM owning the
+    /// ancestor's directory) is refused one layer down by the backend's own live-baked-path probe
+    /// (`reject_live_baked_vsock`), which the restore already ran.
+    ///
+    /// `self.lineage` is set only when the claim is **ours**, so `Drop` never releases an id this
+    /// guard did not take — handing a live VM's identity back to the pool would be a worse version
+    /// of the defect being fixed.
+    ///
+    /// # Errors
+    /// Propagates everything from [`VmidAllocator::reserve`] that is *not* a conflict:
+    /// [`crate::error::Error::Config`] for an out-of-range id (a foreign directory whose name parses
+    /// but names no legal vmid) and [`crate::error::Error::Io`] for a lock directory that cannot be
+    /// used at all — an unusable lock directory is not a conflict (finding `m3`).
+    fn adopt_lineage(&mut self, ancestor: u32) -> Result<()> {
+        // Already ours, and therefore already safe for the exact lifetime that matters: the
+        // ancestor's directory carries a DIFFERENT pid (a snapshot taken by another process) but the
+        // same id this VM happened to draw. Kept ahead of the reserve so the common cross-process
+        // restore does not log a warning about its own claim.
+        if ancestor == self.vmid {
+            return Ok(());
+        }
+        match self.allocator.reserve(ancestor) {
+            Ok(_) => {
+                self.lineage = Some(ancestor);
+                Ok(())
+            }
+            Err(crate::error::Error::Exhaustion(_)) => {
+                tracing::warn!(
+                    "this snapshot's baked host paths live in vmid {ancestor}'s scratch directory, \
+                     and that vmid is already claimed elsewhere. No new VM can draw it while that \
+                     claim stands, so the restore continues — but the claim is not ours to hold, so \
+                     it must outlive this VM.",
+                );
+                Ok(())
+            }
+            Err(other) => Err(other),
+        }
+    }
 }
 
 impl Drop for VmidGuard {
     fn drop(&mut self) {
+        if let Some(ancestor) = self.lineage {
+            self.allocator.release(ancestor);
+        }
         self.allocator.release(self.vmid);
     }
 }
@@ -671,9 +773,14 @@ pub struct MicroVm<V: Vmm> {
     /// queryable descriptor, never the enforcement path: per-op guards keep their own authoritative
     /// typed refusals (§7.2 rule 3).
     features: crate::feature::FeatureSet,
-    /// `true` when the VM boots a custom `init=` (§5.3, The kernel command line) that replaces the vmcell
-    /// steward, so there is **no** vsock control plane. Set from `cfg.init` at
-    /// construction; makes [`MicroVm::steward`] fail loud immediately rather than hang
+    /// `true` when this cell expects **no** steward, so there is no vsock control plane.
+    ///
+    /// The retained answer to C8's FIRST question: set from
+    /// `cfg.steward_placement.steward_port().is_none()` at construction — i.e. from
+    /// [`StewardPlacement::None`](crate::config::StewardPlacement::None), the one placement with no
+    /// port — never from `cfg.init`, which decides init *identity* only. A `Service` cell booting a
+    /// custom `init=` keeps its control plane and is therefore `false` here; that is the difference
+    /// delta 4 exists for. Makes [`MicroVm::steward`] fail loud immediately rather than hang
     /// connecting to a listener that will never answer.
     control_plane_disabled: bool,
 }
@@ -1466,6 +1573,8 @@ impl<V: Vmm> MicroVm<V> {
         let vmid = VmidGuard {
             vmid: vmid_value,
             allocator: env.vmids.clone(),
+            // A cold boot adopts nothing: every host path is keyed on `vmid_value` itself.
+            lineage: None,
         };
         // Create the single owned per-VM scratch dir EARLY — before networking —
         // so its guard reclaims it even if setup or create/boot fails partway, and
@@ -1503,16 +1612,17 @@ impl<V: Vmm> MicroVm<V> {
         // probe exists to catch. §3.5 names this the site most likely to be missed in the re-key,
         // and the C8 call-site scan pins it. CH/FC probes are no-ops.
         //
-        // One sizing consequence rides the re-key: the per-attempt budget is tuned against `Pid1`
-        // time-to-ready (~0.7 s p50), but a `Service` steward arrives only after the guest's own
-        // init brings it up. So under `Service` the overall window derives from the caller's
-        // connect budget rather than the `Pid1`-tuned constant — otherwise a slow-but-healthy
-        // systemd cell would be killed and re-booted to exhaustion by its own health check.
+        // One sizing consequence rides the re-key, and it is a BRANCH, not a remark: the constant is
+        // tuned against `Pid1` time-to-ready (~0.7 s p50), but a `Service` steward arrives only
+        // after the guest's own init brings it up. So the window is selected on the placement by
+        // `control_plane_probe_budget` — the caller's default connect budget under `Service`, the
+        // `Pid1`-tuned constant otherwise — because otherwise a slow-but-healthy systemd cell would
+        // be killed and re-booted to exhaustion by its own health check.
         if cfg.steward_placement.steward_port().is_some() {
             let clamped = cfg.timeouts.clamped();
             let mut respawns = 0u32;
             while let Err(e) = instance
-                .verify_control_plane(CONTROL_PLANE_PROBE_BUDGET, &clamped)
+                .verify_control_plane(control_plane_probe_budget(cfg.steward_placement), &clamped)
                 .await
             {
                 if respawns >= MAX_CONTROL_PLANE_RESPAWNS {
@@ -1690,9 +1800,11 @@ impl<V: Vmm> MicroVm<V> {
             Some(v) => env.vmids.reserve(v)?,
             None => env.vmids.allocate()?,
         };
-        let vmid = VmidGuard {
+        let mut vmid = VmidGuard {
             vmid: vmid_value,
             allocator: env.vmids.clone(),
+            // Set below, once the backend has told us which host paths it actually adopted (M9).
+            lineage: None,
         };
         // Create the single owned per-VM scratch dir EARLY (see `start()`).
         let tmp_dir = crate::vmm::VmTempDir::create(&cfg.resource_prefix, vmid.vmid).await?;
@@ -1741,6 +1853,20 @@ impl<V: Vmm> MicroVm<V> {
         let mut instance = vmm
             .restore(&effective_dir, &cfg, &staged.res, &*env.cgroups)
             .await?;
+        // M9: Firecracker's restore re-binds the vsock UDS its snapshot BAKED (FC's
+        // `PUT /snapshot/load` has no override for it), so the restored VM lives in the ANCESTOR
+        // vmid's scratch directory while holding a freshly allocated vmid of its own. Reserve the
+        // ancestor's for this VM's lifetime — otherwise a later VM draws it, mints the very
+        // directory this one is living in, and deletes it on teardown. Keyed on the path the backend
+        // actually adopted (the one `adopted_scratch_vmid` law), so CH/QEMU/crosvm need no branch
+        // here, and done BEFORE the resume: a squatting VM must not be brought back up.
+        if let Some(ancestor) = crate::vmm::adopted_scratch_vmid(
+            &cfg.resource_prefix,
+            tmp_dir.path(),
+            instance.vsock_path(),
+        ) {
+            vmid.adopt_lineage(ancestor)?;
+        }
         info!("Resuming instance...");
         instance.resume().await?;
         info!("Instance resumed.");
@@ -1839,7 +1965,7 @@ impl<V: Vmm> MicroVm<V> {
                 .unwrap_or(crate::vmm::STEWARD_VSOCK_PORT);
             let client = StewardClient::connect_endpoint(
                 &instance.vsock_endpoint().with_port(port),
-                timeout.unwrap_or(std::time::Duration::from_secs(10)),
+                timeout.unwrap_or(DEFAULT_STEWARD_CONNECT_BUDGET),
                 &self.timeouts,
                 &crate::vmm::RealSerialLog {
                     path: instance.serial_log().to_path_buf(),
@@ -1913,10 +2039,12 @@ impl<V: Vmm> MicroVm<V> {
     /// Panics if the VM instance is missing (e.g. after shutdown).
     ///
     /// # Errors
-    /// Returns an [`Error::Steward`](crate::error::Error::Steward) immediately when
-    /// this VM boots a custom `init=` that replaces the steward (no control
-    /// plane, §5.3, The kernel command line), or if the connection or `Ready` handshake does not complete
-    /// within `timeout`.
+    /// Returns an [`Error::Steward`](crate::error::Error::Steward) immediately when this cell
+    /// declares [`StewardPlacement::None`](crate::config::StewardPlacement::None) — the placement
+    /// whose `steward_port()` is `None`, so no steward is expected (§3.5, invariant C8) — or if the
+    /// connection or `Ready` handshake does not complete within `timeout`. A custom `init=` is *not*
+    /// what takes this arm: a `Service` cell booting somebody else's init keeps its sessions, and a
+    /// `None` cell booting no custom init at all is refused.
     pub async fn connect_sessions(
         &self,
         timeout: Option<std::time::Duration>,
@@ -1938,7 +2066,7 @@ impl<V: Vmm> MicroVm<V> {
             .unwrap_or(crate::vmm::STEWARD_VSOCK_PORT);
         crate::steward::session::SessionMux::connect_endpoint(
             &instance.vsock_endpoint().with_port(port),
-            timeout.unwrap_or(std::time::Duration::from_secs(10)),
+            timeout.unwrap_or(DEFAULT_STEWARD_CONNECT_BUDGET),
             &self.timeouts,
             &crate::vmm::RealSerialLog {
                 path: instance.serial_log().to_path_buf(),
@@ -1953,15 +2081,22 @@ impl<V: Vmm> MicroVm<V> {
     /// owns its own protocol: no framing, no `Ready` handshake, no steward.
     ///
     /// **Independent of the control plane, by design.** Unlike [`steward`](Self::steward)
-    /// and [`connect_sessions`](Self::connect_sessions), this does *not* refuse when
-    /// a custom `init=` replaced the steward (§5.3, The kernel command line): the vsock
-    /// **device** is attached unconditionally on every backend — CH's `vsock` create
-    /// payload field, Firecracker's `PUT /vsock`, QEMU's device/daemon block, and
-    /// crosvm's `--vsock cid=` are all straight-line, none reads `cfg.init` — so a
-    /// custom-init guest that binds a vsock port is reachable even though the steward
-    /// is absent. That is precisely FR-V3's cheapest shape: an in-guest listener
-    /// reachable from the host with no IP stack, on every backend and both operating
-    /// modes.
+    /// and [`connect_sessions`](Self::connect_sessions), this does *not* refuse when the
+    /// cell declares [`StewardPlacement::None`](crate::config::StewardPlacement::None) —
+    /// the placement whose `steward_port()` is `None`, so no steward is expected
+    /// (§3.5, Where the steward runs; invariant C8): the vsock **device** is attached
+    /// unconditionally on every backend — CH's `vsock` create payload field,
+    /// Firecracker's `PUT /vsock`, QEMU's device/daemon block, and crosvm's
+    /// `--vsock cid=` are all straight-line, none reads the placement — so a guest that
+    /// binds a vsock port itself is reachable even with no steward anywhere. That is
+    /// precisely FR-V3's cheapest shape: an in-guest listener reachable from the host
+    /// with no IP stack, on every backend and both operating modes.
+    ///
+    /// A custom `init=` is not what this bypasses. Since v33 the two questions are
+    /// separate: a `Service` cell booting somebody else's init keeps its control plane
+    /// (so [`steward`](Self::steward) does not refuse it either), and a `None` cell has
+    /// no control plane to bypass whether it names an `init` or not — naming one with no
+    /// declared placement *derives* `None`.
     ///
     /// The endpoint is re-derived from the instance on every call (its port
     /// overridden with `port`), never cached: Firecracker's restore replaces the
@@ -2085,8 +2220,13 @@ impl<V: Vmm> MicroVm<V> {
     /// # Errors
     /// Returns an error if the backend fails to snapshot,
     /// [`crate::error::Error::Unsupported`] on a backend without snapshot support, or
-    /// [`crate::error::Error::Unsupported`] when this VM boots a custom `init=` (its restored
-    /// clones could never run the mandatory post-restore resync).
+    /// [`crate::error::Error::Unsupported`] when this cell's declared placement is not
+    /// post-restore-resync-reachable
+    /// ([`StewardPlacement::resync_reachable`](crate::config::StewardPlacement::resync_reachable),
+    /// C8's SECOND question — `Pid1` only in v33). So a `Service { port }` cell is refused even
+    /// though its control plane is live and even though it boots no custom `init=`: whether the
+    /// guest's own init restarts the steward after the vhost-vsock device is re-created is unmeasured
+    /// (§17), and its restored clones could not be trusted to run the mandatory post-restore resync.
     pub async fn snapshot(&mut self, dir: &std::path::Path) -> Result<()> {
         // docs/78 M2: refuse to *write* an image whose restore can never be correct. A custom
         // `init=` replaces the vmcell steward, so the mandatory post-restore resync (clock,
@@ -2094,9 +2234,9 @@ impl<V: Vmm> MicroVm<V> {
         // from this image. `build()` rejects `init` + `snapshotting`, but a VM built WITHOUT
         // `snapshotting` can still reach this method (and `Zygote::suspend` routes straight
         // through it), so the eligibility law needs its guard at this boundary too — the earliest
-        // point that refuses the bad artifact instead of the N restores of it.
-        // `control_plane_disabled` is the retained `cfg.init.is_some()`; the config-only arms live
-        // in `clone_ineligible_feature`, which needs a `VmConfig` a live `MicroVm` no longer owns.
+        // point that refuses the bad artifact instead of the N restores of it. The config-only arms
+        // live in `clone_ineligible_feature`, which needs a `VmConfig` a live `MicroVm` no longer
+        // owns, which is why this boundary retains the placement itself.
         // C8's SECOND question, deliberately not the first. `control_plane_disabled` (the
         // availability field) would be WRONG here: a `Service{5000}` cell HAS a reachable steward
         // and is still snapshot-ineligible, because whether the guest's init restarts it after the
@@ -2130,7 +2270,11 @@ impl<V: Vmm> MicroVm<V> {
 
     /// Releases every per-VM resource that must be torn down **after** the VMM
     /// instance, in the one canonical order:
-    /// smoltcp NAT → egress proxy → netns → cgroup → CID → VMID → scratch dir.
+    /// smoltcp NAT → egress proxy → netns → segment slot → cgroup → CID → scratch dir → VMID.
+    ///
+    /// The VMID is **last**, after the scratch dir whose path is a pure function of
+    /// `(prefix, pid, vmid)` — see the tail of the body, and finding `m2`, which is exactly this
+    /// inversion shipped as code.
     ///
     /// Both [`shutdown`](Self::shutdown) (after the graceful async
     /// `request_shutdown` + `kill`) and [`Drop`] route through this single
@@ -2214,13 +2358,13 @@ impl<V: Vmm> MicroVm<V> {
             if let Err(e) = inst.request_shutdown().await {
                 tracing::debug!("graceful shutdown request failed (will force-kill): {}", e);
             }
-            // Post-ack floor: the shutdown RPC has no timeout
-            // (`vmm::unix_api_request`), so an RPC stalled for >= the grace would
-            // arrive here with the deadline already past and skip the poll loop
-            // entirely — ~0 post-ack flush time, the exact anti-pattern the ORCH-7
-            // grace exists to prevent. Clamping the deadline to now + one poll
-            // step guarantees >= 1 `has_exited` check after the guest acknowledged
-            // the shutdown.
+            // Post-ack floor: the shutdown RPC is bounded, but by `vmm::unix_api_request`'s own
+            // 5 s `CONTROL_REQUEST_TIMEOUT` — which is *longer* than every shipped
+            // `shutdown_grace` (250 ms default, 50 ms on `throughput`). So a slow-but-successful
+            // RPC routinely arrives here with the deadline already past and would skip the poll
+            // loop entirely — ~0 post-ack flush time, the exact anti-pattern the ORCH-7 grace
+            // exists to prevent. Clamping the deadline to now + one poll step guarantees >= 1
+            // `has_exited` check after the guest acknowledged the shutdown.
             grace_deadline = grace_deadline.max(tokio::time::Instant::now() + poll_step);
             while tokio::time::Instant::now() < grace_deadline {
                 if inst.has_exited().await {
@@ -2279,8 +2423,10 @@ impl<V: Vmm> Drop for MicroVm<V> {
 /// * **host** — [`crate::feature::HostDeclaration::probe`] (nested-virt readiness).
 /// * **artifacts** — the feature-manifest sidecar travelling beside the kernel and the rootfs
 ///   image, or the stated baseline when there is none.
-/// * **config** — the cell's own shape. Today that is one arm: a custom `init=` replaces the
-///   steward, so the cell has no control plane.
+/// * **config** — the cell's own shape. Today that is one arm, keyed on C8's first question: a cell
+///   whose `steward_port()` is `None` — i.e. one declaring `StewardPlacement::None` — has no control
+///   plane, and the removal says so in those words. Not `cfg.init`: a `Service` cell booting somebody
+///   else's init keeps the feature.
 ///
 /// # Errors
 ///
@@ -2418,7 +2564,10 @@ pub(crate) fn clone_ineligible_feature(cfg: &VmConfig) -> Option<crate::feature:
     // steward. `build()` rejects `init` + `snapshotting`, but nothing rejected *restoring* (or
     // fanning out) such a config: the clone would come up on a frozen clock with a correlated
     // CSPRNG and a stale MAC/IP, and `steward()` fails loud, so the resync is structurally
-    // unreachable. Config-only and identical at both boundaries, hence an arm here.
+    // unreachable. Config-only and identical at both boundaries, hence an arm here. v33 re-keyed
+    // the arm onto C8's second question, which is strictly wider than the `init` it was written
+    // for: `Service` also fails it, because whether the guest's own init restarts the steward after
+    // the vhost-vsock device is re-created is unmeasured (§17).
     if !cfg.steward_placement.resync_reachable() {
         return Some(INELIGIBLE_PLACEMENT);
     }
@@ -2502,7 +2651,9 @@ pub trait OrphanScanner: Send + Sync {
 /// Host-facing (privileged) — this real path reads privileged host state and is
 /// **correct-by-construction, not KVM/privilege-validated here**; the unit tests
 /// drive [`sweep_orphans`] through a recording fake instead. Deeply-nested
-/// delegated cgroup slices are found by a bounded recursive walk.
+/// delegated cgroup slices are found by a bounded recursive walk whose depth is derived from where a
+/// per-VM slice actually goes ([`crate::naming::vm_slice_name`]'s own component count), so a systemd
+/// user session's component-5 placement is in reach.
 ///
 /// Matches names by the **same prefix** the VM naming uses ([`crate::naming`]) — an operator running
 /// `vmcelld --resource-prefix acme` sweeps `acme-*`, never `vmcell-*` from another tool. Build it with
@@ -2512,6 +2663,27 @@ pub struct HostOrphanScanner {
     /// The resource prefix; netns are matched by `<prefix>-net-`, cgroup slices and scratch dirs by
     /// `<prefix>-vm-`.
     prefix: String,
+    /// The cgroup half of the scan's inputs (see [`CgroupScan`]).
+    cgroup: CgroupScan,
+}
+
+/// What the cgroup arm of the sweep walks: the tree, and the composed slice name whose depth bounds
+/// how far down that walk goes (M4).
+///
+/// Production is always the real mount plus **this process's own** composition, captured once at
+/// construction because a process's cgroup placement does not change during its life. The unit gate
+/// injects a fake tree together with a systemd-user-session-shaped name, which is the only way to
+/// prove the depth *at the call site* on a host that is not in such a session — and a green depth
+/// unit test standing beside an unchanged call site is precisely the shape §18's call-site-scan
+/// convention exists to catch.
+#[derive(Debug, Clone)]
+struct CgroupScan {
+    /// The cgroup-v2 mount to enumerate.
+    root: std::path::PathBuf,
+    /// A composed [`crate::metrics::vm_slice_name`] for this prefix: the name a per-VM slice of this
+    /// process's placement takes. Read only for its **depth**
+    /// ([`crate::metrics::vm_slice_scan_depth`]), never matched against.
+    slice_name: String,
 }
 
 impl Default for HostOrphanScanner {
@@ -2525,13 +2697,43 @@ impl HostOrphanScanner {
     /// [`crate::naming::DEFAULT_RESOURCE_PREFIX`] for the historical `vmcell-*` names.
     #[must_use]
     pub fn new(prefix: impl Into<String>) -> Self {
+        let prefix = prefix.into();
+        Self {
+            cgroup: CgroupScan {
+                root: std::path::PathBuf::from("/sys/fs/cgroup"),
+                // vmid 0 is a SENTINEL, not a VM: the vmid names the leaf only, so the composed
+                // name's DEPTH is vmid-independent, and the allocators hand out `1..=max`, so 0
+                // can never collide with a live slice.
+                slice_name: crate::metrics::vm_slice_name(&prefix, 0),
+            },
+            prefix,
+        }
+    }
+
+    /// The same scanner against an injected cgroup tree and slice-name composition — the unit gate's
+    /// only way to drive [`OrphanScanner::scan_cgroup_slices`]'s own depth derivation without
+    /// running under a systemd user session.
+    #[cfg(test)]
+    fn with_cgroup_scan(
+        prefix: impl Into<String>,
+        root: impl Into<std::path::PathBuf>,
+        slice_name: impl Into<String>,
+    ) -> Self {
         Self {
             prefix: prefix.into(),
+            cgroup: CgroupScan {
+                root: root.into(),
+                slice_name: slice_name.into(),
+            },
         }
     }
 
     /// Bounded recursive walk of the cgroup-v2 tree under `root`, collecting the paths (relative to
-    /// `/sys/fs/cgroup`) of directories named `<vm_prefix>*` (`vm_prefix` = `<prefix>-vm-`).
+    /// `root`, which the [`CgroupFs`](crate::metrics::CgroupFs) seam resolves against the same mount)
+    /// of directories named `<vm_prefix>*` (`vm_prefix` = `<prefix>-vm-`).
+    ///
+    /// `depth` is the deepest path component a match may sit at, and it comes from
+    /// [`crate::metrics::vm_slice_scan_depth`] — never a literal (M4).
     fn walk_cgroup_slices(
         vm_prefix: &str,
         root: &std::path::Path,
@@ -2568,7 +2770,9 @@ impl HostOrphanScanner {
 impl OrphanScanner for HostOrphanScanner {
     fn scan_netns(&self) -> Vec<String> {
         let netns_prefix = crate::naming::netns_sweep_prefix(&self.prefix);
-        let Ok(dir) = std::fs::read_dir("/var/run/netns") else {
+        // One law: the enumerating sweeps read the layout from `net::tap::netns_dir`, which exists
+        // for exactly this — so the sweep and the creation path cannot drift onto two directories.
+        let Ok(dir) = std::fs::read_dir(crate::net::tap::netns_dir()) else {
             return Vec::new();
         };
         dir.flatten()
@@ -2579,7 +2783,9 @@ impl OrphanScanner for HostOrphanScanner {
 
     fn scan_segment_netns(&self) -> Vec<String> {
         let seg_prefix = crate::naming::segment_netns_sweep_prefix(&self.prefix);
-        let Ok(dir) = std::fs::read_dir("/var/run/netns") else {
+        // The segment arm reads the same directory through the same law; only the prefix and the
+        // id space it is checked against differ (§6.5, law F2).
+        let Ok(dir) = std::fs::read_dir(crate::net::tap::netns_dir()) else {
             return Vec::new();
         };
         dir.flatten()
@@ -2591,13 +2797,11 @@ impl OrphanScanner for HostOrphanScanner {
     fn scan_cgroup_slices(&self) -> Vec<String> {
         let vm_prefix = crate::naming::vm_resource_sweep_prefix(&self.prefix);
         let mut out = Vec::new();
-        Self::walk_cgroup_slices(
-            &vm_prefix,
-            std::path::Path::new("/sys/fs/cgroup"),
-            "",
-            4,
-            &mut out,
-        );
+        // The walk depth is DERIVED from where a per-VM slice actually goes, never a literal: the
+        // shipped `4` could not reach component 5, which is where every systemd user session puts
+        // it, so this arm of the crash-recovery sweep was structurally unreachable (M4).
+        let depth = crate::metrics::vm_slice_scan_depth(&self.cgroup.slice_name);
+        Self::walk_cgroup_slices(&vm_prefix, &self.cgroup.root, "", depth, &mut out);
         out
     }
 
@@ -3336,6 +3540,7 @@ mod tests {
                     cids: cids.clone(),
                     cid,
                 })),
+                lineage: None,
             }),
             instance: Some(instance),
             netns: Some(netns),
@@ -4548,7 +4753,9 @@ mod tests {
     // docs/78 M2, snapshot boundary. The image is refused where it is WRITTEN, not only where it
     // is restored: `Zygote::suspend` routes straight through `MicroVm::snapshot`, which had no
     // guard at all, so a custom-init VM could produce a master image that is unusable by
-    // construction. `control_plane_disabled` is the retained `cfg.init.is_some()`.
+    // construction. The guard is `resync_reachable()` (C8's second question), and this cell reaches
+    // it because naming an `init` with no placement DERIVES `StewardPlacement::None` — the
+    // eligibility answer, not the `cfg.init.is_some()` the pre-v33 field was set from.
     //
     // Red on the inverse: drop the guard and the snapshot succeeds (the `FakeVmm` instance records
     // a "snapshot" call and returns `Ok`).
@@ -5304,6 +5511,7 @@ mod tests {
             vmid: Some(VmidGuard {
                 vmid,
                 allocator: vmid_alloc.clone(),
+                lineage: None,
             }),
             instance: None,
             netns: None,
@@ -5509,6 +5717,66 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&live_dir);
+    }
+
+    // M4: the REAL `HostOrphanScanner::scan_cgroup_slices` must reach a slice at the depth a
+    // systemd user session puts it — `user.slice/user-1000.slice/user@1000.service/<scope>/<leaf>`,
+    // path component 5 — because that is where every blessed-runner and `vmcelld` slice on such a
+    // host actually lives. The shipped walk depth was the literal `4`, so this arm of the
+    // crash-recovery sweep reported zero slices reclaimed while the netns and scratch arms worked:
+    // a partial, quiet leak that reads as success.
+    //
+    // The tree AND the composed slice name are injected, which is what makes this a gate on the
+    // CALL SITE rather than on `vm_slice_scan_depth` alone (the depth law has its own unit test in
+    // `metrics`): a green derivation standing beside an unchanged `4` is the exact shape §18's
+    // call-site convention exists to catch.
+    //
+    // RED on the inverse: restore the literal `4` in `scan_cgroup_slices` and the session leg finds
+    // nothing.
+    #[test]
+    fn cgroup_sweep_reaches_a_systemd_user_session_slice() {
+        let tree = tempfile::tempdir().expect("tempdir");
+        let prefix = "vmcell-m4test";
+        // Where a per-VM slice of this prefix sits in a user session, composed through the ONE law
+        // so the fixture cannot drift from the name a start would create.
+        let session = "user.slice/user-1000.slice/user@1000.service/run-r0.scope";
+        let leaf = crate::naming::cgroup_slice_name(prefix, 3);
+        let slice = format!("{session}/{leaf}");
+        std::fs::create_dir_all(tree.path().join(&slice)).expect("plant the session slice");
+        // A foreign sibling at the same depth, so a scan that matched everything would fail too.
+        std::fs::create_dir_all(tree.path().join(format!("{session}/other.scope")))
+            .expect("plant a foreign sibling");
+
+        let scanner = HostOrphanScanner::with_cgroup_scan(prefix, tree.path(), &slice);
+        assert_eq!(
+            scanner.scan_cgroup_slices(),
+            vec![slice.clone()],
+            "the sweep must find the session-nested slice, by the path the CgroupFs seam deletes"
+        );
+
+        // Non-vacuity: the same tree with the pre-fix depth finds nothing, so the assertion above
+        // is about the derivation and not about the fixture.
+        let mut shallow = Vec::new();
+        HostOrphanScanner::walk_cgroup_slices(
+            &crate::naming::vm_resource_sweep_prefix(prefix),
+            tree.path(),
+            "",
+            4,
+            &mut shallow,
+        );
+        assert!(
+            shallow.is_empty(),
+            "the shipped depth 4 must be too shallow for a session slice, or this gate proves \
+             nothing: {shallow:?}"
+        );
+
+        // And the bare-leaf placement (no `/proc/self/cgroup` base) still works: depth 1.
+        let flat = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(flat.path().join(&leaf)).expect("plant a top-level slice");
+        assert_eq!(
+            HostOrphanScanner::with_cgroup_scan(prefix, flat.path(), &leaf).scan_cgroup_slices(),
+            vec![leaf],
+        );
     }
 
     // ---- ORCH-2: shutdown() tears down the proxy BEFORE the netns ----
@@ -5951,17 +6219,58 @@ mod tests {
             .expect("a Pid1 cell must still snapshot");
     }
 
+    // M2 / §3.5: the health gate's window is SELECTED on the placement. `Pid1` keeps the constant
+    // tuned against a kernel-started steward (~0.7 s p50 time-to-ready); `Service` gets the caller's
+    // default connect budget, because there the steward arrives only after the guest's own init
+    // brings it up — and a slow-but-healthy systemd cell must not be torn down and re-booted to
+    // exhaustion by its own health check, which is the outcome §3.5 says the sizing prevents. Before
+    // the fix the comment above the call site said exactly this and the code passed the constant
+    // unconditionally.
+    //
+    // RED on the inverse: make the selector unconditional (either constant) and the inequality leg
+    // fails; the `Service` leg names which way.
+    #[test]
+    fn the_health_gate_window_is_selected_on_the_placement() {
+        use crate::config::StewardPlacement;
+        assert_eq!(
+            control_plane_probe_budget(StewardPlacement::Pid1),
+            CONTROL_PLANE_PROBE_BUDGET,
+            "a kernel-started steward keeps the Pid1-tuned constant"
+        );
+        // Any declared port, default or not: the window is about WHO starts the steward, not about
+        // which port it binds.
+        for port in [vmcell_protocol::STEWARD_VSOCK_PORT, 5100] {
+            assert_eq!(
+                control_plane_probe_budget(StewardPlacement::Service { port }),
+                DEFAULT_STEWARD_CONNECT_BUDGET,
+                "a Service cell's window is the caller's default connect budget"
+            );
+        }
+        assert!(
+            DEFAULT_STEWARD_CONNECT_BUDGET > CONTROL_PLANE_PROBE_BUDGET,
+            "the Service window must be WIDER than the Pid1 constant, or the selection is a \
+             rename: {DEFAULT_STEWARD_CONNECT_BUDGET:?} vs {CONTROL_PLANE_PROBE_BUDGET:?}"
+        );
+        // `None` never reaches the gate (`start` keys it on `steward_port().is_some()`), so it takes
+        // the floor rather than a third, unexercised policy.
+        assert_eq!(
+            control_plane_probe_budget(StewardPlacement::None),
+            CONTROL_PLANE_PROBE_BUDGET
+        );
+    }
+
     // §3.2 (The host side: StewardClient and SessionMux) / §18 delta 7: `dial_vsock` must NOT copy
-    // `steward()`'s custom-init guard. The vsock DEVICE is attached unconditionally by
-    // every backend (none reads `cfg.init`), so a custom-init guest that binds a vsock
-    // port is reachable even with no steward anywhere — that is the whole point of the
-    // raw dial. This drives the real transport (a mock bridge on a UDS) through a VM
-    // whose `control_plane_disabled` is TRUE and asserts the dial reached the wire:
-    // the bridge saw a `CONNECT` for the DIALED port, and the handle came back.
-    // Red-on-inverse: adding the `control_plane_disabled` early-return to
-    // `dial_vsock` makes this fail with the custom-init Steward error instead.
+    // `steward()`'s control-plane guard. The vsock DEVICE is attached unconditionally by
+    // every backend (none reads the placement), so a guest that binds a vsock port itself
+    // is reachable even with no steward anywhere — that is the whole point of the raw
+    // dial. This drives the real transport (a mock bridge on a UDS) through a VM whose
+    // `control_plane_disabled` is TRUE — the `StewardPlacement::None` answer, not a
+    // custom `init=`, which since v33 costs a `Service` cell nothing — and asserts the
+    // dial reached the wire: the bridge saw a `CONNECT` for the DIALED port, and the
+    // handle came back. Red-on-inverse: adding the `control_plane_disabled` early-return
+    // to `dial_vsock` makes this fail with that Steward error instead.
     #[tokio::test]
-    async fn dial_vsock_bypasses_the_custom_init_guard() {
+    async fn dial_vsock_bypasses_the_control_plane_guard() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let sock = std::env::temp_dir().join(format!(
@@ -6172,7 +6481,10 @@ mod nat_plan_gate {
     /// This file's production text: everything before the unit-test module, comment lines dropped
     /// and whitespace collapsed (so a call split across rustfmt lines is still seen whole, and a
     /// rustdoc mention of a spelling is not a call site).
-    fn production_code(source: &str) -> String {
+    ///
+    /// `pub(super)` so the sibling [`probe_budget_gate`](super::probe_budget_gate) scans the same
+    /// text through the same reader: a second copy of the scanner is a second thing to keep in sync.
+    pub(super) fn production_code(source: &str) -> String {
         let (production, _) = source
             .split_once("#[cfg(test)]\nmod tests")
             .expect("orchestrator.rs must carry its `#[cfg(test)] mod tests` marker");
@@ -6185,7 +6497,9 @@ mod nat_plan_gate {
     }
 
     /// The top-level argument expressions of the call whose `(` follows `code[at..]`'s head.
-    fn call_args(code: &str, at: usize) -> Vec<&str> {
+    ///
+    /// `pub(super)` for the same reason as [`production_code`].
+    pub(super) fn call_args(code: &str, at: usize) -> Vec<&str> {
         let open = at + code[at..].find('(').expect("a call has an argument list");
         let mut depth = 0usize;
         let mut args = Vec::new();
@@ -6350,5 +6664,142 @@ mod nat_plan_gate {
              socket_path.clone(),\n    nat_egress,\n);\n#[cfg(test)]\nmod tests { }";
         let code = production_code(synthetic);
         plan_reaches_the_nat(&code).expect("the real formatting must scan cleanly");
+    }
+}
+
+/// Call-site gate for M2's placement-selected health-gate window: the window
+/// [`control_plane_probe_budget`] computes is the window `verify_control_plane` is actually handed.
+///
+/// The claim is about the CALL SITE in `start`, and the selector's own unit test
+/// (`the_health_gate_window_is_selected_on_the_placement`) cannot see the difference — a `start` that
+/// keeps passing the bare `CONTROL_PLANE_PROBE_BUDGET` leaves it green while shipping exactly the
+/// defect M2 records, a comment describing a branch that is not in the code. Nor can a behavioral
+/// test see it: `FakeVmm::verify_control_plane` ignores the budget it is given, so nothing observable
+/// on a fake-driven `start()` names it.
+///
+/// So this reads this file's own production text, through the same reader as
+/// [`nat_plan_gate`](super::nat_plan_gate) — the shape `vmcell-qemu`'s `virtiofs_pacing_gate`
+/// established, whose doc carries the full rationale for scanning source. Its limit is the same: a
+/// scan sees spellings, not values.
+#[cfg(test)]
+mod probe_budget_gate {
+    use super::nat_plan_gate::{call_args, production_code};
+
+    const SOURCE: &str = include_str!("orchestrator.rs");
+
+    /// The control-plane probes this orchestrator ships: one, in `start`'s health gate. (`restore`
+    /// deliberately has none — a restored VM's transport was already proven before the snapshot.)
+    ///
+    /// Asserted exactly, so a scan that silently matched nothing — how every source-scanning gate
+    /// fails vacuously — reddens instead of passing over an empty set.
+    const EXPECTED_PROBES: usize = 1;
+
+    /// The one expression the probe's budget argument may be.
+    const SELECTOR: &str = "control_plane_probe_budget(cfg.steward_placement)";
+
+    /// Checks that every shipped `verify_control_plane` call takes its window from the placement
+    /// selector. `Err` names the violation — factored out so the test below can drive it against
+    /// buggy inputs (AGENTS.md rule 2).
+    fn probe_window_is_selected(code: &str) -> Result<(), String> {
+        // Call sites only: the `async fn verify_control_plane(` definition lives in `vmm`, but a
+        // `.`-prefixed match cannot pick up a definition anywhere.
+        let sites: Vec<usize> = code
+            .match_indices(".verify_control_plane(")
+            .map(|(at, _)| at)
+            .collect();
+        if sites.len() != EXPECTED_PROBES {
+            return Err(format!(
+                "expected {EXPECTED_PROBES} `.verify_control_plane(` call site; found {}. If one \
+                 was legitimately added or removed, update EXPECTED_PROBES — do not delete the \
+                 scan.",
+                sites.len()
+            ));
+        }
+        let args = call_args(code, sites[0]);
+        if args.len() != 2 {
+            return Err(format!(
+                "`verify_control_plane` takes (budget, timeouts); the call site passes {}: {args:?}",
+                args.len()
+            ));
+        }
+        if args[0] != SELECTOR {
+            return Err(format!(
+                "the health-gate window must be `{SELECTOR}`, not {:?} — a bare constant here is \
+                 the M2 defect: the `Pid1`-tuned 4 s applied to a `Service` cell whose steward is \
+                 brought up by the guest's own init, re-booting a slow-but-healthy systemd cell to \
+                 exhaustion",
+                args[0]
+            ));
+        }
+        // The `Pid1` constant may be spelled only in its definition and in the selector: a third
+        // mention is a second policy site, which is how the branch got lost the first time.
+        let mentions = code.matches("CONTROL_PLANE_PROBE_BUDGET").count();
+        if mentions != 2 {
+            return Err(format!(
+                "`CONTROL_PLANE_PROBE_BUDGET` must appear exactly twice in production text (its \
+                 `const` and the selector's `Pid1` arm); found {mentions}"
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn the_health_gate_is_handed_the_window_the_placement_selects() {
+        probe_window_is_selected(&production_code(SOURCE)).unwrap_or_else(|e| {
+            panic!("M2: the health gate must honor the placement-selected window — {e}")
+        });
+    }
+
+    /// The gate's own red-on-inverse: each way the selection can rot must be rejected, so the scan
+    /// above is not a test that can only ever pass.
+    #[test]
+    fn the_window_predicate_rejects_a_bare_constant_and_a_second_policy_site() {
+        const GOOD: &str = "const CONTROL_PLANE_PROBE_BUDGET: Duration = Duration::from_secs(4); \
+             fn control_plane_probe_budget(p: StewardPlacement) -> Duration { match p { \
+             Pid1 | None => CONTROL_PLANE_PROBE_BUDGET, Service { .. } => \
+             DEFAULT_STEWARD_CONNECT_BUDGET, } } \
+             while let Err(e) = instance .verify_control_plane( \
+             control_plane_probe_budget(cfg.steward_placement), &clamped) .await";
+        probe_window_is_selected(GOOD).expect("the shipped shape must pass");
+
+        for (case, code) in [
+            (
+                "the bare constant, the M2 defect itself",
+                GOOD.replace(SELECTOR, "CONTROL_PLANE_PROBE_BUDGET"),
+            ),
+            (
+                "an inline literal",
+                GOOD.replace(SELECTOR, "std::time::Duration::from_secs(4)"),
+            ),
+            (
+                "a second probe that bypasses the selector",
+                format!("{GOOD} inst.verify_control_plane(CONTROL_PLANE_PROBE_BUDGET, &t).await"),
+            ),
+            (
+                "no probe at all",
+                GOOD.replace(".verify_control_plane(", ".boot("),
+            ),
+        ] {
+            assert!(
+                probe_window_is_selected(&code).is_err(),
+                "{case}: the window predicate must reject this"
+            );
+        }
+    }
+
+    /// The scanner's own controls: prose naming the spelling is not a call site, and a call split
+    /// across rustfmt lines is still seen whole (which is how the shipped one is formatted).
+    #[test]
+    fn the_scanner_ignores_comments_and_survives_line_breaks() {
+        let synthetic = "// .verify_control_plane(CONTROL_PLANE_PROBE_BUDGET, &clamped) in a \
+             comment is not a call site\n\
+             /// nor is `.verify_control_plane(` in rustdoc\n\
+             const CONTROL_PLANE_PROBE_BUDGET: Duration = Duration::from_secs(4);\n\
+             fn control_plane_probe_budget(p: P) -> Duration { CONTROL_PLANE_PROBE_BUDGET }\n\
+             while let Err(e) = instance\n    .verify_control_plane(\n        \
+             control_plane_probe_budget(cfg.steward_placement),\n        &clamped,\n    )\n    \
+             .await\n{ }\n#[cfg(test)]\nmod tests { }";
+        probe_window_is_selected(&production_code(synthetic))
+            .expect("the real formatting must scan cleanly");
     }
 }

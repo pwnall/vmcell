@@ -4,7 +4,7 @@ version = "0.2.0"
 edition = "2024"
 rust-version.workspace = true
 license = "MIT OR Apache-2.0"
-description = "vmcell guest-side multicall helper: real ip/curl/kvm-ok, baked into the rootfs erofs (§5.3)"
+description = "vmcell guest-side multicall helper: real ip/curl/kvm-ok, baked into the rootfs erofs (§4.4)"
 publish = false
 
 # A *guest* binary cross-compiled into the rootfs. Needs reqwest for genuine HTTP, so it is
@@ -21,7 +21,7 @@ libc = "0.2"
 # table and the rootfs injection manifest DERIVE from one list instead of restating it
 # (docs/81 m22, design §4.4). The explicit `version` (alongside `path`) keeps the cargo-deny
 # `wildcards = "deny"` gate happy — a bare path dep reads as a `*` requirement.
-vmcell-protocol = { path = "../vmcell-protocol", version = "0.7.0" }
+vmcell-protocol = { path = "../vmcell-protocol", version = "0.8.0" }
 # v33 delta 5: `mini-init` assembles the guest root through the steward library's ONE assembly
 # function rather than carrying a second copy of the mount sequence — the duplicate-law hazard
 # AGENTS.md names, and the reason a service-placement cell's filesystem is byte-for-byte the one a

@@ -253,7 +253,9 @@ pub fn run(opts: StewardOptions) -> Result<(), Box<dyn std::error::Error>> {
             tracing::info!("vmcell-steward: received SIGTERM; shutting down (service placement)");
             // Order matters. Stop accepting first, so a connection cannot be registered after the
             // teardown sweep and outlive it; then honor law C3 on every connection that is still
-            // live; then return, letting the init that started us restart us.
+            // live — its interactive sessions *and* the one-shot `exec` children it has in flight,
+            // which are the ones that would otherwise reparent to the real init and keep running;
+            // then return, letting the init that started us restart us.
             ctx.shutdown.store(true, Ordering::SeqCst);
             if listener.join().is_err() {
                 tracing::warn!(

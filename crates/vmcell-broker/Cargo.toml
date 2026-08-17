@@ -16,7 +16,7 @@ version = "0.2.0"
 edition = "2024"
 rust-version.workspace = true
 license = "MIT OR Apache-2.0"
-description = "vmcell setup broker: a minimal privileged spawn helper that holds the caps and performs netns/tap/nft/cgroup setup + the jailed VMM spawn for a cap-dropped daemon parent (design §20.5)"
+description = "vmcell setup broker: a minimal privileged spawn helper that holds the caps and performs netns/tap/nft/cgroup setup + the jailed VMM spawn for a cap-dropped daemon parent (design §12.4)"
 publish = false
 
 # Links `vmcell` for the audited netns/nft/cgroup/sweep + jail code it reuses at privilege (one law,
@@ -24,7 +24,7 @@ publish = false
 # link `vmcell-daemon` / any web stack — the whole point is that the HTTP surface is NOT co-located
 # with the caps. `vmcell` has no edge back here.
 [dependencies]
-vmcell = { path = "../vmcell", version = "0.20.0", default-features = false, features = ["cloud-hypervisor"] }
+vmcell = { path = "../vmcell", version = "0.21.0", default-features = false, features = ["cloud-hypervisor"] }
 vmcell-privilege = { path = "../vmcell-privilege", version = "0.2.0" }
 serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["use-std"] }

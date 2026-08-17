@@ -185,7 +185,7 @@ async fn zygote_fan_out_impl<V: Vmm>(vmm: &V) {
                 std::fs::read(master_dir.join("config.json")).expect("read master config.json");
             assert_eq!(
                 before, after,
-                "zygote master config.json must be byte-identical after fan-out (§12.12)"
+                "zygote master config.json must be byte-identical after fan-out (§13, law S3)"
             );
         }
 

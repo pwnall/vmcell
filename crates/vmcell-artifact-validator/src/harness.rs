@@ -106,10 +106,17 @@ fn ensure_artifacts_or_panic() {
     );
 }
 
-/// The Cloud Hypervisor binary (`VMCELL_CH_BIN` or `cloud-hypervisor`).
+/// The Cloud Hypervisor binary ([`vmcell::artifact::ch_binary_path`]: `VMCELL_CH_BIN`, else
+/// `cloud-hypervisor` on `PATH`).
+///
+/// A one-line delegation for the reason the CLI's `ch_bin` is one. docs/90 A2 named this function
+/// as the *other* byte-identical copy of that resolver beside the CLI's; the CLI's was closed then
+/// and this one was not, so a change to the law — a second env var, a fallback list, a `PATH` probe
+/// — would have moved the library and left the conformance battery booting whatever the old body
+/// resolved. Behavior is unchanged: same variable, same default.
 #[must_use]
 pub fn ch_bin() -> String {
-    std::env::var("VMCELL_CH_BIN").unwrap_or_else(|_| "cloud-hypervisor".to_string())
+    vmcell::artifact::ch_binary_path()
 }
 
 /// The Firecracker binary (`VMCELL_FC_BIN` or `firecracker`).

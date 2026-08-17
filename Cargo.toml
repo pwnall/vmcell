@@ -27,7 +27,7 @@ members = [
     "crates/vmcell-kernel-builder",
     "crates/vmcell-cli",
     # Boots test micro-VMs to validate a candidate kernel+rootfs pair against the whole
-    # artifact↔system contract (§5.4/§8.5/§12); depends on `vmcell`, reuses its integration
+    # artifact↔system contract (§4.3/§5.4/§13); depends on `vmcell`, reuses its integration
     # checks. `vmcell`'s tests dev-depend on it (a permitted dev-dep cycle).
     "crates/vmcell-artifact-validator",
     # v21 §D1.1: the control-plane daemon and its client. `vmcell-privilege` is the lean shared

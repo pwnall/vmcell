@@ -1,12 +1,70 @@
+//! Test doubles and request interception — one of design §1.3's two designed-in extension points,
+//! and the one whose seam types are **not** vmcell's own.
+//!
+//! # Naming the seam types from out of tree (docs/90 E1)
+//!
+//! [`Matcher`](crate::proxy::doubles::Matcher) and [`Responder`](crate::proxy::doubles::Responder)
+//! are `Fn` aliases over `hyper::Request` / `hyper::Response` and `hudsucker::Body` — third-party
+//! types vmcell neither owns nor versions on the §10.4 contract list.
+//! An out-of-repo consumer writing a double therefore has to *name* those types, and the in-tree
+//! tests never noticed the cost because they share the workspace lockfile: a git-dep consumer had to
+//! add `hudsucker` and `hyper` to its own manifest at exactly vmcell's resolved versions, and
+//! discover those versions by reading vmcell's `Cargo.lock`. Two crates at incompatible versions do
+//! not unify, so the failure is a type mismatch on a name that looks right.
+//!
+//! **So name them through the re-exports below** — [`hudsucker`] and [`hyper`] — which resolve to the
+//! exact versions these aliases are built from:
+//!
+//! ```
+//! use vmcell::proxy::doubles::{hudsucker, hyper, Matcher, Responder, TestDouble};
+//!
+//! let matcher: Matcher = Box::new(|req: &hyper::Request<hudsucker::Body>| {
+//!     req.uri().host() == Some("api.example.test")
+//! });
+//! let responder: Responder = Box::new(|_req: &hyper::Request<hudsucker::Body>| {
+//!     hyper::Response::builder()
+//!         .status(503)
+//!         .body(hudsucker::Body::empty())
+//!         .expect("a static response builds")
+//! });
+//! let double = TestDouble { matcher, responder };
+//! ```
+//!
+//! That example is a doctest (`just test-doc`), so the documented spelling is compiled rather than
+//! asserted.
+//!
+//! Neither crate appears in the consumer's manifest, and a bump inside vmcell moves both aliases and
+//! re-exports together. That bump is not hypothetical — hudsucker went 0.23 → 0.24 in the
+//! dependency-modernization pass — and `cargo semver-checks` cannot see it, because the aliases'
+//! *shape* is unchanged across it. `the_seam_types_are_reachable_through_the_reexported_crates` is the
+//! gate: it builds a double naming nothing but the re-exports, so a re-export that stops matching the
+//! aliases stops compiling.
+//!
+//! The larger fix — vmcell-owned request/response types at the seam, so no third-party name crosses
+//! it at all — is worth its weight only if this surface grows past matcher/responder (docs/90 E1).
 #![forbid(unsafe_code)]
 
 use hudsucker::{HttpContext, HttpHandler, RequestOrResponse};
 use hyper::{Request, Response};
 use std::sync::Arc;
 
+/// The `hudsucker` version [`Matcher`]/[`Responder`] are built from, re-exported so a consumer names
+/// it once, through vmcell, instead of pinning it in its own manifest (see the module docs).
+pub use hudsucker;
+/// The `hyper` version [`Matcher`]/[`Responder`] are built from, re-exported for the same reason as
+/// [`hudsucker`] above.
+pub use hyper;
+
 /// A type alias for a test double matching function.
+///
+/// Name the parameter type through this module's re-exports —
+/// `&hyper::Request<hudsucker::Body>` with `hyper`/`hudsucker` taken from
+/// [`crate::proxy::doubles`] — never from a consumer-side dependency on either crate.
 pub type Matcher = Box<dyn Fn(&Request<hudsucker::Body>) -> bool + Send + Sync>;
 /// A type alias for a test double responder function.
+///
+/// The response body is `hudsucker::Body`, not `hyper::body::Incoming`: build it through the
+/// re-exported [`hudsucker`] so the type is the one this alias resolves to.
 pub type Responder =
     Box<dyn Fn(&Request<hudsucker::Body>) -> Response<hudsucker::Body> + Send + Sync>;
 
@@ -218,6 +276,55 @@ mod tests {
             blocked_domains: blocked,
             requests: Arc::new(std::sync::Mutex::new(Vec::new())),
             record_path: Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    /// docs/90 E1: a double built naming **only** this module's re-exports, the way an out-of-repo
+    /// consumer must (its manifest carries neither crate).
+    ///
+    /// The gate is the compile, not the asserts: `super::hudsucker` / `super::hyper` are the paths the
+    /// module docs tell a consumer to use, so if a re-export ever named a different version than the
+    /// aliases resolve to — the drift a hudsucker bump causes, invisible to `cargo semver-checks`
+    /// because the aliases' shape does not change — this stops building. Deleting either `pub use` has
+    /// the same effect, which is what keeps the documented seam from being quietly withdrawn.
+    ///
+    /// The asserts then prove the double is a *working* one rather than a type-level decoration: it
+    /// matches on the request and its response is served.
+    #[test]
+    fn the_seam_types_are_reachable_through_the_reexported_crates() {
+        let matcher: Matcher = Box::new(|req: &super::hyper::Request<super::hudsucker::Body>| {
+            req.uri().host() == Some("api.example.test")
+        });
+        let responder: Responder =
+            Box::new(|_req: &super::hyper::Request<super::hudsucker::Body>| {
+                super::hyper::Response::builder()
+                    .status(418)
+                    .body(super::hudsucker::Body::empty())
+                    .expect("a static response builds")
+            });
+
+        let handler = handler_with(vec![], vec![TestDouble { matcher, responder }]);
+        let matching = Request::builder()
+            .method(hyper::Method::GET)
+            .uri("http://api.example.test/v1")
+            .body(hudsucker::Body::empty())
+            .expect("request builds");
+        match handler.route_request(matching) {
+            RequestOrResponse::Response(resp) => assert_eq!(resp.status(), 418),
+            RequestOrResponse::Request(_) => {
+                panic!("the double must answer the host it matches on")
+            }
+        }
+        // Negative control: another host is forwarded, so the match is the double's own predicate
+        // and not "everything".
+        let other = Request::builder()
+            .method(hyper::Method::GET)
+            .uri("http://elsewhere.test/v1")
+            .body(hudsucker::Body::empty())
+            .expect("request builds");
+        match handler.route_request(other) {
+            RequestOrResponse::Request(_) => {}
+            RequestOrResponse::Response(_) => panic!("an unmatched host must be forwarded"),
         }
     }
 

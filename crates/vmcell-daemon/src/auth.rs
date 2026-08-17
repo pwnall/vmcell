@@ -312,7 +312,7 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
         assert!(
             load_api_key_file(&path).is_err(),
-            "a group/other-readable key file must be refused (§12.18)"
+            "a group/other-readable key file must be refused (§11.6, law P4)"
         );
 
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");

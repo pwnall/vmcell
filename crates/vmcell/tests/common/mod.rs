@@ -168,6 +168,20 @@ pub fn keep_from_env_value(value: Option<&std::ffi::OsStr>) -> bool {
     }
 }
 
+/// Where a capability skip is recorded — the **one** place the manifest path is decided, so a
+/// reader (a gate asserting that a skip was recorded) cannot drift from the writer.
+///
+/// `VMCELL_SKIP_MANIFEST` when the suite recipes set it (the run-scoped, durable path
+/// `just skip-manifest-show` prints); otherwise a per-PID temp file, which is what makes a bare
+/// `cargo nextest run` record somewhere rather than nowhere.
+pub fn skip_manifest_path() -> std::path::PathBuf {
+    std::env::var_os("VMCELL_SKIP_MANIFEST")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::temp_dir().join(format!("vmcell-skips-{}.txt", std::process::id()))
+        })
+}
+
 /// Records a capability-driven test skip to a durable, run-scoped manifest so the skip is an
 /// auditable artifact rather than an invisible nextest pass (H-TEST-3). Best-effort by design.
 ///
@@ -175,29 +189,124 @@ pub fn keep_from_env_value(value: Option<&std::ffi::OsStr>) -> bool {
 /// the suite exits (`just`'s recipes point `VMCELL_SKIP_MANIFEST` at a durable path), so an owner
 /// that deleted it would delete the evidence.
 pub fn record_capability_skip(vmm: &str, capability: &str) {
+    record_capability_skip_to(&skip_manifest_path(), vmm, capability);
+}
+
+/// [`record_capability_skip`] with the sink as a parameter — the one writer, aimed.
+///
+/// The seam exists for the gates: proving that a skip is *recorded* rather than merely printed
+/// means observing the file afterwards, and doing that against the run's own manifest would append
+/// a synthetic `SKIP` a reviewer reads as a real capability gap. A false entry in the audit
+/// artifact is worse than the gap it pretends to describe, so a gate aims this at a scratch path
+/// and the batteries call the one-argument form above.
+pub fn record_capability_skip_to(manifest: &std::path::Path, vmm: &str, capability: &str) {
     use std::io::Write as _;
-    let path = std::env::var_os("VMCELL_SKIP_MANIFEST")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| {
-            std::env::temp_dir().join(format!("vmcell-skips-{}.txt", std::process::id()))
-        });
     let line = format!("SKIP {vmm} {capability}\n");
     match std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&path)
+        .open(manifest)
     {
         Ok(mut f) => {
             if let Err(e) = f.write_all(line.as_bytes()) {
                 eprintln!(
                     "record_capability_skip: append to {} failed: {e}",
-                    path.display()
+                    manifest.display()
                 );
             }
         }
         Err(e) => eprintln!(
             "record_capability_skip: open {} failed: {e}",
-            path.display()
+            manifest.display()
+        ),
+    }
+}
+
+/// The backend the ext4 battery's capability skip is attributed to.
+///
+/// Cloud Hypervisor because the §15.4 ext4 battery is CH-only (`ext4_cell`'s module docs say why:
+/// the image is a host-side packing product and the reader is the guest kernel's ext4 driver). The
+/// pair is spelled once here so the law that writes the line and the gate that asserts it was
+/// written cannot drift.
+#[cfg(all(feature = "pipeline", feature = "ext4-producer"))]
+pub const EXT4_SKIP_VMM: &str = "cloud-hypervisor";
+
+/// The capability the ext4 battery's skip names — see [`EXT4_SKIP_VMM`].
+#[cfg(all(feature = "pipeline", feature = "ext4-producer"))]
+pub const EXT4_SKIP_CAPABILITY: &str = "ext4_producer";
+
+/// **The one law** every §15.4 ext4 leg asks before it packs (design §4.7, §18 delta 8): probes the
+/// host's external ext4 producer, and records a reviewable capability skip when the facility is
+/// **absent**.
+///
+/// `Some(producer)` is the product's own receipt that both halves of the gate ran — the version and
+/// the dlopen'd libarchive. It cannot be forged: `Ext4Producer`'s fields are private to `vmcell`, so
+/// a probe is the only thing that mints one, and a leg that takes the receipt as an argument
+/// (`ext4_cell`'s `pack_ext4_rootfs`) cannot pack without one. Obtaining a receipt *behind* this
+/// law is a different question, and the one the call-site scan in `ext4_producer.rs` answers.
+///
+/// `None`, after appending `SKIP cloud-hypervisor ext4_producer` to the run's skip manifest, when
+/// the probe classifies the facility as absent (§7.2) — which is what makes the gap show up in
+/// `just skip-manifest-show` instead of passing as green.
+///
+/// A probe result the product calls **broken** — present but unexecutable, an unparseable banner —
+/// **panics**: that is a host misconfiguration this battery must not paper over, and it is exactly
+/// the distinction §7.2 rule 3 draws. Skipping on it would be the `println!("SKIP") + return`
+/// green-PASS defect wearing the probe's clothes.
+///
+/// # Why the law lives here and not in the batteries
+///
+/// The three delta-8 files answered an absent `mkfs.ext4` three different ways, and two of the
+/// three were wrong: `ext4_producer.rs` **panicked**, which on GitHub's `ubuntu-24.04` runner
+/// (e2fsprogs 1.47.0 — one patch release below the `-d <tarball>` gate) meant four red tests on
+/// `test-unit` plus the same four retried four times each by `test-integration`'s profile, for four
+/// commits; `repack_outside_checkout.rs` printed a bare `println!("SKIP")` and returned, which AGENTS.md
+/// names as a green PASS — its doc comment claimed to record a skip and no `record_capability_skip`
+/// call existed anywhere in the file (docs/90 G3). One law, one answer, and the call-site scan in
+/// `ext4_producer.rs` is what keeps a fourth answer from appearing.
+///
+/// The recorded skip is not the whole fix: a permanently-skipped battery is coverage nobody reads,
+/// so `.github/workflows/ci.yml` **obtains** the facility (a pinned, checksum-verified e2fsprogs
+/// built from source) ahead of the suites, non-gating, so a failed install degrades to this
+/// recorded skip instead of a red job. `ci_obtains_the_ext4_facility_rather_than_living_with_the_skip`
+/// is that step's gate.
+#[cfg(all(feature = "pipeline", feature = "ext4-producer"))]
+#[must_use]
+pub fn probe_ext4_or_record_skip() -> Option<vmcell::artifact::ext4::Ext4Producer> {
+    classify_ext4_probe(
+        vmcell::artifact::ext4::Ext4Producer::probe(),
+        &skip_manifest_path(),
+    )
+}
+
+/// [`probe_ext4_or_record_skip`]'s body, with the probe's verdict and the skip sink as parameters.
+///
+/// Both seams exist for one reason: the absent-facility arm is the arm that matters and it is
+/// unreachable on a host that *has* e2fsprogs — which every host that can run the battery does. A
+/// gate hands this a synthetic `CapabilityUnavailable` plus a scratch manifest and watches the line
+/// appear, so the difference between "printed SKIP" and "recorded SKIP" can go red. The batteries
+/// call the no-argument form above; nothing else calls this.
+#[cfg(all(feature = "pipeline", feature = "ext4-producer"))]
+#[must_use]
+pub fn classify_ext4_probe(
+    probed: vmcell::error::Result<vmcell::artifact::ext4::Ext4Producer>,
+    manifest: &std::path::Path,
+) -> Option<vmcell::artifact::ext4::Ext4Producer> {
+    match probed {
+        Ok(producer) => Some(producer),
+        Err(vmcell::error::Error::CapabilityUnavailable { op, needed }) => {
+            record_capability_skip_to(manifest, EXT4_SKIP_VMM, EXT4_SKIP_CAPABILITY);
+            let (ma, mi, pa) = vmcell::artifact::ext4::MIN_E2FSPROGS_VERSION;
+            println!(
+                "SKIP: this host cannot produce ext4 rootfs images ({op}: {needed}). The §15.4 \
+                 ext4 battery needs e2fsprogs >= {ma}.{mi}.{pa} with libarchive support"
+            );
+            None
+        }
+        Err(other) => panic!(
+            "`{}` is present but BROKEN on this host, which is a misconfiguration and not an \
+             absent facility — fix it rather than skipping the delta-8 gates: {other}",
+            vmcell::artifact::ext4::EXT4_PRODUCER_BIN
         ),
     }
 }
