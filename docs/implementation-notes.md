@@ -4782,3 +4782,156 @@ whose first line is the design's title, and splices that row into an otherwise f
 whose older two- and three-cap grants are the record rather than drift. `cargo test -p vmcell-privilege
 --lib` → 23 passed.
 
+---
+
+# As built: the docs/90 review pass (2026-08-16)
+
+A comprehensive review of the tree at `c276da7` — the closed v33 register — recorded in
+`docs/90-claude-opus-code-review.md`. That document carries the divergences that should be
+**fixed**. What follows is the other half AGENTS.md asks for: the divergences that are **justified
+and stay**, and the coverage gaps this pass chose to record rather than close, each written here so
+the next reader finds a decision instead of an unexplained mismatch.
+
+Every suite was executed on this host during the review, not presumed: `just ci` green
+(1142 tests, 298-config powerset, 19 gate self-tests), `test-privileged` 228/228,
+`test-unprivileged` 4/4, `test-daemon` 16/16, `test-validator` 4/4, `test-crosvm` 30/30,
+`test-systemd` 2/2, nine capability skips matching the recorded roster.
+
+## Recorded (justified): `pack_rootfs_with_injection` is the general pack tail, and `pack_erofs_with_injection` is its erofs door
+
+Delta 8 needed the one inject+pack tail to emit two formats. Rather than widen the §10.4-listed
+`pack_erofs_with_injection` into a function whose name lies about half its outputs, it kept that
+name as a **format-checking wrapper** — it refuses any `PackOptions::format` other than
+`RootfsFormat::Erofs` with a typed error naming the general door — and put the format-honoring tail
+behind a new `pub async fn pack_rootfs_with_injection`
+(`crates/vmcell/src/artifact/rootfs/mod.rs:1294`, with the ungated arm at `:1615`).
+
+**The shape is right and stays.** A door that packs erofs by name should keep doing exactly that,
+and a caller that passes `format: Ext4` to it has made a mistake worth a message rather than a
+surprise. What was missing is the record: the new entry point appears in **neither** the
+`crates/vmcell/Cargo.toml` ledger, this file, design §10.4's "one named list", nor the README's copy
+of it, so the only route to an ext4 artifact through the pack tail is a public function the contract
+does not name. Adding a `pub fn` is additive, so `cargo semver-checks` is silent by construction —
+which is the whole reason §10.4 asks for a ledger entry rather than trusting the tool. This entry is
+that record; the ledger and §10.4 line are named as fixes in docs/90.
+
+## Recorded (justified): there is no `build_labelled_rootfs` / `build_labelled_handler` — the labelled constructors are the shipped shape
+
+Design §10.5's "where selection lives" paragraph and §10.4's contract list both name
+`build_labelled_rootfs` / `build_labelled_handler` as the library-side selection entry points,
+mirroring `build_labelled_kernel`. Neither function exists. What shipped instead is a **constructor
+pair** on the stages themselves — `RootfsStage::labelled(label)`
+(`artifact/rootfs/mod.rs:547`, `:939`) and `GuestToolsStage::labelled(label, source)`
+(`artifact/guest_tools.rs:62`) — which a consumer composes into its own `Pipeline` beside
+`ResolvePinsStage`, plus the `vmcell build --rootfs-label / --handler-label` verbs.
+
+**The constructors are the better shape and stay.** `build_labelled_kernel` exists because a kernel
+build is a fixed two-stage assembly (`ResolvePinsStage → KernelStage`) with nothing for a caller to
+vary; a rootfs or handler build composes with injections, extra files, a pack format and an xattr
+policy, so a thin assembler would either hide those or grow a parameter per knob — the shape
+`PackOptions` was created to avoid. The register's own convention governs the rest ("sketched
+names/signatures are advisory; the behavior and its gate bind; a shift is recorded, never silent"):
+delta 6 landed the behavior and its gates and did not record the shift. This is that record.
+
+The consequence worth stating: a git-dep consumer building a labelled rootfs today writes more code
+than one building a labelled kernel, and §10.4 tells it to call a function that is not there. The
+doc correction is named in docs/90.
+
+## Recorded (justified): delta 3's battery budget is the conformance battery's, not `validate()`'s
+
+Design §17 lists "`validate()` has **no overall wall-clock budget** today … **directed closed by
+§18 delta 3** (`ConformanceOptions.battery_budget`)". Delta 3 landed `battery_budget` on
+`ConformanceOptions` (`vmcell-artifact-validator/src/conformance.rs:284`) and bounds `run_battery`
+with it. It did **not** touch `validate()`: `ValidationOptions`
+(`vmcell-artifact-validator/src/lib.rs:167`) still carries exactly one field, `level`, and
+`validate()` never calls `run_battery` — the two are parallel entry points, and every in-tree
+`run_battery` call site is a test.
+
+**The scoping is defensible and stays.** R4's argument was that a kit which doubles its check count
+doubles the visibility of "fails loudly per check, hangs per battery", so the budget belongs to the
+battery R4 added. `validate()`'s per-check deadlines are unchanged and each one still fails loud.
+What is not defensible is §17 reading as though the older entry point were fixed: it is the
+documented downstream conformance route (§9.1, §10.4), a `Level::Full` run boots several VMs
+sequentially, and a wedged boot there is still bounded only by the sum of the per-check deadlines.
+Recorded here so the gap is not lost when §17's line is read as closed; docs/90 names both the doc
+correction and the one-field code fix.
+
+## Recorded (AGENTS rule 4 — "cover it or record it"): the shipped-knob live-coverage gap
+
+Rule 4 asks for the enumeration of what the suite structurally cannot reach. This pass measured it
+for the config surface; every item below is *shipped, documented, and never exercised by a live
+boot in any gate*. The rendering half of each is unit-tested — what is missing is evidence that the
+value reaches the kernel, the VMM or the guest and does anything.
+
+- **`ResourceLimits`: three of four fields.** `crates/vmcell/tests/metrics_limits.rs:38` sets
+  `mem_max_mib` and nothing else; `cpu_max_pct`, `pids_max` and `io_max` appear in no integration
+  test in the tree. `io.max` is the sharp one — its `device` field is a caller-supplied
+  `"major:minor"` string and the kernel's rejection of an unsupported device has never been
+  observed — and §7.3's own history (a `memory.max` that did not bind until `memory.swap.max=0` and
+  `memory.oom.group=1` joined it) is the record of why a rendered limit is not an enforced one.
+- **`ConsoleMode::VirtioConsole`.** `console_mode` appears zero times under `crates/*/tests/`. Three
+  backends advertise `virtio_console: true`; the honesty pin at `tests/nested_virt.rs:45-53` says in
+  its own comment that the flag "has no dedicated matrix integration leg". The only live evidence on
+  record is the `bench-vm` console table (CH and QEMU); crosvm's claim rests on an arg-builder unit
+  test alone.
+- **`Timeouts::low_latency()` / `throughput()`.** Constructed only in one `config.rs` clamp test and
+  in `bench-vm`; no integration test boots a VM under a non-default profile. See the next entry for
+  why that matters more than it looks.
+- **`ksm_mergeable`.** Builder and rejection tests exist; nothing asserts the coupling
+  `cloud_hypervisor.rs:719-720` implements (`shared: !ksm_mergeable, mergeable: ksm_mergeable`).
+  §8.3 calls that coupling mandatory and records the measurement that makes it so — KSM merges
+  **zero** pages of a `shared=on` guest — so a regression that set `mergeable` and left `shared` on
+  would deduplicate nothing, silently, which is the F1 shape.
+- **`RestoreMode::Eager` / `Lazy`.** Present in backend unit tests as refusal/argv assertions; no
+  gate performs a restore under either mode.
+
+Recorded rather than closed because each costs a live boot in an already-long suite and none is a
+correctness risk to the default path. The two worth closing first are `ksm_mergeable`'s coupling (a
+KVM-free serialization assertion on the CH payload, the `CH_RAW_IMAGE_TYPE` shape, costs nothing)
+and a `cpu_max_pct` leg (the one limit whose enforcement mechanism differs from memory's).
+
+## Recorded: the guest tuning-token channel has no falsifiable end-to-end gate
+
+`vmcell_accept_poll_ms=` / `vmcell_rebind_idle_ms=` are hand-spelled on both sides of the process
+boundary — host at `config.rs:429`, guest at `vmcell-steward/src/options.rs:200,207` — with no
+shared const, because `vmcell` does not depend on `vmcell-steward` (the same asymmetry
+`STEWARD_VSOCK_PORT` solved by moving to `vmcell-protocol`, which both link). On its own that is
+survivable. What makes the channel **unfalsifiable** is that the guest's compiled fallbacks are
+byte-identical to the host's emitted defaults: `ACCEPT_POLL = 20 ms` / `REBIND_IDLE = 250 ms`
+(`options.rs:130,140`) against `guest_accept_poll: 20 ms` / `guest_rebind_idle: 250 ms`
+(`config.rs:358-359`). Rename either literal, or delete the guest's parse block outright, and every
+suite stays green — the steward falls back to exactly the numbers the host meant to send.
+
+The user-visible consequence is narrow but real: a caller selecting `low_latency()` (5 ms / 150 ms)
+gets the compiled 20 / 250 cadence, and nothing reports that the request was ignored — including the
+post-restore re-bind window, which bounds how long a restored guest stays unreachable after CH
+re-creates the vhost-vsock device. Recorded rather than fixed because the cheap half (move the two
+token names into `vmcell-protocol` as consts both crates import, the `STEWARD_VSOCK_PORT`
+precedent) removes the *spelling* drift but not the unfalsifiability; only a live boot under a
+non-default profile that reads the honored cadence back does that, and it is the same boot the entry
+above already asks for.
+
+## Recorded: `review-preflight-priv.sh`'s READY answers "can the suites run", not "is the runner current"
+
+The preflight checks that the blessed runner carries the four capabilities with the effective bit
+and that its mode is 0700. It does **not** compare the blessed copy against the current source — the
+staleness check is the content-hash `.blessed` stamp, and that lives only in the `bless` recipe,
+which needs one sudo and therefore cannot run in a non-interactive session.
+
+Measured during this review: the preflight printed READY while the blessed copy
+(`.vmcell-bin/debug/vmcell-test-runner`, 2026-08-14 11:24) predated `d02527b`'s rewrite of the
+privilege transition into a step-list executor. The probe is decisive — `strings` finds **0**
+occurrences of `PrivilegeStep` in the blessed copy and **84** in the current build — so every
+privileged run since 2026-08-15, including this review's 228/228 and the v33 handoff's stated bar,
+executed through the pre-rewrite binary. `bless` detected it correctly and refused to replace a
+working blessing when sudo was unavailable, which is the stage-then-swap design working as written.
+
+**CI is unaffected and that is why this is recorded rather than urgent**: `.github/workflows/ci.yml`
+runs `just bless` between building the artifacts and the privileged suite, so a CI runner is always
+current. The exposure is the local reviewer path, which AGENTS rule 5 sends through the preflight,
+and the v5 handoff's reproduction sequence omits the bless step. No behavioral difference between
+the two binaries has been demonstrated — the risk is that the live gate on the runner's *own*
+posture (`the_bounding_set_is_shrunk_to_exactly_the_delivered_caps`) certifies whichever binary
+happens to be blessed. docs/90 names the fix: give the preflight a third verdict for a stale stamp,
+mapping onto the existing BLOCKED-ON-BLESS exit, and add the bless step to the documented sequence.
+
