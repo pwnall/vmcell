@@ -27,8 +27,8 @@ version = "0.1.0"
 edition = "2024"
 # Git-dep guidance item (1) — a consumer's toolchain is at least vmcell's single-source MSRV. The
 # repo's `rust-toolchain.toml` governs this directory too (rustup ascends), so CI builds it on the
-# same pinned 1.96.1 without a second toolchain fact.
-rust-version = "1.96.1"
+# same pinned 1.98.0 without a second toolchain fact.
+rust-version = "1.98.0"
 license = "MIT OR Apache-2.0"
 description = "Out-of-tree consumer of the vmcell downstream toolkit: builds a labelled kernel from its own pins overlay, asserts the fragment survived, and validates the result"
 publish = false

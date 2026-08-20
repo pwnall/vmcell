@@ -1549,11 +1549,13 @@ own framing, preserved).
 
 The guest is a minimal **Debian Trixie (13)** rootfs (§4.2) with security support to 2028; the steward
 bypasses distro init, so a larger userland does not grow the boot working set. The committed kernel is
-**Linux 6.12.94** (the Trixie-aligned 6.12 LTS line), direct-booted as a custom-minimal `vmlinux` from
-Debian kernel source. The 6.12.94 bump also fixed a from-scratch build break under modern toolchains:
+**Linux 6.12.104** (the Trixie-aligned 6.12 LTS line), direct-booted as a custom-minimal `vmlinux` from
+Debian kernel source. The earlier 6.12.94 bump fixed a from-scratch build break under modern toolchains:
 gcc-15 defaults to C23, where `false`/`bool` are keywords, and `drivers/firmware/efi/libstub` was compiled
-without `-std=gnu11`; 6.12.94 carries the fix (and CH boots via PVH, never the EFI stub, so
-`CONFIG_EFI_STUB=n` is a clean alternative).
+without `-std=gnu11`; every 6.12.x since carries the fix (and CH boots via PVH, never the EFI stub, so
+`CONFIG_EFI_STUB=n` is a clean alternative). The pin tracks the 6.12 LTS line's newest point release —
+6.12.94 → 6.12.104 in the 2026-08-20 dependency pass — which is a security-patch move within one line,
+not a line change; the §16 figures name the kernel they were measured on and are not restated here.
 
 A `vmlinux` reaches the artifacts dir by one of **three producers** (§5.4 is the contract each must
 satisfy). Two are lightweight bootstrap producers in `vmcell`: `KernelStage` host-`make`-compiles from
@@ -3228,7 +3230,7 @@ assertion (no `axum`, no `vmcell-daemon` — it legitimately owns the engine) is
 **`guest-tools` is deliberately not under that ban** — it needs `reqwest` for real HTTP and runs
 unprivileged in-guest, so its lean boundary is "not the host *library*," not "no async."
 
-**Toolchain note.** The MSRV is **1.96.1, single-sourced**: `rust-toolchain.toml` pins it and the one
+**Toolchain note.** The MSRV is **1.98.0, single-sourced**: `rust-toolchain.toml` pins it and the one
 `[workspace.package] rust-version` equals it, with a CI sync assertion so the two cannot drift. The
 declared MSRV is the *tested floor*, never an aspiration — an **understated** `rust-version` is a live
 vulnerability path, because an MSRV-aware resolver re-resolves older consumers onto dependency versions
@@ -5028,11 +5030,13 @@ in-kernel path and shed the ~11% external-daemon bring-up flake — is also ship
 `uses_in_kernel_vsock` predicate. Remaining QEMU gaps: QEMU UFFD lazy-restore (`lazy_restore: false`, no
 backend wired) and wiring the unprivileged smoltcp NAT (needs the vendored `vhost` patch, §9.6). `mkfs.erofs`
 shell fallback is designed but unimplemented — a missing packer input is fail-loud today (§4.2).
-Cross-version snapshot pinning: the snapshot stage folds the `cloud_hypervisor` pin into its cache key,
-so a CH bump *would* invalidate stale snapshots at build time — but **no `cloud_hypervisor` pin is
-committed** in `pins.json` (the fold hashes an empty string), and the README installs CH from git HEAD,
-so today the mechanism is wired and idle. Committing the pin is the one-line close; the *runtime*
-"restore under the CH it was taken on" advice remains advice either way.
+Cross-version snapshot pinning: **CLOSED** (2026-08-20 dependency pass). The snapshot stage folds the
+`cloud_hypervisor` pin into its cache key, and `pins.json` now commits that pin (`"v53.0"`, the latest
+release and the one `ci.yml` installs), so the fold hashes a real value and a CH bump invalidates stale
+snapshots at build time. The README's `cargo install --git` instruction — which installed an unreleased
+`main` build and was the reason the pin could not be trusted even if committed — was replaced with the
+checksum-verified pinned release. The *runtime* "restore under the CH it was taken on" advice remains
+advice either way.
 
 **crosvm (v29).** Boot, lifecycle, vsock/steward, tap networking, sessions, and cgroup limits are **validated
 live** (§2.5, the `just test-crosvm` matrix); the CLI flag spellings and the seccomp/jail posture were
@@ -5452,7 +5456,7 @@ the **gate** that pins it.
    the eight key/name composers — `kernel_pin_key`/`kernel_artifact_key` exported as one-law since
    the docs/81 pass, with `vmcell-kernel-builder` calling them rather than byte-duplicating —
    `reject_sanitized_label_collision`, `sort_kernel_registry`); `pins.json` carries labels
-   `6.6.143`/`6.12.94`/`usbhost`, five fragments, a **singleton** `rootfs {image, digest}`
+   `6.6.152`/`6.12.104`/`usbhost`, five fragments, a **singleton** `rootfs {image, digest}`
    (flattened to `rootfs_image`/`rootfs_digest`; no `rootfs_artifact_key`, no
    `resolve_rootfs_registry` anywhere), and `kernel_prebuilt {url, archive_sha256, sha256,
    archive_member}` — four keys, not the three the requester listed; `KNOWN_PINS_NAMESPACES` is
@@ -5678,11 +5682,14 @@ verified against, because the next version may differ:
   (so a nested guest is not snapshot-portable) (§5.3).
 - **There is no `herolib-virt` crate** — an early dependency assumption that did not exist; the VMM
   integration is direct against each backend's process/API.
-- **CVE-2026-45782 is fixed in CH v52.0.0** — but vmcell **pins no CH version**: `pins.json` carries no
-  `cloud_hypervisor` key and the README installs CH from git HEAD, so what a host actually runs is
-  whatever it built (the live matrix ran on 54.0.0). The snapshot cache key's fold of the
-  `cloud_hypervisor` pin (§10.2) is the mechanism that would make a bump invalidate stale snapshots;
-  committing the pin is what would turn "we are past the fix" from an assumption into a fact.
+- **CVE-2026-45782 is fixed in CH v52.0.0**, and as of the 2026-08-20 dependency pass that is a
+  **fact rather than an assumption**: `pins.json` now carries `cloud_hypervisor: "v53.0"` and the
+  README installs that pinned release (checksum-verified, the same one `ci.yml` installs) instead of
+  `cargo install --git`. The old git-HEAD instruction was how the gap persisted — it installs an
+  *unreleased* build of `main` reporting the next version number (`v54.0.0`, which is why the earlier
+  live matrix ran on a "54.0.0" that no release tag ever carried), so nobody could say which CH a
+  green suite had actually validated. The snapshot cache key's fold of the `cloud_hypervisor` pin
+  (§10.2) now hashes a real value, so a CH bump invalidates stale snapshots at build time.
 
 ### Appendix D — Prior art
 

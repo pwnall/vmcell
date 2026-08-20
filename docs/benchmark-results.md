@@ -689,7 +689,10 @@ freq-pinned, warm-cache. This is the canonical backend × `Timeouts`-preset matr
 - **Host:** Intel Core Ultra 7 258V (Lunar Lake), 8 cores / 8 threads; **base 2.2 GHz, turbo
   4.7 GHz**. 30 GiB RAM (~13 GiB free). Root FS ext4 on NVMe; **`/tmp` is tmpfs**.
 - **Pinned tools:** Cloud Hypervisor v52.0.0, Firecracker v1.16.0, QEMU 10.2.1, virtiofsd 1.13.3,
-  mmdebstrap 1.5.7; **guest kernel Linux 6.12.94** (the committed pin, distro-aligned with Trixie);
+  mmdebstrap 1.5.7; **guest kernel Linux 6.12.94** (the committed pin *at measurement time*,
+  distro-aligned with Trixie; the pin has since moved to 6.12.104 within the same LTS line — these
+  figures are not restated for it, and the 6.6-vs-6.12 sweep below showed the guest kernel version is
+  not a material hot-path lever);
   rootfs base `debian@…` (trixie). Built from scratch via `vmcell build` under gcc 15.2.0.
 - **mm:** THP `madvise`, **KSM on**. Macro runs go through the capability runner under
   `systemd-run --user --scope`, and are **CPU-frequency-pinned** (`performance` + turbo off →

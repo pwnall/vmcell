@@ -614,9 +614,23 @@ impl Stage for KernelStage {
                 let tar_uncompressed_path = workdir_path.join("linux.tar");
                 if !tar_uncompressed_path.exists() {
                     let xz_file = std::fs::File::open(&tarball_path)?;
-                    let mut tar_file = std::fs::File::create(&tar_uncompressed_path)?;
-                    lzma_rs::xz_decompress(&mut std::io::BufReader::new(xz_file), &mut tar_file)
+                    let mut tar_file =
+                        std::io::BufWriter::new(std::fs::File::create(&tar_uncompressed_path)?);
+                    // `lzma_rust2::XzReader` is a streaming `Read`, so the ~1.5 GiB kernel tar is
+                    // copied through a fixed buffer rather than materialized: the `lzma-rs` call
+                    // this replaced took `&mut impl Write` but buffered the whole output first.
+                    // `true` = accept concatenated XZ streams (kernel.org ships one, but a
+                    // multi-stream producer must not become a decode failure); the reader verifies
+                    // the stream's own integrity check, and the tarball's pinned sha256 has already
+                    // been checked before we get here.
+                    let mut xz = lzma_rust2::XzReader::new(std::io::BufReader::new(xz_file), true);
+                    std::io::copy(&mut xz, &mut tar_file)
                         .map_err(|e| Error::Artifact(format!("Decompression failed: {e:?}")))?;
+                    // A BufWriter drops its buffer on the floor unless flushed, and the very next
+                    // statement re-OPENS this path to read the archive back — so an unflushed tail
+                    // would surface as a corrupt-tar parse error, not as a write error.
+                    std::io::Write::flush(&mut tar_file)
+                        .map_err(|e| Error::Artifact(format!("Decompression flush failed: {e}")))?;
                 }
 
                 let tar_file_read = std::fs::File::open(&tar_uncompressed_path)?;

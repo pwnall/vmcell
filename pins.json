@@ -1,21 +1,21 @@
 {
   "kernel": {
-    "source_url": "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.12.94.tar.xz",
-    "source_sha256": "e998a232b9418db3301cb58468e291a4f41d6ab8306029b30d991f56251dc8d2",
+    "source_url": "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.12.104.tar.xz",
+    "source_sha256": "949d166a1263bd0cf0c5aab44eeb57869615099e7c48bf88d0e4adb77379b999",
     "microvm_config": "CONFIG_PVH=y\nCONFIG_SYSTEM_TRUSTED_KEYS=\"\"\nCONFIG_SYSTEM_REVOCATION_KEYS=\"\"\nCONFIG_MODULE_SIG=n\nCONFIG_PCI=y\nCONFIG_VIRTIO=y\nCONFIG_VIRTIO_PCI=y\nCONFIG_VIRTIO_MMIO=y\nCONFIG_VIRTIO_BLK=y\nCONFIG_VIRTIO_NET=y\nCONFIG_VIRTIO_CONSOLE=y\nCONFIG_HW_RANDOM_VIRTIO=y\nCONFIG_VIRTIO_BALLOON=y\nCONFIG_VSOCKETS=y\nCONFIG_VIRTIO_VSOCKETS=y\nCONFIG_VHOST_VSOCK=y\nCONFIG_FUSE_FS=y\nCONFIG_VIRTIO_FS=y\nCONFIG_EROFS_FS=y\nCONFIG_EROFS_FS_ZIP=y\nCONFIG_OVERLAY_FS=y\nCONFIG_TMPFS=y\nCONFIG_EXT4_FS=y\nCONFIG_SERIAL_8250=y\nCONFIG_SERIAL_8250_CONSOLE=y\nCONFIG_DEVTMPFS=y\nCONFIG_DEVTMPFS_MOUNT=y\nCONFIG_PARAVIRT=y\nCONFIG_KVM_GUEST=y\nCONFIG_KVM=y\nCONFIG_KVM_INTEL=y\nCONFIG_KVM_AMD=y\nCONFIG_IP_PNP=y\n"
   },
   "kernels": {
-    "6.6.143": {
-      "source_url": "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.6.143.tar.xz",
-      "source_sha256": "dace1f8dc9c0dbf5df14f47e3229cd62c298e83049681731ef229f2ba7592932"
+    "6.6.152": {
+      "source_url": "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.6.152.tar.xz",
+      "source_sha256": "778b058c63da849d0b74006b23509255b2bed57c62a5151e9dd7a62e2cdd70d6"
     },
-    "6.12.94": {
-      "source_url": "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.12.94.tar.xz",
-      "source_sha256": "e998a232b9418db3301cb58468e291a4f41d6ab8306029b30d991f56251dc8d2"
+    "6.12.104": {
+      "source_url": "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.12.104.tar.xz",
+      "source_sha256": "949d166a1263bd0cf0c5aab44eeb57869615099e7c48bf88d0e4adb77379b999"
     },
     "usbhost": {
-      "source_url": "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.12.94.tar.xz",
-      "source_sha256": "e998a232b9418db3301cb58468e291a4f41d6ab8306029b30d991f56251dc8d2",
+      "source_url": "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.12.104.tar.xz",
+      "source_sha256": "949d166a1263bd0cf0c5aab44eeb57869615099e7c48bf88d0e4adb77379b999",
       "fragments": ["USBHOST"]
     }
   },
@@ -25,6 +25,7 @@
     "archive_member": "./opt/kata/share/kata-containers/vmlinux-6.18.35-197",
     "sha256": "43701715ae2885f936bbe5c66a2de7c14dc51de7d19412d04833e4bbcf205bd0"
   },
+  "cloud_hypervisor": "v53.0",
   "rootfs": {
     "default": {
       "image": "docker.io/library/debian",

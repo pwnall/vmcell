@@ -2165,6 +2165,17 @@ async fn run_net_egress_plain<V: Vmm>(
 /// origin — so the upstream handshake is deliberately out of scope; §16). The proxy
 /// self-generates its CA (baked into the rootfs trust store, so the guest verifies).
 fn mitm_proxy_config() -> vmcell::config::ProxyConfig {
+    // `Matcher`/`Responder` are `Fn` aliases over `hyper::Request` / `hudsucker::Body`, so the
+    // types here must be the ones VMCELL resolved, not whatever this crate's own manifest would
+    // pick. Naming them through the re-exports is the documented contract (design §10.4,
+    // `vmcell::proxy::doubles`' module docs) and this call site is its in-tree proof: while
+    // `bench-vm` carried its own `hudsucker = "0.24"` requirement, vmcell's bump to 0.25 put two
+    // hudsuckers in the graph and this function stopped compiling with "expected
+    // `vmcell::proxy::doubles::hudsucker::Body`, found `hudsucker::Body`" — the exact break the
+    // module docs predict. Both direct requirements were dropped from Cargo.toml with this
+    // change, so the mismatch is now unrepresentable rather than merely fixed.
+    use vmcell::proxy::doubles::{hudsucker, hyper};
+
     // `ProxyConfig` is `#[non_exhaustive]`, so build via `default()` + field-set (the exact
     // pattern the `egress_proxy` test uses; clippy does not fire `field_reassign_with_default`
     // for a `#[non_exhaustive]` struct from another crate).

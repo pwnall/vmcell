@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ONE MSRV FACT — and ONE place that asserts it. AGENTS.md ("Docs and dependencies" → Toolchain):
-# "`rust-toolchain.toml` pins 1.96.1 and the declared `rust-version` **equals** it (one
+# "`rust-toolchain.toml` pins 1.98.0 and the declared `rust-version` **equals** it (one
 # `[workspace.package]` fact, sync-asserted). An understated MSRV lets MSRV-aware resolvers
 # re-resolve older consumers onto vulnerable dependency versions (the `time 0.3.45` class)."
 #

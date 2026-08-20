@@ -79,7 +79,7 @@ fn kernel_registry_entry_declares_its_fragments() {
     );
     // Scoped to the entries that carry no `fragments` key — v30 delta 9 added a committed
     // entry (`usbhost`) that DOES declare one, which is the feature above working.
-    for label in ["6.6.143", "6.12.94"] {
+    for label in ["6.6.152", "6.12.104"] {
         let entry = baseline
             .iter()
             .find(|e| e.label == label)
@@ -128,12 +128,12 @@ fn kernel_registry_order_is_pinned_sorted() {
     assert_eq!(
         baseline,
         vec![
-            "6.12.94".to_string(),
-            "6.6.143".to_string(),
+            "6.12.104".to_string(),
+            "6.6.152".to_string(),
             // v30 delta 9's capability-gate kernel — after the digits in byte order.
             "usbhost".to_string(),
         ],
-        "byte-lexicographic label order: 6.12.94 builds before 6.6.143"
+        "byte-lexicographic label order: 6.12.104 builds before 6.6.152"
     );
 
     // The roster and the registry cannot drift: the labels ARE the registry's labels, in order.

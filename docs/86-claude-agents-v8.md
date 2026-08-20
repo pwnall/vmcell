@@ -589,7 +589,7 @@ fragment is the one defended exception shape and never carries a consumer's usbi
   requirement silently drops the patch, and a **git-dep consumer must replicate the
   `[patch.crates-io]` stanza** (design §10.4; `scripts/check-vendored-vhost.sh` is the
   consumer-runnable check, and it distinguishes not-applicable from not-patched).
-- Toolchain: `rust-toolchain.toml` pins 1.96.1 and the declared `rust-version` **equals** it (one
+- Toolchain: `rust-toolchain.toml` pins 1.98.0 and the declared `rust-version` **equals** it (one
   `[workspace.package]` fact, asserted in one place — `scripts/check-msrv-sync.sh`, which replaced the
   mirrored inline `sed` comparisons in the `ci` recipe and in ci.yml, a pair that could have drifted in
   *strictness* silently). An understated MSRV lets MSRV-aware resolvers

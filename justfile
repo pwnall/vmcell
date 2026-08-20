@@ -810,7 +810,7 @@ ci:
     # ci.yml's test-unit job invokes this same recipe.
     {{just_executable()}} test-doc
     # public-API semver intent (CI runs this PRs-only against the PR base; locally diff vs the main
-    # merge-base). Runs on the pinned toolchain — 1.96.1 satisfies cargo-semver-checks' rustc floor.
+    # merge-base). Runs on the pinned toolchain — 1.98.0 satisfies cargo-semver-checks' rustc floor.
     # v30 delta 2: `vmcell-artifact-validator` is downstream CONTRACT surface (§10.4), so it is
     # semver-gated exactly like `vmcell` — a silent breaking change to the validator battery is the
     # same defect as one to the library, and "discovered by a consumer's build breaking" is the

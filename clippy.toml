@@ -1,8 +1,8 @@
-# Declared MSRV = the tested floor, tracking the latest stable (1.96.1). An UNDERSTATED rust-version is
+# Declared MSRV = the tested floor, tracking the latest stable (1.98.0). An UNDERSTATED rust-version is
 # worse than cosmetic — it lets an MSRV-aware resolver hand consumers older, potentially-vulnerable
 # dependency versions instead of the advisory-clean ones the lockfile pins. Kept in lockstep with
 # rust-toolchain.toml + [workspace.package] rust-version by the sync assertion in `just ci` / ci.yml.
-msrv = "1.96.1"
+msrv = "1.98.0"
 
 # Tests may unwrap/expect/print/dbg; production code may not (see the not(test) deny-list in lib.rs).
 allow-unwrap-in-tests  = true

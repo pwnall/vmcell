@@ -3319,8 +3319,8 @@ mod tests {
         let labels: Vec<&str> = registry.iter().map(|e| e.label.as_str()).collect();
         assert_eq!(
             labels,
-            vec!["6.12.94", "6.6.143", "aa", "usbhost", "zz"],
-            "labels build in byte-lexicographic order (6.12.94 before 6.6.143), baseline included"
+            vec!["6.12.104", "6.6.152", "aa", "usbhost", "zz"],
+            "labels build in byte-lexicographic order (6.12.104 before 6.6.152), baseline included"
         );
         // The fragment sets ride along with their labels.
         let by = |l: &str| {
@@ -3343,17 +3343,20 @@ mod tests {
     #[test]
     fn kernel_registry_rejects_labels_colliding_on_one_filename() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        // Premise: the committed baseline carries the dotted `6.12.94`, so the overlay only has to
-        // add its already-sanitized twin to collide (the shape a downstream author actually hits).
+        // Premise: the committed baseline carries the dotted `6.12.104`, so the overlay only has
+        // to add its already-sanitized twin to collide (the shape a downstream author actually
+        // hits). The premise assertion is what keeps this test honest across a pin bump: when the
+        // baseline label moved 6.12.94 → 6.12.104 it failed HERE first, naming the reason, instead
+        // of the collision silently ceasing to be a collision and the test passing vacuously.
         assert!(
             resolve_pins(None)
                 .expect("baseline resolves")
-                .contains_key("kernel_6.12.94_source_url"),
-            "fixture premise: the committed baseline carries the 6.12.94 label"
+                .contains_key("kernel_6.12.104_source_url"),
+            "fixture premise: the committed baseline carries the 6.12.104 label"
         );
         let overlay = write_overlay(
             tmp.path(),
-            r#"{ "kernels": { "6-12-94": { "source_url": "https://d.example/l.tar.xz",
+            r#"{ "kernels": { "6-12-104": { "source_url": "https://d.example/l.tar.xz",
                  "source_sha256": "beef" } } }"#,
         );
         let res = resolve_kernel_registry(Some(&overlay));
@@ -3361,11 +3364,11 @@ mod tests {
             panic!("colliding labels must be a hard error, got {res:?}");
         };
         assert!(
-            msg.contains("6.12.94") && msg.contains("6-12-94"),
+            msg.contains("6.12.104") && msg.contains("6-12-104"),
             "the refusal must name BOTH colliding labels, got: {msg}"
         );
         assert!(
-            msg.contains(&kernel::kernel_filename(Some("6.12.94"))),
+            msg.contains(&kernel::kernel_filename(Some("6.12.104"))),
             "the refusal must name the one filename they share, got: {msg}"
         );
         // The label roster is the same reader, so it refuses too — no route around the check.
@@ -4457,12 +4460,12 @@ mod tests {
         );
         // The baseline's own labels survive alongside the added one.
         assert!(
-            baseline.contains_key("kernel_6.12.94_source_url"),
-            "fixture premise: the committed baseline carries the 6.12.94 label"
+            baseline.contains_key("kernel_6.12.104_source_url"),
+            "fixture premise: the committed baseline carries the 6.12.104 label"
         );
         assert_eq!(
-            merged.get("kernel_6.12.94_source_url"),
-            baseline.get("kernel_6.12.94_source_url"),
+            merged.get("kernel_6.12.104_source_url"),
+            baseline.get("kernel_6.12.104_source_url"),
             "an added registry entry must not evict the baseline's entries"
         );
         assert_eq!(
@@ -4473,7 +4476,7 @@ mod tests {
         // downstream label is not merely resolvable but buildable (the gate-blindness this closes).
         let labels = resolve_kernel_labels(Some(&overlay)).expect("labels resolve");
         assert!(
-            labels.contains(&"9.9.9".to_string()) && labels.contains(&"6.12.94".to_string()),
+            labels.contains(&"9.9.9".to_string()) && labels.contains(&"6.12.104".to_string()),
             "the label roster must be the MERGED registry, got {labels:?}"
         );
         assert_eq!(

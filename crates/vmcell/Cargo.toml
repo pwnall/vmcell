@@ -643,10 +643,46 @@ name = "vmcell"
 #     literals this crate and `vmcell-steward` each carried with no shared const between them —
 #     re-spell either and the guest fell back to a compiled cadence that happened to be the same
 #     number, so nothing could go red (docs/90 G7). Same tokens, same values, same order.
-version = "0.21.0"
+#
+# 0.21.0 → 0.22.0: the 2026-08-20 dependency-modernization pass. One breaking edge, and — like the
+# 0.20 → 0.21 edge above — `cargo semver-checks` is BLIND to the thing that breaks: every signature
+# on the contract surface is byte-identical, so the tool reports "no semver update required" and this
+# entry is written by hand (§10.4; `tests/contract_ledger.rs` gates the chain this line closes).
+#
+#   * BREAKING, SEMVER-CHECKS-BLIND — `proxy::doubles` re-exports a DIFFERENT `hudsucker`.
+#     `hudsucker` 0.24 → 0.25, so `proxy::doubles::hudsucker`, the `Matcher`/`Responder` aliases
+#     built over it, and `TestDouble` all resolve to new underlying types. The alias *shapes* are
+#     unchanged, which is exactly why no lint sees it — the module's own docs already named this
+#     bump class as the reason the ledger entry has to be hand-written, citing the 0.23 → 0.24 move
+#     the previous pass made. A consumer that names the types through the re-exports (the documented
+#     spelling, compiled as a doctest) needs only to rebuild; a consumer that ALSO pins its own
+#     `hudsucker` gets a hard type mismatch. That is not hypothetical either: `vmcell-bench` was such
+#     a consumer inside this very workspace, and this bump broke it with "expected
+#     `vmcell::proxy::doubles::hudsucker::Body`, found `hudsucker::Body`". Its own `hudsucker` and
+#     `hyper` requirements were deleted rather than re-aligned, so the in-tree composition root now
+#     demonstrates the documented rule instead of contradicting it.
+#
+#   * NOT ON THIS EDGE, deliberately — the vendored rust-vmm family. `vhost`/`vhost-user-backend`
+#     stay `=0.16.0`/`=0.22.0` (with `vm-memory =0.17.1`, `virtio-queue 0.17.0`). The pass proved the
+#     re-vendor onto 0.17.0/0.23.0 works and that upstream still needs the carried patch, then
+#     reverted: `fuse-backend-rs` 0.14.0 (latest) pins `vm-memory = "=0.17.1"` and `virtio-queue
+#     0.17`, and `fs/in_process.rs` bridges descriptor chains to it, so the set cannot move while
+#     `experiment-fuse` exists. The rationale at the pin site records this; it replaced a recorded
+#     reason that was a hazard rather than a blocker.
+#
+#   * UNCHANGED on the contract surface otherwise: the pins schema and its namespaces, the stage /
+#     pipeline / build entry points, `pack_rootfs_with_injection` and the labelled pack surface, the
+#     `VMCELL_*` env table, and the validator battery all keep their signatures and behavior. The
+#     `pins.json` edits in this pass are VALUE moves inside the existing schema (kernel labels
+#     `6.6.143`/`6.12.94` → `6.6.152`/`6.12.104` within the same two LTS lines, and a newly committed
+#     `cloud_hypervisor: "v53.0"` scalar — a namespace that already existed and already fed the
+#     snapshot cache key, closing design §17's "wired and idle" gap). A consumer overlay that named
+#     the old kernel labels resolves them no longer — that is a data edge, called out here because
+#     the schema gate cannot see a label rename either.
+version = "0.22.0"
 edition = "2024"
 # MSRV is the single workspace floor (`[workspace.package] rust-version`, in lockstep with
-# rust-toolchain.toml via the `just ci` sync assertion) — currently the latest stable, 1.96.1.
+# rust-toolchain.toml via the `just ci` sync assertion) — currently the latest stable, 1.98.0.
 rust-version.workspace = true
 license = "MIT OR Apache-2.0"
 description = "Micro-VM-per-test integration & evaluation platform for a hypothetical agentic harness"
@@ -800,7 +836,7 @@ serde_json = { version = "1", optional = true }
 
 
 # Net
-rtnetlink = { version = "0.21", optional = true }
+rtnetlink = { version = "0.23", optional = true }
 netns-rs = { version = "0.2", optional = true }
 tun-tap = { version = "0.1", optional = true }
 
@@ -809,7 +845,7 @@ tun-tap = { version = "0.1", optional = true }
 rustls = { version = "0.23", optional = true }
 tokio-rustls = { version = "0.26", optional = true }
 rcgen = { version = "0.14", optional = true, features = ["x509-parser"] }
-hudsucker = { version = "0.24", optional = true }
+hudsucker = { version = "0.25", optional = true }
 
 
 # Pipeline
@@ -818,7 +854,14 @@ sha2 = { version = "0.11", optional = true }
 blake3 = { version = "1", optional = true }
 tar = { version = "0.4", optional = true }
 flate2 = { version = "1", optional = true }
-lzma-rs = { version = "0.3", optional = true }
+# XZ decode for the kernel-source tarball. `default-features = false` DELIBERATELY drops
+# `optimization`, the one feature that enables `unsafe`: with it off the crate's own
+# `#![cfg_attr(not(feature = "optimization"), forbid(unsafe_code))]` makes unsafe-freedom a
+# COMPILER-ENFORCED property of the dependency rather than a promise — which is what lets a crate
+# with an `unsafe`-bearing feature past this tree's unsafe rules at all. `encoder` and `lzip` are
+# dropped because vmcell only ever decodes XZ. `xz` pulls `sha2` (the XZ integrity check), which
+# this crate already depends on, so the swap adds no new crate to the graph.
+lzma-rust2 = { version = "0.19", default-features = false, features = ["std", "xz"], optional = true }
 zstd = { version = "0.13", optional = true }
 reflink-copy = { version = "0.1", optional = true }
 walkdir = { version = "2", optional = true }
@@ -836,19 +879,44 @@ fuse-backend-rs = { version = "0.14.0", optional = true }
 # these at vendor/vhost{,-user-backend}. A caret bump (e.g. to 0.17) would silently
 # drop the patch with only a "Patch was not used" warning — regressing the
 # QEMU-unprivileged SET_VRING_ENABLE quirk with a green build. `=` forbids the bump;
-# the `ci` recipe additionally asserts both resolve from the path patch.
+# `scripts/check-vendored-vhost.sh` additionally asserts both resolve from the path patch.
+#
+# HELD BACK at 0.16.0/0.22.0/0.17.1/0.17.0 — and the 2026-08-20 dependency pass replaced the
+# reason, because the one recorded here before was NOT the blocker. The old rationale was
+# "bumping forks the version and silently drops the patch"; that is a hazard, not an
+# obstacle — the pass re-vendored 0.17.0/0.23.0, re-applied the patch and its red-on-inverse
+# test onto the new sources, and `check-vendored-vhost.sh` stayed green (it reads the pinned
+# version out of the vendored manifest precisely so a pin bump is supported). Upstream was
+# re-checked at the same time and still carries the unconditional PROTOCOL_FEATURES check on
+# published 0.17.0/0.23.0 AND on `main`, so the patch remains load-bearing either way.
+#
+# THE ACTUAL BLOCKER IS `experiment-fuse`. vhost 0.17 / vhost-user-backend 0.23 both require
+# vm-memory 0.18 + virtio-queue 0.18, so the four move as one set. But `fuse-backend-rs`
+# 0.14.0 — latest, and the in-process virtio-fs backend behind `experiment-fuse` (design
+# Appendix B #6) — requires `virtio-queue 0.17` and pins `vm-memory = "=0.17.1"` EXACTLY, and
+# `fs/in_process.rs` hands a `virtio_queue::DescriptorChain` straight to that crate's
+# `Reader::from_descriptor_chain`. Two virtio-queue majors cannot meet at that bridge, so the
+# bump compiles under default features and fails under `--features experiment-fuse` (which
+# `--all-features` and the `cargo hack` powerset both select) with "expected
+# `DescriptorChain<_>`, found `DescriptorChain<...>`".
+#
+# The trade was judged the wrong way round: vhost 0.17's headline fix is the `SHMEM` protocol
+# feature-bit position (21 → 22), and vmcell negotiates no SHMEM on any device it ships
+# (vhost-user-vsock and the smoltcp vhost-user-net NAT), so the fix is inert here — while the
+# cost is breaking a shipped feature. UNBLOCKS WHEN: fuse-backend-rs publishes a release built
+# on vm-memory 0.18 / virtio-queue 0.18. Re-check that first; the re-vendor itself is proven.
 vhost = { version = "=0.16.0", optional = true }
 vhost-user-backend = { version = "=0.22.0", optional = true }
 virtio-queue = { version = "0.17.0", optional = true }
 vmm-sys-util = { version = "0.15.0", optional = true }
 vm-memory = { version = "=0.17.1", optional = true }
 virtio-bindings = { version = "0.2.7", optional = true }
-smoltcp = { version = "0.13.1", optional = true, features = ["std", "log", "medium-ethernet", "socket-tcp", "socket-udp", "socket-icmp", "socket-dhcpv4", "phy-tuntap_interface"] }
+smoltcp = { version = "0.14", optional = true, features = ["std", "log", "medium-ethernet", "socket-tcp", "socket-udp", "socket-icmp", "socket-dhcpv4", "phy-tuntap_interface"] }
 am-fs-erofs = { version = "0.1.1", optional = true }
 async-trait = { version = "0.1.89", optional = true }
-# Used only by the privileged tap path (`net/tap.rs`, alongside rtnetlink 0.21) and the proxy CA
+# Used only by the privileged tap path (`net/tap.rs`, alongside rtnetlink 0.23) and the proxy CA
 # authority type (`proxy/tls.rs`); both are optional so they stay out of feature-trimmed builds.
-netlink-packet-route = { version = "0.30", optional = true }
+netlink-packet-route = { version = "0.33", optional = true }
 http = { version = "1", optional = true }
 
 [dev-dependencies]
@@ -877,7 +945,7 @@ criterion = { version = "0.8", features = ["html_reports"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "test-util"] }
 assert_cmd = "2"
 predicates = "3"
-serial_test = "3"
+serial_test = "4"
 tempfile = "3"
 tracing-test = "0.2"
 proptest = "1"
@@ -987,7 +1055,7 @@ metrics = ["host-common"]
 pipeline = [
     "host-common",
     "dep:reqwest", "dep:sha2", "dep:blake3",
-    "dep:tar", "dep:flate2", "dep:lzma-rs", "dep:zstd",
+    "dep:tar", "dep:flate2", "dep:lzma-rust2", "dep:zstd",
     # `reflink-copy`/`walkdir` are declared on `host-common` (zygote CoW fan-out,
     # §8.4); `pipeline` inherits them through `host-common` above.
     "dep:tempfile",

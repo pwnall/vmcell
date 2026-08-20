@@ -59,11 +59,11 @@ members = [
 exclude = ["fuzz", "examples/downstream-kernel"]
 
 [workspace.package]
-# The single MSRV fact: the tested floor, tracking the latest stable (1.96.1). Understating it is a
+# The single MSRV fact: the tested floor, tracking the latest stable (1.98.0). Understating it is a
 # live vulnerability path (see clippy.toml's msrv comment). Every member inherits it via
 # `rust-version.workspace = true`, and the `just ci` sync assertion keeps it equal to
 # rust-toolchain.toml's pinned channel.
-rust-version = "1.96.1"
+rust-version = "1.98.0"
 
 # Carried patch: QEMU-unprivileged vhost-user only (relaxes a PROTOCOL_FEATURES check on
 # SET_VRING_ENABLE that QEMU sends before SET_FEATURES finalizes). Lives at the workspace root

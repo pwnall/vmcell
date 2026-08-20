@@ -242,22 +242,36 @@ What these are for:
 
 ### 2. Cargo-installed subprocess binaries
 
-`cloud-hypervisor` (the primary VMM) and `virtiofsd` (the virtio-fs daemon) are installed via Cargo
-so they build as optimized release binaries spawned by the orchestration layer. `vhost-device-vsock`
-backs the unprivileged vsock control plane on the QEMU backend.
+`virtiofsd` (the virtio-fs daemon) and `vhost-device-vsock` are installed via Cargo. Cloud
+Hypervisor — the **primary** VMM — is installed from its **pinned release**, not from git:
 
 ```sh
-cargo install --git https://github.com/cloud-hypervisor/cloud-hypervisor.git cloud-hypervisor
-cargo install virtiofsd --locked
-cargo install vhost-device-vsock --locked
+# Cloud Hypervisor v53.0 — the release ci.yml pins, checksum-verified exactly as CI does.
+curl --proto '=https' --tlsv1.2 -fsSL -o /tmp/cloud-hypervisor \
+    https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/v53.0/cloud-hypervisor-static
+echo "448af3d4e59b22c2987f7df94c213ad40fb53a10d437e42b5ee6c4fce7c29ecc  /tmp/cloud-hypervisor" | sha256sum -c -
+sudo install -m 0755 /tmp/cloud-hypervisor /usr/local/bin/cloud-hypervisor
+
+cargo install virtiofsd --locked          # 1.14.0 at the time of writing
+cargo install vhost-device-vsock --locked # 0.3.0 at the time of writing
 ```
 
 All three are required for the full suites, `vhost-device-vsock` included: it is the **default** QEMU
 vsock transport (`uses_in_kernel_vsock` returns `cfg.snapshotting` on `Auto`), so every
 non-snapshotting QEMU leg spawns it — by bare name, with a deliberately loud failure if it is
-missing. Cloud Hypervisor also publishes a static `cloud-hypervisor-static` binary on its GitHub
-releases; CI uses that (pinned by digest) instead of the source build above, which is the faster
-route if you do not need a local CH build.
+missing.
+
+**Do not install Cloud Hypervisor with `cargo install --git`.** This file used to say to, and it
+silently installs an *unreleased* build of `main`: upstream bumps the crate version immediately after
+cutting a release, so `cargo install --git` yields a binary reporting the **next** version number
+(`v54.0.0` today) from a tree ~237 commits ahead of the pinned `v53.0`. That is not a cosmetic
+difference — post-v53.0 `main` changes vsock local-port ownership and RST-reply behavior (the
+steward's entire transport), remaps CH API errors from HTTP 500 to 404/400/409, and adds syscalls to
+CH's own seccomp filter, which the confinement battery inspects on a *running* CH. A live suite that
+passes against such a build is not evidence about the version CI runs, in exactly the direction
+AGENTS.md's "CI executes what it claims" rule warns about. If you do want a local source build, keep
+it *beside* the pinned binary and point one run at a time through `$VMCELL_CH_BIN` — the one resolver
+every harness reads (`vmcell::artifact::ch_binary_path`) — rather than putting it on `$PATH`.
 
 Ensure that `~/.cargo/bin` is in your `$PATH` so the test suite can discover these executables.
 
@@ -267,15 +281,21 @@ Unlike Cloud Hypervisor, Firecracker uses a custom containerized build process (
 is not intended to be built via a standard `cargo install`. Instead, we use the pre-compiled external
 binaries from their GitHub releases.
 
-Download and install the latest Firecracker release (e.g. v1.16.0) on Debian/Ubuntu:
+Install **v1.16.1** — the version `ci.yml` pins, so a local run and CI exercise the same binary:
 
 ```sh
-curl -LO https://github.com/firecracker-microvm/firecracker/releases/download/v1.16.0/firecracker-v1.16.0-x86_64.tgz
-tar -xzf firecracker-v1.16.0-x86_64.tgz
-sudo mv release-v1.16.0-x86_64/firecracker-v1.16.0-x86_64 /usr/local/bin/firecracker
-sudo chmod +x /usr/local/bin/firecracker
-rm -rf firecracker-v1.16.0-x86_64.tgz release-v1.16.0-x86_64
+curl -LO https://github.com/firecracker-microvm/firecracker/releases/download/v1.16.1/firecracker-v1.16.1-x86_64.tgz
+curl -LO https://github.com/firecracker-microvm/firecracker/releases/download/v1.16.1/firecracker-v1.16.1-x86_64.tgz.sha256.txt
+sha256sum -c firecracker-v1.16.1-x86_64.tgz.sha256.txt
+tar -xzf firecracker-v1.16.1-x86_64.tgz
+sudo install -m 0755 release-v1.16.1-x86_64/firecracker-v1.16.1-x86_64 /usr/local/bin/firecracker
+rm -rf firecracker-v1.16.1-x86_64.tgz firecracker-v1.16.1-x86_64.tgz.sha256.txt release-v1.16.1-x86_64
 ```
+
+Firecracker publishes a `.sha256.txt` beside each tarball; verifying against **it** (rather than a
+digest copied into this file) is what keeps this instruction from going stale silently, and is what
+`ci.yml` does. `firecracker --version` should print `Firecracker v1.16.1` — the version pinned here
+and in CI must match, because a backend binary is spawned *with capabilities* beside the suite.
 
 ### 4. QEMU Binary
 
@@ -285,6 +305,28 @@ Install the `qemu-system-x86` package which provides the `qemu-system-x86_64` bi
 ```sh
 sudo apt install -y qemu-system-x86
 ```
+
+vmcell pins **no** QEMU version: the backend spawns `qemu-system-x86_64` by name (or
+`$VMCELL_QEMU_BIN`) and CI installs whatever `qemu-system-x86` the runner image carries, so the
+distro package is the supported route and the floor is "new enough for the flags the arg-builder
+emits". On **Ubuntu 26.04 (resolute) that package is QEMU 10.2.1**, which is what the suites are
+validated against.
+
+**The `-hwe` virtualization stack does not currently get you a newer QEMU.** It is easy to assume it
+does — the name suggests a rolling newer-hardware-enablement channel, and it is intended to become
+one — but on resolute today `ubuntu-virt-hwe` / `qemu-system-x86-hwe` sit at
+`1:10.2.1+ds-1ubuntu4.3` against the base stack's `1:10.2.1+ds-1ubuntu3.2`: **the same upstream
+10.2.1**, forked at parity, differing only in the SRU patch series. No refresh onto a newer upstream
+has happened yet. Note also that `ubuntu-helper-virt-hwe` is *only* the switching helper (an apt hook
+plus `/usr/bin/ubuntu_virt_helper`) — installing it moves nothing; `ubuntu_virt_helper` is what
+switches the stack, and doing so still lands on 10.2.1.
+
+Upstream QEMU is further along — **11.1.0** (2026-08-11), with 11.0.3 and 10.2.4 on the stable
+branches — but **no 11.x is packaged for resolute in any pocket, and no PPA carries one**; Ubuntu
+26.10 has 11.0.3 and Debian sid has 11.1.0. So getting 11.x on this host means building from source
+or rebuilding the Debian package. Nothing in vmcell needs it: no QEMU 11 feature is used, and the
+QEMU legs are validated on 10.2.1. Treat 11.x as an untested configuration until someone runs
+`just test-privileged` and the QEMU matrix against it.
 
 ### 5. crosvm Binary (optional, secondary backend)
 

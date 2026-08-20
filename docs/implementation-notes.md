@@ -5960,3 +5960,199 @@ it.**
   (`crates/vmcell/src/artifact/rootfs/oci.rs:820-869`). Both arms are then unenterable on the wrong kind
   of host, no wording is matched at all, and the ext4-bytes claim is left to the batteries that can
   record the gap — which the comment names.
+
+## Dependency modernization — the 2026-08-20 latest-stable pass
+
+Second full bump pass (the first is the 2026-07-14 entry above). Everything with a newer **stable**
+release moved; everything held back is recorded here with the blocker that was *measured*, not the one
+that was assumed. `docs/91-claude-opus-workaround-inventory.md` is the companion register — it answers
+"is this workaround still load-bearing?" per row and is where the two replaced rationales live.
+
+### Toolchain
+
+Rust **1.96.1 → 1.98.0** (latest stable, released 2026-08-20). The MSRV is one fact in five files plus
+`clippy.toml`; `scripts/check-msrv-sync.sh` gates all of them and its red-on-inverse self-test still
+drives every arm. **The bump was clean**: `cargo build --workspace --all-features` and
+`cargo clippy --workspace --all-targets --all-features`, both under `RUSTFLAGS=-D warnings`, passed with
+zero source changes. No new default-on lint fired — worth recording, because a new lint is the usual
+cost of a toolchain bump in a `-D warnings` tree, and the pass budgeted for it.
+
+### Breaking-major bumps applied
+
+`base64` 0.22 → 0.23, `serial_test` 3 → 4, `smoltcp` 0.13.1 → 0.14, `rtnetlink` 0.21 → 0.23 with
+`netlink-packet-route` 0.30 → 0.33 **in lockstep** (0.23 requires `^0.33`), and `hudsucker`
+0.24 → 0.25. All five needed **no source migration** — notable for `smoltcp`, whose 0.11 → 0.13 move in
+the previous pass required two, and whose 0.14 is mostly TCP congestion-control and RFC-compliance work
+plus TSO. The netlink pair, whose whole API surface lives in `net/tap.rs`, compiled untouched.
+
+The netlink bump also removed `paste` from the graph, retiring `RUSTSEC-2024-0436`; the ignore was
+deleted rather than left as a dead entry (`deny.toml`'s header forbids exactly that shape). 15 ignores
+remain, 14 of them the `tun-tap` subtree — see the inventory, row A1, for why that count is one crate
+and one ioctl rather than fourteen problems.
+
+### The hudsucker bump is a contract edge, and it broke an in-tree consumer
+
+`proxy::doubles` re-exports `hudsucker` and `hyper` at the versions its `Matcher`/`Responder` aliases
+are built from, so 0.24 → 0.25 moves types a downstream names. `cargo semver-checks` is blind to it
+(the alias *shapes* are unchanged) — the module docs already said so, citing the previous pass's
+0.23 → 0.24 move as precedent. Hand-written ledger entry `0.21.0 → 0.22.0` added; all fourteen sibling
+path-dep requirements moved with it (a rollback in one manifest is a workspace-wide resolution error).
+
+The predicted consumer break happened **inside this workspace**: `vmcell-bench` carried its own
+`hudsucker = "0.24"` and `hyper` requirements, used only to build a `TestDouble`, and failed with
+`expected vmcell::proxy::doubles::hudsucker::Body, found hudsucker::Body` — the module docs' exact
+example. Both requirements were **deleted** rather than realigned and the call site now names the
+crates through the re-exports, so the duplicate-version break is unrepresentable rather than repaired,
+and the composition root demonstrates the documented rule instead of contradicting it.
+
+### Held back — the vendored rust-vmm family, for a different reason than the one on record
+
+`vhost`/`vhost-user-backend`/`vm-memory`/`virtio-queue` stay at `=0.16.0`/`=0.22.0`/`=0.17.1`/`0.17.0`.
+
+**The recorded rationale was empirically wrong** — the register convention's own failure mode, found by
+testing it. It said bumping "silently drops the patch"; that is a hazard, not a blocker, and
+`check-vendored-vhost.sh` reads the pinned version out of the vendored manifest *precisely* so a pin
+bump is supported. The pass performed the whole re-vendor onto 0.17.0/0.23.0 — extracted the crates,
+re-applied both patch hunks and the carried `set_vring_enable_quirk_gating` test, moved the pins — and
+the gate stayed green.
+
+**The real blocker is `experiment-fuse`.** `fuse-backend-rs` 0.14.0 (latest) requires `virtio-queue
+0.17` and pins `vm-memory = "=0.17.1"` exactly, while `vhost` 0.17 / `vhost-user-backend` 0.23 both
+require the 0.18 pair — so the four move as one set, and `fs/in_process.rs` bridges a
+`virtio_queue::DescriptorChain` straight into `fuse-backend-rs`. Default features compile;
+`--features experiment-fuse` (selected by `--all-features` and the `cargo hack` powerset) does not.
+The trade was judged the wrong way round: vhost 0.17's headline fix is the `SHMEM` feature-bit position
+(21 → 22), and vmcell negotiates no SHMEM on any device it ships, so it is inert here while the cost is
+breaking a shipped feature. Reverted; the pin-site comment now carries this. **Unblocks when**
+`fuse-backend-rs` publishes on `vm-memory 0.18`.
+
+Upstream was re-checked while there and still carries the unconditional
+`check_feature(PROTOCOL_FEATURES)` on `set_vring_enable` — on published 0.17.0/0.23.0 **and** on `main`
+at `c96c3722`. The patch is still load-bearing; `vendor/` cannot be deleted.
+
+Also held: `libc` (latest is `1.0.0-alpha.4`) and `rustls` (0.23.43 is latest stable) — pre-release and
+already-latest respectively, unchanged from the previous pass's reasoning.
+
+### `lzma-rs` → `lzma-rust2` for the kernel-tarball XZ decode
+
+Swapped on the one call site that decodes the kernel source tarball
+(`artifact/kernel.rs`). The prompt for it was operational: during this pass's artifact rebuild the
+decompress phase looked like a wedged download — one thread pinned at 100% CPU, no socket traffic,
+an empty `kernel-build/` — and it was simply `lzma-rs` grinding through a 142 MiB `.xz` into a
+1.5 GiB tar. (Diagnosis note for the next person: `linux.tar` growing is the progress signal; the
+process being in `futex_do_wait` with an idle keep-alive socket is not evidence of a stall.)
+
+Measured, same session, interleaved, release build, idle box, on the real
+`linux-6.12.104.tar.xz` (142 MiB in, 1,549,117,440 bytes out):
+
+| decoder | time | throughput |
+|---|---|---|
+| `lzma-rs` 0.3.0 | 15.97 s | 92.5 MiB/s |
+| `lzma-rust2` 0.19.0 | 9.76 s | 151.3 MiB/s |
+
+**1.64×**, reproducible across rounds to within 0.1%, and the output is **byte-identical**
+(sha256 `4b93c9f0…` both ways) — the acceptance condition for a codec swap.
+
+Why this crate specifically:
+
+- **Maintained.** `lzma-rs` 0.3.0 is the newest release and dates to **2023-01-04**; `lzma-rust2`
+  0.19.0 shipped **2026-08-16**, on a roughly fortnightly cadence.
+- **Licence.** Apache-2.0, already on `deny.toml`'s allow-list. (`lzma-rs` is MIT; both fine.)
+- **`unsafe` is opted OUT, and the opt-out is compiler-enforced.** The crate carries an
+  `optimization` feature that enables `unsafe`, and it is ON by default — so the dependency is
+  declared `default-features = false, features = ["std", "xz"]`. With `optimization` off the crate's
+  own `#![cfg_attr(not(feature = "optimization"), forbid(unsafe_code))]` applies, which makes
+  unsafe-freedom a property `rustc` checks rather than one the README asserts. That is the whole
+  reason a crate with an `unsafe`-bearing feature is admissible here. Dropping `encoder` and `lzip`
+  as well keeps the compiled surface to the one thing vmcell does: decode XZ.
+- **No new crate in the graph.** The `xz` feature pulls `sha2` (for the stream integrity check),
+  which this crate already depends on.
+- **Streaming.** `XzReader` is a `Read`, so the 1.5 GiB tar is `io::copy`'d through a fixed buffer;
+  the `lzma-rs` entry point took `&mut impl Write` but buffered the entire output first.
+
+**`lzma-rs` does not leave the lockfile** — `am-fs-erofs` 0.1.1 (the erofs writer) still depends on
+it transitively. So this is a hot-path and maintenance win on vmcell's own call site, not a
+dependency removal; do not expect the crate to disappear from `cargo tree`.
+
+### External binaries, and a local-vs-CI divergence the pass found
+
+- **Cloud Hypervisor.** CI's `v53.0` pin **is** latest — no v54 tag exists. But this host had a
+  `cloud-hypervisor v54.0.0`, because the README said `cargo install --git`, which installs an
+  unreleased `main` build reporting the *next* version. Design Appendix C had already recorded "the
+  live matrix ran on 54.0.0" without noting that no such release exists. `main` is ~237 commits past
+  v53.0 and three of them touch surfaces the suites assert on: vsock local-port ownership / RST-reply
+  behavior, CH API errors remapped 500 → 404/400/409, and additions to CH's own seccomp filter (which
+  the confinement battery reads off a *running* CH). The README now installs the checksum-verified
+  pinned release, and the live suites were run against a locally installed v53.0 via `$VMCELL_CH_BIN`.
+- **`pins.json` now commits `cloud_hypervisor: "v53.0"`** — design §17's named "one-line close". The
+  snapshot cache key's fold of that pin was wired and hashing an empty string; it now hashes a real
+  value, so a CH bump invalidates stale snapshots at build time. §17 and Appendix C updated.
+- **Firecracker.** CI's `v1.16.1` is latest; the README was stale at v1.16.0 (five occurrences) and now
+  matches CI, verifying against the published `.sha256.txt` rather than a digest copied into the file.
+  The dev box had 1.16.0, which matters more than a patch bump usually does: 1.16.1's two fixes are a
+  jailer `O_NOFOLLOW` revert and — squarely on a path the suites exercise — *"vsock guest-to-host
+  connections time out after snapshot restore, triggered by taking a snapshot with a TX descriptor
+  in-flight"*. The live suites for this pass were therefore run against 1.16.1, installed per-user and
+  selected through `$VMCELL_FC_BIN` (the same trick used for CH), so both backends matched CI's pins
+  exactly rather than approximately.
+- **QEMU.** No version is pinned anywhere — the backend spawns by name and CI takes the runner's
+  package — so nothing to bump. Recorded in the README because the question recurs: upstream is at
+  **11.1.0** (2026-08-11), but Ubuntu 26.04 resolute has **10.2.1** in *both* the base and the `-hwe`
+  stacks (`1:10.2.1+ds-1ubuntu3.2` vs `…-1ubuntu4.3` — same upstream, forked at parity, differing only
+  in SRU patches), and no 11.x is packaged for resolute in any pocket nor in any PPA. `-hwe` is
+  intended to become a rolling channel but has not refreshed yet; `ubuntu-helper-virt-hwe` is only the
+  switching helper and installs no QEMU at all. The QEMU legs remain validated on 10.2.1.
+- **`virtiofsd` 1.14.0 / `vhost-device-vsock` 0.3.0** are already latest; so are all six cargo dev
+  tools and `actionlint` 1.7.12. Nothing to do.
+- **crosvm** still has no tagged release (git `main` only), so nothing to pin. Noted for a future pass:
+  a `--nested` flag landed upstream 2026-07-15, which is what crosvm's honest-`false` `nested_virt`
+  was waiting on — a capability-flag change re-validates empirically (`just test-crosvm`), never in the
+  descriptor, so it is out of scope here.
+
+### Artifact pins
+
+Guest kernel **6.12.94 → 6.12.104** and the alternate **6.6.143 → 6.6.152** — security-patch moves
+within the same two LTS lines, not line changes. Checksums came from kernel.org's `sha256sums.asc`;
+the method was proved by recomputing the *existing* pins from the same file and matching both exactly.
+`usbhost` follows the default. `e2fsprogs` 1.47.2 → 1.47.4 in CI (recomputed locally; the old digest
+reproduced exactly).
+
+Renaming the two registry labels reddened **four** tests that assert against the committed baseline,
+each of which had been written with an explicit "fixture premise" assertion — so the rename failed
+*there*, naming the reason, instead of the collision test quietly ceasing to test a collision. That is
+the premise-assertion convention paying out, and the comment at the collision test now says so.
+The byte-vs-version collation the roster test pins stays non-vacuous across the rename: byte order puts
+`6.12.104` before `6.6.152`, version order the reverse.
+
+**`kata-containers` 3.32.0 held at 3.32.0** though 4.0.0 exists. The `kernel_prebuilt` pin is the anchor
+of a recorded empirical comparison (design §5, the Kata `vmlinux.container` finding, Linux 6.18.35);
+a major bump changes the kernel *under* that comparison, so re-pinning without re-running it would
+silently invalidate a validated finding. Bump it in a change that re-runs the comparison.
+
+### Operational finding: `just ci` grows an unbounded `target/`
+
+Not a dependency fact, recorded because it **stopped this pass** and will stop the next one. `just ci`
+failed at `rustc-LLVM ERROR: IO failure on output stream: No space left on device`, with `rust-lld`
+dying on `signal 7 [Bus error]` a few crates earlier — both symptoms of a full disk, neither naming
+one. `target/` had reached **1.7 TB**: 803 GB across 59,392 `debug/incremental` directories, 733 GB
+and 133,624 files in `debug/deps`, plus 83 GB under `semver-checks`.
+
+The driver is the `cargo hack` feature powerset: every feature combination fingerprints as a distinct
+unit and nothing evicts the old ones, so the directory grows monotonically with the number of `just
+ci` runs. CI never sees it — a hosted runner starts each job on a clean disk — so it is strictly a
+long-lived-dev-box failure, which is also why it presents as a mysterious linker crash rather than as
+anything a gate would catch.
+
+Periodic `cargo clean` is the remedy. Note that plain `cargo clean` also deletes
+`target/vmcell-artifacts`, which costs a full kernel rebuild; removing `target/debug`,
+`target/semver-checks`, `target/release`, `target/doc` and the per-triple directory keeps the
+artifacts and the (out-of-`target/`) blessed runner intact.
+
+### GitHub Actions
+
+Dependabot owns these pins but had not landed them: `actions/checkout` v4 → v7.0.1, `actions/cache`
+v4.3.0 → v6.1.0, `actions/upload-artifact` v4 → v7.0.1, `Swatinem/rust-cache` → v2.9.2,
+`taiki-e/install-action` → v2.86.4, `dtolnay/rust-toolchain` re-pinned to the current `nightly` branch
+head. All to full commit SHAs. Their breaking changes are Node-24 runtime bumps (hosted runners are
+past the runner floor) and `checkout`'s `allow-unsafe-pr-checkout`, which applies to
+`pull_request_target` — this workflow uses `pull_request`, so it does not apply.

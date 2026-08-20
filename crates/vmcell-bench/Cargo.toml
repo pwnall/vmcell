@@ -13,7 +13,7 @@ publish = false
 # `firecracker`/`qemu`/`crosvm` features gate the three secondary backends the same way the in-tree
 # bin used to.
 [dependencies]
-vmcell = { path = "../vmcell", version = "0.21.0", default-features = false, features = ["cloud-hypervisor", "metrics", "cli", "proxy"] }
+vmcell = { path = "../vmcell", version = "0.22.0", default-features = false, features = ["cloud-hypervisor", "metrics", "cli", "proxy"] }
 vmcell-firecracker = { path = "../vmcell-firecracker", version = "0.1.0", optional = true }
 vmcell-qemu = { path = "../vmcell-qemu", version = "0.1.0", optional = true }
 vmcell-crosvm = { path = "../vmcell-crosvm", version = "0.1.0", optional = true }
@@ -22,8 +22,14 @@ anyhow = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "fs", "net", "process", "sync", "time", "signal"] }
 serde_json = "1"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream", "blocking"] }
-hyper = { version = "1", features = ["client", "http1"] }
-hudsucker = "0.24"
+# NO direct `hyper` / `hudsucker` requirements. The only site that named them builds a
+# `vmcell::proxy::doubles::TestDouble`, whose `Matcher`/`Responder` aliases are built from the
+# versions VMCELL resolved; naming them through `vmcell::proxy::doubles`' re-exports (design
+# §10.4) is what keeps this crate off a second, independently-resolved copy. A requirement here
+# reintroduces the duplicate-version break — vmcell's hudsucker 0.24 → 0.25 bump produced exactly
+# that ("expected `vmcell::proxy::doubles::hudsucker::Body`, found `hudsucker::Body`"), which is
+# why the pair is documented as absent rather than simply not present. `cargo machete` is the
+# gate that keeps an unused re-added requirement from lingering.
 futures = "0.3"
 libc = "0.2"
 tempfile = "3"

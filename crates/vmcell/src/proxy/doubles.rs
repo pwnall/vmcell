@@ -34,9 +34,14 @@
 //! asserted.
 //!
 //! Neither crate appears in the consumer's manifest, and a bump inside vmcell moves both aliases and
-//! re-exports together. That bump is not hypothetical — hudsucker went 0.23 → 0.24 in the
-//! dependency-modernization pass — and `cargo semver-checks` cannot see it, because the aliases'
-//! *shape* is unchanged across it. `the_seam_types_are_reachable_through_the_reexported_crates` is the
+//! re-exports together. That bump is not hypothetical — hudsucker went 0.23 → 0.24, then 0.24 → 0.25
+//! in the two dependency-modernization passes — and `cargo semver-checks` cannot see it, because the
+//! aliases' *shape* is unchanged across it; each edge is hand-written into the `Cargo.toml` ledger.
+//! Nor is the consumer-side break hypothetical: at the 0.24 → 0.25 edge `vmcell-bench` was still
+//! carrying its own `hudsucker` requirement and failed to compile with "expected
+//! `vmcell::proxy::doubles::hudsucker::Body`, found `hudsucker::Body`" — the exact error this module
+//! exists to prevent, from inside this workspace. Its direct `hudsucker`/`hyper` requirements were
+//! deleted rather than realigned, so the one in-tree consumer now follows the rule it documents. `the_seam_types_are_reachable_through_the_reexported_crates` is the
 //! gate: it builds a double naming nothing but the re-exports, so a re-export that stops matching the
 //! aliases stops compiling.
 //!
