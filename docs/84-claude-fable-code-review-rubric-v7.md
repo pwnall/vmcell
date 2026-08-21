@@ -1233,7 +1233,9 @@ the `Service` positive control (10).
   bucket ordering (environmental still dominates) carry red-on-inverse legs in
   `scripts/test-review-preflight-priv.sh`, which runs inside `just gates`.
 - **`just bless` is a step in the sequence, ahead of every runner-wrapped suite** [90] — and it is
-  the maintainer's step, not the reviewer's: it needs one sudo (`setcap`), so a BLOCKED-ON-BLESS
+  the maintainer's step, not the reviewer's: it may need a sudo (`setcap`) — it does whenever the
+  recipe falls through its idempotence skip, and does not on the mtime-proxy arm, where the binary is
+  unchanged and it merely re-dates the stamp — so a BLOCKED-ON-BLESS
   verdict is ask-and-rerun-the-preflight, never attempt it yourself and never silently skip.
   AGENTS.md's bless-remediable roster already listed a **stale stamp** beside a missing runner and a
   `+p`-only blessing — the rule was deployed while nothing in the tree computed it, which is its own

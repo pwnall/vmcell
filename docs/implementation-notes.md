@@ -3738,9 +3738,15 @@ the boundary check is what shipped, with the rationale at the site.
   was always `Ok(None)` and read by nobody, while forcing every out-of-tree implementor of this
   ledgered seam to depend on `tun-tap` (which `vmcell` does not re-export, so the pin had to be
   guessed) and teaching them to hold the tap fd open — the one thing that breaks single-opener
-  discipline. `vmcell-broker`, whose recording `Netlink` fake now compiles with **no** `tun-tap`
-  dependency at all, is the living gate against the type coming back. Breaking, and invisible to
-  `cargo semver-checks` (it has no return-type lint), which is why it is hand-ledgered.
+  discipline. Breaking, and invisible to `cargo semver-checks` (it has no return-type lint), which is
+  why it is hand-ledgered. **Retired half:** this entry, and the `0.13.0 → 0.14.0` ledger edge in
+  `crates/vmcell/Cargo.toml`, both said `vmcell-broker`'s zero-dev-dependency posture was *the*
+  living gate against the type coming back. That was true while `vmcell` still carried the
+  dependency — the broker's fake was then the only thing that could not name it. Since the `tun-tap`
+  removal the crate is out of the graph entirely, so `cargo check -p vmcell` fails first and
+  `deny.toml`'s by-name ban keeps it out transitively; the broker's posture is still worth holding
+  for the *next* type a seam might leak, but it no longer discriminates. The ledger edge is a record
+  of a shipped release and stays as written; this entry is the live one, so it is corrected here.
 - **The QEMU argv composer is `qemu_launch_plan`, returning `vmcell::vmm::LaunchPlan`** — not
   `build_qemu_command` returning a `Command`. Command and jail posture now travel together from
   composition to exec, so no step can substitute either half; `LaunchPlan::jail` is private, so the
@@ -6215,8 +6221,22 @@ While confirming the above, the `setup_tap_on_bridge` comment claiming an `EEXIS
 interface is someone else's" was corrected: `EEXIST` is not reachable from this call site at all — the
 kernel returns it only for a second `TUNSETIFF` on the *same* fd.
 
-**Gates.** `net_sys`'s four KVM-free unit tests (the ABI pin, the name law, the read-back helper, the
-device path) and `tests/tap_create.rs`'s four live legs — no VM, `CAP_NET_ADMIN` only, so they run on
+**Two things checked so the next reviewer need not re-derive them.** The error text `Error::Network`
+wraps is unchanged (`"tap create fail: {e}"`), but the inner message is now vmcell's own rather than
+`tun-tap`'s — nothing in the tree matches on the old text, and `net/segment.rs`'s `RecordingNetlink`
+fake imitates the kernel's `EBUSY` in the same shape, so it stays honest. And there is **no**
+production path that puts a tap in the host namespace: a correctly created tap lives inside a netns
+and dies when `cleanup_orphan_netns` removes it, so a crashed privileged run leaves nothing the sweep
+misses. The host-namespace residue below is reachable only from a deliberately broken build.
+
+**Gates.** `scripts/ban-raw-fd-open.sh` (+ its self-test) holds the O_CLOEXEC law, which is the one
+law here that is neither a compile error nor test-observable: `libc::open` compiles fine and the tap
+still comes up, and the failure needs a concurrent fork/exec to race the open while
+`create_tap_in_current_netns` is `pub(crate)`, so no live leg could hold it. The ban is anchored on
+the file and refuses as *misconfigured* if that file moves or stops opening through `OpenOptions` —
+an exemption that outlives its site is a widened blind spot, not a pass. Beside it, `net_sys`'s four
+KVM-free unit tests (the ABI pin, the name law, the read-back helper, the device path) and
+`tests/tap_create.rs`'s four live legs — no VM, `CAP_NET_ADMIN` only, so they run on
 the blessed runner and close the gap that `Netlink::setup_tap`, reached on every privileged boot, had
 no live leg of its own. Plus `deny.toml`'s by-name ban and `unused-ignored-advisory = "deny"`, which
 turns a stale advisory ignore from a `warning[advisory-not-detected]` that exits 0 into a red gate —
@@ -6267,5 +6287,15 @@ the workspace moves `Cargo.lock` while the thin runner closure rarely moves — 
 build it just made against the stable copy, finds them identical, takes its idempotence skip,
 re-dates the stamp and **sets no caps at all**. No sudo occurs. Promising one either way is how STALE
 gets read as routine noise, which erodes the signal the probe exists to give. Both the script's
-message and the `AGENTS.md`/`docs/86` pair now say the bless is cheap and sudo-free unless the binary
-genuinely changed, while keeping "do not skip it" unambiguous.
+message and the `AGENTS.md`/`docs/86` pair now scope the claim, while keeping "do not skip it"
+unambiguous.
+
+**And the first attempt at that fix was itself the same defect.** It (a) said "sudo-free unless the
+binary changed" against a trigger list of which only ONE arm is sudo-free — the recipe's idempotence
+skip needs five conjuncts, so a missing runner, a missing stamp, or stripped caps all still fall
+through to `setcap` — and (b) claimed the sweep was complete while four live statements of "one sudo"
+survived, in `review-preflight-priv.sh` itself (twice, one of them directly above the
+`BLOCKED-ON-BLESS` verdict), in `docs/84`'s rubric bullet, and in `guest_tuning.rs`'s runbook. Both
+are now fixed; the accurate rule is **a sudo happens whenever `bless_one` falls through its
+idempotence skip**, and the mtime proxy is the one arm that does not. `README.md`'s first-bless and
+`implementation-notes`' caps-mismatch mentions are correct as written and were left alone.

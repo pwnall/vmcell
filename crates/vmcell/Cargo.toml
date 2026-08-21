@@ -680,6 +680,10 @@ name = "vmcell"
 #     on it directly, which is the same anti-pattern `proxy::doubles`' module docs warn about, and
 #     which now stops resolving. Such a consumer names `tun-tap` in its own manifest, or does what
 #     vmcell did. The crate is `[bans]`-denied in `deny.toml`, transitively too, so it cannot return.
+#     One compiler-invisible edge, named here rather than discovered: `Error::Network`'s wrapper text
+#     is unchanged (`"tap create fail: {e}"`) but the INNER message is now vmcell's own, so a consumer
+#     matching on `tun-tap`'s wording — `EBUSY`/`EINVAL` still render as the OS error, but a refused
+#     name is now a typed `InvalidInput` naming the length rule — matches different bytes.
 #
 #   * UNCHANGED on the contract surface otherwise: the pins schema and its namespaces, the stage /
 #     pipeline / build entry points, `pack_rootfs_with_injection` and the labelled pack surface, the

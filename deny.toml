@@ -29,7 +29,7 @@ deny = [
     { name = "seccomp", reason = "LGPL-2.1 crate + links libseccomp; use seccompiler (§20.6)" },
     { name = "syscallz", reason = "pulls seccomp-sys → the LGPL-2.1 libseccomp C library; use seccompiler (§20.6)" },
     { name = "birdcage", reason = "alternative sandbox crate (seccomp/landlock); banned by name so seccompiler stays the single sanctioned sandbox/seccomp dependency (§20.6, rubric B13)" },
-    { name = "tun-tap", reason = "unmaintained; supplied ONE TUNSETIFF ioctl (now vmcell::net_sys::create_tap_in_current_netns) and dragged in the whole tokio-0.1 subtree — 14 permanent RUSTSEC ignores and 47 lockfile packages. Banned by NAME because no other gate can see the re-entry: re-adding it does not redden, it merely makes those 14 advisories live again, to be 'fixed' with 14 fresh ignores. Applies transitively too (docs/91 A1)." },
+    { name = "tun-tap", reason = "unmaintained; supplied ONE TUNSETIFF ioctl (now vmcell::net_sys::create_tap_in_current_netns) and dragged in the whole tokio-0.1 subtree — 14 permanent RUSTSEC ignores and 47 lockfile packages. Banned by NAME because the advisory gate's redness is the kind that gets 'fixed' rather than heeded: re-adding it makes those 14 advisories live (verified: an unignored unmaintained advisory FAILS in this configuration), and the path of least resistance is 14 fresh ignores, not a second look. The ban is the arm that cannot be silenced that way. Applies transitively too, verified (docs/91 A1)." },
 ]
 
 [advisories]

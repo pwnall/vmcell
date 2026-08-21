@@ -57,7 +57,8 @@
 //! **These legs mean nothing against a stale rootfs.** The parser under test is baked into
 //! `rootfs.erofs`. A central runner must therefore, in order: `vmcell build --kernel-source
 //! host-make` (the bare default is `prebuilt`, which swaps in a `vmlinux` lacking
-//! `CONFIG_KVM_INTEL`), then `just bless` (one sudo; blessing is stripped on rewrite), then
+//! `CONFIG_KVM_INTEL`), then `just bless` (a sudo here, since a rebuilt runner strips its blessing;
+//! an mtime-only bump re-dates without one), then
 //! `systemd-run --user --scope -p Delegate=yes scripts/with-delegated-scope.sh just
 //! test-privileged`.
 

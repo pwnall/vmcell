@@ -257,8 +257,10 @@ mod tests {
         ] {
             assert!(
                 name.len() <= MAX_INTERFACE_NAME_LEN,
-                "{class} name {name:?} is {} bytes; the kernel silently truncates anything over \
-                 {MAX_INTERFACE_NAME_LEN}, so this must be caught here and not at rtnetlink",
+                "{class} name {name:?} is {} bytes, over {MAX_INTERFACE_NAME_LEN}; the composer \
+                 must not emit a name the boundary will refuse — `net_sys::create_tap_in_current_netns` \
+                 rejects it typed for the tap, and netlink's IFLA_IFNAME policy rejects it for the \
+                 bridge, so the failure would land far from whatever composed it",
                 name.len()
             );
         }

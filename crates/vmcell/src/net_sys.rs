@@ -10,11 +10,21 @@ const TUN_DEVICE: &str = "/dev/net/tun";
 
 /// `IFF_TAP | IFF_NO_PI`, narrowed to the `c_short` the `ifr_flags` union arm carries.
 ///
-/// `IFF_NO_PI` is not decoration: without it the kernel prepends a 4-byte `tun_pi` header to every
-/// frame, which every VMM that opens this tap would then have to strip. Both halves are fixed ABI
-/// constants (`0x0002`, `0x1000`), so the OR is `0x1002` and the narrowing to the 16-bit union arm
-/// is lossless — `tunsetiff_abi_is_pinned_to_the_kernel` asserts that round trip rather than
-/// trusting it, the same shape `vmcell_steward::netif`'s `IFF_UP` narrowing carries.
+/// `IFF_NO_PI` suppresses the 4-byte `tun_pi` header the kernel would otherwise prepend to every
+/// frame. Be precise about who it protects, because the obvious answer is wrong: `IFF_NO_PI` is in
+/// the kernel's `TUN_FEATURES` set, which `tun_set_iff` **overwrites** from the ifreq of whoever
+/// last issues `TUNSETIFF` (`tun->flags = (tun->flags & ~TUN_FEATURES) | (ifr->ifr_flags &
+/// TUN_FEATURES)`, on the create *and* attach paths). vmcell hands the tap to the VMM by name and
+/// drops this fd, so the VMM's own open re-keys the flag and ours does not reach it. What setting it
+/// buys is that the interface is correct in the window where it is ours — which is the window
+/// `tap_create.rs` observes — and byte-identical behavior to the `tun-tap` call this replaced.
+/// Contrast the `IFF_MULTI_QUEUE` note below: that one the kernel **compares** rather than
+/// overwrites. One flag in this word propagates, the other is rejected on mismatch; they are not
+/// the same kind of thing.
+///
+/// Both halves are fixed ABI constants (`0x0002`, `0x1000`), so the OR is `0x1002` and the narrowing
+/// to the 16-bit union arm is lossless — `tunsetiff_abi_is_pinned_to_the_kernel` asserts that round
+/// trip rather than trusting it, the same shape `vmcell_steward::netif`'s `IFF_UP` narrowing carries.
 ///
 /// Deliberately **not** `IFF_MULTI_QUEUE`: no backend asks for a multi-queue tap
 /// (`ChNet` has no `num_queues`, QEMU's `-netdev tap` passes no `queues=`), and the kernel rejects
@@ -61,10 +71,12 @@ pub(crate) fn setns_net(fd: RawFd) -> io::Result<()> {
 /// is the boundary that has to *hold* that bound rather than assume it.
 ///
 /// Only the two facts needed to build the struct are checked here — the length that must leave room
-/// for the NUL, and the absence of an interior NUL that would silently shorten the name. Everything
-/// else the kernel may object to (`dev_valid_name`'s rejects, or a `%d` pattern it would *expand*)
-/// is caught loudly by the caller's read-back comparison, so this is not a second, partial copy of
-/// the kernel's name rules.
+/// for the NUL, and the absence of an interior NUL that would silently shorten the name. This is
+/// deliberately not a second, partial copy of the kernel's name rules, because the kernel is loud
+/// about the rest, by two different mechanisms: a name `dev_valid_name` **rejects** fails inside
+/// `tun_set_iff`, and `__tun_chr_ioctl` returns before its `copy_to_user`, so it surfaces as the
+/// ioctl's own error; a `%d` pattern is not rejected at all but silently **expanded**, and only the
+/// caller's read-back comparison catches that one.
 ///
 /// # Errors
 /// [`io::ErrorKind::InvalidInput`] naming the offending value if `name` is empty, is `IFNAMSIZ`

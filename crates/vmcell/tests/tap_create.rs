@@ -22,6 +22,12 @@ mod common;
 ///
 /// `TUNSETIFF` is privileged-capability-class; the blessed capability runner is what makes this
 /// suite runnable unprivileged, so an absent capability is a real failure, not a skip.
+///
+/// Probes the **effective** set, while every kernel-observable assertion below runs through an
+/// `ip`/`nsenter` subprocess and so depends on the **ambient** set. Under the blessed runner the two
+/// coincide by construction (`BLESSED_FILE_CAPS` raises both), which is the only documented way to
+/// run this file — but they are different sets, and if they ever diverged these legs would fail
+/// pointing at the product instead of at the environment.
 fn require_privileged_net() {
     if !common::has_cap_net_admin() {
         panic!(
@@ -60,7 +66,14 @@ impl Drop for NetnsFixture {
     }
 }
 
-/// A vmid this suite owns, chosen high so it cannot collide with a concurrently running VM leg.
+/// The vmid this suite's fixtures are named after.
+///
+/// It is **not** protected by being high: `VmidAllocator::allocate` walks `seeded_id_order(clock,
+/// 254)`, a nanosecond-seeded rotation over the whole `1..=254` space precisely so no id is tried
+/// first, so 231 is exactly as likely to be handed out as 1. What protects these legs is that
+/// nextest's `serial-host` group runs them one at a time — `.config/nextest.toml`'s
+/// `package(~vmcell) & kind(test) & !binary(proptests)` override selects this binary — and that
+/// every leg sweeps `clean_vmcell_netns()` first, so a crashed earlier run cannot collide either.
 const FIXTURE_VMID: u32 = 231;
 
 /// `ip -d link show dev <name>` **inside** `netns` — the detailed view that renders the tun/tap
@@ -79,13 +92,22 @@ fn link_details_in(netns: &std::path::Path, name: &str) -> Option<String> {
 
 /// Whether `ip -o link show` in the **host** namespace lists interface `name`.
 ///
-/// Matches the whole name token, never a bare substring — the same trap `segment.rs`'s
-/// `link_listed` documents, and the reason the negative leg below cannot pass vacuously.
+/// Matches the whole name token rather than a bare substring, but note which way that cuts here:
+/// every caller **negates** this, so narrowing the match makes a `false` easier to get, not harder.
+/// It buys a *spurious red* — `vmcell-tap-231` must not be reported present because `vmcell-tap-23`
+/// is — and nothing more. What keeps the negations from passing vacuously is the exit-status
+/// assertion below: a failing `ip` yields empty stdout, which every caller would otherwise read as
+/// "nothing in the host namespace", quietly turning the leak gate AND the reaper into no-ops.
 fn listed_in_host_netns(name: &str) -> bool {
     let out = std::process::Command::new("ip")
         .args(["-o", "link", "show"])
         .output()
         .expect("ip link must be runnable");
+    assert!(
+        out.status.success(),
+        "listing host-namespace links failed, so an absence here would be meaningless: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     String::from_utf8_lossy(&out.stdout)
         .lines()
         .any(|line| line.split_whitespace().nth(1) == Some(&format!("{name}:")))
@@ -103,20 +125,32 @@ fn listed_in_host_netns(name: &str) -> bool {
 ///
 /// `ip` inherits `CAP_NET_ADMIN` from the blessed runner's **ambient** set, so no elevation is
 /// needed beyond what the suite already runs with.
+/// **Best-effort and loud**, never panicking: this runs from a [`HostTapReaper`] `Drop`, and a panic
+/// in a destructor *during unwinding* aborts the process — which would skip [`NetnsFixture`]'s own
+/// `Drop` (declared earlier, so it runs later) and strand the fixture namespace and everything in
+/// it. That is the residue class this function exists to close, so it must not create a worse one.
+/// Every other test `Drop` in the tree is non-panicking for the same reason.
 fn reap_from_host_netns(name: &str) -> bool {
     if !listed_in_host_netns(name) {
         return false;
     }
-    let out = std::process::Command::new("ip")
+    match std::process::Command::new("ip")
         .args(["link", "delete", name])
         .output()
-        .expect("ip link delete must be runnable");
-    assert!(
-        out.status.success(),
-        "leaked host-namespace interface {name} could not be reaped: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    true
+    {
+        Ok(out) if out.status.success() => true,
+        Ok(out) => {
+            eprintln!(
+                "tap_create: leaked host-namespace interface {name} could NOT be reaped: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            false
+        }
+        Err(e) => {
+            eprintln!("tap_create: could not run `ip link delete {name}`: {e}");
+            false
+        }
+    }
 }
 
 /// Reaps a host-namespace leak of `name` on the way out, **including the panic path**.
@@ -160,6 +194,11 @@ fn tap_is_created_layer2_without_packet_info_and_persists_past_our_fd() {
         FIXTURE_VMID,
     ));
     let tap = vmcell::naming::tap_name(vmcell::naming::DEFAULT_RESOURCE_PREFIX, FIXTURE_VMID);
+    // This leg only ever looks inside the fixture namespace, so it would not NOTICE a tap that
+    // landed in the host's — but under the hoist it persists one there all the same, and the run
+    // that does notice is the next one. Reaping is cheap; a leak that only bites a later invocation
+    // is the residue class this file already had to learn once.
+    let _reaper = HostTapReaper(&tap);
 
     vmcell::net::tap::RtNetlink
         .setup_tap(&netns.name, &tap, FIXTURE_VMID)
@@ -196,8 +235,14 @@ fn tap_is_created_layer2_without_packet_info_and_persists_past_our_fd() {
 /// every tap in the **host** namespace. Nothing about that is loud: the call returns `Ok`, and it
 /// surfaces one step later at an in-namespace `rtnetlink` lookup.
 ///
-/// The absence half is the real gate; the presence half is its positive control, without which a
-/// tap that was never created at all would satisfy the assertion vacuously.
+/// **Order matters, and the obvious order hides the defect.** Under the hoist, `setup_tap` FAILS —
+/// the tap is in the host namespace, so its own in-namespace `rtnetlink` lookup finds nothing — so
+/// an `.expect()` on the result would panic first and the host would never be looked at. The leg
+/// would still go red, but via the `.expect`, leaving the absence assertion something that has
+/// never once been evaluated in its failing direction. Worse, asserting presence-in-the-namespace
+/// first makes absence-from-the-host a logical *consequence* of it (a netdevice lives in exactly
+/// one namespace), so it could not fail even in principle. The result is therefore captured, the
+/// host checked first, and only then is the call's own success asserted as the positive control.
 #[test]
 #[ignore = "needs CAP_NET_ADMIN"]
 fn tap_lands_in_the_target_netns_and_not_the_host() {
@@ -211,31 +256,38 @@ fn tap_lands_in_the_target_netns_and_not_the_host() {
     ));
     let tap = vmcell::naming::tap_name(vmcell::naming::DEFAULT_RESOURCE_PREFIX, FIXTURE_VMID);
 
-    // Sweep first, then assert the sweep worked — the same shape `clean_vmcell_netns` uses at the
-    // top of every leg here. Reaping is what keeps one red run from poisoning the next; the
-    // assertion is what proves the reap actually took, so this is not the vacuous
-    // "delete-then-check-it-is-gone" it would be if the reaper were unconditional.
+    // Sweep an earlier run's leak before starting — the same auto-heal `clean_vmcell_netns()` above
+    // does for namespaces, and what stops one red run from making every later one report a
+    // pre-existing interface instead of the defect. The assertion after it is a backstop for a reap
+    // that failed, not proof the reap took: `reap_from_host_netns` already returns `false` unless
+    // the name was absent or `ip link delete` succeeded, so it holds on both branches. (It is
+    // conditional for a mechanical reason: `ip link delete` on an absent device exits non-zero, so
+    // an unconditional reap would report a failure on every clean run.)
     if reap_from_host_netns(&tap) {
         eprintln!("tap_create: reaped a stale host-namespace {tap} left by an earlier run");
     }
     assert!(
         !listed_in_host_netns(&tap),
-        "{tap} must not exist in the host namespace before the test creates it"
+        "{tap} still exists in the host namespace and could not be reaped; the gate below would \
+         report a stale leak rather than this run's"
     );
     let _reaper = HostTapReaper(&tap);
 
-    vmcell::net::tap::RtNetlink
-        .setup_tap(&netns.name, &tap, FIXTURE_VMID)
-        .expect("setting up the tap must succeed under CAP_NET_ADMIN");
+    let created = vmcell::net::tap::RtNetlink.setup_tap(&netns.name, &tap, FIXTURE_VMID);
 
+    // The gate, evaluated before anything can short-circuit it.
+    assert!(
+        !listed_in_host_netns(&tap),
+        "{tap} leaked into the host namespace — the /dev/net/tun open ran outside in_netns \
+         (setup_tap returned {created:?})"
+    );
+    // Positive controls: the call succeeded, and the interface really is in the namespace — without
+    // both, a tap that was never created at all would satisfy the assertion above vacuously.
+    created.expect("setting up the tap must succeed under CAP_NET_ADMIN");
     assert!(
         link_details_in(&netns.path(), &tap).is_some(),
         "positive control: {tap} must be present in {}",
         netns.name
-    );
-    assert!(
-        !listed_in_host_netns(&tap),
-        "{tap} leaked into the host namespace — the /dev/net/tun open ran outside in_netns"
     );
 }
 
@@ -290,6 +342,7 @@ fn an_over_long_tap_name_creates_no_interface_under_any_name() {
     // Positive control: the same call with a name that fits does create the interface, so the
     // absences above are the rejection and not a namespace nothing can be created in.
     let ok_name = vmcell::naming::tap_name(vmcell::naming::DEFAULT_RESOURCE_PREFIX, FIXTURE_VMID);
+    let _reaper = HostTapReaper(&ok_name);
     vmcell::net::tap::RtNetlink
         .setup_tap(&netns.name, &ok_name, FIXTURE_VMID)
         .expect("the allowed path must succeed");
@@ -307,6 +360,11 @@ fn an_over_long_tap_name_creates_no_interface_under_any_name() {
 /// past the length check — `"vmcell-tap-%d"` is 13 bytes — and that the kernel then renames:
 /// `dev_get_valid_name` substitutes the first free index, so a caller asking for one name silently
 /// gets another, and the VMM would later be pointed at an interface that does not exist.
+///
+/// Reachable **at the `Netlink` seam**, to be precise, not through vmcell's own orchestration:
+/// `naming::tap_name` is the only in-tree composer and `validate_resource_prefix` admits no `%`.
+/// The seam is public and ledgered, so an out-of-tree implementor or a direct `setup_tap` call is
+/// the caller this defends — which is the same reason the seam validates at all.
 ///
 /// The residue half matters as much as the error: `TUNSETIFF` really did create `vmcell-tap-0`, and
 /// what removes it is that the read-back fails **before** `TUNSETPERSIST`, so the interface dies

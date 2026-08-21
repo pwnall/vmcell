@@ -600,6 +600,15 @@ gates:
     # file, and the stale-exemption check.
     ./scripts/ban-inline-setns.sh
     ./scripts/test-ban-inline-setns.sh
+    # The O_CLOEXEC half of the same module's law. `net_sys`'s `/dev/net/tun` open goes through
+    # `std::fs::OpenOptions`, which sets O_CLOEXEC; C's `open(2)` does not, and `vmcelld` fork/execs
+    # VMMs concurrently with that call, so a leaked tun fd is an ATTACHED TAP QUEUE and the VMM's own
+    # TUNSETIFF fails EBUSY. The drift is neither a compile error nor test-observable (the failure
+    # needs a concurrent fork to race the open, and the fn is `pub(crate)`), which is exactly the
+    # shape AGENTS.md says earns a grep-ban. The self-test proves the call pattern, every raw
+    # spelling, the comment-stripping, and both anchor-moved refusals red.
+    ./scripts/ban-raw-fd-open.sh
+    ./scripts/test-ban-raw-fd-open.sh
     # The netns LAYOUT half of the same net law (F2-adjacent): `/var/run/netns/<name>` is composed
     # only from `net::tap::NETNS_DIR`. `net/tap.rs`'s `netns_layout_gate` pins that roster in both
     # directions, but it walks `env!("CARGO_MANIFEST_DIR")/src` — so its whole verdict is about

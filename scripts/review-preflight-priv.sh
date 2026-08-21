@@ -67,7 +67,7 @@ NEEDED_CAPS=(cap_net_admin cap_sys_admin cap_dac_override cap_setpcap)
 BLESS_SRC_PATHS_DEFAULT="crates/vmcell-test-runner/src:crates/vmcell-privilege/src:Cargo.lock"
 IFS=: read -r -a BLESS_SRC_PATHS <<<"${VMCELL_RUNNER_SRC_PATHS:-$BLESS_SRC_PATHS_DEFAULT}"
 
-# Failures split into two buckets so the verdict tells a maintainer's one-sudo `just bless` fix
+# Failures split into two buckets so the verdict tells a maintainer's `just bless` fix
 # (runner missing / caps stripped / stale stamp) apart from a genuinely absent facility (no KVM, no
 # artifacts, no cgroup delegation). An agent must ask for the bless instead of downgrading a
 # privileged-aware review to static-only — the exact reflex this split removes (AGENTS.md rule 5).
@@ -275,7 +275,9 @@ if [ "${#env_problems[@]}" -gt 0 ]; then
   echo "Fix the items above, or label this run STATIC-ONLY and mark every runtime claim unverified."
   exit 1
 fi
-# Only bless-remediable failures remain — one maintainer `just bless` (single sudo) unblocks the suites.
+# Only bless-remediable failures remain — one maintainer `just bless` unblocks the suites. It takes a
+# sudo only when it falls through its idempotence skip (runner missing, stamp missing, binary changed,
+# caps or mode lost); the mtime-proxy arm re-dates and returns without one. See check_blessing_fresh.
 echo "PREFLIGHT: BLOCKED-ON-BLESS — ask the maintainer to run \`just bless\`, then rerun preflight and the suites:"
 for p in "${bless_problems[@]}"; do echo "  - $p"; done
 echo
