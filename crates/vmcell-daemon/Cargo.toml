@@ -82,7 +82,47 @@ name = "vmcell-daemon"
 #     disk (`tokio::fs::File` → `reqwest::Body`) instead of `std::fs::read`-ing it into memory. A
 #     streamed body has no `Content-Length` — it is sent chunked — which a strict intermediary or a
 #     hand-rolled test server may need to expect. `vmcelld-ctl` gains `pause`/`resume` subcommands.
-version = "0.6.0"
+# 0.6.0 → 0.7.0: three more §17 daemon gaps — the PERIODIC orphan sweeper, the UDS transport, and
+# the artifact-store quota + start-up GC. Same reasoning as every entry above: `cargo semver-checks`
+# does not cover this crate (§10.4 lists neither it nor its wire), so this line is the only thing
+# that will tell a consumer.
+#   * NEW ROUTE `GET /v1/store` (op id `storeUsage`), authenticated like every other route and served
+#     in the OpenAPI document from the same one table. It answers the new `dto::StoreUsage`
+#     (`used_bytes`, `quota_bytes`, `artifact_count`, `snapshot_prefix_count`). `quota_bytes` is a
+#     plain `Option` with NO `skip_serializing_if`, so `null` is always on the wire — deliberately
+#     not a presence attribute.
+#   * NEW BEHAVIOR, off by default: `vmcelld --max-store-bytes <N>` caps the WHOLE store. Once it is
+#     reached, `PUT /v1/artifacts/{name}` and `POST /v1/vms/{id}/snapshot` return 413
+#     `payload_too_large` naming the usage, the quota and the remedy. Nothing is ever EVICTED to make
+#     room — a client at the ceiling frees space itself with `DELETE /v1/artifacts/{name}`. An upload
+#     that fits the per-upload cap but not the remaining headroom is refused at the chunk that
+#     crosses, and the message names WHICH ceiling bound it. With no `--max-store-bytes` the store is
+#     unbounded and pays no scan, exactly as before.
+#   * NEW BEHAVIOR: a start-up artifact GC removes the daemon's OWN crash residue — abandoned upload
+#     temp files (now prefixed `artifact_store::UPLOAD_TEMP_PREFIX`) and digest sidecars whose
+#     artifact is gone — older than `DEFAULT_RESIDUE_MIN_AGE`. It never touches an uploaded artifact,
+#     a snapshot prefix, or any file it did not create. A client cannot observe this except as
+#     reclaimed bytes in `GET /v1/store`. The upload temp-file NAME changed (`.tmp*` →
+#     `.vmcelld-tmp.*`), which matters only to a test or tool that matched the old prefix.
+#   * NEW BEHAVIOR: `vmcelld --sweep-interval-secs <N>` (default 300, `0` disables) runs the orphan
+#     sweep periodically, not only at start-up. It is liveness-aware in two independent ways — the
+#     registry's live-vmid set and the cross-process id-claim registry — and it DEFERS a whole pass
+#     while any VM launch is in flight, because a launching VM's resources exist under a vmid the
+#     table does not list yet. A value between 1 and `sweep::MIN_SWEEP_INTERVAL` is REFUSED at
+#     start-up rather than rounded up.
+#   * NEW TRANSPORT: `vmcelld --uds` (or `--uds-path <path>`) also serves the API on a Unix-domain
+#     socket under `$XDG_RUNTIME_DIR/vmcell/vmcelld.sock`. It carries the SAME bearer authentication
+#     as the TCP bind — the socket's `0700` directory and `0600` mode are defence in depth, not a
+#     substitute (the reasoning is recorded in `vmcell_daemon::uds`). The daemon refuses to start if
+#     that directory is wider than `0700`, if a LIVE daemon already holds the socket, or if a
+#     non-socket is in the way; a stale socket is reclaimed and logged.
+#   * SOURCE-BREAKING for an out-of-tree Rust caller: `Registry` gains a private field (it is
+#     constructed only through `Registry::new`, so this is a break only for a struct literal, which
+#     was never possible); `ArtifactWriter` no longer borrows the store by value-field. Neither is
+#     reachable from a `default-features = false` client.
+#   * COMPANION, in `vmcell-daemon-client` (0.1.0, unbumped — it has no ledger and the edge is
+#     additive): a `store_usage()` verb, and `vmcelld-ctl` gains a `store` subcommand.
+version = "0.7.0"
 edition = "2024"
 rust-version.workspace = true
 license = "MIT OR Apache-2.0"
@@ -157,5 +197,8 @@ vmcell = { path = "../vmcell", version = "0.23.0", features = ["cloud-hypervisor
 ignored = ["async-trait"]
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
+# `test-util` is what lets the periodic sweeper's SCHEDULER be gated: `#[tokio::test(start_paused =
+# true)]` runs its cadence on a virtual clock, so a 300-second interval is exercised in microseconds
+# instead of being the one part of the feature no test executes.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "test-util"] }
 tempfile = "3"

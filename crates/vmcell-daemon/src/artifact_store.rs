@@ -11,19 +11,93 @@
 //! never sits in the daemon's memory (design §11.7, The client library and CLI; §17, Open gaps and
 //! future capabilities). [`ArtifactStore::create`] is that same path with one chunk — the
 //! create-only/atomic/digest/cap laws exist once.
+//!
+//! # Quota and garbage collection (§17, Open gaps and future capabilities)
+//!
+//! The policy is deliberately asymmetric, and the asymmetry IS the design:
+//!
+//! * **Nothing a client uploaded is ever collected.** No LRU, no age-based eviction, no
+//!   "unreferenced for N days". An artifact is a client's own bytes in a store with no update verb;
+//!   the daemon cannot tell a stale kernel from one a nightly job boots, and a wrong answer there
+//!   deletes data a `create` will later ask for. A store at its quota therefore **refuses the next
+//!   upload, loudly** ([`ArtifactStore::check_quota_headroom`], a 413 naming the usage, the quota and
+//!   `DELETE /v1/artifacts/{name}`) rather than making room by guessing. Loud beats destructive.
+//! * **The daemon's OWN residue is collected**, because it is provably garbage rather than
+//!   judged so: an abandoned upload temp file (prefix [`UPLOAD_TEMP_PREFIX`], a name no client can
+//!   ever create — it fails the name predicate) and a digest sidecar whose artifact is gone (a name
+//!   reserved on every verb). [`ArtifactStore::collect_residue`] removes exactly those two classes
+//!   and nothing else, so **pinning needs no consultation**: a pinned name is a valid artifact name,
+//!   and neither class can be one. That structural argument is gated by
+//!   `residue_collection_leaves_artifacts_and_their_sidecars_alone`.
+//! * **It runs at start-up, not on a timer.** Both classes are *crash* residue: an
+//!   [`ArtifactWriter`] dropped by a live daemon removes its own temp file, and a sidecar is orphaned
+//!   only by a delete that half-failed. A periodic pass would add a window in which it races a slow
+//!   in-flight upload, to collect a class that only appears when the process died — which is the
+//!   same argument the orphan sweep's start-up pass makes (§11.4, The VM registry and the start-up
+//!   sweep). The age floor is the belt: nothing younger than [`DEFAULT_RESIDUE_MIN_AGE`] is touched.
 
-use crate::dto::ArtifactInfo;
+use crate::dto::{ArtifactInfo, StoreUsage};
 use crate::error::DaemonError;
 use crate::name::{SHA256_SIDECAR_SUFFIX, is_reserved_sidecar_name, resolve_artifact_path};
 use sha2::{Digest, Sha256};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+/// The filename prefix every temp file this store creates carries — uploads in progress and sidecar
+/// writes alike.
+///
+/// **One const, two readers**: the writer that creates the file and [`ArtifactStore::collect_residue`]
+/// that reclaims an abandoned one. The GC's needle is therefore this store's own signature rather
+/// than "a name that fails the predicate", which would also match an operator's `.gitignore` or
+/// `notes.md` sitting in the artifacts dir. A leading `.` also means no client can ever create an
+/// artifact whose name collides with it (the predicate rejects a leading dot).
+pub const UPLOAD_TEMP_PREFIX: &str = ".vmcelld-tmp.";
+
+/// How old a piece of residue must be before [`ArtifactStore::collect_residue`] will remove it.
+///
+/// The two collectable classes are crash residue, so any live upload is *far* younger than this;
+/// the floor is what keeps a GC that somehow ran beside a live daemon from taking an upload that is
+/// merely slow. A recorded residual: an upload still streaming after this long would be collectable,
+/// which is why the pass is a start-up one.
+pub const DEFAULT_RESIDUE_MIN_AGE: Duration = Duration::from_secs(3600);
+
+/// How deep [`ArtifactStore::usage`] walks into a snapshot prefix before refusing to go further.
+///
+/// The store's shape is one level of prefix directories holding files; the cap is generous enough
+/// for that and finite enough that a symlink loop or a hand-built tree cannot hang a request. Going
+/// deeper is a **fail-loud** refusal, never a silent short count that would understate the quota.
+const MAX_STORE_WALK_DEPTH: u32 = 4;
+
+/// What one [`ArtifactStore::collect_residue`] pass reclaimed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GcReport {
+    /// Digest sidecars whose artifact is gone, in removal order.
+    pub orphan_sidecars: Vec<String>,
+    /// Upload temp files a crashed daemon left behind, in removal order.
+    pub abandoned_uploads: Vec<String>,
+    /// Total bytes the pass freed.
+    pub bytes_freed: u64,
+}
+
+impl GcReport {
+    /// Whether the pass reclaimed anything (worth a log line).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.orphan_sidecars.is_empty() && self.abandoned_uploads.is_empty()
+    }
+}
 
 /// A content-addressed-by-name store rooted at one directory.
 #[derive(Debug, Clone)]
 pub struct ArtifactStore {
     dir: PathBuf,
     max_bytes: u64,
+    /// The whole-store ceiling, or `None` for an unbounded store (the default).
+    ///
+    /// `None` is not "a very large quota": it skips the usage scan entirely, so an operator who has
+    /// not asked for a quota pays nothing for one.
+    quota_bytes: Option<u64>,
 }
 
 impl ArtifactStore {
@@ -36,7 +110,154 @@ impl ArtifactStore {
         std::fs::create_dir_all(&dir).map_err(|e| {
             DaemonError::Internal(format!("cannot create artifacts dir {dir:?}: {e}"))
         })?;
-        Ok(Self { dir, max_bytes })
+        Ok(Self {
+            dir,
+            max_bytes,
+            quota_bytes: None,
+        })
+    }
+
+    /// Sets the whole-store quota in bytes (`None` — the default — leaves the store unbounded).
+    ///
+    /// A builder rather than an `open` parameter: every existing caller keeps compiling, and the
+    /// quota is an operator policy layered on a store that already knows its per-upload cap.
+    #[must_use]
+    pub fn with_quota(mut self, quota_bytes: Option<u64>) -> Self {
+        self.quota_bytes = quota_bytes;
+        self
+    }
+
+    /// The configured whole-store quota, if any.
+    #[must_use]
+    pub const fn quota_bytes(&self) -> Option<u64> {
+        self.quota_bytes
+    }
+
+    /// Measures the store: bytes on disk, artifacts, snapshot prefixes (`GET /v1/store`).
+    ///
+    /// Counts **everything under the directory** — artifacts, their sidecars, snapshot prefixes and
+    /// any residue — because the quota is about the disk the daemon is consuming, not about the
+    /// subset a client can name. Symlinks are counted as links and never followed, so the walk
+    /// cannot leave the store.
+    ///
+    /// # Errors
+    /// [`DaemonError::Internal`] if the directory cannot be read or the tree is deeper than
+    /// `MAX_STORE_WALK_DEPTH` — a measurement that could not be completed is an error, never a
+    /// short count silently reported as the usage.
+    pub fn usage(&self) -> Result<StoreUsage, DaemonError> {
+        let mut used_bytes = 0u64;
+        let mut artifact_count = 0u64;
+        let mut snapshot_prefix_count = 0u64;
+        for entry in read_dir_loud(&self.dir)? {
+            let path = entry.path();
+            let meta = symlink_meta_loud(&path)?;
+            let file_type = meta.file_type();
+            if file_type.is_symlink() {
+                used_bytes = used_bytes.saturating_add(meta.len());
+                continue;
+            }
+            if file_type.is_dir() {
+                snapshot_prefix_count += 1;
+                used_bytes = used_bytes.saturating_add(dir_bytes(&path, MAX_STORE_WALK_DEPTH)?);
+                continue;
+            }
+            used_bytes = used_bytes.saturating_add(meta.len());
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !is_reserved_sidecar_name(&name) && self.path_for(&name).is_ok() {
+                artifact_count += 1;
+            }
+        }
+        Ok(StoreUsage {
+            used_bytes,
+            quota_bytes: self.quota_bytes,
+            artifact_count,
+            snapshot_prefix_count,
+        })
+    }
+
+    /// The **one** quota predicate: how many more bytes this store may accept, or the typed refusal
+    /// when it is already full.
+    ///
+    /// Both writers into the store go through it — the upload path
+    /// ([`ArtifactStore::create_streaming`], which bounds the upload to the headroom) and the
+    /// snapshot path ([`crate::registry::Registry::snapshot`], which asks before it creates the
+    /// prefix directory). A snapshot's size is not knowable in advance, so the quota gates the
+    /// **start** of that write rather than its size; stating one rule for both is what keeps a
+    /// second, differently-wrong copy from appearing beside it.
+    ///
+    /// `Ok(None)` means "no quota configured" — unbounded, and no scan was performed.
+    ///
+    /// # Errors
+    /// [`DaemonError::PayloadTooLarge`] when the store is at or over its quota, naming the usage,
+    /// the quota and the remedy (delete something — the daemon will not evict); or the
+    /// [`DaemonError::Internal`] a failed measurement produces, because refusing a write is the
+    /// safe answer to "I could not tell how full I am".
+    pub fn check_quota_headroom(&self) -> Result<Option<u64>, DaemonError> {
+        let Some(quota) = self.quota_bytes else {
+            return Ok(None);
+        };
+        let usage = self.usage()?;
+        if usage.used_bytes >= quota {
+            return Err(DaemonError::PayloadTooLarge(format!(
+                "the artifact store holds {} of its {quota}-byte quota (--max-store-bytes) and                  cannot accept another write. vmcelld never evicts artifacts to make room — they                  are your bytes and it cannot tell which are stale — so free space with DELETE                  /v1/artifacts/{{name}} (or raise the quota).",
+                usage.used_bytes
+            )));
+        }
+        Ok(Some(quota - usage.used_bytes))
+    }
+
+    /// Removes this daemon's **own** crash residue: abandoned upload temp files and orphaned digest
+    /// sidecars older than `min_age` (design §17, Open gaps and future capabilities).
+    ///
+    /// What it will never remove — the half that matters — is anything a client uploaded, any
+    /// snapshot prefix, and any file it did not itself create: the two classes are identified by
+    /// this store's own [`UPLOAD_TEMP_PREFIX`] and by the reserved sidecar suffix *with its artifact
+    /// absent*, and a name in either class can never be an artifact name (see the module docs), so
+    /// the pass cannot collect a pinned artifact even in principle.
+    ///
+    /// Per-file removal failures are logged and counted as not-collected, never fatal: a GC that
+    /// aborts halfway is worse than one that reports what it could not do.
+    ///
+    /// # Errors
+    /// [`DaemonError::Internal`] if the store directory cannot be read at all.
+    pub fn collect_residue(&self, min_age: Duration) -> Result<GcReport, DaemonError> {
+        let mut report = GcReport::default();
+        for entry in read_dir_loud(&self.dir)? {
+            let path = entry.path();
+            let meta = symlink_meta_loud(&path)?;
+            if !meta.file_type().is_file() {
+                continue; // Snapshot prefixes and symlinks are never residue.
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            let abandoned_upload = name.starts_with(UPLOAD_TEMP_PREFIX);
+            let orphan_sidecar = is_reserved_sidecar_name(&name) && !artifact_of(&path).exists();
+            if !abandoned_upload && !orphan_sidecar {
+                continue;
+            }
+            if !older_than(&meta, min_age) {
+                tracing::debug!(
+                    file = %name,
+                    "artifact GC: residue is younger than the age floor; leaving it"
+                );
+                continue;
+            }
+            match std::fs::remove_file(&path) {
+                Ok(()) => {
+                    report.bytes_freed = report.bytes_freed.saturating_add(meta.len());
+                    if abandoned_upload {
+                        report.abandoned_uploads.push(name);
+                    } else {
+                        report.orphan_sidecars.push(name);
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    file = %name,
+                    error = %e,
+                    "artifact GC: cannot remove residue; it stays on disk and counts against the quota"
+                ),
+            }
+        }
+        Ok(report)
     }
 
     /// The store's root directory.
@@ -120,20 +341,38 @@ impl ArtifactStore {
                 "artifact {name:?} already exists (the store has no update; delete then create)"
             )));
         }
+        // The whole-store quota, asked ONCE per upload and BEFORE a byte is read (the same
+        // reason the name checks are here): a store that is already full refuses the request
+        // rather than draining a body it will throw away. The upload is then bounded by whichever
+        // ceiling is lower — the per-upload cap or the remaining headroom — so the quota is
+        // enforced as the bytes flow, not discovered after they landed.
+        let (limit, limit_label) = match self.check_quota_headroom()? {
+            Some(headroom) if headroom < self.max_bytes => {
+                (headroom, "the store quota headroom (--max-store-bytes)")
+            }
+            _ => (self.max_bytes, "the per-upload cap (--max-artifact-bytes)"),
+        };
         // The temp file lives IN THE SAME DIR, so the closing rename is atomic rather than
         // cross-device. It is a `NamedTempFile`, so every abandoned upload — a torn stream, an
         // over-cap chunk, a dropped connection, a panic — removes it on `Drop` without the ingest
-        // loop needing an error path of its own.
-        let tmp = tempfile::NamedTempFile::new_in(&self.dir).map_err(|e| {
-            DaemonError::Internal(format!("cannot create temp file in {:?}: {e}", self.dir))
-        })?;
+        // loop needing an error path of its own. Its name carries `UPLOAD_TEMP_PREFIX` so the
+        // start-up GC can recognise a temp file a CRASHED daemon left, which is the one case that
+        // `Drop` cannot cover.
+        let tmp = tempfile::Builder::new()
+            .prefix(UPLOAD_TEMP_PREFIX)
+            .tempfile_in(&self.dir)
+            .map_err(|e| {
+                DaemonError::Internal(format!("cannot create temp file in {:?}: {e}", self.dir))
+            })?;
         Ok(ArtifactWriter {
-            store: self,
             name: name.to_string(),
             path,
             tmp,
             hasher: Sha256::new(),
             written: 0,
+            limit,
+            limit_label,
+            store: std::marker::PhantomData,
         })
     }
 
@@ -254,7 +493,6 @@ impl ArtifactStore {
 /// The borrow of the store is what keeps `max_bytes` and the store directory one fact rather than a
 /// copy carried alongside the write.
 pub struct ArtifactWriter<'a> {
-    store: &'a ArtifactStore,
     name: String,
     /// The final, already-validated, dir-anchored path — resolved once at open, never re-derived
     /// from the client's name at publish time (invariant §13, Cross-cutting invariants).
@@ -262,6 +500,22 @@ pub struct ArtifactWriter<'a> {
     tmp: tempfile::NamedTempFile,
     hasher: Sha256,
     written: u64,
+    /// The ceiling this upload is held to: the **lower** of the per-upload cap and the store's
+    /// remaining quota headroom, resolved once at open.
+    ///
+    /// Resolved once rather than re-measured per chunk because the store's usage is an O(entries)
+    /// scan and a per-chunk one would make a large upload quadratic. The accepted consequence,
+    /// recorded: two uploads opened concurrently each see the same headroom, so together they can
+    /// exceed the quota by up to the smaller of the two. That overshoot is bounded, non-destructive
+    /// and visible in `GET /v1/store`, and the next upload is refused; the alternative (a
+    /// reservation table) is state the single-tenant model does not earn.
+    limit: u64,
+    /// Which ceiling `limit` came from, for the refusal message — a client told only a number
+    /// cannot tell "your file is too big" from "the store is nearly full".
+    limit_label: &'static str,
+    /// Ties the writer to the store it writes into, so a store cannot be dropped or reconfigured
+    /// while an upload is in flight.
+    store: std::marker::PhantomData<&'a ArtifactStore>,
 }
 
 impl ArtifactWriter<'_> {
@@ -270,17 +524,20 @@ impl ArtifactWriter<'_> {
     /// The cap is checked **before** the write and against the running total, so an over-cap upload
     /// is refused at the chunk that crosses the line — not after the whole body has been read into
     /// memory (which is the property that makes this path streaming at all) and never after more
-    /// than `max_bytes` have reached the disk.
+    /// than the ceiling has reached the disk.
+    ///
+    /// The ceiling is `ArtifactWriter::limit` — the lower of the per-upload cap and the store's
+    /// quota headroom — and the refusal names which one it was.
     ///
     /// # Errors
-    /// [`DaemonError::PayloadTooLarge`] when this chunk would cross the per-upload cap;
+    /// [`DaemonError::PayloadTooLarge`] when this chunk would cross that ceiling;
     /// [`DaemonError::Internal`] on a write failure.
     pub fn write_chunk(&mut self, chunk: &[u8]) -> Result<(), DaemonError> {
         let total = self.written.saturating_add(chunk.len() as u64);
-        if total > self.store.max_bytes {
+        if total > self.limit {
             return Err(DaemonError::PayloadTooLarge(format!(
-                "artifact {:?} is at least {total} bytes; the per-upload cap is {} bytes",
-                self.name, self.store.max_bytes
+                "artifact {:?} is at least {total} bytes; {} is {} bytes",
+                self.name, self.limit_label, self.limit
             )));
         }
         self.tmp.write_all(chunk).map_err(|e| {
@@ -369,9 +626,12 @@ fn sidecar_path(artifact_path: &Path) -> PathBuf {
 fn write_sidecar(artifact_path: &Path, digest: &str) -> Result<(), DaemonError> {
     let sidecar = sidecar_path(artifact_path);
     let dir = artifact_path.parent().unwrap_or_else(|| Path::new("."));
-    let mut tmp = tempfile::NamedTempFile::new_in(dir).map_err(|e| {
-        DaemonError::Internal(format!("cannot create sidecar temp in {dir:?}: {e}"))
-    })?;
+    let mut tmp = tempfile::Builder::new()
+        .prefix(UPLOAD_TEMP_PREFIX)
+        .tempfile_in(dir)
+        .map_err(|e| {
+            DaemonError::Internal(format!("cannot create sidecar temp in {dir:?}: {e}"))
+        })?;
     tmp.write_all(digest.as_bytes())
         .map_err(|e| DaemonError::Internal(format!("cannot write sidecar {sidecar:?}: {e}")))?;
     tmp.flush()
@@ -441,6 +701,70 @@ fn hex_digest(hasher: Sha256) -> String {
     s
 }
 
+/// `read_dir` with the failure surfaced as a typed error — a store scan that could not read its own
+/// directory must never look like an empty store.
+fn read_dir_loud(dir: &Path) -> Result<Vec<std::fs::DirEntry>, DaemonError> {
+    let rd = std::fs::read_dir(dir)
+        .map_err(|e| DaemonError::Internal(format!("cannot read artifacts dir {dir:?}: {e}")))?;
+    let mut out = Vec::new();
+    for entry in rd {
+        out.push(
+            entry.map_err(|e| {
+                DaemonError::Internal(format!("cannot read an entry of {dir:?}: {e}"))
+            })?,
+        );
+    }
+    Ok(out)
+}
+
+/// `symlink_metadata` with the failure typed. Never `metadata`: following a symlink would let a link
+/// planted out-of-band pull the walk out of the store.
+fn symlink_meta_loud(path: &Path) -> Result<std::fs::Metadata, DaemonError> {
+    std::fs::symlink_metadata(path)
+        .map_err(|e| DaemonError::Internal(format!("cannot stat {path:?}: {e}")))
+}
+
+/// Bytes held under `dir`, to `depth` levels. Deeper than that is an error, not a short count.
+fn dir_bytes(dir: &Path, depth: u32) -> Result<u64, DaemonError> {
+    if depth == 0 {
+        return Err(DaemonError::Internal(format!(
+            "the artifact store is deeper than {MAX_STORE_WALK_DEPTH} levels at {dir:?}; refusing \
+             to report a usage figure that would understate it"
+        )));
+    }
+    let mut total = 0u64;
+    for entry in read_dir_loud(dir)? {
+        let path = entry.path();
+        let meta = symlink_meta_loud(&path)?;
+        if meta.file_type().is_dir() {
+            total = total.saturating_add(dir_bytes(&path, depth - 1)?);
+        } else {
+            total = total.saturating_add(meta.len());
+        }
+    }
+    Ok(total)
+}
+
+/// The artifact a digest sidecar belongs to: the sidecar path with its reserved suffix removed.
+/// Derived from the resolved path, never from client input.
+fn artifact_of(sidecar: &Path) -> PathBuf {
+    let s = sidecar.as_os_str().to_string_lossy();
+    PathBuf::from(
+        s.strip_suffix(SHA256_SIDECAR_SUFFIX)
+            .unwrap_or(&s)
+            .to_string(),
+    )
+}
+
+/// Whether `meta`'s mtime is at least `min_age` in the past. An unreadable or future mtime reads as
+/// **too young** — "I cannot tell how old this is" must not authorize a deletion.
+fn older_than(meta: &std::fs::Metadata, min_age: Duration) -> bool {
+    meta.modified()
+        .ok()
+        .and_then(|t| std::time::SystemTime::now().duration_since(t).ok())
+        .is_some_and(|age| age >= min_age)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -449,6 +773,212 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = ArtifactStore::open(dir.path(), 1024).expect("open");
         (dir, store)
+    }
+
+    /// Backdates `path`'s mtime by `age`, so the age-floor arm of the GC can be driven without a
+    /// test that sleeps for an hour.
+    fn backdate(path: &Path, age: Duration) {
+        let file = std::fs::File::options()
+            .write(true)
+            .open(path)
+            .expect("open for backdating");
+        let when = std::time::SystemTime::now() - age;
+        file.set_modified(when).expect("set mtime");
+    }
+
+    // Usage is measured over EVERYTHING under the store — artifacts, their sidecars, snapshot
+    // prefixes — because that is what the quota bounds, while `artifact_count` counts only what a
+    // client can name. RED on the inverse: count only listable artifacts' own bytes and the sidecar
+    // and prefix bytes vanish from a figure an operator sizes a disk with.
+    #[test]
+    fn usage_measures_the_whole_store_and_counts_only_nameable_artifacts() {
+        let (dir, store) = store();
+        store.create("k1", b"0123456789").expect("create");
+        std::fs::create_dir(dir.path().join("snap")).expect("prefix");
+        std::fs::write(dir.path().join("snap").join("state"), b"abc").expect("snapshot file");
+
+        let usage = store.usage().expect("usage");
+        assert_eq!(usage.artifact_count, 1, "the sidecar is not an artifact");
+        assert_eq!(usage.snapshot_prefix_count, 1);
+        assert_eq!(
+            usage.used_bytes,
+            10 + 64 + 3,
+            "the artifact, its 64-hex sidecar, and the snapshot file"
+        );
+        assert_eq!(
+            usage.quota_bytes, None,
+            "an unconfigured store is unbounded"
+        );
+    }
+
+    // The quota is LOUD, never destructive: a full store refuses the next upload naming the usage,
+    // the ceiling and the remedy — and the artifact already in it is still there afterwards. The
+    // positive control is the same upload against the same store with a quota that fits.
+    //
+    // RED on the inverse: drop the `check_quota_headroom` call from `create_streaming` and the
+    // over-quota upload succeeds; or make the refusal evict, and the survival assertion fails.
+    #[test]
+    fn a_full_store_refuses_the_next_upload_and_evicts_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let seed = ArtifactStore::open(dir.path(), 1024).expect("open");
+        seed.create("k1", b"0123456789").expect("first fits");
+        // A quota set to exactly what is already on disk: the store is FULL, so the refusal comes
+        // from the quota predicate itself rather than from an upload that outgrew its headroom.
+        let full = seed.usage().expect("usage").used_bytes;
+        let store = ArtifactStore::open(dir.path(), 1024)
+            .expect("open")
+            .with_quota(Some(full));
+
+        let err = store
+            .create("k2", b"x")
+            .expect_err("a full store accepts nothing more");
+        assert!(
+            matches!(err, DaemonError::PayloadTooLarge(_)),
+            "got {err:?}"
+        );
+        let msg = err.message();
+        assert!(
+            msg.contains(&full.to_string()) && msg.contains("DELETE"),
+            "the refusal names the quota and the remedy: {msg}"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("k1")).expect("k1 survives"),
+            b"0123456789",
+            "vmcelld never evicts an artifact to make room"
+        );
+        assert!(
+            !store.exists("k2"),
+            "and publishes nothing for the refused upload"
+        );
+
+        // Positive control: the identical upload against a store whose quota fits.
+        let roomy = ArtifactStore::open(dir.path(), 1024)
+            .expect("open")
+            .with_quota(Some(1_000_000));
+        roomy.create("k2", b"x").expect("the control fits");
+    }
+
+    // A quota with room bounds the upload to the HEADROOM when that is lower than the per-upload
+    // cap, and the refusal says which ceiling it was — a client told only a number cannot tell "your
+    // file is too big" from "the store is nearly full".
+    //
+    // RED on the inverse: keep `write_chunk` reading the per-upload cap and a 300-byte upload lands
+    // in a store with 200 bytes of headroom.
+    #[test]
+    fn an_upload_is_bounded_by_the_quota_headroom_when_that_is_the_lower_ceiling() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = ArtifactStore::open(dir.path(), 10_000)
+            .expect("open")
+            .with_quota(Some(200));
+        let err = store
+            .create("big", &[b'x'; 300])
+            .expect_err("300 bytes do not fit in 200 bytes of headroom");
+        let msg = err.message();
+        assert!(
+            msg.contains("--max-store-bytes"),
+            "the refusal names the ceiling that bound it: {msg}"
+        );
+        assert!(!store.exists("big"));
+    }
+
+    // The GC collects THIS DAEMON'S residue and nothing else. Both classes in one pass: an upload
+    // temp file a crashed daemon left, and a digest sidecar whose artifact is gone. The artifact
+    // beside them — and its own sidecar — must survive, which is the structural reason the pass
+    // needs no pinning consultation (a pinned name is a valid artifact name; neither collectable
+    // class can be one).
+    //
+    // RED on the inverse: collect on "the name fails the artifact predicate" instead of on
+    // `UPLOAD_TEMP_PREFIX`, and the operator's `.notes` file below is deleted; or drop the
+    // `!artifact_of(..).exists()` clause, and the live artifact's sidecar goes with it.
+    #[test]
+    fn residue_collection_leaves_artifacts_and_their_sidecars_alone() {
+        let (dir, store) = store();
+        store.create("k1", b"live").expect("create");
+        let orphan_sidecar = dir.path().join(format!("gone{SHA256_SIDECAR_SUFFIX}"));
+        std::fs::write(&orphan_sidecar, "0".repeat(64)).expect("orphan sidecar");
+        let abandoned = dir.path().join(format!("{UPLOAD_TEMP_PREFIX}abcdef"));
+        std::fs::write(&abandoned, b"half an upload").expect("abandoned upload");
+        let operator_file = dir.path().join(".notes");
+        std::fs::write(&operator_file, b"not ours").expect("operator file");
+        for p in [&orphan_sidecar, &abandoned, &operator_file] {
+            backdate(p, Duration::from_secs(7200));
+        }
+
+        let report = store
+            .collect_residue(DEFAULT_RESIDUE_MIN_AGE)
+            .expect("gc pass");
+        assert_eq!(report.orphan_sidecars.len(), 1, "{report:?}");
+        assert_eq!(report.abandoned_uploads.len(), 1, "{report:?}");
+        assert_eq!(report.bytes_freed, 64 + 14);
+        assert!(!orphan_sidecar.exists() && !abandoned.exists());
+
+        assert!(store.exists("k1"), "a client's artifact is never collected");
+        assert!(
+            dir.path()
+                .join(format!("k1{SHA256_SIDECAR_SUFFIX}"))
+                .exists(),
+            "nor is a sidecar whose artifact is still there"
+        );
+        assert!(
+            operator_file.exists(),
+            "nor is a file this store did not create — the needle is our own temp prefix, not              `the name is not a valid artifact name`"
+        );
+    }
+
+    // The age floor: residue younger than the floor is left alone, and the SAME file is collected
+    // once it is old enough. Two legs over one file, so the floor is proven to be what decided it.
+    //
+    // RED on the inverse: drop the `older_than` check and the first leg collects a temp file that
+    // could still be a live upload.
+    #[test]
+    fn residue_younger_than_the_age_floor_is_left_alone() {
+        let (dir, store) = store();
+        let fresh = dir.path().join(format!("{UPLOAD_TEMP_PREFIX}inflight"));
+        std::fs::write(&fresh, b"streaming right now").expect("temp");
+
+        let report = store
+            .collect_residue(DEFAULT_RESIDUE_MIN_AGE)
+            .expect("gc pass");
+        assert!(
+            report.is_empty(),
+            "a fresh temp file is not residue: {report:?}"
+        );
+        assert!(fresh.exists());
+
+        backdate(&fresh, Duration::from_secs(7200));
+        let report = store
+            .collect_residue(DEFAULT_RESIDUE_MIN_AGE)
+            .expect("gc pass");
+        assert_eq!(report.abandoned_uploads.len(), 1, "{report:?}");
+        assert!(!fresh.exists());
+    }
+
+    // The temp-file prefix is ONE law with two readers — the writer that creates it and the GC that
+    // reclaims it. A real upload's temp file must therefore be recognisable to the GC, which a
+    // hand-written prefix in either place would break silently.
+    //
+    // RED on the inverse: give `create_streaming` a different `prefix(..)` (or drop the builder for
+    // a bare `NamedTempFile::new_in`) — the in-flight temp file no longer carries the needle.
+    #[test]
+    fn a_live_upload_temp_file_carries_the_prefix_the_gc_looks_for() {
+        let (dir, store) = store();
+        let writer = store.create_streaming("k1").expect("open the upload");
+        let temps: Vec<String> = std::fs::read_dir(dir.path())
+            .expect("read dir")
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with(UPLOAD_TEMP_PREFIX))
+            .collect();
+        assert_eq!(
+            temps.len(),
+            1,
+            "the in-flight upload's temp file: {temps:?}"
+        );
+        drop(writer);
+        assert!(
+            !dir.path().join(&temps[0]).exists(),
+            "and a live daemon's own Drop removes it — the GC covers only the CRASH case"
+        );
     }
 
     // The "no update" guard: a second create of the same name is AlreadyExists, and the original
@@ -524,7 +1054,11 @@ mod tests {
         let stray: Vec<_> = std::fs::read_dir(store.dir())
             .expect("readdir")
             .flatten()
-            .filter(|e| e.file_name().to_string_lossy().starts_with(".tmp"))
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(UPLOAD_TEMP_PREFIX)
+            })
             .collect();
         assert!(
             stray.is_empty(),
@@ -723,7 +1257,11 @@ mod tests {
         std::fs::read_dir(store.dir())
             .expect("readdir")
             .flatten()
-            .filter(|e| e.file_name().to_string_lossy().starts_with(".tmp"))
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(UPLOAD_TEMP_PREFIX)
+            })
             .count()
     }
 
@@ -839,7 +1377,11 @@ mod tests {
         let on_disk: u64 = std::fs::read_dir(store.dir())
             .expect("readdir")
             .flatten()
-            .filter(|e| e.file_name().to_string_lossy().starts_with(".tmp"))
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(UPLOAD_TEMP_PREFIX)
+            })
             .map(|e| e.metadata().expect("stat").len())
             .sum();
         assert_eq!(on_disk, 1024, "at most `max_bytes` ever reach the disk");

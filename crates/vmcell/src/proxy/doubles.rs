@@ -165,7 +165,11 @@ pub fn fuzz_is_blocked(host: &str, blocked: &[String]) -> bool {
 impl ProxyHandler {
     /// Routes a single request, returning either a synthesized response (an
     /// egress block or a test double) or the request to forward upstream.
-    fn route_request(&self, req: Request<hudsucker::Body>) -> RequestOrResponse {
+    ///
+    /// `pub(crate)` so [`crate::proxy::handler::EgressHandler`] can compose this core without an
+    /// [`HttpContext`], which `hudsucker` marks `#[non_exhaustive]` and gives no constructor for —
+    /// making the trait method unreachable from a unit test.
+    pub(crate) fn route_request(&self, req: Request<hudsucker::Body>) -> RequestOrResponse {
         tracing::debug!("Proxy intercepted request to: {}", req.uri());
 
         let host_str = req

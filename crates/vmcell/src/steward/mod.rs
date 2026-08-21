@@ -18,6 +18,12 @@ pub use vmcell_protocol::{
 /// connection, beside the one-shot [`StewardClient`].
 #[cfg(feature = "host-common")]
 pub mod session;
+
+// The port-forward bridge. Its documentation is the module's own `//!` header — a doc comment HERE
+// as well would make rustdoc resolve one module's links in two scopes, which it reports as
+// unresolved links with the crate root's span.
+#[cfg(feature = "host-common")]
+pub mod forward;
 #[cfg(feature = "host-common")]
 pub use session::{Session, SessionEvent, SessionMux, SessionSpecBuilder};
 

@@ -60,6 +60,236 @@ impl SegmentMembership {
     }
 }
 
+// -------------------------------------------------------------------------------------------
+// Link impairment (design §17, Segment refinements — "a typed netem/impairment API")
+// -------------------------------------------------------------------------------------------
+
+/// The iproute2 binary the impairment transport shells out to.
+const TC_BINARY: &str = "tc";
+
+/// The ceiling on a single [`Impairment`] delay or jitter component.
+///
+/// Not a taste call: `netem`'s classic `tc_netem_qopt.latency`/`jitter` fields are **u32 psched
+/// ticks**, and on the ~1 ns/tick clock every modern kernel runs, a value at or above 2³² ns
+/// (≈4.295 s) is unrepresentable in them — beyond it `tc` depends on the optional 64-bit
+/// attributes, so what the kernel installs stops being a property of this API. Four seconds is the
+/// largest whole second inside that bound. An over-ceiling delay is refused at construction rather
+/// than accepted and silently reinterpreted, which is also the shape that catches the units bug
+/// (`from_secs` where `from_millis` was meant).
+pub const MAX_IMPAIRMENT_DELAY: Duration = Duration::from_secs(4);
+
+/// A **link impairment**: what gets applied to one segment member's tap, as a first-class value
+/// rather than a hand-spelled `tc` argv (design §17, Segment refinements).
+///
+/// Apply one with [`NetSegment::impair_member`] and remove it with
+/// [`NetSegment::clear_impairment`]. Every field is validated at construction
+/// ([`ImpairmentBuilder::build`]), so an impairment that exists is an impairment `tc` will accept.
+///
+/// # Direction
+///
+/// `netem` shapes **egress** from the interface it sits on, and a member's tap is written by the
+/// host bridge — so an impairment on member *X* degrades the traffic flowing **toward X's guest**,
+/// not away from it. A round-trip test therefore impairs *both* members' taps; a one-sided
+/// partition needs only one.
+///
+/// # Transport, and what it does not give you
+///
+/// The impairment is installed by running `tc` inside the segment's network namespace, not over
+/// `rtnetlink`. That is a deliberate, recorded limit rather than an oversight: the `rtnetlink`
+/// stack in this tree (`netlink-packet-route` 0.33) types exactly two qdiscs — `fq_codel` and
+/// `ingress` — and `TcOption::Other(DefaultNla)` is the only door left for netem, i.e. exactly the
+/// hand-assembled `TcMessage`s design §17 records as this item's blocker. Verified against the
+/// version in the lockfile, not assumed. So this type makes the **surface** typed — one validated
+/// value, one composer, one call site per segment — while the **transport** stays a subprocess.
+///
+/// What that costs: a `fork`/`exec` per call; a dependency on iproute2 being installed (an absent
+/// `tc` is a typed [`Error::CapabilityUnavailable`], an absent facility, never a silent no-op); and
+/// diagnostics that are `tc`'s stderr rather than a kernel errno. It is the same shape, and the
+/// same precedent, as this module's `nft` rule application. What it does give: the impairment is a
+/// value that can be built, compared, logged and passed around; the netem argv is composed in
+/// exactly one place ([`Impairment::netem_args`]) instead of once per harness; and a nonsense
+/// impairment is refused before any host state is touched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Impairment {
+    delay: Option<Duration>,
+    jitter: Option<Duration>,
+    loss_percent: Option<u8>,
+}
+
+impl Impairment {
+    /// Starts building an impairment. At least one component must be set before
+    /// [`ImpairmentBuilder::build`].
+    #[must_use]
+    pub fn builder() -> ImpairmentBuilder {
+        ImpairmentBuilder {
+            delay: None,
+            jitter: None,
+            loss_percent: None,
+        }
+    }
+
+    /// The one-way delay this impairment adds, if any.
+    #[must_use]
+    pub fn delay(&self) -> Option<Duration> {
+        self.delay
+    }
+
+    /// The delay jitter, if any. Only ever `Some` alongside [`Impairment::delay`].
+    #[must_use]
+    pub fn jitter(&self) -> Option<Duration> {
+        self.jitter
+    }
+
+    /// The whole-percent packet loss this impairment applies, if any.
+    #[must_use]
+    pub fn loss_percent(&self) -> Option<u8> {
+        self.loss_percent
+    }
+
+    /// The `netem` parameter words this impairment means — **the one composer**, and the only
+    /// place in the tree that spells a netem argv (`scripts/ban-inline-netem-argv.sh` is that
+    /// law's grep-ban).
+    ///
+    /// Public so a harness that must drive `tc` itself — a different namespace, a different
+    /// interface, an `ingress` mirred setup — composes the same words instead of writing a second,
+    /// divergent copy. Returns the parameters *after* the literal `netem`, in `tc`'s own usage
+    /// order (delay, then jitter as delay's positional second argument, then loss).
+    ///
+    /// Durations render in **microseconds**, `netem`'s finest unit: milliseconds would silently
+    /// floor a sub-millisecond delay to `0ms`, which `tc` accepts and the kernel then ignores.
+    #[must_use]
+    pub fn netem_args(&self) -> Vec<String> {
+        let mut args = Vec::new();
+        if let Some(delay) = self.delay {
+            args.push("delay".to_string());
+            args.push(format!("{}us", delay.as_micros()));
+            // `netem`'s jitter is delay's positional second argument, never a `jitter` keyword —
+            // `tc` rejects `jitter` outright, which is why it is composed here and not by a caller.
+            if let Some(jitter) = self.jitter {
+                args.push(format!("{}us", jitter.as_micros()));
+            }
+        }
+        if let Some(loss) = self.loss_percent {
+            args.push("loss".to_string());
+            args.push(format!("{loss}%"));
+        }
+        args
+    }
+}
+
+/// Builder for [`Impairment`]. Every accepted value is honored or rejected at
+/// [`build`](ImpairmentBuilder::build).
+#[derive(Debug, Clone)]
+pub struct ImpairmentBuilder {
+    delay: Option<Duration>,
+    jitter: Option<Duration>,
+    loss_percent: Option<u8>,
+}
+
+impl ImpairmentBuilder {
+    /// Adds a fixed one-way delay to traffic entering the impaired member's guest.
+    #[must_use]
+    pub fn delay(mut self, delay: Duration) -> Self {
+        self.delay = Some(delay);
+        self
+    }
+
+    /// Adds uniform jitter around [`delay`](ImpairmentBuilder::delay), which must also be set.
+    #[must_use]
+    pub fn jitter(mut self, jitter: Duration) -> Self {
+        self.jitter = Some(jitter);
+        self
+    }
+
+    /// Drops `percent` of the packets entering the impaired member's guest. `100` is a full
+    /// partition.
+    #[must_use]
+    pub fn loss_percent(mut self, percent: u8) -> Self {
+        self.loss_percent = Some(percent);
+        self
+    }
+
+    /// Validates and freezes the impairment.
+    ///
+    /// # Errors
+    /// [`Error::Config`] when the impairment names nothing (a no-op the caller did not mean —
+    /// removing an impairment is [`NetSegment::clear_impairment`], not an empty one), when a delay
+    /// or jitter is zero or exceeds [`MAX_IMPAIRMENT_DELAY`], when jitter is set without a delay
+    /// (`netem` has no such shape — `tc` refuses it), or when loss exceeds 100 percent.
+    pub fn build(self) -> Result<Impairment> {
+        for (what, value) in [("delay", self.delay), ("jitter", self.jitter)] {
+            let Some(value) = value else { continue };
+            if value.is_zero() {
+                return Err(Error::Config(format!(
+                    "impairment {what} must be non-zero: a zero {what} is an impairment that does \
+                     not impair, which `tc` accepts and the kernel then ignores"
+                )));
+            }
+            if value > MAX_IMPAIRMENT_DELAY {
+                return Err(Error::Config(format!(
+                    "impairment {what} {value:?} exceeds the {MAX_IMPAIRMENT_DELAY:?} ceiling \
+                     netem's u32 psched-tick field can represent"
+                )));
+            }
+        }
+        if self.jitter.is_some() && self.delay.is_none() {
+            return Err(Error::Config(
+                "impairment jitter needs a delay to vary around: netem carries jitter as delay's \
+                 positional second argument and has no jitter-only shape"
+                    .to_string(),
+            ));
+        }
+        if let Some(loss) = self.loss_percent
+            && loss > 100
+        {
+            return Err(Error::Config(format!(
+                "impairment loss {loss}% exceeds 100%"
+            )));
+        }
+        if self.delay.is_none() && self.loss_percent.is_none() {
+            return Err(Error::Config(
+                "an impairment must name at least one of delay or loss; use \
+                 NetSegment::clear_impairment to remove one"
+                    .to_string(),
+            ));
+        }
+        Ok(Impairment {
+            delay: self.delay,
+            jitter: self.jitter,
+            loss_percent: self.loss_percent,
+        })
+    }
+}
+
+/// Renders a `tc` invocation that ran and refused, naming the argv and its stderr — one renderer,
+/// so both impairment verbs report the same shape.
+fn tc_failed(what: &str, args: &[String], out: &std::process::Output) -> Error {
+    let code = out
+        .status
+        .code()
+        .map_or_else(|| "terminated by signal".to_string(), |c| c.to_string());
+    Error::Subprocess(format!(
+        "{what} failed: `{TC_BINARY} {}` exited {code}: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&out.stderr).trim()
+    ))
+}
+
+/// Turns a failed `tc` **spawn** into the typed error its cause deserves (§7.2 capability honesty):
+/// an absent binary is an absent *facility*, not a broken one.
+fn classify_tc_spawn_error(e: std::io::Error) -> Error {
+    if e.kind() == std::io::ErrorKind::NotFound {
+        return Error::CapabilityUnavailable {
+            op: "segment link impairment".to_string(),
+            needed: format!(
+                "the iproute2 `{TC_BINARY}` binary on PATH (install iproute2); the impairment \
+                 transport is a subprocess because the rtnetlink stack types no netem options"
+            ),
+        };
+    }
+    Error::Io(e)
+}
+
 /// The state one segment owns, released in [`Drop`] when the last [`NetSegment`] handle goes.
 struct SegmentInner {
     prefix: String,
@@ -235,8 +465,8 @@ impl NetSegment {
     }
 
     /// The segment's network-namespace path, for a harness's own tooling — e.g.
-    /// `nsenter --net=<path> tc qdisc add dev <tap> root netem …` (§6.5 exposes the *names*, not a
-    /// typed impairment API).
+    /// `nsenter --net=<path> ip -o link show`. Link impairment has a typed surface of its own
+    /// ([`NetSegment::impair_member`]) and does not need this.
     #[must_use]
     pub fn netns_path(&self) -> std::path::PathBuf {
         // One law: the `/var/run/netns` layout is composed in exactly one place, shared with the
@@ -343,6 +573,110 @@ impl NetSegment {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&slot);
+    }
+
+    /// Applies `impairment` to member `vmid`'s tap inside the segment namespace (design §17,
+    /// Segment refinements).
+    ///
+    /// Idempotent by construction — it `replace`s the tap's root qdisc, so calling it twice, or
+    /// changing an impairment in place, is one call and not an add-after-delete dance.
+    ///
+    /// Degrades traffic flowing **toward** `vmid`'s guest; see [`Impairment`] for why, and for what
+    /// the subprocess transport costs. Blocks for the lifetime of one `tc` invocation.
+    ///
+    /// # Errors
+    /// - [`Error::Config`] if `vmid` holds no slot in this segment — refused before any host state
+    ///   is touched, rather than surfacing as `tc`'s "Cannot find device".
+    /// - [`Error::CapabilityUnavailable`] if the iproute2 `tc` binary is absent (an absent
+    ///   facility, §7.2), or [`Error::Io`] with the errno intact if it cannot be spawned.
+    /// - [`Error::Subprocess`] carrying `tc`'s exit status and stderr if it refuses the request —
+    ///   the shape a missing `sch_netem` module or an absent `CAP_NET_ADMIN` takes.
+    /// - [`Error::Network`] if the segment namespace cannot be entered.
+    pub fn impair_member(&self, vmid: u32, impairment: &Impairment) -> Result<()> {
+        let tap = self.member_tap(vmid)?;
+        let mut args = vec![
+            "qdisc".to_string(),
+            "replace".to_string(),
+            "dev".to_string(),
+            tap,
+            "root".to_string(),
+            "netem".to_string(),
+        ];
+        args.extend(impairment.netem_args());
+        let out = self.run_tc(&args)?;
+        if !out.status.success() {
+            return Err(tc_failed("applying the impairment", &args, &out));
+        }
+        Ok(())
+    }
+
+    /// Removes any impairment from member `vmid`'s tap, restoring the unimpaired link.
+    ///
+    /// Idempotent: clearing a tap that carries no impairment succeeds. That is decided by
+    /// **re-reading the tap's qdisc** when the delete fails — the postcondition, not iproute2's
+    /// error text, which is not an interface this can depend on.
+    ///
+    /// # Errors
+    /// The same set as [`NetSegment::impair_member`]; [`Error::Subprocess`] only when the delete
+    /// failed *and* an impairment is still installed afterwards.
+    pub fn clear_impairment(&self, vmid: u32) -> Result<()> {
+        let tap = self.member_tap(vmid)?;
+        let del = vec![
+            "qdisc".to_string(),
+            "delete".to_string(),
+            "dev".to_string(),
+            tap.clone(),
+            "root".to_string(),
+        ];
+        let out = self.run_tc(&del)?;
+        if out.status.success() {
+            return Ok(());
+        }
+        // The postcondition is "no netem on this tap", and deleting a root qdisc that was never
+        // there fails while satisfying it. Ask the kernel rather than parse the complaint.
+        let show = vec![
+            "qdisc".to_string(),
+            "show".to_string(),
+            "dev".to_string(),
+            tap,
+        ];
+        let listed = self.run_tc(&show)?;
+        if listed.status.success() && !String::from_utf8_lossy(&listed.stdout).contains("netem") {
+            return Ok(());
+        }
+        Err(tc_failed("clearing the impairment", &del, &out))
+    }
+
+    /// The tap name of the member holding `vmid`'s slot — the accepted-input check both impairment
+    /// verbs share, so a non-member is refused at the API boundary, not by `tc`.
+    fn member_tap(&self, vmid: u32) -> Result<String> {
+        let held = {
+            let slots = self.0.slots.lock().unwrap_or_else(|e| e.into_inner());
+            slots.values().any(|held| *held == vmid)
+        };
+        if !held {
+            return Err(Error::Config(format!(
+                "vmid {vmid} is not a member of segment {}: impairment names a member, and its \
+                 tap is created only when the member claims its slot",
+                self.0.netns
+            )));
+        }
+        Ok(crate::naming::tap_name(&self.0.prefix, vmid))
+    }
+
+    /// Runs `tc <args…>` inside the segment namespace.
+    ///
+    /// Entered through the module's one `setns` helper (a dedicated thread, joined before this
+    /// returns), so the child inherits the namespace with no `nsenter` dependency of its own. The
+    /// subprocess is unbounded for the same reason this module's `nft` application is: `tc` is a
+    /// local utility that performs one netlink transaction and exits — it blocks on no network I/O
+    /// and no guest.
+    fn run_tc(&self, args: &[String]) -> Result<std::process::Output> {
+        let owned: Vec<String> = args.to_vec();
+        let spawned = crate::net::tap::in_netns(&self.0.netns, move || {
+            std::process::Command::new(TC_BINARY).args(&owned).output()
+        })?;
+        spawned.map_err(classify_tc_spawn_error)
     }
 
     /// Dials a TCP listener inside a member guest **from the host** (FR-V3's privileged shape).
@@ -972,5 +1306,267 @@ mod tests {
             .position(|s| s.starts_with("delete_netns"))
             .expect("the namespace must be cleaned up after a bridge failure");
         assert!(pos_add < pos_del, "{c:?}");
+    }
+    // ---------------------------------------------------------------------------------------
+    // Link impairment (design §17, Segment refinements)
+    // ---------------------------------------------------------------------------------------
+
+    /// The one netem composer emits exactly the words `tc` means, for every shape the builder can
+    /// produce.
+    ///
+    /// Buggy impls guarded: rendering durations in milliseconds (a 500 µs delay becomes `0ms`,
+    /// which `tc` accepts and the kernel ignores); emitting a `jitter` keyword (`tc` refuses it);
+    /// emitting the loss percentage without its `%`.
+    #[test]
+    fn netem_args_are_composed_in_one_place() {
+        let delay_only = Impairment::builder()
+            .delay(Duration::from_millis(50))
+            .build()
+            .expect("a delay-only impairment is legal");
+        assert_eq!(delay_only.netem_args(), ["delay", "50000us"]);
+
+        let loss_only = Impairment::builder()
+            .loss_percent(100)
+            .build()
+            .expect("a loss-only impairment is legal");
+        assert_eq!(loss_only.netem_args(), ["loss", "100%"]);
+
+        let both = Impairment::builder()
+            .delay(Duration::from_millis(20))
+            .jitter(Duration::from_millis(5))
+            .loss_percent(3)
+            .build()
+            .expect("delay + jitter + loss is legal");
+        assert_eq!(
+            both.netem_args(),
+            ["delay", "20000us", "5000us", "loss", "3%"],
+            "jitter is delay's positional second argument, and loss follows"
+        );
+
+        // Sub-millisecond resolution survives: the unit is microseconds precisely so it can.
+        let fine = Impairment::builder()
+            .delay(Duration::from_micros(500))
+            .build()
+            .expect("a sub-millisecond delay is legal");
+        assert_eq!(fine.netem_args(), ["delay", "500us"]);
+
+        // The accessors report what was built — an impairment is a value, not just an argv.
+        assert_eq!(both.delay(), Some(Duration::from_millis(20)));
+        assert_eq!(both.jitter(), Some(Duration::from_millis(5)));
+        assert_eq!(both.loss_percent(), Some(3));
+        assert_eq!(loss_only.delay(), None);
+    }
+
+    /// Every argv the composer can emit is accepted by the **installed** iproute2 parser — the one
+    /// thing a golden-string test cannot prove.
+    ///
+    /// Privilege-free and kernel-free by construction: iproute2 parses the qdisc options *before*
+    /// it resolves the device, so aiming at a device that does not exist reaches the parser and
+    /// nothing else. A well-formed argv dies at `Cannot find device`; a malformed one dies in the
+    /// parser with `What is "…"?` and the netem usage block — and the malformed leg is the
+    /// positive control proving the discriminator can fire at all.
+    ///
+    /// Buggy impl guarded: the `jitter` keyword, or a bare number where `tc` wants a unit-suffixed
+    /// TIME, is invisible to `netem_args_are_composed_in_one_place` and reddens here.
+    #[test]
+    fn netem_args_are_accepted_by_the_installed_tc_parser() {
+        // A device that must not exist: the probe is only harmless because nothing can be
+        // modified through it. Checked, not assumed.
+        let absent_dev = "vmcellprobe0";
+        assert!(
+            !std::path::Path::new("/sys/class/net")
+                .join(absent_dev)
+                .exists(),
+            "gate misconfigured: the parser probe's target device {absent_dev} exists on this \
+             host, so the probe could reach a real interface"
+        );
+
+        let run = |extra: &[String]| -> std::process::Output {
+            let mut args = vec![
+                "qdisc".to_string(),
+                "replace".to_string(),
+                "dev".to_string(),
+                absent_dev.to_string(),
+                "root".to_string(),
+                "netem".to_string(),
+            ];
+            args.extend_from_slice(extra);
+            match std::process::Command::new(TC_BINARY).args(&args).output() {
+                Ok(out) => out,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => panic!(
+                    "gate misconfigured: the iproute2 `{TC_BINARY}` binary is required to validate \
+                     the netem argv composer against a real parser (install iproute2)"
+                ),
+                Err(e) => panic!("spawning `{TC_BINARY}` failed: {e}"),
+            }
+        };
+
+        for impairment in [
+            Impairment::builder().delay(Duration::from_millis(50)),
+            Impairment::builder().loss_percent(100),
+            Impairment::builder().delay(Duration::from_micros(500)),
+            Impairment::builder()
+                .delay(Duration::from_millis(20))
+                .jitter(Duration::from_millis(5))
+                .loss_percent(3),
+            Impairment::builder()
+                .delay(MAX_IMPAIRMENT_DELAY)
+                .loss_percent(0),
+        ] {
+            let impairment = impairment.build().expect("every probe shape is legal");
+            let out = run(&impairment.netem_args());
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                !stderr.contains("Usage:") && !stderr.contains("What is"),
+                "the installed tc parser rejected the composed argv for {impairment:?}: {stderr}"
+            );
+            assert!(
+                stderr.contains("Cannot find device"),
+                "the probe must reach device resolution (and stop there) for {impairment:?}: \
+                 {stderr}"
+            );
+        }
+
+        // Positive control: the discriminator fires on an argv the parser really does refuse.
+        let bogus = run(&["jitter".to_string(), "5ms".to_string()]);
+        let bogus_stderr = String::from_utf8_lossy(&bogus.stderr);
+        assert!(
+            bogus_stderr.contains("Usage:") && bogus_stderr.contains("What is"),
+            "the parser-error discriminator never fires, so the legs above are vacuous: \
+             {bogus_stderr}"
+        );
+    }
+
+    /// Every nonsense impairment is refused at construction, so an `Impairment` that exists is one
+    /// `tc` will accept.
+    #[test]
+    fn impairment_rejects_nonsense_at_construction() {
+        let cases: Vec<(ImpairmentBuilder, &str)> = vec![
+            (Impairment::builder(), "at least one of delay or loss"),
+            (
+                Impairment::builder().delay(Duration::ZERO),
+                "must be non-zero",
+            ),
+            (
+                Impairment::builder()
+                    .delay(Duration::from_millis(1))
+                    .jitter(Duration::ZERO),
+                "must be non-zero",
+            ),
+            (
+                Impairment::builder().delay(MAX_IMPAIRMENT_DELAY + Duration::from_micros(1)),
+                "exceeds the",
+            ),
+            (
+                Impairment::builder()
+                    .delay(Duration::from_millis(1))
+                    .jitter(MAX_IMPAIRMENT_DELAY + Duration::from_micros(1)),
+                "exceeds the",
+            ),
+            (
+                Impairment::builder().jitter(Duration::from_millis(5)),
+                "needs a delay",
+            ),
+            (Impairment::builder().loss_percent(101), "exceeds 100%"),
+        ];
+        for (builder, needle) in cases {
+            let err = builder
+                .clone()
+                .build()
+                .expect_err(&format!("{builder:?} must be refused"));
+            match err {
+                Error::Config(msg) => assert!(
+                    msg.contains(needle),
+                    "{builder:?} must be refused naming {needle:?}: {msg}"
+                ),
+                other => panic!("{builder:?} must be refused as a Config error, got {other:?}"),
+            }
+        }
+
+        // The boundaries themselves are legal — the refusals above are not off by one.
+        assert!(
+            Impairment::builder()
+                .delay(MAX_IMPAIRMENT_DELAY)
+                .build()
+                .is_ok()
+        );
+        assert!(Impairment::builder().loss_percent(100).build().is_ok());
+        assert!(Impairment::builder().loss_percent(0).build().is_ok());
+    }
+
+    /// Impairment names a **member**, and a vmid that holds no slot is refused at the API boundary
+    /// — before any host state is touched, and before `tc` is spawned at all.
+    ///
+    /// Buggy impl guarded: composing `naming::tap_name(prefix, vmid)` without consulting the slot
+    /// map, which reaches `tc` and returns "Cannot find device" — indistinguishable, to a caller,
+    /// from a member whose tap really did vanish.
+    #[test]
+    fn impairment_refuses_a_vmid_that_is_not_a_member() {
+        let (seg, _env, calls) = fake_segment("vmcell");
+        let member = seg.claim_member(7).expect("a first member claims a slot");
+        let before = calls.lock().unwrap().len();
+
+        let imp = Impairment::builder()
+            .loss_percent(100)
+            .build()
+            .expect("legal impairment");
+        for verb in ["impair", "clear"] {
+            let err = if verb == "impair" {
+                seg.impair_member(9, &imp).expect_err("vmid 9 is no member")
+            } else {
+                seg.clear_impairment(9).expect_err("vmid 9 is no member")
+            };
+            match err {
+                Error::Config(msg) => assert!(
+                    msg.contains("vmid 9") && msg.contains(seg.netns_name()),
+                    "{verb} must name the vmid and the segment: {msg}"
+                ),
+                other => panic!("{verb} on a non-member must be a Config error: {other:?}"),
+            }
+        }
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            before,
+            "a refused impairment must touch no host state"
+        );
+        // The member's own vmid resolves to the one naming law's tap — the positive control for
+        // the refusals above.
+        assert_eq!(
+            seg.member_tap(7).expect("the member resolves"),
+            crate::naming::tap_name("vmcell", 7)
+        );
+        drop(member);
+        assert!(
+            seg.member_tap(7).is_err(),
+            "a released slot stops being impairable"
+        );
+    }
+
+    /// §7.2 capability honesty: an absent `tc` is an absent **facility**
+    /// ([`Error::CapabilityUnavailable`]); one that exists but cannot be spawned is a **broken**
+    /// one, reported with its errno intact.
+    ///
+    /// Buggy impl guarded: collapsing both into `Error::Subprocess`, which tells an operator to
+    /// debug a permission problem they do not have.
+    #[test]
+    fn an_absent_tc_is_a_capability_and_a_broken_one_is_an_errno() {
+        match classify_tc_spawn_error(std::io::Error::from_raw_os_error(libc::ENOENT)) {
+            Error::CapabilityUnavailable { op, needed } => {
+                assert!(op.contains("impairment"), "{op}");
+                assert!(
+                    needed.contains(TC_BINARY) && needed.contains("iproute2"),
+                    "{needed}"
+                );
+            }
+            other => panic!("an absent tc must be a capability, got {other:?}"),
+        }
+        match classify_tc_spawn_error(std::io::Error::from_raw_os_error(libc::EACCES)) {
+            Error::Io(e) => assert_eq!(
+                e.raw_os_error(),
+                Some(libc::EACCES),
+                "a broken tc keeps its errno"
+            ),
+            other => panic!("a broken tc must keep its errno, got {other:?}"),
+        }
     }
 }

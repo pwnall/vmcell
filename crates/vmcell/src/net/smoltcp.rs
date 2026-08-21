@@ -1959,7 +1959,7 @@ pub mod backend {
                 HOST_NAT_MAC[4],
                 HOST_NAT_MAC[5],
             );
-            for vmid in 1u32..=254 {
+            for vmid in 1u32..=crate::net::MAX_VMID {
                 assert_ne!(
                     crate::net::mac_math(vmid).unwrap(),
                     host,

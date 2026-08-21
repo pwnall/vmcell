@@ -71,6 +71,8 @@ pub mod registry;
 pub mod server;
 #[cfg(feature = "server")]
 pub mod sweep;
+#[cfg(feature = "server")]
+pub mod uds;
 
 /// Re-export the resource-naming helpers so the daemon binary (`vmcelld`) can validate its
 /// `--resource-prefix` without a direct `vmcell` dependency (design).

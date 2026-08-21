@@ -11,10 +11,11 @@ use crate::auth::{AuthDecision, AuthPolicy, authorize};
 use crate::bridge::VmEngine;
 use crate::dto::{
     ArtifactInfo, CreateVmRequest, CreateVmResponse, ExecOutcomeDto, ExecRequestDto,
-    ResourceUsageDto, SnapshotInfo, SnapshotRequest, VmId, VmInfo,
+    ResourceUsageDto, SnapshotInfo, SnapshotRequest, StoreUsage, VmId, VmInfo,
 };
 use crate::error::{DaemonError, DaemonResult};
 use crate::openapi::{API_ROUTES, RouteDef, openapi_document};
+use crate::uds::UdsBinding;
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Path as AxPath, Request, State};
 use axum::http::{StatusCode, header};
@@ -60,6 +61,7 @@ fn method_router_for(route: &RouteDef) -> Option<MethodRouter<AppState>> {
         ("GET", "/v1/artifacts") => get(list_artifacts),
         ("GET", "/v1/artifacts/{name}") => get(get_artifact),
         ("DELETE", "/v1/artifacts/{name}") => delete(delete_artifact),
+        ("GET", "/v1/store") => get(store_usage),
         ("POST", "/v1/vms") => post(create_vm),
         ("GET", "/v1/vms") => get(list_vms),
         ("GET", "/v1/vms/{id}") => get(get_vm),
@@ -238,6 +240,13 @@ async fn delete_artifact(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// `GET /v1/store` — the store's usage against its quota (design §17, Open gaps and future
+/// capabilities). Served by the parent's own store handle: this is unprivileged file I/O, so it
+/// never crosses to the engine.
+async fn store_usage(State(state): State<AppState>) -> DaemonResult<Json<StoreUsage>> {
+    Ok(Json(state.artifacts.usage()?))
+}
+
 // ---- VM handlers ----
 
 async fn create_vm(
@@ -331,6 +340,27 @@ pub async fn serve(state: AppState, listener: tokio::net::TcpListener) -> std::i
     axum::serve(listener, build_router(state).into_make_service()).await
 }
 
+/// Serves the API on a **Unix-domain socket** — the same router, the same auth (design §17, Open
+/// gaps and future capabilities; [`crate::uds`] owns the socket's location and permissions).
+///
+/// The router is [`build_router`], byte for byte the one [`serve`] mounts: auth is a property of the
+/// route table, not of the transport, so the UDS is authenticated by exactly the same middleware
+/// over exactly the same rows (the reasoning, including why the socket's `0700`/`0600` permissions
+/// are defence in depth rather than a substitute for the key, is recorded in [`crate::uds`]).
+///
+/// Takes the [`UdsBinding`] whole and destructures it, so the unlink-on-drop guard lives for the
+/// entire serve and the socket is removed when this returns — teardown is ownership.
+///
+/// # Errors
+/// Propagates a fatal `axum::serve` I/O error.
+pub async fn serve_uds(state: AppState, binding: UdsBinding) -> std::io::Result<()> {
+    let UdsBinding { listener, guard } = binding;
+    tracing::info!(socket = %guard.path().display(), "vmcelld serving on the control socket");
+    let result = axum::serve(listener, build_router(state).into_make_service()).await;
+    drop(guard);
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -365,6 +395,13 @@ mod tests {
     /// The router **and** the artifacts directory behind it, so an upload gate can assert on the
     /// store the handler actually wrote into (and on the temp residue beside it).
     fn app_with_artifacts_dir(auth: AuthPolicy) -> (Router, std::path::PathBuf) {
+        let (state, dir) = state_with(auth);
+        (build_router(state), dir)
+    }
+
+    /// The [`AppState`] the router is built from — needed whole by the UDS gate, which serves it
+    /// through [`serve_uds`] rather than through `oneshot`.
+    fn state_with(auth: AuthPolicy) -> (AppState, std::path::PathBuf) {
         let dir = Box::leak(Box::new(tempfile::tempdir().expect("tempdir")));
         let art_dir = dir.path().join("artifacts");
         // The engine (registry) and the parent's artifact store are separate seams over the same
@@ -380,7 +417,114 @@ mod tests {
             auth,
             max_artifact_bytes: 1 << 20,
         };
-        (build_router(state), art_dir)
+        (state, art_dir)
+    }
+
+    /// One HTTP/1.1 request over the control socket, hand-written onto the wire and read back whole.
+    ///
+    /// Hand-rolled deliberately: this crate has no HTTP *client*, and the point of the gate is that
+    /// a real connection to a real socket reaches the same authenticated router — a `oneshot`
+    /// against the `Router` value would prove nothing about the transport.
+    async fn over_uds(path: &std::path::Path, target: &str, auth: Option<&str>) -> String {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let mut sock = tokio::net::UnixStream::connect(path)
+            .await
+            .expect("connect to the control socket");
+        let mut req = format!("GET {target} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n");
+        if let Some(a) = auth {
+            req.push_str(&format!("Authorization: {a}\r\n"));
+        }
+        req.push_str("\r\n");
+        sock.write_all(req.as_bytes()).await.expect("write request");
+        sock.flush().await.expect("flush");
+        let mut out = String::new();
+        sock.read_to_string(&mut out).await.expect("read response");
+        out
+    }
+
+    // The UDS transport carries the SAME authenticated router as the TCP bind (design §17, Open gaps
+    // and future capabilities; the decision is recorded in `crate::uds`). Asserted over a real
+    // socket with real requests, not against a `Router` value:
+    //
+    //   * an open route answers without a token,
+    //   * a protected route is 401 without one and 403 with a wrong one — the API key is NOT dropped
+    //     because the transport is local,
+    //   * the right token reaches the handler and returns its BODY (`[]`, the empty VM list), so the
+    //     leg proves the request was served rather than merely admitted, and
+    //   * the socket is unlinked when serving stops (teardown is ownership).
+    //
+    // RED on the inverse: have `serve_uds` build a router without the auth layer (or serve
+    // `AuthPolicy::Unauthenticated` regardless of the state) — the 401 and 403 legs go 200.
+    #[tokio::test]
+    async fn the_uds_transport_serves_the_same_authenticated_router() {
+        let (state, _art) = state_with(AuthPolicy::Key(ApiKey::from_secret(b"secret")));
+        let rt_dir = tempfile::tempdir().expect("tempdir");
+        let socket = crate::uds::uds_path_under_runtime_dir(Some(rt_dir.path().to_path_buf()))
+            .expect("the socket path resolves under a runtime dir");
+        let binding = crate::uds::bind_uds(&socket).expect("bind the control socket");
+        let serving = tokio::spawn(serve_uds(state, binding));
+
+        assert!(
+            over_uds(&socket, "/healthz", None).await.contains("200 OK"),
+            "an open route answers over the socket without a token"
+        );
+        assert!(
+            over_uds(&socket, "/v1/vms", None).await.contains("401"),
+            "a protected route still demands the bearer key on a local socket"
+        );
+        assert!(
+            over_uds(&socket, "/v1/vms", Some("Bearer wrong"))
+                .await
+                .contains("403"),
+            "a wrong key is still 403 on a local socket"
+        );
+        let ok = over_uds(&socket, "/v1/vms", Some("Bearer secret")).await;
+        assert!(ok.contains("200 OK"), "the right key is served: {ok}");
+        assert!(
+            ok.trim_end().ends_with("[]"),
+            "and the handler's own body comes back over the socket: {ok}"
+        );
+
+        serving.abort();
+        // The abort drops the `UdsPathGuard` the serve was holding.
+        while socket.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    // `GET /v1/store` is authenticated like every other route and answers with the store's real
+    // usage — the data plane, not just a status. Without it the quota is enforceable but not
+    // observable, and a client's first news of a full store is a 413 on an upload it already began.
+    //
+    // RED on the inverse: drop the `("GET", "/v1/store")` arm from `method_router_for` and the row
+    // falls through to the loud `unwired` 500 instead of 200.
+    #[tokio::test]
+    async fn the_store_usage_route_is_authenticated_and_reports_real_bytes() {
+        let (app, art_dir) =
+            app_with_artifacts_dir(AuthPolicy::Key(ApiKey::from_secret(b"secret")));
+        std::fs::create_dir_all(&art_dir).expect("artifacts dir");
+        std::fs::write(art_dir.join("k1"), b"0123456789").expect("plant an artifact");
+
+        assert_eq!(
+            get_status(&app, "/v1/store", None).await,
+            StatusCode::UNAUTHORIZED,
+            "the store report is not an open route"
+        );
+
+        let req = Request::builder()
+            .uri("/v1/store")
+            .header(header::AUTHORIZATION, "Bearer secret")
+            .body(Body::empty())
+            .expect("request");
+        let resp = app.clone().oneshot(req).await.expect("response");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .expect("body");
+        let usage: StoreUsage = serde_json::from_slice(&body).expect("decode StoreUsage");
+        assert_eq!(usage.used_bytes, 10, "the bytes actually on disk");
+        assert_eq!(usage.artifact_count, 1);
+        assert_eq!(usage.quota_bytes, None, "this store is unbounded");
     }
 
     async fn status_of(uri: &str, auth: Option<&str>) -> StatusCode {
@@ -552,7 +696,11 @@ mod tests {
         std::fs::read_dir(dir)
             .expect("readdir")
             .flatten()
-            .filter(|e| e.file_name().to_string_lossy().starts_with(".tmp"))
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(crate::artifact_store::UPLOAD_TEMP_PREFIX)
+            })
             .count()
     }
 

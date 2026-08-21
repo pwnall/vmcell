@@ -704,6 +704,21 @@ gates:
     # through `just --show`, so an interpolated `{{{{just_executable()}}}}` call reads as it runs.
     ./scripts/ban-orphan-recipe.sh
     ./scripts/test-ban-orphan-recipe.sh
+    # G4/§17: the netem argv is ONE law (`Impairment::netem_args`), and its drift is not a compile
+    # error — the law's output is a `Vec<String>` handed to a subprocess, so a second hand-spelled
+    # `["qdisc","add",…,"netem",…]` runs perfectly and diverges silently. The home is held to an
+    # EXACT count in both directions, so a composer added INSIDE it is still flagged and a home that
+    # lost its composers reports as a stale exemption. The self-test carries the exact pre-existing
+    # regression (a harness spelling the argv itself) and the empty-tree misconfiguration arm.
+    ./scripts/ban-inline-netem-argv.sh
+    ./scripts/test-ban-inline-netem-argv.sh
+    # G2/§6.4: one HTTP `CONNECT` request-line composer in the host tree, guarded by
+    # `transparent::validate_authority_host`. The transparent intake splices a GUEST-chosen SNI /
+    # Host header into a request line, so a second composer is the request-smuggling hole re-opened
+    # and no compiler sees it. The vsock `CONNECT <port>\n` prologue is a DIFFERENT law and is not
+    # flagged; the in-guest curl shim is the one rostered exemption, with its reason.
+    ./scripts/ban-http-connect-composers.sh
+    ./scripts/test-ban-http-connect-composers.sh
     # E1: "what does a guest-kernel fault look like on the console" is ONE law
     # (`vmcell::vmm::fault`), because the host already had two readers of the same bytes — the
     # boolean panic detector's three inline literals and the validator's §5.4 clause literals — and

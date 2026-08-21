@@ -784,7 +784,80 @@ name = "vmcell"
 #     `net_sys::setns_net` exists), which carries the same `rtnl_link_stats64` fields sysfs renders
 #     as text. `net::usage`'s `counter_reader_gate` holds both halves: the decode is spelled once,
 #     and NO production site reads `/sys/class/net`.
-version = "0.23.1"
+# 0.23.1 → 0.23.2: ADDITIVE plus one BEHAVIOR change behind unchanged signatures — §6.4's two
+# recorded gaps close (docs/92 Tier E, G2): snapshot-and-replay cassettes, and full MITM on the
+# transparent (raw 80/443) egress path. A PATCH edge on purpose, for the reason the 0.23.0 → 0.23.1
+# edge names: nothing on any signature moves, so the fourteen sibling manifests pinning
+# `vmcell = "0.23.0"` (a `^0.23.0` requirement) keep resolving without an edit. `cargo semver-checks`
+# is SILENT on both halves by construction — an addition, and a behavior change behind an unchanged
+# signature — so this entry is the only thing that records either.
+#
+#   * ADDITIVE: `proxy::cassette` (the module, `CassetteOptions` / `CassetteError` / `CassetteMiss` /
+#     `RecordedInteraction` / `RecordedBody` / `interaction_key` / `is_recordable_response_header`
+#     and the four consts), plus `EgressProxy::record_cassette` / `replay_cassette` /
+#     `cassette_misses`. A cassette records the whole INTERACTION (key → status/headers/body) and
+#     replays it with no upstream at all; `EgressProxy::record_to`'s request-line log is unchanged,
+#     still writes the same one-line-per-request format, and is documented as the lesser facility
+#     rather than retired — a consumer parsing it is not moved.
+#
+#     Three rules a consumer must read rather than infer, because a cassette is a PERSISTED
+#     ARTIFACT under the same no-secrets rule as a serial log. (1) It is keyed by method + canonical
+#     absolute URI ONLY: no request header and no request body is persisted or matched, which is
+#     both the determinism story (a nonce or a `Date` cannot make replay miss) and the secrets story
+#     (`Authorization` cannot reach the file). Repeated calls under one key replay in RECORDED ORDER.
+#     (2) Query parameters named in `REDACTED_QUERY_PARAMS` are dropped from the key entirely, and a
+#     caller adds its own volatile names with `CassetteOptions::redacting`. (3) Response headers are
+#     filtered to the `RECORDED_RESPONSE_HEADERS` allowlist (`content-type`), so `set-cookie` never
+#     lands in the artifact — while the response BODY is recorded verbatim, since serving it is the
+#     whole point. The one stated hole: a secret in a URI *path* is not redacted, because no general
+#     rule tells a secret path segment from a resource id.
+#
+#     A replay MISS is a typed `CassetteError::Miss`, served to the guest as a `504` naming the key
+#     and retained by `cassette_misses()`. It NEVER falls through to the real upstream: a
+#     fall-through would make a green replay run evidence of nothing.
+#
+#   * BEHAVIOR, SEMVER-CHECKS-BLIND — the transparent intake. `EgressProxy::start` /
+#     `start_transparent` keep their signatures and their listening port, but connections now reach
+#     `hudsucker` through `proxy::transparent::serve_intake`, which classifies each one and recovers
+#     the destination a transparently-redirected connection names NOWHERE in HTTP: the `Host` header
+#     for an origin-form request, and the ClientHello's SNI for a raw TLS connection (handed on
+#     behind a synthesized `CONNECT`, the explicit-proxy intake hudsucker does understand). What
+#     changes for a consumer: raw 80/443 egress is now MITM'd — logged under its reconstructed
+#     absolute URI, matched by doubles, and **subject to the deny list**, which before could not see
+#     a host at all on that path. An explicit-proxy connection is classified on its first byte and
+#     spliced through unchanged; §6.4's "the transparent path only constrains egress" no longer
+#     holds, and the recorded limitation in its own text is the thing that moved.
+#
+#     Two boundaries stated rather than discovered: a ClientHello split across TLS records, or
+#     larger than `transparent::MAX_INTAKE_PREFIX_BYTES`, is REFUSED (logged as
+#     `TRANSPARENT REFUSED`, never guessed at); and a TLS intake with no SNI falls back to the
+#     kernel-preserved original destination only where there is one (the privileged `TPROXY` case) —
+#     under the unprivileged NAT there is nothing to fall back to and the connection is refused.
+#
+#   * UNCHANGED: `proxy::doubles` — the `Matcher`/`Responder` aliases, `TestDouble`, and the
+#     `hudsucker`/`hyper` re-exports they are built from all resolve to the same types at the same
+#     versions, so design §1.3's other extension point is untouched and its doctest compiles the
+#     same spelling. `ProxyHandler` keeps its exact field set: the new stages compose AROUND it
+#     (`proxy::handler::EgressHandler`) precisely because adding a field to a public all-public
+#     struct is a major break, which at 0.x would have forced 0.24.0 and stranded those fourteen
+#     pins.
+#
+#   * ADDITIVE, on the same edge and for the same reason (docs/92 Tier E, G5 — §17's "the persistent
+#     port-forward bridge remains"): `steward::forward` (the module, `PortForward` / `ForwardOptions`
+#     / `EndOfStream`). A host `TcpListener` that relays each accepted TCP connection into a guest
+#     AF_VSOCK port, so a tool that knows nothing about vsock reaches an in-guest listener over
+#     `127.0.0.1:<port>`. It is built ON `VsockDial` and changes nothing about it.
+#
+#     The one thing a consumer must read rather than infer: **`EndOfStream` is not a tuning knob, it
+#     is the backend question**. A host half-close is not portable — Firecracker and QEMU translate
+#     it into a teardown of the whole vsock connection and silently discard whatever the guest had
+#     not yet flushed (the measured table on `VsockDial`) — so the default,
+#     `EndOfStream::DrainThenClose`, never forwards one and bounds what follows with
+#     `ForwardOptions::drain_budget` instead. Selecting `ForwardHalfClose` is selecting Cloud
+#     Hypervisor or crosvm. The REVERSE direction (a guest dialling out through a host listener) is
+#     deliberately not shipped: it is two different mechanisms on the two transport families, one of
+#     which `VsockEndpoint` does not model.
+version = "0.23.2"
 edition = "2024"
 # MSRV is the single workspace floor (`[workspace.package] rust-version`, in lockstep with
 # rust-toolchain.toml via the `just ci` sync assertion) — currently the latest stable, 1.98.0.

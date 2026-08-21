@@ -60,8 +60,8 @@ use vmcell_daemon::auth::{AuthPolicy, load_api_key_file};
 use vmcell_daemon::bridge::{BrokerClientEngine, VmEngine, serve_engine};
 use vmcell_daemon::launcher::MicroVmLauncher;
 use vmcell_daemon::registry::Registry;
-use vmcell_daemon::server::{AppState, serve};
-use vmcell_daemon::sweep::startup_sweep;
+use vmcell_daemon::server::{AppState, serve, serve_uds};
+use vmcell_daemon::sweep::{PeriodicSweeper, SweepSchedule, startup_sweep};
 use vmcell_privilege::PRIVILEGED_CAPS;
 
 /// The vmcell control-plane daemon.
@@ -90,6 +90,13 @@ struct Cli {
     #[arg(long, default_value_t = 4 * 1024 * 1024 * 1024)]
     max_artifact_bytes: u64,
 
+    /// Whole-store quota in bytes (default: unbounded). Once the store holds this much, uploads and
+    /// snapshots are refused with a 413 naming the usage and the remedy — vmcelld never evicts an
+    /// artifact to make room (design §17, Open gaps and future capabilities). `GET /v1/store`
+    /// reports the usage against it.
+    #[arg(long)]
+    max_store_bytes: Option<u64>,
+
     /// The `cloud-hypervisor` binary path (else `$VMCELL_CH_BIN`, else `cloud-hypervisor`).
     #[arg(long)]
     ch_bin: Option<String>,
@@ -99,6 +106,24 @@ struct Cli {
     /// never sweep each other's resources. `[A-Za-z0-9]`, ≤ 6 chars (v21).
     #[arg(long, default_value = "vmcell")]
     resource_prefix: String,
+
+    /// Also serve the API on a Unix-domain socket under `$XDG_RUNTIME_DIR/vmcell/vmcelld.sock`
+    /// (design §17, Open gaps and future capabilities). Implied by `--uds-path`. The socket carries
+    /// the SAME authentication as the TCP bind — its `0700`/`0600` permissions are defence in depth,
+    /// not a substitute for the key (see `vmcell_daemon::uds`).
+    #[arg(long)]
+    uds: bool,
+
+    /// Serve the control socket at this exact path instead of the `$XDG_RUNTIME_DIR` default. Its
+    /// parent directory must be owner-only (`0700`) or the daemon refuses to start.
+    #[arg(long)]
+    uds_path: Option<PathBuf>,
+
+    /// How often the **periodic** orphan sweeper runs, in seconds (design §17, Open gaps and future
+    /// capabilities). `0` turns it off explicitly; a non-zero value below the 30 s floor is refused
+    /// at start-up rather than rounded up. The start-up sweep runs either way.
+    #[arg(long, default_value_t = vmcell_daemon::sweep::DEFAULT_SWEEP_INTERVAL.as_secs())]
+    sweep_interval_secs: u64,
 
     /// Fall back to the single-process retain-caps model (§11.2, Privilege and blessing): no broker fork, the caps stay in
     /// the HTTP-serving process. The setup-broker split (§12.4, Layer 3 — the setup broker (network surface never holds caps)) is the default.
@@ -148,6 +173,34 @@ fn run() -> Result<(), i32> {
         return Err(1);
     }
 
+    // Reject an unhonorable cadence BEFORE the fork, so both sides start from a validated value and
+    // the operator learns at start-up rather than from a sweeper that quietly never armed.
+    let schedule = match SweepSchedule::from_secs(cli.sweep_interval_secs) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("vmcelld: {e}");
+            return Err(1);
+        }
+    };
+
+    // Resolve the control-socket path (but do not bind it — binding needs a runtime) before the
+    // fork, so an unresolvable `--uds` is a start-up error rather than a half-started daemon.
+    // `--uds-path` IMPLIES `--uds`: a path the daemon silently ignored would be an accepted input
+    // that is neither honored nor rejected.
+    let uds_path = match (cli.uds, cli.uds_path.clone()) {
+        (_, Some(path)) => Some(path),
+        (true, None) => match vmcell_daemon::uds::uds_path_under_runtime_dir(
+            std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from),
+        ) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                tracing::error!("vmcelld: {e}");
+                return Err(1);
+            }
+        },
+        (false, None) => None,
+    };
+
     let ch_bin = cli
         .ch_bin
         .clone()
@@ -156,14 +209,14 @@ fn run() -> Result<(), i32> {
 
     if cli.no_setup_broker {
         // Single-process retain-caps fallback (§11.2, Privilege and blessing): the HTTP surface keeps the caps.
-        return run_single_process(&cli, ch_bin);
+        return run_single_process(&cli, ch_bin, schedule, uds_path);
     }
 
     // The setup-broker split (§12.4, Layer 3 — the setup broker (network surface never holds caps)): fork BEFORE any thread/runtime exists (fork-with-threads is
     // unsafe). The child keeps the caps and owns the registry; the parent drops all caps and serves.
     match vmcell_broker::fork_privileged_child() {
-        Ok(ForkSide::Child { sock }) => run_broker_child(&cli, ch_bin, sock),
-        Ok(ForkSide::Parent { sock, child }) => run_http_parent(&cli, sock, child),
+        Ok(ForkSide::Child { sock }) => run_broker_child(&cli, ch_bin, schedule, sock),
+        Ok(ForkSide::Parent { sock, child }) => run_http_parent(&cli, sock, child, uds_path),
         Err(e) => {
             tracing::error!("vmcelld: cannot fork the setup broker: {e}");
             Err(1)
@@ -174,9 +227,14 @@ fn run() -> Result<(), i32> {
 /// The **broker child**: keeps the three caps, owns the VM [`Registry`], runs the start-up orphan
 /// sweep, and serves the [`vmcell_daemon::bridge`] RPC over `sock`. Never returns — it `_exit`s so a
 /// forked child does not run the parent's at-exit handlers.
-fn run_broker_child(cli: &Cli, ch_bin: String, sock: std::os::unix::net::UnixStream) -> ! {
+fn run_broker_child(
+    cli: &Cli,
+    ch_bin: String,
+    schedule: SweepSchedule,
+    sock: std::os::unix::net::UnixStream,
+) -> ! {
     ignore_terminal_signals();
-    let code = run_broker_child_inner(cli, ch_bin, sock);
+    let code = run_broker_child_inner(cli, ch_bin, schedule, sock);
     // SAFETY: `_exit` is async-signal-safe and skips at-exit handlers — the forked child must not run
     // the parent's teardown. The registry (and its VMs) already dropped inside `block_on` above.
     unsafe { libc::_exit(code) }
@@ -214,7 +272,12 @@ fn ignore_terminal_signals() {
     }
 }
 
-fn run_broker_child_inner(cli: &Cli, ch_bin: String, sock: std::os::unix::net::UnixStream) -> i32 {
+fn run_broker_child_inner(
+    cli: &Cli,
+    ch_bin: String,
+    schedule: SweepSchedule,
+    sock: std::os::unix::net::UnixStream,
+) -> i32 {
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -241,12 +304,9 @@ fn run_broker_child_inner(cli: &Cli, ch_bin: String, sock: std::os::unix::net::U
             );
         }
 
-        let artifacts = match ArtifactStore::open(&cli.artifacts_dir, cli.max_artifact_bytes) {
+        let artifacts = match open_store(cli) {
             Ok(a) => a,
-            Err(e) => {
-                tracing::error!("vmcelld broker: {e}");
-                return 1;
-            }
+            Err(_) => return 1,
         };
         let launcher = match MicroVmLauncher::new(ch_bin, &cli.resource_prefix) {
             Ok(l) => l,
@@ -255,8 +315,14 @@ fn run_broker_child_inner(cli: &Cli, ch_bin: String, sock: std::os::unix::net::U
                 return 1;
             }
         };
-        let registry: Arc<dyn VmEngine> =
-            Arc::new(Registry::new(Box::new(launcher), artifacts, id_seed()));
+        let registry = Arc::new(Registry::new(Box::new(launcher), artifacts, id_seed()));
+        // The PERIODIC sweep (design §17, Open gaps and future capabilities) lives here, in the
+        // cap-holding child: deleting a netns needs `CAP_NET_ADMIN`, which the HTTP parent has
+        // dropped. It reads its live-vmid set (and the in-flight launch count it defers on) from the
+        // registry beside it, and its handle is held for the life of this scope so the task cannot
+        // outlive the registry it is protecting.
+        let sweeper = PeriodicSweeper::spawn(&cli.resource_prefix, schedule, registry.clone());
+        let registry: Arc<dyn VmEngine> = registry;
 
         if let Err(e) = sock.set_nonblocking(true) {
             tracing::error!("vmcelld broker: cannot set the control socket nonblocking: {e}");
@@ -276,6 +342,9 @@ fn run_broker_child_inner(cli: &Cli, ch_bin: String, sock: std::os::unix::net::U
         // off a `create` between its VMM launch and the registry insert — that VMM would be in
         // nobody's table and survive as an orphan on the graceful path.
         serve_engine(registry, sock).await;
+        // Stops the periodic sweeper before this scope's `registry` drop tears the VMs down: a pass
+        // running against a table mid-teardown would read a shrinking live set.
+        drop(sweeper);
         0
     })
 }
@@ -286,6 +355,7 @@ fn run_http_parent(
     cli: &Cli,
     sock: std::os::unix::net::UnixStream,
     child: vmcell_broker::BrokerChild,
+    uds_path: Option<PathBuf>,
 ) -> Result<(), i32> {
     // Drop EVERY capability before binding the network socket — the HTTP surface holds none (§12.4, Layer 3 — the setup broker (network surface never holds caps)).
     let plan = vmcell_privilege::plan_broker_parent_drop(&vmcell_privilege::probe_supported_caps());
@@ -296,13 +366,10 @@ fn run_http_parent(
 
     // Auth policy: an owner-only key file, or the explicit dev bypass (§11.6, Authentication — a bearer API key).
     let auth = auth_policy(cli)?;
-    let artifacts = match ArtifactStore::open(&cli.artifacts_dir, cli.max_artifact_bytes) {
-        Ok(a) => Arc::new(a),
-        Err(e) => {
-            tracing::error!("vmcelld: {e}");
-            return Err(1);
-        }
-    };
+    let artifacts = Arc::new(open_store(cli)?);
+    // The artifact GC is unprivileged file I/O, so it belongs in the cap-dropped parent — the same
+    // side that serves `GET /v1/store` and the uploads the quota bounds.
+    startup_artifact_gc(&artifacts);
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -341,9 +408,10 @@ fn run_http_parent(
             tracing::error!("vmcelld: cannot bind {bind}: {e}");
             1
         })?;
+        let uds = bind_control_socket(uds_path)?;
         tracing::info!(bind = %bind, "vmcelld serving (HTTP parent; no capabilities)");
         let serve_result = tokio::select! {
-            r = serve(state, listener) => r.map_err(|e| { tracing::error!("vmcelld: server error: {e}"); 1 }),
+            r = serve_transports(state, listener, uds) => r.map_err(|e| { tracing::error!("vmcelld: server error: {e}"); 1 }),
             _ = shutdown_signal() => {
                 tracing::info!("vmcelld: shutdown signal received; asking the broker to tear down VMs");
                 Ok(())
@@ -357,19 +425,19 @@ fn run_http_parent(
 
 /// The single-process retain-caps fallback (§11.2, Privilege and blessing): the HTTP surface keeps the three caps and owns
 /// the registry directly — no broker, no privilege separation. Selected with `--no-setup-broker`.
-fn run_single_process(cli: &Cli, ch_bin: String) -> Result<(), i32> {
+fn run_single_process(
+    cli: &Cli,
+    ch_bin: String,
+    schedule: SweepSchedule,
+    uds_path: Option<PathBuf>,
+) -> Result<(), i32> {
     tracing::warn!(
         "vmcelld: --no-setup-broker; the HTTP surface RETAINS the three caps (no privilege \
          separation). Prefer the default setup-broker split (§12.4, Layer 3 — the setup broker)."
     );
     let auth = auth_policy(cli)?;
-    let artifacts = match ArtifactStore::open(&cli.artifacts_dir, cli.max_artifact_bytes) {
-        Ok(a) => a,
-        Err(e) => {
-            tracing::error!("vmcelld: {e}");
-            return Err(1);
-        }
-    };
+    let artifacts = open_store(cli)?;
+    startup_artifact_gc(&artifacts);
 
     let report = startup_sweep(&cli.resource_prefix);
     if !report.netns.is_empty()
@@ -391,17 +459,11 @@ fn run_single_process(cli: &Cli, ch_bin: String) -> Result<(), i32> {
             return Err(1);
         }
     };
-    let registry: Arc<dyn VmEngine> =
-        Arc::new(Registry::new(Box::new(launcher), artifacts, id_seed()));
-    let parent_artifacts = match ArtifactStore::open(&cli.artifacts_dir, cli.max_artifact_bytes) {
-        Ok(a) => Arc::new(a),
-        Err(e) => {
-            tracing::error!("vmcelld: {e}");
-            return Err(1);
-        }
-    };
+    let registry = Arc::new(Registry::new(Box::new(launcher), artifacts, id_seed()));
+    let parent_artifacts = Arc::new(open_store(cli)?);
+    let engine: Arc<dyn VmEngine> = registry.clone();
     let state = AppState {
-        engine: registry.clone(),
+        engine: engine.clone(),
         artifacts: parent_artifacts,
         auth,
         max_artifact_bytes: usize::try_from(cli.max_artifact_bytes).unwrap_or(usize::MAX),
@@ -418,21 +480,107 @@ fn run_single_process(cli: &Cli, ch_bin: String) -> Result<(), i32> {
         }
     };
     let bind = cli.bind.clone();
+    let resource_prefix = cli.resource_prefix.clone();
     runtime.block_on(async move {
+        // The periodic orphan sweeper (design §17, Open gaps and future capabilities). This process
+        // kept the caps, so it is the one that can delete a netns. Held for the whole serve, dropped
+        // (and so aborted) before the teardown below.
+        let sweeper = PeriodicSweeper::spawn(resource_prefix, schedule, registry.clone());
         let listener = tokio::net::TcpListener::bind(&bind).await.map_err(|e| {
             tracing::error!("vmcelld: cannot bind {bind}: {e}");
             1
         })?;
+        let uds = bind_control_socket(uds_path)?;
         tracing::info!(bind = %bind, "vmcelld serving (single-process, retains caps)");
-        tokio::select! {
-            r = serve(state, listener) => r.map_err(|e| { tracing::error!("vmcelld: server error: {e}"); 1 }),
+        let result = tokio::select! {
+            r = serve_transports(state, listener, uds) => r.map_err(|e| { tracing::error!("vmcelld: server error: {e}"); 1 }),
             _ = shutdown_signal() => {
                 tracing::info!("vmcelld: shutdown signal received; tearing down owned VMs");
+                drop(sweeper);
                 registry.shutdown_all().await;
                 Ok(())
             }
-        }
+        };
+        result
     })
+}
+
+/// Opens the artifact store with this daemon's per-upload cap **and** its whole-store quota — one
+/// helper, so the three stores a daemon opens (the broker child's, the HTTP parent's, and the
+/// single-process one) cannot be given different ceilings, which would make the quota depend on
+/// which writer got there first.
+fn open_store(cli: &Cli) -> Result<ArtifactStore, i32> {
+    ArtifactStore::open(&cli.artifacts_dir, cli.max_artifact_bytes)
+        .map(|s| s.with_quota(cli.max_store_bytes))
+        .map_err(|e| {
+            tracing::error!("vmcelld: {e}");
+            1
+        })
+}
+
+/// Runs the start-up artifact GC and logs what it reclaimed (design §17, Open gaps and future
+/// capabilities).
+///
+/// Start-up, not a timer: the two collectable classes — an abandoned upload temp file and an
+/// orphaned digest sidecar — are *crash* residue, exactly like the orphan sweep's netns and cgroup
+/// leaks, and a live daemon's own [`ArtifactStore`] writer removes its temp file on `Drop`. A
+/// failed pass is warned, never fatal: residue costs disk, not correctness.
+fn startup_artifact_gc(store: &ArtifactStore) {
+    match store.collect_residue(vmcell_daemon::artifact_store::DEFAULT_RESIDUE_MIN_AGE) {
+        Ok(report) if report.is_empty() => {}
+        Ok(report) => tracing::info!(
+            orphan_sidecars = report.orphan_sidecars.len(),
+            abandoned_uploads = report.abandoned_uploads.len(),
+            bytes_freed = report.bytes_freed,
+            "vmcelld: reclaimed artifact-store residue from a prior daemon"
+        ),
+        Err(e) => tracing::warn!(
+            error = %e,
+            "vmcelld: the start-up artifact GC could not run; residue stays on disk and counts              against the store quota"
+        ),
+    }
+}
+
+/// Binds the control socket when one was configured, mapping its typed refusal to the fatal exit
+/// code — one helper, so both the broker-split parent and the single-process fallback bind it the
+/// same way and neither can start "half serving".
+fn bind_control_socket(
+    uds_path: Option<PathBuf>,
+) -> Result<Option<vmcell_daemon::uds::UdsBinding>, i32> {
+    let Some(path) = uds_path else {
+        return Ok(None);
+    };
+    match vmcell_daemon::uds::bind_uds(&path) {
+        Ok(binding) => Ok(Some(binding)),
+        Err(e) => {
+            tracing::error!("vmcelld: {e}");
+            Err(1)
+        }
+    }
+}
+
+/// Serves the API on the TCP listener and, when one is bound, on the control socket as well.
+///
+/// The **one** place transports are started, so both are handed the same [`AppState`] and therefore
+/// the same authenticated router — a second start-up site is how a transport acquires a different
+/// auth posture (the reasoning is recorded in `vmcell_daemon::uds`). A fatal serve error on either
+/// transport ends the daemon: the `select!` drops the other, which is the same outcome a single-
+/// transport daemon has always had.
+async fn serve_transports(
+    state: AppState,
+    listener: tokio::net::TcpListener,
+    uds: Option<vmcell_daemon::uds::UdsBinding>,
+) -> std::io::Result<()> {
+    match uds {
+        None => serve(state, listener).await,
+        Some(binding) => {
+            let uds_state = state.clone();
+            tokio::select! {
+                r = serve(state, listener) => r,
+                r = serve_uds(uds_state, binding) => r,
+            }
+        }
+    }
 }
 
 /// Resolves the bearer-auth policy from the CLI: an owner-only key file, or the explicit dev bypass.

@@ -22,10 +22,11 @@ use crate::dto::{
 use crate::error::{DaemonError, DaemonResult};
 use crate::launcher::{LaunchSpec, VmHandle, VmLauncher};
 use crate::name::validate_artifact_name;
+use crate::sweep::{LiveIdSource, LiveIds};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use tokio::sync::Mutex;
 
 /// One owned VM. The identity fields are immutable (set once at create) so a pin check reads them
@@ -176,6 +177,36 @@ pub struct Registry {
     vms: Mutex<HashMap<VmId, Arc<VmSlot>>>,
     counter: AtomicU64,
     seed: u64,
+    /// How many `create`s are between "the launcher was called" and "the slot is in `vms`".
+    ///
+    /// A launching VM already owns host resources — a netns, a tap, a cgroup slice, a scratch dir,
+    /// all named after a vmid — that `vms` does not yet list, so the live-vmid set the periodic
+    /// orphan sweeper reads is knowingly incomplete for exactly this window. The sweeper **defers**
+    /// its whole pass while this is non-zero rather than reaping a booting VM's namespace (design
+    /// §17, Open gaps and future capabilities; the deferral law lives in
+    /// [`crate::sweep::sweep_pass`]).
+    launches_in_flight: AtomicUsize,
+}
+
+/// Holds the in-flight-launch count up for the window between calling the launcher and inserting the
+/// slot, and releases it on **every** exit — a launch that fails, an early `?`, or a panic — because
+/// a count that leaked upward would disable the periodic sweeper permanently and one that leaked
+/// downward would re-open the window it exists to close.
+struct LaunchGuard<'a> {
+    counter: &'a AtomicUsize,
+}
+
+impl<'a> LaunchGuard<'a> {
+    fn claim(counter: &'a AtomicUsize) -> Self {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Self { counter }
+    }
+}
+
+impl Drop for LaunchGuard<'_> {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl Registry {
@@ -189,6 +220,7 @@ impl Registry {
             vms: Mutex::new(HashMap::new()),
             counter: AtomicU64::new(1),
             seed,
+            launches_in_flight: AtomicUsize::new(0),
         }
     }
 
@@ -295,6 +327,9 @@ impl Registry {
             init: req.init.as_deref().map(PathBuf::from),
             steward_placement,
         };
+        // The launch window opens HERE, before any host resource exists under the new vmid, and
+        // closes only after the slot is in `vms` — see `LaunchGuard`.
+        let launching = LaunchGuard::claim(&self.launches_in_flight);
         let handle = self.launcher.launch(&spec).await?;
         let id = self.mint_id();
         let slot = Arc::new(VmSlot {
@@ -315,6 +350,10 @@ impl Registry {
         });
         let info = slot.info();
         self.vms.lock().await.insert(id.clone(), slot);
+        // The slot is in the table: the live-vmid set now covers this VM, so the sweeper may run
+        // again. Dropped explicitly (not at end of scope) so the window is exactly the launch, not
+        // the inline `exec` that may follow it.
+        drop(launching);
 
         let Some(cmd) = req.command else {
             return Ok(CreatedVm { info, exec: None });
@@ -446,6 +485,13 @@ impl Registry {
         // The prefix names a subdirectory of the artifact store — validate it as a single safe
         // component (invariant §13, Cross-cutting invariants) so a snapshot cannot escape the store.
         validate_artifact_name(artifact_prefix)?;
+        // The whole-store quota, through the ONE predicate the upload path also uses
+        // (`ArtifactStore::check_quota_headroom`, §17, Open gaps and future capabilities). A
+        // snapshot's size is not knowable before it is taken, so what the quota gates here is the
+        // START of the write: a store already at its ceiling refuses before any directory is
+        // created, which is both loud and residue-free. Asked before the VM is even resolved, so a
+        // refusal cannot leave a prefix behind.
+        let _headroom = self.artifacts.check_quota_headroom()?;
         let out_dir = self.artifacts.dir().join(artifact_prefix);
 
         // Resolve the VM and assert `Ready` BEFORE any filesystem mutation, so a NotFound/Conflict
@@ -639,6 +685,28 @@ impl Registry {
         }
     }
 
+    /// The live-id snapshot the orphan sweeps run against (design §11.4, The VM registry and the
+    /// start-up sweep; §17, Open gaps and future capabilities).
+    ///
+    /// The vmid set and the in-flight count are read as **one** snapshot, under one hold of the VM
+    /// table: sampling them separately could pair a set from before an insert with a count from
+    /// after it, which is precisely the window that produces a live VM in neither.
+    ///
+    /// `segids` is empty and that is complete, not a stub: the daemon creates no segments (§6.5,
+    /// VM-to-VM segments). Another process's segments are protected by the cross-process id-claim
+    /// registry, never by this set.
+    pub async fn live_ids(&self) -> LiveIds {
+        let vms = self.vms.lock().await;
+        let vmids = vms.values().map(|s| s.vmid).collect();
+        let launches_in_flight = self.launches_in_flight.load(Ordering::SeqCst);
+        drop(vms);
+        LiveIds {
+            vmids,
+            segids: std::collections::BTreeSet::new(),
+            launches_in_flight,
+        }
+    }
+
     /// The number of owned VMs.
     pub async fn len(&self) -> usize {
         self.vms.lock().await.len()
@@ -647,6 +715,13 @@ impl Registry {
     /// Whether the registry owns no VMs.
     pub async fn is_empty(&self) -> bool {
         self.len().await == 0
+    }
+}
+
+#[async_trait::async_trait]
+impl LiveIdSource for Registry {
+    async fn live_ids(&self) -> LiveIds {
+        Self::live_ids(self).await
     }
 }
 
@@ -892,6 +967,19 @@ mod tests {
         }
     }
 
+    /// What a fake `launch` does — the window between "the launcher was called" and "the slot is
+    /// in the table", which is the one the periodic orphan sweeper defers on.
+    #[derive(Clone, Default)]
+    enum LaunchBehavior {
+        /// Return a handle immediately.
+        #[default]
+        Normal,
+        /// Signal `entered`, then block until `release` — the in-flight launch window itself.
+        Blocked(Arc<HandleGate>),
+        /// Fail the launch, so the guard's release-on-error path can be driven.
+        Fails,
+    }
+
     /// The `LaunchSpec`s a [`FakeLauncher`] was handed, in order.
     ///
     /// The fake used to take `_spec: &LaunchSpec` and discard it, which made every registry-level
@@ -901,6 +989,7 @@ mod tests {
     type LaunchLog = Arc<std::sync::Mutex<Vec<LaunchSpec>>>;
 
     struct FakeLauncher {
+        launch_behavior: LaunchBehavior,
         next_vmid: AtomicU64,
         shutdowns: Arc<AtomicUsize>,
         snapshot_behavior: SnapshotBehavior,
@@ -914,6 +1003,18 @@ mod tests {
     impl VmLauncher for FakeLauncher {
         async fn launch(&self, spec: &LaunchSpec) -> DaemonResult<Box<dyn VmHandle>> {
             self.launches.lock().expect("launch log").push(spec.clone());
+            match &self.launch_behavior {
+                LaunchBehavior::Normal => {}
+                LaunchBehavior::Blocked(gate) => {
+                    gate.entered.notify_one();
+                    gate.release.notified().await;
+                }
+                LaunchBehavior::Fails => {
+                    return Err(DaemonError::Internal(
+                        "fake launch: the VMM never came up".to_string(),
+                    ));
+                }
+            }
             Ok(Box::new(FakeHandle {
                 vmid: self.next_vmid.fetch_add(1, Ordering::SeqCst) as u32,
                 shutdowns: self.shutdowns.clone(),
@@ -952,6 +1053,7 @@ mod tests {
     /// arm it drives and a new arm does not touch every call site.
     #[derive(Clone, Default)]
     struct Faults {
+        launch: LaunchBehavior,
         snapshot: SnapshotBehavior,
         fail_exec: bool,
         pause: PauseBehavior,
@@ -972,6 +1074,7 @@ mod tests {
         let shutdowns = Arc::new(AtomicUsize::new(0));
         let launches: LaunchLog = Arc::default();
         let launcher = FakeLauncher {
+            launch_behavior: faults.launch,
             next_vmid: AtomicU64::new(1),
             shutdowns: shutdowns.clone(),
             snapshot_behavior: faults.snapshot,
@@ -1002,6 +1105,86 @@ mod tests {
             reg.get(&created.info.id).await,
             Err(DaemonError::NotFound(_))
         ));
+    }
+
+    // The live-id snapshot the periodic orphan sweeper runs against (design §17, Open gaps and
+    // future capabilities). Three facts in one test, because they are one law: a launch in flight is
+    // COUNTED (the sweeper defers), the launched VM's vmid appears in the set once its slot is in the
+    // table, and the count is back to zero by then.
+    //
+    // RED on the inverse: delete the `LaunchGuard::claim` in `create` and the mid-launch assertion
+    // reads 0 — a booting VM whose netns/tap/cgroup/scratch already exist under a vmid no live set
+    // names, which is exactly the resource a liveness-blind periodic pass reaps.
+    #[tokio::test]
+    async fn a_launch_in_flight_is_counted_until_its_slot_is_in_the_table() {
+        let gate = Arc::new(HandleGate::default());
+        let (reg, _s, _log, _d) = registry_faulty(Faults {
+            launch: LaunchBehavior::Blocked(gate.clone()),
+            ..Faults::default()
+        });
+        let reg = Arc::new(reg);
+
+        let before = reg.live_ids().await;
+        assert_eq!(
+            before,
+            LiveIds::default(),
+            "an empty registry knows nothing"
+        );
+
+        let creating = tokio::spawn({
+            let reg = reg.clone();
+            async move { reg.create(create_req()).await.expect("create").info }
+        });
+        gate.entered.notified().await;
+
+        let during = reg.live_ids().await;
+        assert_eq!(
+            during.launches_in_flight, 1,
+            "the launch window must be visible to the sweeper"
+        );
+        assert!(
+            during.vmids.is_empty(),
+            "the launching VM is deliberately NOT in the table yet — that is the window"
+        );
+
+        gate.release.notify_one();
+        let info = creating.await.expect("join");
+
+        let after = reg.live_ids().await;
+        assert_eq!(
+            after.launches_in_flight, 0,
+            "the window closes once the slot is inserted"
+        );
+        assert_eq!(
+            after.vmids,
+            std::collections::BTreeSet::from([info.vmid]),
+            "the live set now names the VM the sweeper must not touch"
+        );
+
+        reg.destroy(&info.id).await.expect("destroy");
+        assert_eq!(
+            reg.live_ids().await,
+            LiveIds::default(),
+            "a torn-down VM leaves the live set, so its residue becomes reclaimable"
+        );
+    }
+
+    // The guard releases on the ERROR path too. A launch that fails leaves the count at zero, so a
+    // daemon whose VMM never comes up does not permanently disable its own periodic sweeper.
+    //
+    // RED on the inverse: replace `LaunchGuard`'s `Drop` with an explicit decrement after the insert
+    // — the failing `create` returns through `?` and the count sticks at 1 forever.
+    #[tokio::test]
+    async fn a_failed_launch_closes_its_window() {
+        let (reg, _s, _log, _d) = registry_faulty(Faults {
+            launch: LaunchBehavior::Fails,
+            ..Faults::default()
+        });
+        assert!(matches!(
+            reg.create(create_req()).await,
+            Err(DaemonError::Internal(_))
+        ));
+        assert_eq!(reg.live_ids().await, LiveIds::default());
     }
 
     #[tokio::test]
@@ -1280,6 +1463,59 @@ mod tests {
     // gate the fs-blind FakeHandle cannot cover on its own. RED on the pre-fix ordering
     // (`create_dir_all` before the slot lookup), which creates `snap-missing/` before returning
     // NotFound; a leftover empty dir would shadow a later artifact/snapshot of the same name.
+    // The snapshot path goes through the SAME quota predicate the upload path does (§17, Open gaps
+    // and future capabilities). A full store refuses the snapshot BEFORE the prefix directory is
+    // created, so the refusal is both loud and residue-free — and the VM is still `Ready`
+    // afterwards, because nothing about it was touched.
+    //
+    // RED on the inverse: delete the `check_quota_headroom()` call from `Registry::snapshot` and the
+    // snapshot writes into a store the operator capped, past its ceiling.
+    #[tokio::test]
+    async fn a_snapshot_into_a_full_store_is_refused_before_any_directory_is_created() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let art_dir = dir.path().join("artifacts");
+        let seed = ArtifactStore::open(&art_dir, 1 << 20).expect("seed store");
+        seed.create("vmlinux", b"kernel").expect("kernel");
+        seed.create("rootfs.erofs", b"rootfs").expect("rootfs");
+        let full = seed.usage().expect("usage").used_bytes;
+        let artifacts = ArtifactStore::open(&art_dir, 1 << 20)
+            .expect("store")
+            .with_quota(Some(full));
+        let reg = Registry::new(
+            Box::new(FakeLauncher {
+                launch_behavior: LaunchBehavior::Normal,
+                next_vmid: AtomicU64::new(1),
+                shutdowns: Arc::new(AtomicUsize::new(0)),
+                snapshot_behavior: SnapshotBehavior::Normal,
+                fail_exec: false,
+                pause_behavior: PauseBehavior::Normal,
+                vcpu_calls: Arc::default(),
+                launches: Arc::default(),
+            }),
+            artifacts,
+            7,
+        );
+        let created = reg.create(create_req()).await.expect("create");
+
+        let err = reg
+            .snapshot(&created.info.id, "snap")
+            .await
+            .expect_err("a full store refuses the snapshot");
+        assert!(
+            matches!(err, DaemonError::PayloadTooLarge(_)),
+            "got {err:?}"
+        );
+        assert!(
+            !art_dir.join("snap").exists(),
+            "and leaves no prefix directory behind"
+        );
+        assert_eq!(
+            reg.get(&created.info.id).await.expect("get").state,
+            VmState::Ready,
+            "the VM is untouched by a refusal that never reached it"
+        );
+    }
+
     #[tokio::test]
     async fn snapshot_on_missing_vm_leaves_no_residue_dir() {
         let (reg, _s, _d) = registry();

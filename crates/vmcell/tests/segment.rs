@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use vmcell::MicroVm;
 use vmcell::config::{Egress, NetConfig, RootfsSource, VmConfig};
-use vmcell::net::NetSegment;
+use vmcell::net::{Impairment, NetSegment};
 use vmcell::steward::protocol::ExecRequest;
 use vmcell::vmm::Vmm;
 
@@ -247,16 +247,6 @@ fn links_in_segment(segment: &NetSegment) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
-/// `nsenter --net=<segment netns> tc <args…>` — §6.5 exposes the *names*, not a typed impairment
-/// API, so the fault-injection legs shell out exactly as a downstream harness would.
-fn tc_in_segment(segment: &NetSegment, args: &[&str]) -> std::process::Output {
-    let mut cmd = std::process::Command::new("nsenter");
-    cmd.arg(format!("--net={}", segment.netns_path().display()))
-        .arg("tc")
-        .args(args);
-    cmd.output().expect("nsenter tc must be runnable")
-}
-
 // ---------------------------------------------------------------------------------------------
 // Legs
 // ---------------------------------------------------------------------------------------------
@@ -467,34 +457,34 @@ async fn segment_netem_delay_impl<V: Vmm>(vmm: &V) {
         .addresses()
         .expect("addresses")
         .1;
-    let a_tap = a.segment_membership().expect("membership").tap_name.clone();
-    let b_tap = b.segment_membership().expect("membership").tap_name.clone();
+    let (a_vmid, b_vmid) = (a.vmid(), b.vmid());
 
     // Warm up (and prove the link works) before timing anything.
     echo_probe_until_ok(&mut a, &b_ip, ECHO_PORT, "WARMUP", 20).await;
 
     let baseline = time_exchanges(&mut a, b_ip).await;
 
-    // netem on the root qdisc of each member tap delays every frame the bridge forwards INTO that
-    // guest, so a connect + echo crosses the impairment several times per exchange.
-    for tap in [&a_tap, &b_tap] {
-        let out = tc_in_segment(
-            &segment,
-            &["qdisc", "add", "dev", tap, "root", "netem", "delay", "50ms"],
-        );
-        assert!(
-            out.status.success(),
-            "adding netem delay on {tap} failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+    // The impairment is a VALUE, built and validated once, then applied to each member through
+    // the typed API (§17, Segment refinements). It degrades traffic flowing *toward* each guest,
+    // so a connect + echo crosses it several times per exchange.
+    let slow = Impairment::builder()
+        .delay(Duration::from_millis(50))
+        .build()
+        .expect("a 50 ms delay is a legal impairment");
+    for vmid in [a_vmid, b_vmid] {
+        segment
+            .impair_member(vmid, &slow)
+            .unwrap_or_else(|e| panic!("impairing member {vmid} failed: {e}"));
     }
 
     let delayed = time_exchanges(&mut a, b_ip).await;
 
-    // Remove the impairment before asserting, so a failed assertion still leaves a clean segment.
-    for tap in [&a_tap, &b_tap] {
-        let _ = tc_in_segment(&segment, &["qdisc", "del", "dev", tap, "root"]);
-    }
+    // Remove the impairment before asserting, so a failed assertion still leaves a clean segment;
+    // the clears are checked after the property, so a clear failure never masks the real result.
+    let cleared: Vec<_> = [a_vmid, b_vmid]
+        .into_iter()
+        .map(|vmid| (vmid, segment.clear_impairment(vmid)))
+        .collect();
 
     // Three exchanges, each crossing >= 2 delayed hops (SYN + the echo), on two impaired taps:
     // the floor is deliberately loose (the point is a measurable shift, not a precise model).
@@ -503,6 +493,14 @@ async fn segment_netem_delay_impl<V: Vmm>(vmm: &V) {
         "50 ms netem on both member taps must measurably shift the guest-to-guest round trip: \
          baseline {baseline:?}, delayed {delayed:?}"
     );
+    for (vmid, outcome) in cleared {
+        outcome.unwrap_or_else(|e| panic!("clearing member {vmid}'s impairment failed: {e}"));
+    }
+
+    // Clearing twice is a no-op, not an error: the second call's postcondition already holds.
+    segment
+        .clear_impairment(a_vmid)
+        .expect("clearing an unimpaired member must succeed");
 
     // The link recovers once the qdisc is gone — the impairment was the cause, not a coincidence.
     let recovered = echo_probe_until_ok(&mut a, &b_ip, ECHO_PORT, "RECOVERED", 10).await;
@@ -534,32 +532,23 @@ async fn segment_netem_loss_impl<V: Vmm>(vmm: &V) {
         .addresses()
         .expect("addresses")
         .1;
-    let b_tap = b.segment_membership().expect("membership").tap_name.clone();
+    let b_vmid = b.vmid();
 
     // Positive control first: the link works before the partition.
     echo_probe_until_ok(&mut a, &b_ip, ECHO_PORT, "BEFORE", 20).await;
 
-    let out = tc_in_segment(
-        &segment,
-        &[
-            "qdisc", "add", "dev", &b_tap, "root", "netem", "loss", "100%",
-        ],
-    );
-    assert!(
-        out.status.success(),
-        "adding netem loss on {b_tap} failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    let partition = Impairment::builder()
+        .loss_percent(100)
+        .build()
+        .expect("total loss is a legal impairment");
+    segment
+        .impair_member(b_vmid, &partition)
+        .unwrap_or_else(|e| panic!("partitioning member {b_vmid} failed: {e}"));
 
     let (code, stdout) = echo_probe(&mut a, &b_ip, ECHO_PORT, "PARTITIONED").await;
 
     // Heal before asserting so a red leg still leaves the segment usable for teardown.
-    let del = tc_in_segment(&segment, &["qdisc", "del", "dev", &b_tap, "root"]);
-    assert!(
-        del.status.success(),
-        "removing the netem qdisc failed: {}",
-        String::from_utf8_lossy(&del.stderr)
-    );
+    let healed_ok = segment.clear_impairment(b_vmid);
 
     assert_ne!(
         code, 0,
@@ -569,6 +558,7 @@ async fn segment_netem_loss_impl<V: Vmm>(vmm: &V) {
         stdout.is_empty(),
         "no bytes may cross a fully-lossy link: {stdout:?}"
     );
+    healed_ok.unwrap_or_else(|e| panic!("clearing member {b_vmid}'s impairment failed: {e}"));
 
     // …and it heals: the SAME probe succeeds once the qdisc is gone.
     let healed = echo_probe_until_ok(&mut a, &b_ip, ECHO_PORT, "HEALED", 20).await;

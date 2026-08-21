@@ -4,13 +4,21 @@
 //! machine to access external networks while giving the host visibility,
 //! control over egress traffic, and test double capabilities.
 
+pub mod cassette;
 /// Module for test doubles and request interception
 pub mod doubles;
+/// The shipped handler — transparent reconstruction and the cassette wrapped around
+/// [`doubles::ProxyHandler`].
+pub(crate) mod handler;
 /// Module for generating and managing the MITM Root CA
 pub mod tls;
+/// Full MITM on the transparent (raw 80/443) egress path (§6.4, The transparent egress proxy).
+pub(crate) mod transparent;
 
 use crate::error::{Error, Result};
+use crate::proxy::cassette::{CassetteMiss, CassetteOptions, CassetteState};
 use crate::proxy::doubles::{ProxyHandler, TestDouble};
+use crate::proxy::handler::EgressHandler;
 use hudsucker::builder::ProxyBuilder;
 use std::net::SocketAddr;
 use std::os::unix::io::AsRawFd;
@@ -54,6 +62,7 @@ pub struct EgressProxy {
     requests: Arc<std::sync::Mutex<RequestLog>>,
     doubles: Arc<std::sync::RwLock<Vec<TestDouble>>>,
     record_path: Arc<std::sync::Mutex<Option<std::path::PathBuf>>>,
+    cassette: Arc<std::sync::Mutex<Option<CassetteState>>>,
 }
 
 /// Deadline for [`EgressProxy::drop`] to join the proxy worker before detaching
@@ -192,11 +201,13 @@ impl EgressProxy {
     /// original destination. Recover that destination from an accepted
     /// connection with [`original_destination`].
     ///
-    /// Note: `hudsucker` is an *explicit*-proxy MITM (it expects
-    /// `CONNECT`/absolute-form), so a true transparent intake additionally needs
-    /// the orchestrator to reconstruct absolute-form requests from the recovered
-    /// destination (or to steer the guest to the proxy explicitly). This method
-    /// supplies the transparent socket; the steering is the orchestrator's job.
+    /// `hudsucker` is an *explicit*-proxy MITM (it expects `CONNECT`/absolute-form), so the
+    /// reconstruction a raw intake needs is done by `transparent::serve_intake`, which every
+    /// connection — transparent or explicit — now arrives through: the `Host` header names the
+    /// destination of an origin-form HTTP request, and the ClientHello's SNI names the destination
+    /// of a raw TLS connection, which is then handed to `hudsucker` behind a synthesized `CONNECT`.
+    /// This method supplies the transparent *socket*; the steering (the `TPROXY` ruleset) is the
+    /// orchestrator's job.
     ///
     /// # Errors
     /// Returns an error if binding the transparent listener (which needs
@@ -215,8 +226,12 @@ impl EgressProxy {
 
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
         let record_path = Arc::new(std::sync::Mutex::new(None));
+        let cassette: Arc<std::sync::Mutex<Option<CassetteState>>> =
+            Arc::new(std::sync::Mutex::new(None));
         let requests_clone = requests.clone();
+        let intake_requests = requests.clone();
         let record_path_clone = record_path.clone();
+        let cassette_clone = cassette.clone();
         let doubles = cfg.doubles.clone();
 
         // We run the proxy in its own thread to apply `setns` if needed
@@ -377,12 +392,56 @@ impl EgressProxy {
                 };
                 let ca_cert_pem = ca_manager.ca_cert_pem().to_string();
 
-                let handler = ProxyHandler {
-                    doubles: cfg.doubles.clone(),
-                    blocked_domains: cfg.blocked_domains.clone(),
-                    requests: requests_clone,
-                    record_path: record_path_clone,
+                let handler = EgressHandler::new(
+                    ProxyHandler {
+                        doubles: cfg.doubles.clone(),
+                        blocked_domains: cfg.blocked_domains.clone(),
+                        requests: requests_clone,
+                        record_path: record_path_clone,
+                    },
+                    cassette_clone,
+                );
+
+                // THE TRANSPARENT INTAKE (§6.4, The transparent egress proxy). `hudsucker` is an
+                // explicit-proxy MITM, so it is given a private loopback listener and every
+                // connection reaches it through `transparent::serve_intake`, which recovers the
+                // destination a transparently-redirected connection names nowhere in HTTP — the
+                // `Host` header for plain HTTP, the ClientHello's SNI for TLS (behind a synthesized
+                // `CONNECT`, the intake hudsucker does understand). An explicit-proxy connection is
+                // classified on its first byte and spliced through unchanged.
+                //
+                // The inner listener is bound HERE, after the host-netns re-entry above, so it and
+                // the intake's dial to it are both in the host namespace; the outer listener keeps
+                // the VM-netns binding (and its `IP_TRANSPARENT`) it was created with.
+                let inner_listener =
+                    match TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await {
+                        Ok(l) => l,
+                        Err(e) => {
+                            publish_startup(
+                                tx,
+                                Err(format!("Failed to bind the MITM intake listener: {e}")),
+                            );
+                            return;
+                        }
+                    };
+                let inner_addr = match inner_listener.local_addr() {
+                    Ok(addr) => addr,
+                    Err(e) => {
+                        publish_startup(
+                            tx,
+                            Err(format!("Failed to read the MITM intake address: {e}")),
+                        );
+                        return;
+                    }
                 };
+                tokio::spawn(transparent::serve_intake(
+                    listener,
+                    Arc::new(transparent::IntakeCtx {
+                        inner: inner_addr,
+                        proxy_port: port,
+                        requests: intake_requests,
+                    }),
+                ));
                 // Use `with_listener` directly instead of dropping and binding again.
                 // hudsucker takes ownership of the listener and uses it.
                 let shutdown_signal = async {
@@ -397,7 +456,7 @@ impl EgressProxy {
                 };
 
                 let proxy = match ProxyBuilder::new()
-                    .with_listener(listener)
+                    .with_listener(inner_listener)
                     .with_ca(authority)
                     .with_rustls_connector(rustls::crypto::aws_lc_rs::default_provider())
                     .with_http_handler(handler)
@@ -450,6 +509,7 @@ impl EgressProxy {
             requests,
             doubles,
             record_path,
+            cassette,
         })
     }
 
@@ -486,13 +546,71 @@ impl EgressProxy {
     /// line per request, for the eval layer.
     ///
     /// This is request-line logging only: it captures neither the response
-    /// (status/body) nor blocked (`403`) requests, so it does **not** support
-    /// replay — a snapshot-and-replay cassette is forward work (design §17). The
-    /// fs-write branch it drives is gated by
+    /// (status/body) nor blocked (`403`) requests, so it does **not** support replay. For that,
+    /// use [`record_cassette`](Self::record_cassette) / [`replay_cassette`](Self::replay_cassette),
+    /// which record the whole interaction. The fs-write branch this drives is gated by
     /// `doubles::tests::record_to_writes_forwarded_request_to_cassette`.
     pub fn record_to(&self, cassette: &std::path::Path) {
         let mut rp = self.record_path.lock().unwrap_or_else(|e| e.into_inner());
         *rp = Some(cassette.to_path_buf());
+    }
+
+    /// Starts **recording** a snapshot-and-replay cassette to `path` (§6.4, The transparent egress
+    /// proxy) — the facility [`record_to`](Self::record_to)'s request-line log is not.
+    ///
+    /// Every request the proxy *forwards upstream* is recorded with the response it produced:
+    /// [`interaction_key`](cassette::interaction_key), status, the
+    /// [`RECORDED_RESPONSE_HEADERS`](cassette::RECORDED_RESPONSE_HEADERS) allowlist, and the body.
+    /// A request answered by a test double or refused by the deny list is **not** recorded — a
+    /// cassette holds real interactions, so replaying one is not a tautology.
+    ///
+    /// A cassette is a persisted artifact, so no request header, no request body, and no
+    /// non-allowlisted response header is ever written; see the [`cassette`] module docs for the
+    /// full rule and its one stated hole (a secret in a URI *path*).
+    ///
+    /// # Errors
+    /// Returns [`Error::Proxy`] if `path` already exists (recording is create-only, so two runs
+    /// cannot silently interleave into one file) or cannot be created.
+    pub fn record_cassette(&self, path: &std::path::Path, opts: CassetteOptions) -> Result<()> {
+        let state = CassetteState::open_record(path, opts)?;
+        let mut slot = self.cassette.lock().unwrap_or_else(|e| e.into_inner());
+        *slot = Some(state);
+        Ok(())
+    }
+
+    /// Starts **replaying** the cassette at `path`, with no upstream at all.
+    ///
+    /// Every request that reaches the cassette stage is answered from the file; a request with no
+    /// unconsumed recorded interaction is a typed [`CassetteError::Miss`](cassette::CassetteError)
+    /// served to the guest as a `504` and retained for [`cassette_misses`](Self::cassette_misses).
+    /// Replay never falls through to the network — a fall-through would make a green replay run
+    /// evidence of nothing.
+    ///
+    /// The cassette is loaded eagerly, so a missing, corrupt, foreign-format or empty file fails
+    /// here rather than one indistinguishable `504` at a time.
+    ///
+    /// # Errors
+    /// Returns [`Error::Proxy`] if the cassette cannot be read, holds a line that is not a
+    /// [`CASSETTE_FORMAT`](cassette::CASSETTE_FORMAT) interaction, or holds no interactions.
+    pub fn replay_cassette(&self, path: &std::path::Path, opts: CassetteOptions) -> Result<()> {
+        let state = CassetteState::open_replay(path, opts)?;
+        let mut slot = self.cassette.lock().unwrap_or_else(|e| e.into_inner());
+        *slot = Some(state);
+        Ok(())
+    }
+
+    /// Every replay request that matched no unconsumed recorded interaction, in order.
+    ///
+    /// Empty while recording, or with no cassette. Typed data rather than a log line to grep: a
+    /// replay test asserts this is empty, and a deliberate-miss test asserts what is in it.
+    #[must_use]
+    pub fn cassette_misses(&self) -> Vec<CassetteMiss> {
+        self.cassette
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(CassetteState::misses)
+            .unwrap_or_default()
     }
 }
 
@@ -582,10 +700,10 @@ fn bind_ipv4(fd: std::os::unix::io::RawFd, addr: &std::net::SocketAddrV4) -> Res
 /// [`original_destination`].
 ///
 /// Note: the MITM stack (`hudsucker`) is an *explicit*-proxy intake (it expects
-/// `CONNECT`/absolute-form). This function supplies the `IP_TRANSPARENT` socket
-/// and original-destination recovery the orchestrator needs to build the
-/// transparent front-end on top; the wiring (and steering the guest, or
-/// reconstructing absolute-form requests) is the orchestrator's responsibility.
+/// `CONNECT`/absolute-form), so this socket's connections reach it through
+/// `transparent::serve_intake`, which recovers the destination and reconstructs the request.
+/// This function supplies the `IP_TRANSPARENT` socket and original-destination recovery; the
+/// steering (the `TPROXY` ruleset) is the orchestrator's responsibility.
 ///
 /// Setting `IP_TRANSPARENT` requires `CAP_NET_ADMIN`; without it this returns an
 /// error rather than silently degrading to a non-transparent bind.

@@ -3930,7 +3930,7 @@ dependencies = [
 
 [[package]]
 name = "vmcell"
-version = "0.23.1"
+version = "0.23.2"
 dependencies = [
  "am-fs-erofs",
  "assert_cmd",
@@ -4063,7 +4063,7 @@ dependencies = [
 
 [[package]]
 name = "vmcell-daemon"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "async-trait",
  "axum",

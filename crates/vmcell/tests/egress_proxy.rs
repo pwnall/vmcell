@@ -2,6 +2,7 @@ use hudsucker::Body;
 use hyper::Response;
 use vmcell::MicroVm;
 use vmcell::config::{Egress, ProxyConfig, RootfsSource, VmConfig};
+use vmcell::proxy::cassette::CassetteOptions;
 use vmcell::proxy::doubles::TestDouble;
 use vmcell::steward::protocol::ExecRequest;
 use vmcell::vmm::VmInstance;
@@ -483,19 +484,23 @@ async fn test_egress_privileged_filtered_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
         "egress ruleset must carry the catch-all drop for non-web traffic; applied ruleset:\n{ruleset}"
     );
 
-    // Behavioral corroboration (SECONDARY, not the security gate): a transparent
-    // curl (no http_proxy) must NOT be served the explicit-proxy MITM double —
-    // that double is only returned on the explicit CONNECT/absolute-form path
-    // proven by the CONTROL above. This is deliberately not load-bearing (it is
-    // filter-independent, per the note above); the applied-ruleset check is.
+    // Behavioral corroboration (SECONDARY, not the security gate — the applied-ruleset check above
+    // is): a transparent curl (no http_proxy) is now FULLY MITM'd, so it is served the same double
+    // the explicit-proxy CONTROL got.
     //
-    // NOTE (host validation needed): hudsucker does not yet reconstruct
-    // absolute-form requests from a transparently-redirected connection, so the
-    // transparent path CONSTRAINS egress (the ruleset asserted above) but does
-    // not yet emit a 403 body for raw transparent traffic. See
-    // implementation-notes.md (H-PROXY-1): privileged transparent intake is
-    // wired at the socket layer (IP_TRANSPARENT + original-destination recovery)
-    // pending absolute-form reconstruction in the MITM layer.
+    // THIS ASSERTION IS INVERTED FROM WHAT IT USED TO BE, and the inversion is the point. It used
+    // to read `!starts_with("MITM SUCCESS!")` with a note that "hudsucker does not yet reconstruct
+    // absolute-form requests from a transparently-redirected connection" — §6.4's recorded
+    // limitation. `proxy::transparent::serve_intake` closes it: the ClientHello's SNI names the
+    // destination, and the connection reaches hudsucker behind a synthesized CONNECT. Leaving the
+    // old assertion in place would have made this suite red on the very fix it was describing.
+    //
+    // UNRUN BY THE CHANGE THAT WROTE IT: this leg needs CAP_NET_ADMIN and the blessed privileged
+    // runner. The identical intake is exercised live on the unprivileged NAT by
+    // `test_transparent_mitm_and_cassettes_unprivileged` (same `serve_intake`, same SNI recovery,
+    // same synthesized CONNECT); what only THIS leg can prove is the privileged half of
+    // `transparent::connect_port` — that a TPROXY-preserved original destination is the port the
+    // synthesized CONNECT names.
     let transparent = steward
         .exec(ExecRequest::new(vec![
             "curl".into(),
@@ -503,7 +508,7 @@ async fn test_egress_privileged_filtered_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
             "-k".into(),
             "-sS".into(),
             "--max-time".into(),
-            "5".into(),
+            "15".into(),
             "--resolve".into(),
             "example.com:443:1.2.3.4".into(),
             "https://example.com".into(),
@@ -511,9 +516,346 @@ async fn test_egress_privileged_filtered_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
         .await
         .expect("Failed to execute transparent curl");
     assert!(
-        !transparent.stdout.starts_with(b"MITM SUCCESS!"),
-        "the transparent path must NOT serve the explicit-proxy MITM double; got: {}",
-        String::from_utf8_lossy(&transparent.stdout)
+        transparent.stdout.starts_with(b"MITM SUCCESS!"),
+        "the transparent TPROXY path must now be fully MITM-intercepted (SNI + synthesized \
+         CONNECT), not merely constrained; got: {} / {}",
+        String::from_utf8_lossy(&transparent.stdout),
+        String::from_utf8_lossy(&transparent.stderr)
+    );
+
+    vm.shutdown().await.expect("Shutdown failed");
+}
+
+// ---------------------------------------------------------------------------
+// §6.4's two closed gaps, on the one live path a reviewer without the blessed
+// runner can actually execute: FULL MITM ON THE TRANSPARENT INTAKE, and
+// SNAPSHOT-AND-REPLAY CASSETTES.
+// ---------------------------------------------------------------------------
+
+/// Runs `curl` in the guest with no proxy environment at all, so its packets take the
+/// transparent path (the unprivileged NAT's L4 interception, §6.4) rather than an explicit
+/// proxy. `--resolve` stands in for DNS, which the NAT does not forward.
+async fn transparent_curl(
+    steward: &mut vmcell::steward::StewardClient,
+    host: &str,
+    port: u16,
+    url: &str,
+) -> vmcell::steward::protocol::ExecOutcome {
+    steward
+        .exec(ExecRequest::new(vec![
+            "curl".into(),
+            "-4".into(),
+            "-k".into(),
+            "-sS".into(),
+            "--max-time".into(),
+            "15".into(),
+            "--resolve".into(),
+            format!("{host}:{port}:1.2.3.4"),
+            url.into(),
+        ]))
+        .await
+        .expect("transparent curl could not be executed in the guest")
+}
+
+/// Runs `curl` in the guest steered at the proxy explicitly — the intake `hudsucker` always
+/// understood, used here as the positive control and as the cassette legs' transport.
+async fn proxied_curl(
+    steward: &mut vmcell::steward::StewardClient,
+    gateway: &str,
+    proxy_port: u16,
+    url: &str,
+) -> vmcell::steward::protocol::ExecOutcome {
+    steward
+        .exec(
+            ExecRequest::new(vec![
+                "curl".into(),
+                "-4".into(),
+                "-k".into(),
+                "-sS".into(),
+                "--max-time".into(),
+                "15".into(),
+                url.into(),
+            ])
+            .with_env(vec![
+                (
+                    "http_proxy".to_string(),
+                    format!("http://{gateway}:{proxy_port}"),
+                ),
+                (
+                    "https_proxy".to_string(),
+                    format!("http://{gateway}:{proxy_port}"),
+                ),
+            ]),
+        )
+        .await
+        .expect("explicit-proxy curl could not be executed in the guest")
+}
+
+// UNPRIVILEGED NAMING (`just test-unprivileged` selects `test(unprivileged)`).
+//
+// PART B — FULL MITM ON THE TRANSPARENT PATH (§6.4). Before this, a guest that curled a raw
+// 80/443 destination got its egress *constrained* and nothing more: `hudsucker` is an
+// explicit-proxy MITM, so an origin-form `GET /` (no absolute URI) and a raw TLS ClientHello
+// (no HTTP at all) both named a destination the proxy could not recover. The three treatment
+// legs below assert the fix on the DATA PLANE — the intercepted body reaching the guest — with
+// the explicit-proxy leg as the control proving the proxy was reachable either way.
+//
+// PART A — SNAPSHOT-AND-REPLAY CASSETTES (§6.4). Recorded against a real host service, then
+// replayed with that service KILLED: the recorded body reaching the guest over a dead upstream
+// is the assertion, and the dead-upstream curl in between is the control proving the replay is
+// not just the network still working.
+//
+// RED ON THE INVERSE, per leg: drop `transparent::reconstruct_absolute_uri` and the plain-HTTP
+// leg gets no double (its URI stays `/`); drop the ClientHello/SNI intake and the TLS leg dies
+// with hudsucker's "unexpected eof" (the failure §6.4 recorded); drop the `handle_response`
+// capture and the replay leg misses; make a miss fall through to the upstream and the miss leg
+// gets a transport error instead of the typed 504.
+#[cfg(feature = "cloud-hypervisor")]
+#[tokio::test]
+#[ignore = "unprivileged transparent MITM + cassettes: needs KVM + unprivileged vhost-user-net; selected by `just test-unprivileged`"]
+async fn test_transparent_mitm_and_cassettes_unprivileged() {
+    let vmm = vmcell::vmm::cloud_hypervisor::CloudHypervisor::new(common::ch_bin());
+    // TEST-2: the CH primary path is not exempt from the capability check — `require_cap!` panics
+    // for cloud-hypervisor rather than skipping green.
+    require_cap!(
+        vmcell::vmm::Vmm::capabilities(&vmm),
+        unprivileged_vhost_user_net,
+        vmm
+    );
+
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let vmlinux = common::get_vmlinux();
+    let rootfs = common::get_rootfs();
+
+    let mut proxy_cfg = ProxyConfig::default();
+    proxy_cfg.blocked_domains = vec!["blocked.com".to_string()];
+    proxy_cfg.doubles = std::sync::Arc::new(std::sync::RwLock::new(vec![TestDouble {
+        matcher: Box::new(|req| {
+            req.method() != hyper::Method::CONNECT && req.uri().host() == Some("example.com")
+        }),
+        responder: Box::new(|_req| {
+            Response::builder()
+                .status(200)
+                .body(Body::from("MITM SUCCESS!"))
+                .unwrap()
+        }),
+    }]));
+
+    // A real host service to record a real interaction against. Its own `Drop` kills it, so the
+    // fixture owns its cleanup on the panic path too.
+    let host_port = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    };
+    struct Cleanup(Option<std::process::Child>);
+    impl Cleanup {
+        fn kill_now(&mut self) {
+            if let Some(mut child) = self.0.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            self.kill_now();
+        }
+    }
+    let mut host_service = Cleanup(Some(
+        std::process::Command::new("python3")
+            .arg("-m")
+            .arg("http.server")
+            .arg(host_port.to_string())
+            .spawn()
+            .expect("python3 -m http.server"),
+    ));
+    // The cassette lives in a fixture tree that cleans itself up on the panic path as well.
+    let cassette_dir = tempfile::tempdir().expect("cassette tempdir");
+    let cassette = cassette_dir.path().join("egress.jsonl");
+
+    let mut cfg = VmConfig::builder(vmlinux, RootfsSource::Erofs { image: rootfs })
+        .build()
+        .unwrap();
+    cfg.net = vmcell::config::NetConfig::Unprivileged {
+        egress: Egress::Filtered(proxy_cfg),
+        host_services_port: Some(host_port),
+    };
+
+    let env = vmcell::HostEnv::hermetic();
+    let mut vm = MicroVm::start(&vmm, cfg, &env).await.expect("VM start");
+    let proxy_port = vm.proxy().expect("Filtered egress starts a proxy").port;
+    let vmid = vm.vmid();
+    let (gateway_ip, _g, _c) = vmcell::net::ip_math(vmid).expect("ip_math");
+    let gateway = gateway_ip.to_string();
+
+    let steward = vm.steward(None).await.expect("steward connects");
+    // The NAT needs a moment after the guest's addresses come up, exactly as the sibling test does.
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    // ---- CONTROL: the explicit-proxy intake, which always worked. A failure here means the
+    // proxy is unreachable, so the transparent legs below would be measuring the wrong thing.
+    let control = proxied_curl(steward, &gateway, proxy_port, "http://example.com/").await;
+    assert!(
+        control.stdout.starts_with(b"MITM SUCCESS!"),
+        "CONTROL (explicit proxy) must be MITM-intercepted; got: {} / {}",
+        String::from_utf8_lossy(&control.stdout),
+        String::from_utf8_lossy(&control.stderr)
+    );
+
+    // ---- TREATMENT 1: transparent PLAIN HTTP. No proxy env at all: the guest opens a raw
+    // connection to port 80 and sends an ORIGIN-FORM request line. The destination exists only
+    // in the `Host` header, which is what `reconstruct_absolute_uri` recovers.
+    let plain = transparent_curl(steward, "example.com", 80, "http://example.com/").await;
+    assert!(
+        plain.stdout.starts_with(b"MITM SUCCESS!"),
+        "the transparent plain-HTTP intake must be MITM-intercepted (Host-header reconstruction); \
+         got: {} / {}",
+        String::from_utf8_lossy(&plain.stdout),
+        String::from_utf8_lossy(&plain.stderr)
+    );
+
+    // ---- TREATMENT 2: transparent TLS. Nothing in the stream is HTTP; the destination exists
+    // only in the ClientHello's SNI, which the intake reads before handing the connection to
+    // hudsucker behind a synthesized CONNECT.
+    let tls = transparent_curl(steward, "example.com", 443, "https://example.com/").await;
+    assert!(
+        tls.stdout.starts_with(b"MITM SUCCESS!"),
+        "the transparent TLS intake must be MITM-intercepted (SNI + synthesized CONNECT); \
+         got: {} / {}",
+        String::from_utf8_lossy(&tls.stdout),
+        String::from_utf8_lossy(&tls.stderr)
+    );
+
+    // ---- TREATMENT 3: the DENY LIST now applies to transparent traffic, which is the security
+    // half of the same fix — before it, a raw `GET /` + `Host: blocked.com` named no host for
+    // `is_blocked` to test at all.
+    let blocked = transparent_curl(steward, "blocked.com", 80, "http://blocked.com/").await;
+    assert!(
+        String::from_utf8_lossy(&blocked.stdout).contains("Blocked by vmcell Proxy"),
+        "a transparently-reconstructed blocked host must be denied in-guest; got: {} / {}",
+        String::from_utf8_lossy(&blocked.stdout),
+        String::from_utf8_lossy(&blocked.stderr)
+    );
+    // And its TLS twin: the SNI names a blocked host, so the synthesized CONNECT is refused and
+    // there is no tunnel — a transport failure in-guest, not a served page.
+    let blocked_tls = transparent_curl(steward, "blocked.com", 443, "https://blocked.com/").await;
+    assert_ne!(
+        blocked_tls.code,
+        0,
+        "a transparent TLS connection to a blocked host must fail, not tunnel; got: {} / {}",
+        String::from_utf8_lossy(&blocked_tls.stdout),
+        String::from_utf8_lossy(&blocked_tls.stderr)
+    );
+
+    // ---- PART A: RECORD. The host service is a real upstream, so this is a real forwarded
+    // interaction — a double's answer would make the replay below a tautology.
+    vm.proxy()
+        .expect("proxy")
+        .record_cassette(&cassette, CassetteOptions::default())
+        .expect("recording opens the cassette");
+    let steward = vm.steward(None).await.expect("steward");
+    let recorded = proxied_curl(
+        steward,
+        &gateway,
+        proxy_port,
+        &format!("http://127.0.0.1:{host_port}/"),
+    )
+    .await;
+    let recorded_body = String::from_utf8_lossy(&recorded.stdout).to_string();
+    assert!(
+        recorded_body.contains("Directory listing for"),
+        "the recorded leg must actually reach the host service; got: {recorded_body}"
+    );
+    let cassette_text = std::fs::read_to_string(&cassette).expect("cassette written to disk");
+    assert!(
+        cassette_text.contains(&format!("GET http://127.0.0.1:{host_port}/")),
+        "the cassette must hold the interaction's key: {cassette_text}"
+    );
+    assert!(
+        cassette_text.contains("Directory listing for"),
+        "the cassette must hold the RESPONSE BODY, which is what `record_to`'s request-line log \
+         could not: {cassette_text}"
+    );
+
+    // ---- THE NEGATIVE CONTROL FOR REPLAY: kill the upstream and prove it is gone. Without this,
+    // a green replay leg is equally explained by "the network still works".
+    host_service.kill_now();
+    let dead = proxied_curl(
+        steward,
+        &gateway,
+        proxy_port,
+        &format!("http://127.0.0.1:{host_port}/"),
+    )
+    .await;
+    assert!(
+        !String::from_utf8_lossy(&dead.stdout).contains("Directory listing for"),
+        "the host service must be DEAD before replay, or the replay leg proves nothing; got: {}",
+        String::from_utf8_lossy(&dead.stdout)
+    );
+
+    // ---- PART A: REPLAY. Same request, no upstream at all, and the RECORDED BODY reaches the
+    // guest. This is the assertion the whole feature exists for.
+    vm.proxy()
+        .expect("proxy")
+        .replay_cassette(&cassette, CassetteOptions::default())
+        .expect("replay loads the cassette");
+    let steward = vm.steward(None).await.expect("steward");
+    let replayed = proxied_curl(
+        steward,
+        &gateway,
+        proxy_port,
+        &format!("http://127.0.0.1:{host_port}/"),
+    )
+    .await;
+    assert!(
+        String::from_utf8_lossy(&replayed.stdout).contains("Directory listing for"),
+        "the replayed interaction's BODY must reach the guest with the upstream dead; got: {} / {}",
+        String::from_utf8_lossy(&replayed.stdout),
+        String::from_utf8_lossy(&replayed.stderr)
+    );
+
+    // ---- A MISS IS LOUD, and never a fall-through: a path the cassette never recorded is a typed
+    // 504 whose body names the miss, and the miss is retained as host-side data.
+    let missed = proxied_curl(
+        steward,
+        &gateway,
+        proxy_port,
+        &format!("http://127.0.0.1:{host_port}/never-recorded"),
+    )
+    .await;
+    assert!(
+        String::from_utf8_lossy(&missed.stdout).contains("cassette miss"),
+        "an unrecorded request must be answered by a loud cassette miss; got: {} / {}",
+        String::from_utf8_lossy(&missed.stdout),
+        String::from_utf8_lossy(&missed.stderr)
+    );
+
+    let misses = vm.proxy().expect("proxy").cassette_misses();
+    assert_eq!(
+        misses.iter().map(|m| m.key.clone()).collect::<Vec<_>>(),
+        vec![format!("GET http://127.0.0.1:{host_port}/never-recorded")],
+        "the miss must be retained as typed data, and ONLY the unrecorded request may miss"
+    );
+
+    // The host-observable record of the whole sequence.
+    let requests = vm.proxy().expect("proxy").requests();
+    for expected in ["CASSETTE RECORDED", "CASSETTE HIT", "504 CASSETTE MISS"] {
+        assert!(
+            requests.iter().any(|r| r.starts_with(expected)),
+            "the request log must carry a `{expected}` entry; got: {requests:?}"
+        );
+    }
+    assert!(
+        requests.iter().any(|r| r == "GET http://example.com/"),
+        "the transparent plain-HTTP request must be logged under its RECONSTRUCTED absolute URI \
+         (an un-reconstructed one logs as `GET /`); got: {requests:?}"
+    );
+    assert!(
+        requests
+            .iter()
+            .any(|r| r.starts_with("403 BLOCKED") && r.contains("blocked.com")),
+        "the transparent deny must be recorded host-side; got: {requests:?}"
     );
 
     vm.shutdown().await.expect("Shutdown failed");

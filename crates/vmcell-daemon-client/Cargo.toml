@@ -14,7 +14,7 @@ path = "src/lib.rs"
 [dependencies]
 # `default-features = false` links ONLY the wire DTOs + the name predicate from the daemon — never
 # its axum/vmcell server stack (design §11.1). One type on both sides of the wire.
-vmcell-daemon = { path = "../vmcell-daemon", version = "0.6.0", default-features = false }
+vmcell-daemon = { path = "../vmcell-daemon", version = "0.7.0", default-features = false }
 # `stream` is what makes `upload_artifact` STREAM a local file (§11.7 / §17): it enables
 # `impl From<tokio::fs::File> for reqwest::Body`, which wraps the file in a byte stream instead of
 # requiring the caller to hand over a `Vec` it read itself.

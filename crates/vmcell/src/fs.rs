@@ -256,22 +256,13 @@ impl VirtioFsDaemon {
     ) -> crate::error::Result<Self> {
         let socket_path = vm_tmp.join(format!("{}.sock", share.tag));
         let read_only = matches!(share.access, Access::ReadOnly);
-        // CFG-3: the in-process (fuse-backend-rs passthrough) backend cannot enforce a
-        // read-only share, so it must fail loud rather than silently mount it rw.
-        // Surface that as a typed, matchable `Error::Unsupported` (the capability
-        // contract) up front — instead of the stringly `Error::Subprocess` the
-        // daemon's `io::Error` was formerly wrapped into below. The in-process worker
-        // keeps the same refusal as a lower-layer backstop.
-        if read_only {
-            return Err(crate::error::Error::from_removal(
-                "in-process-virtiofsd",
-                &crate::feature::Removal {
-                    feature: crate::feature::Feature::VirtioFsShares,
-                    by: crate::feature::Source::Config,
-                    reason: "asks for a read-only share, which the in-process backend cannot serve",
-                },
-            ));
-        }
+        // CFG-3 (retired). A read-only share used to be refused here with a typed
+        // `Error::Unsupported`, because the in-process (fuse-backend-rs passthrough) backend could
+        // not enforce read-only and mounting it read-write would have been a silent write-through.
+        // It enforces it now: `in_process::backend::ReadOnlyFs` refuses every mutating FUSE
+        // operation with `EROFS` (§4.5), so the refusal would be a capability claim the code no
+        // longer makes — and §7.2 rule 3 wants the claim to match the behavior in both directions.
+        // The `read_only` flag is passed down instead of consumed here.
         // `start_in_process_virtiofsd` only returns `Ok` after the worker thread has
         // built the daemon and signalled that it has reached its serve loop; a
         // construction failure is reported as a typed error rather than a thread
@@ -799,38 +790,116 @@ mod drop_reaps_tests {
 mod ro_share_tests {
     use super::VirtioFsDaemon;
     use crate::config::{Access, CachePolicy, Share};
+    use std::path::{Path, PathBuf};
 
-    // CFG-3: the in-process (fuse-backend-rs passthrough) backend cannot enforce a
-    // read-only share, so `start_paced` must fail loud with a typed, matchable
-    // `Error::Unsupported` — NOT the stringly `Error::Subprocess` the daemon's
-    // `io::Error` was formerly wrapped into. This goes red if the refusal regresses to
-    // `Subprocess` (or, worse, silently mounts the share read-write).
-    //
-    // Driven through `start_paced` because it is the ONLY entry point: the unpaced `start` shim
-    // that used to sit beside it was deleted in the 0.22 -> 0.23 bump (ledgered), so a caller
-    // reaching for the shorter name is now a compile error rather than a deprecation warning.
+    /// A host share directory that removes itself on drop — on the panic path as much as the
+    /// success one, because a test's own fixtures are residue too (AGENTS.md).
+    struct ShareDir(PathBuf);
+
+    impl ShareDir {
+        fn create(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "vmcell-fs-{tag}-{}-{}",
+                std::process::id(),
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir_all(&dir).expect("create host share dir");
+            std::fs::write(dir.join("seed.txt"), b"hello").expect("seed the share");
+            Self(dir)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for ShareDir {
+        fn drop(&mut self) {
+            #[expect(
+                clippy::let_underscore_must_use,
+                reason = "fixture teardown in Drop has no caller to report to; the directory name is unique per run"
+            )]
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Stands in for the VMM: connects to the daemon's vhost-user socket and hangs up.
+    ///
+    /// Not optional scaffolding. `VhostUserDaemon::start` blocks in `accept()` until a frontend
+    /// connects, and `VirtioFsDaemon::drop` joins that thread — so a test that starts a daemon
+    /// nobody ever connects to hangs in teardown instead of asserting anything (no test had ever
+    /// started an in-process daemon before, so nothing had exercised that). Standing in for the
+    /// frontend is also the stronger assertion: the daemon really is *accepting*, not merely
+    /// holding a bound socket file. The hang-up is what the serve loop terminates on.
+    fn connect_as_the_frontend_and_hang_up(socket: &Path) {
+        let stream = std::os::unix::net::UnixStream::connect(socket)
+            .expect("the in-process daemon must be accepting on its vhost-user socket");
+        drop(stream);
+    }
+
+    /// CFG-3, inverted. A read-only share on the in-process backend used to be refused up front
+    /// with a typed `Error::Unsupported`, because the backend could not enforce read-only and
+    /// mounting it read-write would have been a silent write-through (design §4.5, Appendix B row
+    /// 6: "blocked on read-only enforcement"). It enforces it now —
+    /// `in_process::backend::ReadOnlyFs` answers every mutating FUSE operation with `EROFS` — so
+    /// the refusal is a claim the code no longer makes, and §7.2 rule 3 requires the two to agree.
+    ///
+    /// This is the **wiring** half, and it is not KVM-gated: it starts the real vhost-user daemon
+    /// (a `Listener` bound on a real socket, a real `PassthroughFs` imported over a real
+    /// directory) and asserts it comes up. `read_only_tests` in `fs/in_process.rs` is the
+    /// enforcement half, on the data plane. Goes RED if the typed refusal comes back, and red if
+    /// wrapping the filesystem breaks the mount.
+    ///
+    /// Driven through `start_paced` because it is the ONLY entry point (the unpaced `start` shim
+    /// beside it was deleted on the 0.22 → 0.23 edge, ledgered).
     #[tokio::test]
-    async fn ro_share_is_unsupported_not_subprocess() {
-        let tmp = std::env::temp_dir().join(format!(
-            "vmcell-fs-ro-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&tmp).expect("create host share dir");
-        let share = Share::new("ro", &tmp, Access::ReadOnly, CachePolicy::Never);
+    async fn ro_share_starts_now_that_the_backend_enforces_read_only() {
+        let share_dir = ShareDir::create("ro-share");
+        let run_dir = ShareDir::create("ro-run");
+        let share = Share::new("ro", share_dir.path(), Access::ReadOnly, CachePolicy::Never);
 
-        let err = VirtioFsDaemon::start_paced(&share, &tmp, &crate::config::Timeouts::default())
-            .await
-            .expect_err("a read-only share must be refused by the in-process backend");
+        let daemon = VirtioFsDaemon::start_paced(
+            &share,
+            run_dir.path(),
+            &crate::config::Timeouts::default(),
+        )
+        .await
+        .expect("a read-only share must start now that the backend enforces read-only");
         assert!(
-            matches!(
-                &err,
-                crate::error::Error::Unsupported { feature, .. }
-                    if feature == crate::feature::Feature::VirtioFsShares.name()
-            ),
-            "expected a typed Unsupported naming virtio_fs_shares, got {err:?}"
+            daemon.socket_path.exists(),
+            "the in-process daemon must have bound its vhost-user socket"
         );
-        let _ = std::fs::remove_dir_all(&tmp);
+        connect_as_the_frontend_and_hang_up(&daemon.socket_path);
+        let socket_path = daemon.socket_path.clone();
+        drop(daemon);
+        assert!(
+            !socket_path.exists(),
+            "teardown must remove the socket it created"
+        );
+    }
+
+    /// The positive control the leg above needs: the read-write path reaches the same target, so a
+    /// read-only start that succeeded because *every* start succeeds trivially cannot pass alone.
+    #[tokio::test]
+    async fn rw_share_still_starts_unchanged() {
+        let share_dir = ShareDir::create("rw-share");
+        let run_dir = ShareDir::create("rw-run");
+        let share = Share::new(
+            "rw",
+            share_dir.path(),
+            Access::ReadWrite,
+            CachePolicy::Never,
+        );
+
+        let daemon = VirtioFsDaemon::start_paced(
+            &share,
+            run_dir.path(),
+            &crate::config::Timeouts::default(),
+        )
+        .await
+        .expect("a read-write share must start");
+        assert!(daemon.socket_path.exists());
+        connect_as_the_frontend_and_hang_up(&daemon.socket_path);
     }
 }
 

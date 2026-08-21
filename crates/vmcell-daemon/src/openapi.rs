@@ -57,6 +57,13 @@ pub const API_ROUTES: &[RouteDef] = &[
         summary: "Delete an artifact (409 if pinned by a live VM)",
     },
     RouteDef {
+        method: "GET",
+        path: "/v1/store",
+        op_id: "storeUsage",
+        authenticated: true,
+        summary: "Report the artifact store's usage against its quota",
+    },
+    RouteDef {
         method: "POST",
         path: "/v1/vms",
         op_id: "createVm",

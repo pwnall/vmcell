@@ -70,6 +70,8 @@ enum Command {
         #[command(subcommand)]
         op: ArtifactOp,
     },
+    /// Report the artifact store's usage against its quota (JSON).
+    Store,
     /// Create a VM and keep it (boot to steward-ready).
     Create {
         /// Kernel artifact name.
@@ -215,6 +217,10 @@ async fn run(cli: Cli) -> Result<i32, Box<dyn std::error::Error>> {
                     println!("deleted artifact {name}");
                 }
             }
+            Ok(0)
+        }
+        Command::Store => {
+            print_json(&client.store_usage().await?)?;
             Ok(0)
         }
         Command::Create { kernel, rootfs } => {

@@ -61,6 +61,27 @@ pub struct ArtifactInfo {
     pub sha256: String,
 }
 
+/// What the artifact store is holding, and against what ceiling (`GET /v1/store`, design §11.3, The
+/// artifact store; §17, Open gaps and future capabilities).
+///
+/// Exists so the quota is **observable** rather than only enforceable: without it a client's first
+/// news of a full store is a 413 on an upload it already started. `quota_bytes` is a plain `Option`
+/// with **no** `skip_serializing_if`, so `null` is always on the wire — deliberately not a presence
+/// attribute, which is the DTO shape that has bitten this project before (Appendix A reversal 10);
+/// there is nothing here for a non-self-describing codec to collapse.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoreUsage {
+    /// Bytes on disk under the artifacts directory — artifacts, digest sidecars, snapshot prefixes
+    /// and any residue alike, because that is what the quota bounds.
+    pub used_bytes: u64,
+    /// The configured whole-store quota, or `null` when the store is unbounded.
+    pub quota_bytes: Option<u64>,
+    /// How many listable artifacts the store holds (sidecars and residue excluded).
+    pub artifact_count: u64,
+    /// How many snapshot prefix directories the store holds.
+    pub snapshot_prefix_count: u64,
+}
+
 /// The guest networking mode for a created VM (design §11.5, The HTTP REST API and its OpenAPI document). The daemon holds the caps for the
 /// privileged path, so all three are available.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -653,6 +674,40 @@ mod tests {
             );
         }
         assert_eq!(NetMode::default(), NetMode::None, "the default is eligible");
+    }
+
+    // `StoreUsage`'s `quota_bytes` is an `Option` WITHOUT `skip_serializing_if`, so it is not a
+    // presence attribute at all: `null` is always on the wire and both codecs see the same shape.
+    // Both inhabitants round-trip, and the unbounded one is asserted to SERIALIZE the key rather
+    // than omit it — an omitted key is the shape that decodes identically here and differently on a
+    // non-self-describing codec (Appendix A reversal 10).
+    //
+    // RED on the inverse: add `#[serde(skip_serializing_if = "Option::is_none")]` to `quota_bytes`
+    // and the "quota_bytes" containment check fails on the unbounded leg.
+    #[test]
+    fn store_usage_round_trips_with_and_without_a_quota() {
+        for usage in [
+            StoreUsage {
+                used_bytes: 4096,
+                quota_bytes: Some(1 << 30),
+                artifact_count: 3,
+                snapshot_prefix_count: 1,
+            },
+            StoreUsage {
+                used_bytes: 0,
+                quota_bytes: None,
+                artifact_count: 0,
+                snapshot_prefix_count: 0,
+            },
+        ] {
+            let json = serde_json::to_string(&usage).expect("encode");
+            assert!(
+                json.contains("quota_bytes"),
+                "the key is always on the wire, even unbounded: {json}"
+            );
+            let back: StoreUsage = serde_json::from_str(&json).expect("decode");
+            assert_eq!(back, usage);
+        }
     }
 
     // Additive compatibility: an older client that omits the new fields still deserializes, and

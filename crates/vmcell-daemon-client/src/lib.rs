@@ -111,7 +111,7 @@ pub use vmcell_daemon::name;
 
 use dto::{
     ArtifactInfo, CreateVmRequest, CreateVmResponse, ErrorBody, ErrorKind, ExecOutcomeDto,
-    ExecRequestDto, ResourceUsageDto, SnapshotInfo, SnapshotRequest, VmId, VmInfo,
+    ExecRequestDto, ResourceUsageDto, SnapshotInfo, SnapshotRequest, StoreUsage, VmId, VmInfo,
 };
 
 /// The bytes to upload as an artifact: either in-memory or a local file the client streams.
@@ -322,6 +322,20 @@ impl DaemonClient {
     pub async fn delete_artifact(&self, artifact_name: &str) -> Result<(), ClientError> {
         let url = self.artifact_url(artifact_name)?;
         self.send_no_content(self.http.delete(url)).await
+    }
+
+    /// Reports the artifact store's usage against its quota (`GET /v1/store`, design §17, Open gaps
+    /// and future capabilities).
+    ///
+    /// The way to see a full store *before* an upload is refused: `quota_bytes` is `None` on an
+    /// unbounded daemon, and vmcelld never evicts to make room, so a client at the ceiling frees
+    /// space with [`DaemonClient::delete_artifact`].
+    ///
+    /// # Errors
+    /// [`ClientError`] on transport/decode/daemon failure.
+    pub async fn store_usage(&self) -> Result<StoreUsage, ClientError> {
+        let url = self.url("v1/store")?;
+        self.send_json(self.http.get(url)).await
     }
 
     // ---- VM lifecycle (one-to-one with the vmcell CLI verbs) ----
@@ -848,6 +862,78 @@ mod tests {
             .await
             .expect("upload");
         (info, server.await.expect("server join"))
+    }
+
+    // `store_usage` asks the daemon for `GET /v1/store` with the bearer key and decodes the reply
+    // into the shared DTO. The gate is the REQUEST LINE the client actually put on the wire, because
+    // a verb that targeted the wrong path would still decode a reply this test's own server sent.
+    //
+    // RED on the inverse: point `store_usage` at "v1/artifacts" (or drop the bearer header) and the
+    // request-line / authorization assertion fails.
+    #[tokio::test]
+    async fn store_usage_asks_the_store_route_with_the_key_and_decodes_the_reply() {
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.expect("accept");
+            let (rd, mut wr) = sock.into_split();
+            let mut rd = tokio::io::BufReader::new(rd);
+            let mut head = String::new();
+            loop {
+                let mut line = String::new();
+                let n = rd.read_line(&mut line).await.expect("read head line");
+                assert!(n > 0, "the client closed before finishing the head");
+                if line == "\r\n" {
+                    break;
+                }
+                head.push_str(&line);
+            }
+            let reply = serde_json::to_vec(&StoreUsage {
+                used_bytes: 4096,
+                quota_bytes: Some(1 << 20),
+                artifact_count: 2,
+                snapshot_prefix_count: 1,
+            })
+            .expect("encode");
+            wr.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                    reply.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("write head");
+            wr.write_all(&reply).await.expect("write body");
+            wr.flush().await.expect("flush");
+            head
+        });
+
+        let client = DaemonClient::new(
+            Url::parse(&format!("http://{addr}")).expect("url"),
+            "test-key",
+        )
+        .expect("client");
+        let usage = client.store_usage().await.expect("store usage");
+        // Also the inverse of the path assertion below: a client pointed at the wrong route would
+        // still decode THIS server's reply, which is why the head is checked as well.
+        assert_eq!(usage.used_bytes, 4096);
+        assert_eq!(usage.quota_bytes, Some(1 << 20));
+
+        let head = server.await.expect("server join");
+        assert!(
+            head.starts_with("GET /v1/store "),
+            "the verb must target the store route; head was:\n{head}"
+        );
+        assert!(
+            head.to_ascii_lowercase()
+                .contains("authorization: bearer test-key"),
+            "and carry the bearer key; head was:\n{head}"
+        );
     }
 
     // The file arm STREAMS, proven on the wire: the request carries `Transfer-Encoding: chunked` and
