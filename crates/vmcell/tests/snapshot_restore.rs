@@ -733,3 +733,320 @@ async fn test_snapshot_restore_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
         );
     }
 }
+
+/// The argv of the single live process whose command line names something inside `scratch` — the
+/// VMM this VM is actually running on, read straight out of the host process table.
+///
+/// Selected by the **per-VM scratch directory** (`--api-socket <scratch>/api.sock`), which is
+/// independent of the `--restore` argument the caller then asserts on: selecting the process by
+/// the very token under test would make the assertion vacuous. The restore source lives in a
+/// different directory (the per-leg snapshot copy), so it cannot satisfy this predicate.
+///
+/// Loud on anything but exactly one match: zero means the scratch-dir spelling moved and the scan
+/// is looking at nothing (the `gate misconfigured` shape, never a silent pass), more than one
+/// means a leaked VMM from an earlier leg is still alive and the argv read would be ambiguous.
+fn vmm_argv_in_scratch(scratch: &std::path::Path) -> Vec<String> {
+    let prefix = format!("{}/", scratch.display());
+    let mut found: Vec<Vec<String>> = Vec::new();
+    for entry in std::fs::read_dir("/proc").expect("the host /proc must be readable") {
+        let Ok(entry) = entry else { continue };
+        if entry
+            .file_name()
+            .to_str()
+            .is_none_or(|n| n.parse::<u32>().is_err())
+        {
+            continue;
+        }
+        // A pid can exit between the readdir and the read; that is not a failure.
+        let Ok(raw) = std::fs::read(entry.path().join("cmdline")) else {
+            continue;
+        };
+        let argv: Vec<String> = raw
+            .split(|b| *b == 0)
+            .filter(|part| !part.is_empty())
+            .map(|part| String::from_utf8_lossy(part).into_owned())
+            .collect();
+        if argv.iter().any(|arg| arg.starts_with(&prefix)) {
+            found.push(argv);
+        }
+    }
+    assert_eq!(
+        found.len(),
+        1,
+        "expected exactly one live VMM process naming the scratch dir {}, found {}: {found:#?}",
+        scratch.display(),
+        found.len()
+    );
+    found.pop().expect("length checked above")
+}
+
+/// The value of the live VMM's `--restore` argument, or a loud panic naming the whole argv.
+fn restore_arg_of(argv: &[String]) -> String {
+    let at = argv
+        .iter()
+        .position(|arg| arg == "--restore")
+        .unwrap_or_else(|| panic!("the restored VMM's argv carries no `--restore`: {argv:#?}"));
+    argv.get(at + 1)
+        .unwrap_or_else(|| panic!("`--restore` is the last argv entry: {argv:#?}"))
+        .clone()
+}
+
+/// D1 (docs/todo.md, "Shipped config knobs still never applied in a live boot"): both **non-default**
+/// [`vmcell::config::RestoreMode`]s, performed as real restores.
+///
+/// Until this leg, `Eager` and `Lazy` were shipped, documented and applied in no integration test at
+/// all — the only caller outside the crate was `vmcell-bench`, a tracked metric rather than a gate.
+/// A knob nobody boots is a claim nobody makes (AGENTS.md rule 4).
+///
+/// **Cloud-Hypervisor-only, and that is the honest scope.** The `prefault=on|off` modifier is a CH
+/// `--restore` argument; no other backend has an equivalent selector. The other three are honest
+/// about it rather than silent: `Lazy` is a typed `Unsupported { feature: "lazy_restore" }` on
+/// Firecracker, QEMU and crosvm through the one shared
+/// `vmm::reject_unadvertised_capabilities`, gated by a unit test in each backend crate, and `Eager`
+/// is what those three *do* — Firecracker's `backend_type: "File"`, QEMU's and crosvm's eager
+/// loads — so requesting it is honored, not dropped. Restoring three more backends here to watch
+/// `Eager` change nothing would cost three snapshot+restore cycles for no assertion.
+///
+/// **What this leg proves.** For each non-default mode: the restore really happens under that mode
+/// (the argument reaches the argv of the live `cloud-hypervisor` process, read from `/proc`), and
+/// the guest that comes back **moves a byte** — the same host→guest→host exchange over the VM's own
+/// tap that `snapshot_restore` asserts post-restore, with the identical pre-snapshot exchange as
+/// its positive control.
+///
+/// **What it does NOT prove.** Nothing here observes the *paging* behavior `prefault` selects: a
+/// leg that showed the VM booting under the flag would say the same thing if CH ignored the token.
+/// The honest split is that the composed argument is pinned exactly (here on a live process, and
+/// KVM-free in `cloud_hypervisor.rs`'s `every_restore_mode_reaches_the_composed_argv_as_its_prefault_modifier`),
+/// and that CH honors `prefault` is CH's contract, measured — not asserted — by `bench-vm`'s
+/// `--restore-mode` sweep (docs/benchmark-results.md, ≈1.5× faster resume under lazy).
+///
+/// **Exactly one variable.** Both legs restore from a private copy of the SAME snapshot, through
+/// the same config builder, differing only in `restore_mode` — the tuning battery's shape. The
+/// copies go through `env.overlay` (invariant S4, the one CoW seam) rather than a second
+/// hand-rolled copier, and each leg's copy is dropped before the next is minted, so the peak extra
+/// disk is one snapshot, not two. A restore rewrites its snapshot's `config.json` **in place**
+/// (§8.2), which is why each leg gets its own copy instead of re-restoring the master twice.
+/// [`MicroVm::restore_cow`] would mint that copy for us, but it puts it at an internal path inside
+/// the VM's own scratch dir — so the exact-equality assertion on the `--restore` value below would
+/// have to hard-code that internal spelling. The copy is made here instead, through the same seam,
+/// so the source path the assertion recomputes is one this test owns.
+///
+/// Red on the inverse: hand `spawn_ch` a hardcoded `RestoreMode::Default` instead of
+/// `cfg.restore_mode` — the seam the KVM-free pin structurally cannot cross, since it composes the
+/// `--restore` value itself — and both legs redden on the missing modifier. Swap CH's
+/// `prefault=on`/`prefault=off` arms and both redden naming the other token. Break the restored
+/// data plane (drop the `net[].tap` rewrite of §8.2) and `assert_guest_egress_byte` reddens.
+#[cfg(feature = "cloud-hypervisor")]
+#[tokio::test]
+#[ignore = "needs KVM"]
+async fn non_default_restore_modes_ship_their_prefault_argument_and_restore_a_live_guest() {
+    use vmcell::config::RestoreMode;
+    use vmcell::vmm::cloud_hypervisor::CloudHypervisor;
+
+    let vmm = CloudHypervisor::new(common::ch_bin());
+    let caps = vmcell::vmm::Vmm::capabilities(&vmm);
+    require_cap!(caps, snapshot_restore, vmm);
+    // `Lazy` is refused pre-spawn by the shared `reject_unadvertised_capabilities` unless the
+    // backend advertises it, so the Lazy leg below is only reachable on a backend that does.
+    require_cap!(caps, lazy_restore, vmm);
+
+    common::clean_vmcell_netns();
+    if !common::has_cap_net_admin() {
+        panic!(
+            "SKIP: the restore-mode legs need CAP_NET_ADMIN for privileged tap networking; \
+             not present in the effective capability set"
+        );
+    }
+
+    let kernel = common::get_vmlinux();
+    let rootfs_image = common::get_rootfs();
+
+    // OWNED: a CH guest-RAM snapshot is ~129 MB; the guard removes it on the success path AND on
+    // the panic path, so a red leg cannot leak it into the host tmpfs.
+    let scratch = common::TempTree::create(&format!(
+        "vmcell-test-restore-mode-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    let master_snapshot = scratch.join("snapshot");
+
+    let env = vmcell::HostEnv::hermetic();
+
+    // The ONE config the whole test varies: everything but `restore_mode` is fixed here.
+    let mk_cfg = |mode: RestoreMode| {
+        VmConfig::builder(
+            kernel.clone(),
+            RootfsSource::Erofs {
+                image: rootfs_image.clone(),
+            },
+        )
+        .net(vmcell::config::NetConfig::Privileged {
+            egress: vmcell::config::Egress::Open,
+        })
+        .snapshotting(true)
+        .restore_mode(mode)
+        .build()
+        .expect("build the restore-mode config")
+    };
+
+    // Take the master snapshot from a VM booted at the DEFAULT mode: `restore_mode` is consumed by
+    // `restore()`, never by `create()`, so the source VM must not vary with the legs.
+    {
+        let mut vm = MicroVm::start(&vmm, mk_cfg(RestoreMode::Default), &env)
+            .await
+            .expect("start the source VM");
+        vm.steward(None).await.expect("steward on the source VM");
+        // THE POSITIVE CONTROL for both legs' data-plane assertion, on the same VM over the tap
+        // the create path plumbed — so a red after a restore means "this mode's restore lost the
+        // data plane", never "python3 / the echo applet cannot run on this host". It also leaves
+        // the listener running into the snapshot.
+        assert_guest_egress_byte(&mut vm, "pre-snapshot").await;
+        std::fs::create_dir_all(&master_snapshot).expect("create the snapshot dir");
+        vm.snapshot(&master_snapshot).await.expect("snapshot");
+        vm.shutdown().await.expect("shut down the source VM");
+    }
+
+    for (mode, want_modifier, other_modifier) in [
+        (RestoreMode::Eager, ",prefault=on", ",prefault=off"),
+        (RestoreMode::Lazy, ",prefault=off", ",prefault=on"),
+    ] {
+        // A private copy per leg, through the one CoW seam (S4). Dropped at the end of the
+        // iteration, so at most one copy exists at a time.
+        let leg = common::TempTree::reserve(&format!(
+            "vmcell-test-restore-mode-leg-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        env.overlay
+            .clone_tree(&master_snapshot, leg.path())
+            .expect("clone the master snapshot for this leg");
+
+        let mut vm = MicroVm::restore(&vmm, leg.path(), mk_cfg(mode), &env)
+            .await
+            .unwrap_or_else(|e| panic!("restore under {mode:?} failed: {e}"));
+
+        // The SHIPPED argument, on the live VMM process — the half the KVM-free pin cannot reach,
+        // because it composes the `--restore` value itself instead of reading `cfg.restore_mode`
+        // through `spawn_ch`.
+        let scratch_dir = vm
+            .instance()
+            .vsock_path()
+            .parent()
+            .expect("the per-VM vsock socket lives inside the VM's scratch dir")
+            .to_path_buf();
+        let argv = vmm_argv_in_scratch(&scratch_dir);
+        let restore_arg = restore_arg_of(&argv);
+        assert_eq!(
+            restore_arg,
+            format!("source_url=file://{}{want_modifier}", leg.path().display()),
+            "the live cloud-hypervisor restored under {mode:?} must carry that mode's modifier; \
+             full argv: {argv:#?}"
+        );
+        assert!(
+            !restore_arg.contains(other_modifier),
+            "the {mode:?} leg must not carry {other_modifier:?}: {restore_arg}"
+        );
+
+        // THE DATA PLANE: a byte that actually left the restored guest through eth0 and came back,
+        // the same assertion `snapshot_restore` makes post-restore — not vsock liveness and not an
+        // exit code standing in for it.
+        assert_guest_egress_byte(&mut vm, &format!("post-restore-{mode:?}")).await;
+
+        vm.shutdown()
+            .await
+            .unwrap_or_else(|e| panic!("shut down the {mode:?}-restored VM: {e}"));
+
+        // Residue, both halves: the copy demonstrably EXISTED (so the CoW clone above was not a
+        // no-op the restore silently tolerated), and it is GONE once its owner drops — here on the
+        // success path and equally on the panic path of every assertion above, before the next leg
+        // mints one. Skipped under the documented post-mortem retention opt-in, whose whole
+        // purpose is to leave the tree behind.
+        assert!(
+            leg.path().join("config.json").exists(),
+            "the leg's snapshot copy must have existed before its owner drops it"
+        );
+        let leg_path = leg.path().to_path_buf();
+        let retained = std::env::var_os(common::KEEP_TEMP_ENV).is_some();
+        drop(leg);
+        assert!(
+            retained || !leg_path.exists(),
+            "the leg's snapshot copy must be gone once its owner drops: {}",
+            leg_path.display()
+        );
+    }
+}
+
+/// The KVM-free half of the leg above: the `/proc` scan and the argv reader it depends on, driven
+/// against real processes this test spawns.
+///
+/// Why it exists: the live leg's whole argv assertion rests on `vmm_argv_in_scratch` finding the
+/// right process, and that helper needs no VMM to be wrong. A scan that matched nothing, or that
+/// matched a *sibling* directory sharing the scratch dir's name as a prefix
+/// (`…-vm-1-7` vs `…-vm-1-70`), would take the live leg down with it — or, worse, hand it the wrong
+/// process's argv. So it runs everywhere `just test-unit` runs, not only on a KVM host.
+///
+/// Red on the inverse: drop the trailing `/` from `vmm_argv_in_scratch`'s prefix and the decoy
+/// process matches too, so the exactly-one assertion inside the helper reddens; make the scan
+/// return every process (or none) and the equality below reddens.
+#[test]
+fn the_scratch_dir_process_scan_finds_exactly_the_right_argv() {
+    let scratch = common::TempTree::create(&format!(
+        "vmcell-test-procscan-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    let wanted = scratch.join("api.sock");
+    // A DECOY whose path shares the scratch dir's name as a string prefix but is a different
+    // directory — the boundary a naive `starts_with` on the bare path would cross.
+    let decoy_dir = format!("{}-sibling", scratch.path().display());
+    let decoy = format!("{decoy_dir}/api.sock");
+
+    // `; true` keeps the shell alive with its ORIGINAL argv: a bare `sh -c 'sleep 30'` execs
+    // `sleep` and the path (passed as `$0`) vanishes from the process table with it.
+    let spawn = |marker: &str| {
+        std::process::Command::new("sh")
+            .args(["-c", "sleep 30; true", marker])
+            .spawn()
+            .expect("spawn the scan fixture")
+    };
+    let mut target = spawn(&wanted.display().to_string());
+    let mut decoy_proc = spawn(&decoy);
+    // Both children are in the table before the scan reads it.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    // Scan first, kill second: the children must be reaped even when the assertions below panic.
+    let scanned = std::panic::catch_unwind(|| vmm_argv_in_scratch(scratch.path()));
+    for child in [&mut target, &mut decoy_proc] {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    let argv = scanned.expect("the scan must find exactly one process under the scratch dir");
+
+    assert_eq!(
+        argv,
+        vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "sleep 30; true".to_string(),
+            wanted.display().to_string(),
+        ],
+        "the scan must return the target's whole argv, not the decoy's"
+    );
+
+    // The argv reader: the value is whatever follows `--restore`, even when an earlier argument
+    // merely looks like one.
+    let argv = [
+        "cloud-hypervisor",
+        "--seccomp",
+        "true",
+        "--restore",
+        "source_url=file:///snap,prefault=off",
+        "--api-socket",
+        "/x/api.sock",
+    ]
+    .map(String::from);
+    assert_eq!(
+        restore_arg_of(&argv),
+        "source_url=file:///snap,prefault=off"
+    );
+}

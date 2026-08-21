@@ -2245,6 +2245,111 @@ mod tests {
             "a restore splices `--restore <arg>` between the seccomp flag and the API socket"
         );
     }
+
+    // D1 (docs/todo.md, "Shipped config knobs still never applied in a live boot"): the WHOLE
+    // `RestoreMode` enum, driven from a real `VmConfig`'s `restore_mode` field and asserted on the
+    // COMPOSED argv.
+    //
+    // Why this is not a duplicate of the two gates above.
+    // `ch_restore_arg_maps_each_mode_to_its_prefault_modifier` pins the FRAGMENT — a perfect
+    // per-fragment mapping whose result never reaches the `Command` is precisely the defect
+    // AGENTS.md's "asserted on the **composed** argv, not on a fragment" exists for.
+    // `the_ch_launch_plan_composes_the_whole_argv` does assert the composed form, but for ONE mode
+    // (`Lazy`) out of three, from a hand-written argument rather than from a config: `Eager` and
+    // `Default` — the default arm being "the least-tested path" — reached no composed assertion at
+    // all, which is the T2 gap docs/90 recorded. Here each leg starts at `cfg.restore_mode` and
+    // ends at `LaunchPlan::argv()`, so the whole config→argv path for every variant is pinned.
+    //
+    // Red on the inverse: swap `ch_restore_arg`'s `prefault=on`/`prefault=off` arms and the
+    // Eager/Lazy legs redden (a silent eager/lazy inversion, the d7 class); give
+    // `RestoreMode::Default` a modifier and the Default leg reddens; drop `ch_launch_plan`'s
+    // `--restore` splice and all three redden.
+    #[test]
+    fn every_restore_mode_reaches_the_composed_argv_as_its_prefault_modifier() {
+        use crate::config::{RestoreMode, VmmSeccomp};
+
+        // The three configs differ in EXACTLY one field, so the argvs below differ in exactly
+        // what `restore_mode` selects.
+        let argv_for = |mode: RestoreMode| -> Vec<String> {
+            let cfg = VmConfig::builder(
+                "/boot/vmlinux",
+                crate::config::RootfsSource::Erofs {
+                    image: PathBuf::from("/img/rootfs.erofs"),
+                },
+            )
+            .vmm_seccomp(VmmSeccomp::Enforcing)
+            .restore_mode(mode)
+            .build()
+            .expect("build config");
+            assert_eq!(
+                cfg.restore_mode, mode,
+                "the builder must carry the requested mode onto the config it builds"
+            );
+            // The restore path composes its `--restore` value from `cfg.restore_mode`, exactly
+            // as `spawn_ch` does, and hands it to the one plan composer.
+            let restore_arg = ch_restore_arg(Path::new("/snap"), cfg.restore_mode);
+            ch_launch_plan(
+                Path::new("/usr/bin/cloud-hypervisor"),
+                &cfg,
+                &plan_test_res(),
+                Path::new("/tmp/api.sock"),
+                Some(&restore_arg),
+            )
+            .expect("build the restore plan")
+            .argv()
+        };
+
+        // `Default` omits the modifier entirely — CH's own default, no token spliced in.
+        assert_eq!(
+            argv_for(RestoreMode::Default),
+            [
+                "--seccomp",
+                "true",
+                "--restore",
+                "source_url=file:///snap",
+                "--api-socket",
+                "/tmp/api.sock",
+            ],
+            "RestoreMode::Default must ship a bare `source_url=` with no prefault modifier"
+        );
+        assert_eq!(
+            argv_for(RestoreMode::Eager),
+            [
+                "--seccomp",
+                "true",
+                "--restore",
+                "source_url=file:///snap,prefault=on",
+                "--api-socket",
+                "/tmp/api.sock",
+            ],
+            "RestoreMode::Eager must ship `prefault=on` (fault all guest memory at restore)"
+        );
+        assert_eq!(
+            argv_for(RestoreMode::Lazy),
+            [
+                "--seccomp",
+                "true",
+                "--restore",
+                "source_url=file:///snap,prefault=off",
+                "--api-socket",
+                "/tmp/api.sock",
+            ],
+            "RestoreMode::Lazy must ship `prefault=off` (userfaultfd demand paging)"
+        );
+
+        // Non-vacuity: the three argvs are pairwise DISTINCT, so none of the equalities above is
+        // passing against a composer that ignores its `restore_mode` argument and returns a
+        // constant. (An implementation that emitted the same token for every mode would satisfy
+        // at most one of the three assertions, but this states the property directly.)
+        let (d, e, l) = (
+            argv_for(RestoreMode::Default),
+            argv_for(RestoreMode::Eager),
+            argv_for(RestoreMode::Lazy),
+        );
+        assert_ne!(d, e, "Default and Eager must not compose the same argv");
+        assert_ne!(e, l, "Eager and Lazy must not compose the same argv");
+        assert_ne!(d, l, "Default and Lazy must not compose the same argv");
+    }
 }
 
 /// Source-level gate for §9.4's "`api_socket_poll` paces **every** daemon readiness wait" on the

@@ -508,21 +508,13 @@ async fn requested_io_max_is_refused_loudly_and_never_silently_unenforced() {
     };
 
     // Whether the `io` controller is even available to the VM slice's parent — the same file
-    // `metrics::try_apply_limit_at` consults, reached through the one `cgroup_base_from_proc` law
-    // rather than a second `/proc/self/cgroup` parse. (The whole-token match is spelled here
-    // because `metrics::controller_listed` is private; it is one line and the WHY is that `io`
-    // must not match an `ioX`.)
-    let base = std::fs::read_to_string("/proc/self/cgroup")
-        .ok()
-        .and_then(|c| vmcell::metrics::cgroup_base_from_proc(&c))
-        .expect("this process must have a cgroup-v2 placement to create a sibling slice under");
-    let controllers = std::fs::read_to_string(format!("/sys/fs/cgroup/{base}/cgroup.controllers"))
-        .unwrap_or_default();
-    let io_delegated = controllers.split_whitespace().any(|c| c == "io");
-    println!(
-        "cgroup base {base}: controllers [{}], io_delegated={io_delegated}",
-        controllers.trim()
-    );
+    // `metrics::try_apply_limit_at` consults, through the ONE measurement `IoDelegation` (below,
+    // beside the enforcement leg that asks the same question to decide whether it can run at
+    // all). Two spellings of "is `io` delegated?" that disagreed would have this leg asserting the
+    // kernel-ENODEV arm while that one recorded an absent facility on the same host.
+    let delegation = IoDelegation::measure();
+    let io_delegated = delegation.delegated();
+    println!("{}", delegation.describe());
 
     // `ResourceLimits`/`IoMax` are `#[non_exhaustive]`, so an out-of-crate caller assembles them
     // by mutation rather than by struct expression — the same route a real consumer takes.
@@ -572,4 +564,512 @@ async fn requested_io_max_is_refused_loudly_and_never_silently_unenforced() {
         .await
         .expect("positive control: the same config without io_max must boot");
     ok.shutdown().await.expect("shutdown the control VM");
+}
+
+// -------------------------------------------------------------------------------------------------
+// D5: `io_max`'s ENFORCEMENT half — the cap observed THROTTLING a guest, or a recorded skip
+// -------------------------------------------------------------------------------------------------
+//
+// The refusal leg above proves a requested `io.max` that cannot be applied refuses the boot. What
+// it does not prove is the other half of the claim: that an `io.max` which IS applied bounds the
+// VM's block I/O. Nothing in the tree measured that (docs/90 T2's "a knob nobody boots is a claim
+// nobody makes", recorded in docs/implementation-notes.md as "no leg anywhere measures an `io.max`
+// actually *throttling* a guest"), because the controller it needs is not delegated on the host
+// class the suite runs on.
+//
+// So this closes the gap the way AGENTS.md rule 4's SECOND half asks — "cover it or record it" —
+// with a record that can change: the leg PROBES the facility and either exercises it or records a
+// reviewable capability skip. The shape is `common::probe_ext4_or_record_skip`'s, deliberately,
+// including its broken-versus-absent distinction: a host whose `cgroup.controllers` cannot be read
+// at all is misconfigured and PANICS, while a host that simply has no `io` there (or no block
+// device under its scratch tree) records the skip. The day this suite meets an `io`-delegated
+// host on block-backed scratch, the measurement below runs; until then the gap is a line in the
+// skip manifest rather than an invisible hole.
+
+/// The `io` controller's availability at the **parent** of every VM slice — measured once, here.
+///
+/// Two legs in this file need exactly this fact and must not each ask it their own way: the
+/// refusal leg decides *which* typed error a bad `io.max` earns from it, and the throttling leg
+/// decides whether it can run at all. Two spellings of "is `io` delegated?" that disagree would
+/// have one leg asserting the kernel-`ENODEV` arm while the other records an absent facility on
+/// the same host, and nothing would notice.
+///
+/// The parent is this process's own placement: [`vmcell::metrics::vm_slice_name`] composes a VM
+/// slice as `{base}/{leaf}`, so `{base}` is the `cgroup.subtree_control` that
+/// `metrics::try_apply_limit_at` writes `+io` into — and a controller can only be enabled there if
+/// it is listed in that same cgroup's `cgroup.controllers`, which is what this reads.
+#[cfg(feature = "cloud-hypervisor")]
+struct IoDelegation {
+    /// This process's cgroup-v2 placement — the parent of every slice the orchestrator creates.
+    base: String,
+    /// `{base}/cgroup.controllers`, or the rendered read failure. `Err` is a **broken** host (a
+    /// cgroup-v2 placement whose controller listing cannot be read), never an absent facility.
+    controllers: Result<String, String>,
+}
+
+#[cfg(feature = "cloud-hypervisor")]
+impl IoDelegation {
+    /// Measures the fact. Panics when this process has no cgroup-v2 placement at all — the
+    /// orchestrator could not create a sibling slice either, so there is nothing to be honest
+    /// about.
+    fn measure() -> Self {
+        let base = std::fs::read_to_string("/proc/self/cgroup")
+            .ok()
+            .and_then(|c| vmcell::metrics::cgroup_base_from_proc(&c))
+            .expect("this process must have a cgroup-v2 placement to create a sibling slice under");
+        let controllers =
+            std::fs::read_to_string(format!("/sys/fs/cgroup/{base}/cgroup.controllers"))
+                .map_err(|e| e.to_string());
+        Self { base, controllers }
+    }
+
+    /// Whether `io` is available to be delegated to a VM slice. A whole-token match — never a
+    /// substring — so `io` does not match an `ioX`, matching `metrics::controller_listed` (which
+    /// is private, so this one line is spelled here rather than reached).
+    fn delegated(&self) -> bool {
+        self.controllers
+            .as_ref()
+            .is_ok_and(|c| c.split_whitespace().any(|t| t == "io"))
+    }
+
+    /// The one-line rendering both legs print, so a run's output always records which arm it took.
+    fn describe(&self) -> String {
+        match &self.controllers {
+            Ok(c) => format!(
+                "cgroup base {}: controllers [{}], io_delegated={}",
+                self.base,
+                c.trim(),
+                self.delegated()
+            ),
+            Err(e) => format!(
+                "cgroup base {}: cgroup.controllers UNREADABLE ({e})",
+                self.base
+            ),
+        }
+    }
+}
+
+/// The backend the `io_max` enforcement skips are attributed to.
+///
+/// Cloud Hypervisor because this battery is CH-only for the same reason the refusal leg is:
+/// `create_slice` and the limit writes run before `Vmm::create`, so the behavior is entirely
+/// host-side and identical for every backend — a four-backend matrix would assert one host fact
+/// four times. Spelled once so the line that is written and any future gate that asserts it was
+/// written cannot drift.
+#[cfg(feature = "cloud-hypervisor")]
+const IO_SKIP_VMM: &str = "cloud-hypervisor";
+
+/// The capability recorded when the `io` controller is not delegated to the VM slice's parent.
+#[cfg(feature = "cloud-hypervisor")]
+const IO_SKIP_NO_DELEGATION: &str = "io_max_enforcement_no_io_delegation";
+
+/// The capability recorded when the scratch tree is not backed by a block device `io.max` can
+/// name — a distinct absence from [`IO_SKIP_NO_DELEGATION`], with a distinct remediation, so the
+/// manifest says which one this host hit.
+#[cfg(feature = "cloud-hypervisor")]
+const IO_SKIP_NO_BLOCK_DEVICE: &str = "io_max_enforcement_no_block_backed_scratch";
+
+/// The **whole** block device backing `path`, as the `major:minor` string `io.max` accepts, or a
+/// rendered reason why there is none.
+///
+/// Whole device, not a partition: the kernel's `blkg_conf_open_bdev` refuses a partition with
+/// `ENODEV` (the very errno the refusal leg above classifies), so a cap naming `259:2` would be
+/// rejected while the I/O it meant to bound is charged to `259:0`. A partition's parent disk is
+/// its sysfs parent — `/sys/dev/block/<maj>:<min>` is a symlink into `/sys/devices/…`, so `..`
+/// resolves to the containing disk directory and its `dev` file is that disk's devno. The blkcg
+/// counters agree with this choice: bios are charged to the whole disk's request queue, which is
+/// why the vacuity guard below can read `io.stat` under the same key it capped.
+///
+/// An anonymous device (`major == 0`: tmpfs, overlayfs, btrfs' virtual devno) is the common answer
+/// on this suite's usual host — `std::env::temp_dir()` is a tmpfs there — and is an absent
+/// facility, not a broken host.
+#[cfg(feature = "cloud-hypervisor")]
+fn whole_block_device_of(path: &std::path::Path) -> Result<String, String> {
+    use std::os::unix::fs::MetadataExt as _;
+    let dev = std::fs::metadata(path)
+        .map_err(|e| format!("stat {}: {e}", path.display()))?
+        .dev();
+    let (major, minor) = (libc::major(dev), libc::minor(dev));
+    if major == 0 {
+        return Err(format!(
+            "{} sits on an anonymous device ({major}:{minor}) — a tmpfs/overlay/btrfs placement \
+             has no block device for io.max to name",
+            path.display()
+        ));
+    }
+    let sys = format!("/sys/dev/block/{major}:{minor}");
+    if !std::path::Path::new(&sys).exists() {
+        return Err(format!(
+            "{} is on {major}:{minor}, which has no {sys} entry",
+            path.display()
+        ));
+    }
+    if std::path::Path::new(&format!("{sys}/partition")).exists() {
+        return std::fs::read_to_string(format!("{sys}/../dev"))
+            .map(|d| d.trim().to_string())
+            .map_err(|e| {
+                format!("{major}:{minor} is a partition whose parent disk's dev is unreadable: {e}")
+            });
+    }
+    Ok(format!("{major}:{minor}"))
+}
+
+/// **The one law** the enforcement leg asks before it boots anything: `Some(device)` — the
+/// `major:minor` to cap — when this host can actually enforce an `io.max`, and `None`, after
+/// recording a reviewable capability skip, when it cannot.
+///
+/// Two independent facilities have to be present, and the manifest names which one was missing:
+/// the `io` controller delegated to the VM slice's parent, and a scratch tree on a block device.
+/// Both absences are recorded rather than printed — a `println!("SKIP") + return` is a green PASS
+/// (AGENTS.md), and the skip manifest is the only artifact a reviewer can read afterwards to see
+/// that the `io_max` enforcement claim went unverified on this run.
+///
+/// A cgroup-v2 placement whose `cgroup.controllers` cannot be read is a **misconfiguration**, not
+/// an absent facility, and panics — the same distinction `common::classify_ext4_refusal` draws
+/// between a producer that is absent and one that is broken.
+#[cfg(feature = "cloud-hypervisor")]
+#[must_use]
+fn probe_io_enforcement_or_record_skip(scratch: &std::path::Path) -> Option<String> {
+    let delegation = IoDelegation::measure();
+    println!("{}", delegation.describe());
+    if let Err(e) = &delegation.controllers {
+        panic!(
+            "this process has a cgroup-v2 placement ({}) whose cgroup.controllers cannot be read \
+             ({e}) — that is a broken cgroup mount, not an absent facility; fix the host rather \
+             than skipping the io_max enforcement gate",
+            delegation.base
+        );
+    }
+    if !delegation.delegated() {
+        common::record_capability_skip(IO_SKIP_VMM, IO_SKIP_NO_DELEGATION);
+        println!(
+            "SKIP: the `io` controller is not delegated to {} (a default systemd USER session \
+             delegates cpu/memory/pids only), so no io.max written to a VM slice can bind. Run \
+             this suite in a scope whose ancestors all enable `io` in cgroup.subtree_control.",
+            delegation.base
+        );
+        return None;
+    }
+    match whole_block_device_of(scratch) {
+        Ok(device) => {
+            println!(
+                "io.max enforcement device (whole disk under {}): {device}",
+                scratch.display()
+            );
+            Some(device)
+        }
+        Err(why) => {
+            common::record_capability_skip(IO_SKIP_VMM, IO_SKIP_NO_BLOCK_DEVICE);
+            println!(
+                "SKIP: {why} — io.max throttles requests to a named block device, so this leg \
+                 needs its disk images on one. Point TMPDIR at a directory on a real disk to \
+                 exercise it."
+            );
+            None
+        }
+    }
+}
+
+/// The write-bandwidth cap the throttled boot requests, in bytes per second.
+///
+/// 4 MiB/s against [`IO_WRITE_MIB`] of guest writes floors the throttled run at 8 s — an order of
+/// magnitude above what the same write costs un-throttled on any disk this suite runs on, so the
+/// differential below does not depend on the host's raw speed.
+#[cfg(feature = "cloud-hypervisor")]
+const IO_MAX_WBPS: u64 = 4 << 20;
+
+/// How much the guest writes to its extra disk, in MiB. See [`IO_MAX_WBPS`].
+#[cfg(feature = "cloud-hypervisor")]
+const IO_WRITE_MIB: u64 = 32;
+
+/// The `io.stat` line for `device` under `cg_base`, or `None` when the device has no line yet.
+///
+/// Test-side rather than through `metrics::parse_io_stat_bytes`: that helper is private AND sums
+/// every device's counters, while the whole point here is the ONE device the cap named — a sum
+/// would count the root disk's traffic and hide a cap that bound nothing.
+#[cfg(feature = "cloud-hypervisor")]
+fn io_stat_line(cg_base: &str, device: &str) -> Option<String> {
+    let raw = std::fs::read_to_string(format!("{cg_base}/io.stat")).ok()?;
+    raw.lines()
+        .find(|l| l.split_whitespace().next() == Some(device))
+        .map(str::to_string)
+}
+
+/// A `key=value` counter off one `io.stat` (or `io.max`) line, `None` when the key is absent.
+#[cfg(feature = "cloud-hypervisor")]
+fn io_counter(line: &str, key: &str) -> Option<u64> {
+    line.split_whitespace()
+        .find_map(|f| f.strip_prefix(&format!("{key}=")))
+        .and_then(|v| v.parse().ok())
+}
+
+/// KVM-FREE gate for the three host laws the enforcement leg's measurement rests on, so they are
+/// falsifiable **today** rather than only on the first `io`-delegated host the suite ever meets.
+///
+/// The leg above can only run where the facility exists; these three helpers decide what it caps
+/// and what it reads back, and a wrong answer from any of them turns the vacuity guard into a
+/// green pass — `io.max` silently applied to a partition (which the kernel refuses with `ENODEV`),
+/// or a `wbytes` picked off the *wrong* device's line while the capped device moved nothing.
+/// Nothing about them needs KVM, a VM, or a delegated controller, so they are gated here, in
+/// `just test-unit`'s reach.
+#[cfg(feature = "cloud-hypervisor")]
+#[test]
+fn the_io_max_enforcement_probe_resolves_whole_disks_and_per_device_counters() {
+    use std::os::unix::fs::MetadataExt as _;
+
+    // (1) `whole_block_device_of` against this host's REAL layout. The source devno is reserved
+    // BEFORE the call so the partition arm's `assert_ne!` is non-vacuous.
+    let here = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let dev = std::fs::metadata(here)
+        .expect("stat the crate directory")
+        .dev();
+    let source = format!("{}:{}", libc::major(dev), libc::minor(dev));
+    println!("crate dir {} sits on {source}", here.display());
+    match whole_block_device_of(here) {
+        // The only honest refusal is an anonymous device: a checkout on tmpfs/overlay/btrfs has
+        // no block device at all. A refusal for a real one would silently skip the whole battery.
+        Err(why) => assert_eq!(
+            libc::major(dev),
+            0,
+            "{source} is a real block device, so the probe must resolve it rather than refuse: {why}"
+        ),
+        Ok(resolved) => {
+            assert!(
+                !std::path::Path::new(&format!("/sys/dev/block/{resolved}/partition")).exists(),
+                "the probe resolved {source} to {resolved}, which is a PARTITION — the kernel's                  blkg_conf_open_bdev refuses those with ENODEV, so the cap would never apply"
+            );
+            assert!(
+                std::path::Path::new(&format!("/sys/dev/block/{resolved}/dev")).exists(),
+                "the probe resolved {source} to {resolved}, which is no block device at all"
+            );
+            if std::path::Path::new(&format!("/sys/dev/block/{source}/partition")).exists() {
+                assert_ne!(
+                    resolved, source,
+                    "{source} is a partition and must resolve to its parent disk"
+                );
+            } else {
+                assert_eq!(
+                    resolved, source,
+                    "a whole disk is its own answer; the probe must not walk past it"
+                );
+            }
+        }
+    }
+
+    // (2) The counter readers, against a fixture `io.stat`. Both decoys exist because both wrong
+    // implementations are the natural ones: a `contains` device match (`1259:0` carries `259:0` as
+    // a substring) and a `contains` key match (`rwbytes=` carries `wbytes=`).
+    let tmp = common::TempTree::create(&format!("vmcell-test-iostat-{}", std::process::id()));
+    std::fs::write(
+        tmp.join("io.stat"),
+        "1259:0 rbytes=11 wbytes=7 rios=1 wios=1\n\
+         259:0 rbytes=1024 rwbytes=99 wbytes=4096 rios=2 wios=3\n\
+         8:0 rbytes=5 wbytes=6 rios=1 wios=1\n",
+    )
+    .expect("write the io.stat fixture");
+    let base = tmp.path().to_str().expect("scratch path is UTF-8");
+    let line = io_stat_line(base, "259:0").expect("the fixture has a 259:0 line");
+    assert_eq!(
+        io_counter(&line, "wbytes"),
+        Some(4096),
+        "wbytes must come from the capped device's own line, whole-key: {line:?}"
+    );
+    assert_eq!(
+        io_stat_line(base, "8:0")
+            .as_deref()
+            .and_then(|l| io_counter(l, "wbytes")),
+        Some(6),
+        "each device's counters are its own"
+    );
+    assert_eq!(
+        io_stat_line(base, "7:0"),
+        None,
+        "a device with no line has no counters — the enforcement leg reads that as zero charged"
+    );
+    // `tmp` owns the fixture and drops here, on the panic path too.
+}
+
+/// Times one in-guest write of [`IO_WRITE_MIB`] MiB to `/dev/vdb`, returning the exec outcome and
+/// the host-observed wall time.
+///
+/// `oflag=direct` so the guest's own page cache cannot absorb the writes and hand virtio-blk a
+/// handful of coalesced requests, and `conv=fsync` so `dd` does not return until the guest has
+/// issued a FLUSH and the VMM's `fsync` has pushed every byte through the host block layer — which
+/// is where `io.max` bills them. Without the flush the measurement would time a memcpy into the
+/// host page cache and pass against an absent cap.
+#[cfg(feature = "cloud-hypervisor")]
+async fn timed_guest_write<V: vmcell::vmm::Vmm>(
+    vm: &mut MicroVm<V>,
+) -> (vmcell::ExecOutcome, u128) {
+    let steward = vm
+        .steward(Some(Duration::from_secs(120)))
+        .await
+        .expect("steward must reach ready");
+    let start = std::time::Instant::now();
+    let out = steward
+        .exec(vmcell::steward::protocol::ExecRequest::new(vec![
+            "dd".to_string(),
+            "if=/dev/zero".to_string(),
+            "of=/dev/vdb".to_string(),
+            "bs=1M".to_string(),
+            format!("count={IO_WRITE_MIB}"),
+            "oflag=direct".to_string(),
+            "conv=fsync".to_string(),
+        ]))
+        .await
+        .expect("in-guest dd to the extra disk");
+    (out, start.elapsed().as_millis())
+}
+
+// The DIFFERENTIAL, one variable: two boots of a byte-identical config that differ in exactly
+// `cfg.limits.io_max` and nothing else — same kernel, same rootfs, same extra disk built the same
+// way on the same filesystem, same workload. The un-capped boot is the twin the capped one is
+// measured against, so a host whose disk is slow reddens neither leg.
+//
+// THREE assertions, none of which a passing run can skip:
+//   1. `io.max` read back off the VM's own slice carries the requested `wbps=` for the capped
+//      device — the kernel accepted the value (a cgroup value read back, not a proxy signal).
+//   2. `io.stat`'s `wbytes` for that device advanced by most of what the guest wrote. This is the
+//      VACUITY GUARD: if the writes were never charged to this cgroup and this device — a host
+//      page cache that swallowed them, cgroup writeback not attributing to the slice — then the
+//      timing below means nothing, and the leg must go RED rather than pass on a number it did
+//      not earn.
+//   3. The capped write took at least half its theoretical floor AND several times the twin's.
+//
+// RED ON THE INVERSE: raise `IO_MAX_WBPS` far above the host's disk speed (or drop the `io.max`
+// write from `metrics::apply_limits`) and assertion 3 fires — the capped write finishes in the
+// twin's time. Drop the `conv=fsync` and assertion 2 fires instead, which is the point of having
+// it: the leg refuses to report a throttle it did not observe.
+//
+// NOT MEASURED ANYWHERE YET (2026-08-21, stated rather than implied): every host this suite has
+// run on takes the skip — `io` is delegated to no default systemd user session, and
+// `std::env::temp_dir()` is a tmpfs. The numbers above are derived from the cap, not from an
+// observed run, and the first `io`-delegated host to run this is what turns them into measurements.
+#[cfg(feature = "cloud-hypervisor")]
+#[tokio::test]
+#[ignore = "needs KVM + an `io`-delegated cgroup scope over block-backed scratch"]
+async fn a_requested_io_max_actually_throttles_the_guests_block_io() {
+    // OWNED (`common::TempTree`): removed on the success path AND on every panicking assertion
+    // below, which matters more here than usual — this leg writes two 64 MiB images, and a leaked
+    // fixture tree is what once filled this host's /tmp and reddened an unrelated suite.
+    let tmp = common::TempTree::create(&format!(
+        "vmcell-test-iomax-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock at or after the epoch")
+            .as_nanos()
+    ));
+
+    // Probe BEFORE writing anything: on a host that takes the skip this leg costs an empty
+    // directory rather than 128 MiB of tmpfs.
+    let Some(device) = probe_io_enforcement_or_record_skip(tmp.path()) else {
+        return;
+    };
+
+    // Two images, built identically, so the only thing that differs between the boots is the cap.
+    let image_bytes = usize::try_from(IO_WRITE_MIB << 21).expect("image size fits usize");
+    let baseline_img = tmp.join("baseline.raw");
+    let capped_img = tmp.join("capped.raw");
+    for img in [&baseline_img, &capped_img] {
+        std::fs::write(img, vec![0u8; image_bytes]).expect("write the extra-disk image");
+    }
+
+    let vmm = vmcell::vmm::cloud_hypervisor::CloudHypervisor::new(common::ch_bin());
+    let env = vmcell::HostEnv::hermetic();
+    let mk_cfg = |image: &std::path::Path, io_max: Option<IoMax>| {
+        let mut cfg = VmConfig::builder(
+            common::get_vmlinux(),
+            RootfsSource::Erofs {
+                image: common::get_rootfs(),
+            },
+        )
+        .with_extra_disk(vmcell::config::BlockDevice::read_write(image))
+        .network_disabled()
+        .build()
+        .unwrap();
+        cfg.limits.io_max = io_max;
+        cfg
+    };
+
+    // The twin: same everything, no cap.
+    let mut baseline = MicroVm::start(&vmm, mk_cfg(&baseline_img, None), &env)
+        .await
+        .expect("the un-capped twin must boot");
+    let (baseline_out, baseline_ms) = timed_guest_write(&mut baseline).await;
+    assert_eq!(
+        baseline_out.code, 0,
+        "the un-capped write failed (does this guest's dd support oflag=direct?): {baseline_out:?}"
+    );
+    baseline.kill().await.expect("kill the un-capped twin");
+
+    // The capped boot. `IoMax` is `#[non_exhaustive]`, so it is assembled by mutation — the same
+    // route an out-of-crate caller takes.
+    let mut io = IoMax::default();
+    io.device = device.clone();
+    io.wbps = Some(IO_MAX_WBPS);
+    let mut capped = MicroVm::start(&vmm, mk_cfg(&capped_img, Some(io)), &env)
+        .await
+        .expect("a VM under an enforceable io.max must boot");
+    let cg_base = cgroup_dir(capped.vmid());
+
+    // (1) The kernel accepted the requested value, on the device we asked for.
+    let rule = std::fs::read_to_string(format!("{cg_base}/io.max"))
+        .unwrap_or_else(|e| panic!("io controller not delegated to {cg_base} ({e})"))
+        .lines()
+        .find(|l| l.split_whitespace().next() == Some(device.as_str()))
+        .map(str::to_string)
+        .unwrap_or_else(|| panic!("{cg_base}/io.max carries no rule for {device}"));
+    assert_eq!(
+        io_counter(&rule, "wbps"),
+        Some(IO_MAX_WBPS),
+        "io.max must carry the requested wbps for {device}; got {rule:?}"
+    );
+
+    let before = io_stat_line(&cg_base, &device)
+        .and_then(|l| io_counter(&l, "wbytes"))
+        .unwrap_or(0);
+    let (capped_out, capped_ms) = timed_guest_write(&mut capped).await;
+    assert_eq!(
+        capped_out.code, 0,
+        "the capped write failed: {capped_out:?}"
+    );
+    let after = io_stat_line(&cg_base, &device)
+        .and_then(|l| io_counter(&l, "wbytes"))
+        .unwrap_or(0);
+
+    let written = IO_WRITE_MIB << 20;
+    println!(
+        "io.max wbps={IO_MAX_WBPS} on {device}: {IO_WRITE_MIB} MiB written — capped {capped_ms}ms \
+         vs un-capped {baseline_ms}ms; io.stat wbytes {before} -> {after}"
+    );
+
+    // (2) VACUITY GUARD: the bytes were charged to THIS slice on THAT device, so the time above
+    // is the time of throttled block I/O and not of a memcpy into the host page cache.
+    assert!(
+        after.saturating_sub(before) >= written / 2,
+        "only {} of the {written} bytes the guest wrote were charged to {device} in \
+         {cg_base}/io.stat — the write never reached the block layer from this cgroup, so the \
+         {capped_ms}ms below measures nothing about io.max (cgroup writeback needs the memory \
+         controller on the same slice and a filesystem that supports it)",
+        after.saturating_sub(before)
+    );
+
+    // (3) The cap bound the writes. Floor: `written / IO_MAX_WBPS` seconds is the theoretical
+    // minimum; half of it leaves room for the bucket's initial fill and for whatever the guest
+    // flushed before `dd` started timing, while staying far above the twin.
+    let floor_ms = u128::from(written * 1000 / IO_MAX_WBPS / 2);
+    assert!(
+        capped_ms >= floor_ms,
+        "{IO_WRITE_MIB} MiB at {IO_MAX_WBPS} B/s cannot complete in {capped_ms}ms (floor \
+         {floor_ms}ms) — the io.max limit did not take effect"
+    );
+    assert!(
+        capped_ms > baseline_ms.saturating_mul(3),
+        "the capped write ({capped_ms}ms) must be far slower than the un-capped twin \
+         ({baseline_ms}ms) on this same host"
+    );
+
+    capped.kill().await.expect("kill the capped VM");
+    // No trailing removal: `tmp` owns the images and drops here (and on any panic above).
 }

@@ -4974,8 +4974,11 @@ value reaches the kernel, the VMM or the guest and does anything.
   §8.3 calls that coupling mandatory and records the measurement that makes it so — KSM merges
   **zero** pages of a `shared=on` guest — so a regression that set `mergeable` and left `shared` on
   would deduplicate nothing, silently, which is the F1 shape.
-- **`RestoreMode::Eager` / `Lazy`.** Present in backend unit tests as refusal/argv assertions; no
-  gate performs a restore under either mode.
+- ~~**`RestoreMode::Eager` / `Lazy`.** Present in backend unit tests as refusal/argv assertions; no
+  gate performs a restore under either mode.~~ **CLOSED** 2026-08-21 (loose-end pass, Tier D) — a live restore is now
+  performed under each non-default mode, with the `--restore` value read off the LIVE VMM process's
+  argv and an egress byte asserted afterwards. See the wave-4 entry at the end of this file.
+
 
 Recorded rather than closed because each costs a live boot in an already-long suite and none is a
 correctness risk to the default path. The two worth closing first are `ksm_mergeable`'s coupling (a
@@ -5047,8 +5050,11 @@ actually asks for.
   and `every_shipped_timeouts_profile_is_honored_by_the_guest_verbatim` pins KVM-free that each
   shipped preset's values sit inside the shared clamp window, so a preset would be honored verbatim
   rather than clamped. The other fields of a preset still reach no live boot.
-- **`RestoreMode::Eager` / `Lazy`.** Unchanged: refusal and argv assertions only; no gate performs a
-  restore under either mode.
+- ~~**`RestoreMode::Eager` / `Lazy`.** Unchanged: refusal and argv assertions only; no gate performs a
+  restore under either mode.~~ **CLOSED** 2026-08-21 (loose-end pass, Tier D) — a live restore is now
+  performed under each non-default mode, with the `--restore` value read off the LIVE VMM process's
+  argv and an egress byte asserted afterwards. See the wave-4 entry at the end of this file.
+
 
 ## Recorded: the guest tuning-token channel has no falsifiable end-to-end gate
 
@@ -6536,3 +6542,67 @@ its untouched-interface residue check and a positive control, the sweep keeping 
 namespaces while reclaiming our own stale member tap AND the reclaimed name becoming creatable again
 (the join between the two halves), and the test-start sweeper honoring a held `VmidAllocator::shared`
 claim with the release-then-reclaim non-vacuity leg.
+
+
+## Wave 4 — Tier D: the shipped knobs no test applied in a live boot
+
+For `docs/implementation-notes.md` — the existing "**`io_max`'s enforcement half**" bullet (around line 5034) should be SUPERSEDED rather than deleted, since its refusal-half record still stands:
+
+**SUPERSEDED 2026-08-21: the enforcement half is now a probing leg, and the gap is a recorded skip that can change.**
+
+`a_requested_io_max_actually_throttles_the_guests_block_io` (`crates/vmcell/tests/metrics_limits.rs`) closes the entry above the way AGENTS.md rule 4's second half asks. It PROBES the facility — `io` in the VM slice parent's `cgroup.controllers`, and a whole block device under the scratch tree — and either measures the throttle or records a reviewable capability skip, in `common::probe_ext4_or_record_skip`'s shape including its absent-versus-broken distinction: a cgroup-v2 placement whose `cgroup.controllers` cannot be read PANICS (a broken mount is a misconfiguration), while a host that simply lacks `io`, or whose scratch is on a tmpfs, records `SKIP cloud-hypervisor io_max_enforcement_no_io_delegation` / `…_no_block_backed_scratch`. Two tokens, because the two absences have two different remediations.
+
+The measured host fact, 2026-08-21: the cgroup ROOT lists `io` in `cgroup.controllers` but enables only `cpu memory pids` in its `cgroup.subtree_control`, so `io` is absent from `user.slice`, `user-1000.slice`, `user@1000.service` and every scope below — a user session cannot enable it, and `/sys/fs/cgroup/cgroup.subtree_control` is root-owned. `std::env::temp_dir()` is a tmpfs (`0:48`) on top of that, so the leg takes the delegation skip first and the block-device skip second. **The measurement half has therefore never run anywhere**: its `IO_MAX_WBPS` / `IO_WRITE_MIB` / floor constants are derived from the cap, not observed, and the leg's comment block says so rather than implying a measurement.
+
+What is falsifiable today is `the_io_max_enforcement_probe_resolves_whole_disks_and_per_device_counters` — KVM-free, not `#[ignore]`d, so `just test-unit` runs it on every host. It pins the three laws the measurement rests on: `whole_block_device_of` resolves a partition to its parent disk (the kernel's `blkg_conf_open_bdev` refuses partitions with the same `ENODEV` the refusal leg classifies) and a whole disk to itself, and the `io.stat` readers match device and key WHOLE-token (decoy lines `1259:0 …` and `rwbytes=99` are what make a `contains` implementation go red).
+
+One consolidation came with it: the "is `io` delegated?" question is now `IoDelegation::measure()`, one measurement shared by the refusal leg and the enforcement leg. Two spellings would have had one leg asserting the kernel-`ENODEV` arm while the other recorded an absent facility on the same host, with nothing to notice.
+
+And for `docs/todo.md`, the T1 entry ("`metrics_limits.rs`'s `io_max` refusal leg … kernel-`ENODEV` arm is dead on a default systemd user session") stays true as written, but should gain: the enforcement half is no longer missing-and-invisible — it is a probing leg whose absence shows up as a line in the skip manifest, and the T2 bullet claiming `io_max` reaches no live boot at all should be retired in favour of "its measurement half is written and gated behind a facility probe; no host has yet run it".
+
+
+docs/implementation-notes.md carries the same recorded deviation TWICE and both copies are now false; the orchestrator owns docs/, so here is the replacement text.
+
+At line ~4977 and again at ~5050, this entry:
+  "- **`RestoreMode::Eager` / `Lazy`.** Present in backend unit tests as refusal/argv assertions; no gate performs a restore under either mode."
+  "- **`RestoreMode::Eager` / `Lazy`.** Unchanged: refusal and argv assertions only; no gate performs a restore under either mode."
+
+RETIRE both (empirically disproven) and record instead:
+
+  - **`RestoreMode::Eager` / `Lazy` — CLOSED (2026-08-21, docs/90 T2 / docs/todo D1).** Two halves.
+    KVM-free: `cloud_hypervisor.rs`'s `every_restore_mode_reaches_the_composed_argv_as_its_prefault_modifier`
+    pins ALL THREE variants — `Default` included, the least-tested arm — on the COMPOSED
+    `LaunchPlan::argv()`, driven from a real `VmConfig`'s `restore_mode` rather than from a
+    hand-written argument, plus pairwise distinctness. Live: `tests/snapshot_restore.rs`'s
+    `non_default_restore_modes_ship_their_prefault_argument_and_restore_a_live_guest` restores
+    twice from private `env.overlay` copies of one snapshot, differing in exactly `restore_mode`,
+    and for each mode asserts the `--restore` value on the argv of the LIVE `cloud-hypervisor`
+    process (read from `/proc`, selected by scratch dir, never by the token under test) and then
+    the same host->guest->host egress byte the matrix leg asserts, with the pre-snapshot exchange
+    as its positive control. Its `/proc` scan has its own KVM-free gate,
+    `the_scratch_dir_process_scan_finds_exactly_the_right_argv`, with a prefix-collision decoy.
+    **Deliberately NOT proven, and stated at the test:** nothing here observes the *paging*
+    behavior `prefault` selects — a leg showing the VM boots under the flag would read identically
+    if CH ignored the token. The argument is pinned exactly; that CH honors it is CH's contract,
+    measured (not asserted) by `bench-vm`'s `--restore-mode` sweep.
+    **Deliberately CH-only.** `prefault=on|off` is a CH `--restore` modifier with no equivalent
+    selector on the other three backends; `Lazy` is a typed `Unsupported { feature: "lazy_restore" }`
+    there via the one shared `vmm::reject_unadvertised_capabilities`, and `Eager` is what those
+    three already do. Restoring three more backends to watch `Eager` change nothing would cost
+    three snapshot+restore cycles for no assertion.
+
+And in docs/todo.md, the bullet "Both non-default `RestoreMode`s: shipped, documented, and applied
+in no integration test …" is closed and should be struck, with `Timeouts::low_latency()` as a
+preset left as the remaining T2 survivor.
+
+
+docs/implementation-notes.md (orchestrator owns the file): "docs/90 T2, `Timeouts::low_latency()`/`throughput()` as booted presets — closed in `crates/vmcell/tests/guest_tuning.rs`. The preset is booted unmutated and its `guest_rebind_idle` measured through the /proc/1/fd listener-churn technique against a control that is the SAME preset with only that field restored to the shipped default: one variable by construction, rather than a `Timeouts::default()` twin differing in seven fields. Only that field is on the measured path — `guest_accept_poll` paces failure recovery only (`recovery_backoff(IdleWindowElapsed, _) == Duration::ZERO`), and the other five knobs are host-side. `throughput()` is covered as ARRIVAL only (its own rendered tokens read back from the guest's `/proc/cmdline`): its 200 ms window against the default's 250 is a 1.25x separation inside the measurement's noise, so a churn leg for it would be a coin-flip. `throughput()`'s distinctive knob `shutdown_grace` is host-side and has no in-guest observation — deliberately uncovered, recorded here rather than gated. The live legs' verdict arithmetic is extracted into predicates and driven KVM-free with both outcomes' counts, because a bound loose enough to admit an ignoring guest is invisible to a green live run."
+
+
+For `docs/implementation-notes.md` (I could not touch docs/):
+
+**`nested_virt` is a cmdline-only lever, and the L2-boot leg is a requirement proof, not a flag proof (2026-08-21).** `cfg.nested_virt`'s entire effect in the tree is the `kvm-intel.nested=0|1 kvm-amd.nested=0|1` pair emitted by `config.rs`'s cmdline builder; no backend reads the field except `reject_unadvertised_capabilities`. That module parameter governs whether the **L1's** KVM exposes VMX to *its own* guests (an L3), not whether the L1 can run an L2 — the L1's ability to run an L2 comes from the L0's nested KVM plus the backend's unconditional VMX exposure (`-cpu host` on QEMU, CPUID passthrough on CH). Consequences, recorded so they are not rediscovered: (a) `checks::nested_kvm_ok` / `kvm-ok` can only ever fail because of the *host's* nested support, which is what `nested_virt_disabled`'s comment already says about `/dev/kvm`; (b) a `nested_virt = false` twin of the L2-boot leg would still boot an L2 and must NOT be written as a negative control; (c) the flag's causality is pinned by the module-parameter differential only — `nested_virt_l2_boot` asserts `Y`/`1`, `nested_virt_disabled` asserts `N`/`0`, both through the one extracted `read_guest_kvm_nested_param`.
+
+**The L2 payload is Firecracker, carried in over virtio-fs, and this is deliberate.** `nested_virt_l2_boot` boots a real L2 inside the L1 using the host's `firecracker` binary as an in-guest payload (`static-pie`, 3.4 MB, needs only `/dev/kvm` + two files); CH and crosvm are dynamically linked and QEMU is not a single file. `vmcell-firecracker` is not involved and FC's own arm skips through `require_cap!`. The kernel and rootfs are exported from the artifact directories rather than copied into the test's TempTree: 150 MB per run under the host tmpfs is the shape that produced the `EDQUOT` daemon-suite red. Alternative deliberately not taken: a guest-tools KVM-ioctl applet (`KVM_CREATE_VM`/`KVM_CREATE_VCPU`/`KVM_RUN`) — it would prove less (no L2 kernel, no L2 userspace) and would couple this leg to a `vmcell build --kernel-source host-make` rebuild, which the shipped route needs none of.
+
+**Also update** `docs/92-claude-opus-loose-end-inventory.md` Tier D ("Nested virtualization is validated by opening `/dev/kvm` in the L1 guest; no L2 guest is ever booted") and the `docs/todo.md` entry pointing at `crates/vmcell/tests/nested_virt.rs` once the live legs pass.

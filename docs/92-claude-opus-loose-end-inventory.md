@@ -176,6 +176,26 @@ gated*, because nothing reads it and CI installs it unversioned, so a committed 
 unenforced claim about the host substrate. **C10** deleted the `VirtioFsDaemon::start` shims on the
 0.22 → 0.23 edge, and re-confirmed on the real edge that `semver-checks` is silent on it.
 
+**Wave 4 — Tier D, the knobs nobody booted.** Both non-default `RestoreMode`s now perform a real
+restore, with the `--restore` value read off the **live VMM process's** argv (never off the token
+under test) and an egress byte asserted after — and the test states plainly what it does *not* prove:
+nothing here observes the paging behavior `prefault` selects. `Timeouts::low_latency()` and
+`throughput()` are booted as presets rather than hand-mutated fields. `io_max`'s enforcement half is
+written and gated behind a facility probe that either measures or records a reviewable skip — because
+this host measurably cannot reach it (the cgroup root lists `io` but delegates only `cpu memory pids`,
+and the scratch is tmpfs), so the honest close was rule 4's second half, in a shape that will *run*
+the day the suite meets an `io`-delegated host rather than staying invisible. And nested
+virtualization now boots a real L2 — Firecracker as a static-pie in-guest payload over three
+read-only virtio-fs shares — asserting the L2's own userspace write as a line of its own, because the
+marker rides the L2 kernel cmdline and a `contains()` would be satisfied by an L2 that never reached
+userspace. That distinction was measured, not argued.
+
+That wave also produced a **finding worth its own line**: `cfg.nested_virt`'s entire effect in the
+tree is the `kvm-{intel,amd}.nested` cmdline pair, which governs whether the **L1's** KVM exposes VMX
+to an L3 — it does not gate whether the L1 can run an L2. So the new leg is a *requirement*-level
+proof, not a flag-causality proof, and a `nested_virt = false` twin would still boot an L2 and must
+never be written as a negative control.
+
 Also closed: **A10**, the design sentence outside §17 still asserting `validate()` had no overall
 wall-clock budget. §18's delta-register premise record still describes the pre-delta state, correctly
 and deliberately — that is what a recorded premise is, and editing it would falsify the register.
