@@ -322,6 +322,13 @@ async fn a_create_requests_fields_survive_the_bridge_field_for_field() {
         },
         // both `None`: the old client, unchanged.
         CreateVmRequest::create("vmlinux", "rootfs.erofs"),
+        // §11.5's copy-on-attach disk, the same presence-attribute shape one field out: a
+        // `#[serde(default)] bool` inside a `Vec` of structs, asymmetric on purpose (absent /
+        // explicit `true`), so a `writable` dropped in the forwarding collapses the writable leg
+        // into the read-only one and this leg's `assert_eq!` fails.
+        CreateVmRequest::create("vmlinux", "rootfs.erofs")
+            .with_extra_disk("shared.img")
+            .with_writable_extra_disk("scratch.img"),
     ];
     for req in &sent {
         client.create(req.clone()).await.expect("create");
@@ -351,4 +358,9 @@ async fn a_create_requests_fields_survive_the_bridge_field_for_field() {
     assert_eq!(got[2].steward_placement, None);
     assert_eq!(got[3].init, None);
     assert_eq!(got[3].steward_placement, None);
+    assert!(
+        !got[4].extra_disks[0].writable && got[4].extra_disks[1].writable,
+        "the copy-on-attach request must arrive with its asymmetry intact: {:?}",
+        got[4].extra_disks
+    );
 }

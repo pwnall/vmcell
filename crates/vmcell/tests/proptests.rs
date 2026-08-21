@@ -1,7 +1,7 @@
 use proptest::prelude::*;
 use vmcell::steward::ExecRequest;
 use vmcell::steward::protocol::Message;
-use vmcell::vmm::CidAllocator;
+use vmcell::vmm::{CidAllocator, MAX_GUEST_CID, MIN_GUEST_CID};
 
 proptest! {
     #[test]
@@ -109,22 +109,26 @@ proptest! {
         assert_ne!(p1, p3);
     }
 
+    // Samples the WHOLE vmid domain plus both refusal boundaries. The expected addresses are
+    // recomputed from the two-dimensional map's definition (third octet × which /30 inside it),
+    // never from a `.1`/`.2` literal, which only held while the map had one dimension.
     #[test]
-    fn test_subnet_math(vmid in 0..=255u32) {
-        if vmid == 0 || vmid == 255 {
+    fn test_subnet_math(vmid in 0..=(vmcell::net::MAX_VMID + 1)) {
+        if vmid == 0 || vmid > vmcell::net::MAX_VMID {
             assert!(vmcell::net::ip_math(vmid).is_err());
         } else {
             let (host, guest, cidr) = vmcell::net::ip_math(vmid).unwrap();
             let octet = ((vmid % 254) + 1) as u8;
-            assert_eq!(host.octets(), [10, 200, octet, 1]);
-            assert_eq!(guest.octets(), [10, 200, octet, 2]);
-            assert_eq!(cidr, format!("10.200.{octet}.2/30"));
+            let base = (4 * ((vmid - 1) / 254)) as u8;
+            assert_eq!(host.octets(), [10, 200, octet, base + 1]);
+            assert_eq!(guest.octets(), [10, 200, octet, base + 2]);
+            assert_eq!(cidr, format!("10.200.{octet}.{}/30", base + 2));
         }
     }
 }
 
 // TEST-3: deterministic reuse + "wrap without colliding with live" for the CID
-// allocator. Fills the whole guest range [3, 254], frees two BOUNDARY values
+// allocator. Fills the whole guest range, frees two BOUNDARY values
 // (the lowest and highest), and asserts reallocation reuses exactly those freed
 // values without ever handing back a still-live CID. Buggy impl guarded: a
 // no-op `release()` leaves the range full, so the first post-release
@@ -136,26 +140,36 @@ fn cid_allocator_reuses_freed_and_wraps_without_colliding_with_live() {
 
     let alloc = CidAllocator::new();
 
-    // Fill the entire guest range [3, 254].
+    // Fill the entire guest range.
     let mut live: BTreeSet<u32> = BTreeSet::new();
     while let Ok(cid) = alloc.allocate() {
-        assert!((3..=254).contains(&cid), "cid {cid} out of the guest range");
+        assert!(
+            (MIN_GUEST_CID..=MAX_GUEST_CID).contains(&cid),
+            "cid {cid} out of the guest range"
+        );
         assert!(
             live.insert(cid),
             "allocator handed out a duplicate CID {cid}"
         );
     }
-    assert_eq!(live.len(), 252, "expected 252 guest CIDs (3..=254)");
+    // One guest CID per addressable vmid: the CID space must never be the narrower of the two, or
+    // it — not the address map — is the ceiling on concurrent VMs per host (design §17,
+    // Networking). `net::tests::the_vmid_ceiling_is_one_law_with_five_other_homes` is the roster.
+    assert_eq!(
+        live.len(),
+        vmcell::net::MAX_VMID as usize,
+        "expected one guest CID per addressable vmid"
+    );
     assert!(
         alloc.allocate().is_err(),
         "a full allocator must report exhaustion, not a reserved/duplicate CID"
     );
 
     // Free two BOUNDARY values (lowest and highest); keep the rest live.
-    alloc.release(3);
-    alloc.release(254);
-    live.remove(&3);
-    live.remove(&254);
+    alloc.release(MIN_GUEST_CID);
+    alloc.release(MAX_GUEST_CID);
+    live.remove(&MIN_GUEST_CID);
+    live.remove(&MAX_GUEST_CID);
 
     // Reallocation must reuse the freed values, never a still-live one.
     let a = alloc.allocate().expect("a freed CID must be reusable");
@@ -169,7 +183,7 @@ fn cid_allocator_reuses_freed_and_wraps_without_colliding_with_live() {
     let reused: BTreeSet<u32> = [a, b].into_iter().collect();
     assert_eq!(
         reused,
-        BTreeSet::from([3, 254]),
+        BTreeSet::from([MIN_GUEST_CID, MAX_GUEST_CID]),
         "reallocation must reuse exactly the freed boundary CIDs, got {a} and {b}"
     );
 

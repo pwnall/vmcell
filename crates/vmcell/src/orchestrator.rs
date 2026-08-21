@@ -129,7 +129,7 @@ impl CidGuard {
     /// # Errors
     /// Propagates everything from [`CidAllocator::reserve`](crate::vmm::CidAllocator::reserve) that
     /// is *not* a conflict: [`crate::error::Error::Vmm`] for a CID outside the guest range
-    /// `3..=254` (a snapshot whose baked sidecar names no legal CID is broken, and a VM answering on
+    /// (a snapshot whose baked sidecar names no legal CID is broken, and a VM answering on
     /// it is unreachable — fail loud rather than resume it).
     fn adopt_baked_cid(&mut self, baked: u32) -> Result<()> {
         if baked == self.cid {
@@ -226,7 +226,7 @@ impl FsIdClaim {
     ///
     /// That third arm is the point (finding `m3`): every I/O failure here used to
     /// collapse into `false`, which the callers' full sweep then renders as
-    /// `Exhaustion("No available VMIDs (limit 254)")` — so an operator whose
+    /// `Exhaustion("No available VMIDs (limit …)")` — so an operator whose
     /// `/tmp/vmcell-vmid` is unwritable, or occupied by a regular file, chases a
     /// phantom capacity limit instead of reading `EACCES`. "This id is taken" and
     /// "I cannot tell" are different answers and must stay distinguishable.
@@ -546,36 +546,42 @@ impl VmidAllocator {
     /// Allocates and returns the next available unique VMID.
     ///
     /// # Errors
-    /// Returns [`crate::error::Error::Exhaustion`] if all 254 VMIDs are currently in
-    /// use, or [`crate::error::Error::Io`] naming the path and errno if the
-    /// cross-process lock directory cannot be used at all — an unusable lock directory
-    /// is **not** a full id space and must not be reported as one (finding `m3`).
+    /// Returns [`crate::error::Error::Exhaustion`] if every VMID in
+    /// `1..=`[`crate::net::MAX_VMID`] is currently in use, or [`crate::error::Error::Io`] naming
+    /// the path and errno if the cross-process lock directory cannot be used at all — an unusable
+    /// lock directory is **not** a full id space and must not be reported as one (finding `m3`).
     pub fn allocate(&self) -> Result<u32> {
         let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
-        // The one seeded search order (ORCH-8), shared with `SegmentIdAllocator`.
-        for vmid in seeded_id_order(&*self.clock, 254) {
+        // The one seeded search order (ORCH-8), shared with `SegmentIdAllocator`, over the one
+        // ceiling (`crate::net::MAX_VMID`, home 2 of its roster) — never a local `254`.
+        for vmid in seeded_id_order(&*self.clock, crate::net::MAX_VMID) {
             if !active.contains(&vmid) && self.claim.try_claim(vmid)? {
                 active.insert(vmid);
                 return Ok(vmid);
             }
         }
-        Err(crate::error::Error::Exhaustion(
-            "No available VMIDs (limit 254)".to_string(),
-        ))
+        Err(crate::error::Error::Exhaustion(format!(
+            "No available VMIDs (limit {})",
+            crate::net::MAX_VMID
+        )))
     }
 
     /// Reserves a specific VMID, honoring a caller-supplied `cfg.vmid`.
     ///
     /// # Errors
-    /// Returns [`crate::error::Error::Config`] if `vmid` is out of the `1..=254`
-    /// range, [`crate::error::Error::Exhaustion`] if it is already reserved
+    /// Returns [`crate::error::Error::Config`] if `vmid` is out of the
+    /// `1..=`[`crate::net::MAX_VMID`] range, [`crate::error::Error::Exhaustion`] if it is already
+    /// reserved
     /// (in-process or by another live process), or [`crate::error::Error::Io`] if the
     /// cross-process lock directory could not be used (finding `m3` — an I/O failure
     /// is never reported as a conflict).
     pub fn reserve(&self, vmid: u32) -> Result<u32> {
-        if !(1..=254).contains(&vmid) {
+        // Home 2 of `crate::net::MAX_VMID`'s roster: the accepted window is the address map's
+        // own, read from it rather than restated, so the two cannot disagree.
+        if !(1..=crate::net::MAX_VMID).contains(&vmid) {
             return Err(crate::error::Error::Config(format!(
-                "vmid {vmid} out of range (must be 1..=254)"
+                "vmid {vmid} out of range (must be 1..={})",
+                crate::net::MAX_VMID
             )));
         }
         let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
@@ -3457,7 +3463,7 @@ mod tests {
         let vmid1 = alloc.allocate().unwrap();
         let vmid2 = alloc.allocate().unwrap();
         assert_ne!(vmid1, vmid2);
-        assert!((1..=254).contains(&vmid1));
+        assert!((1..=crate::net::MAX_VMID).contains(&vmid1));
         alloc.release(vmid1);
         alloc.release(vmid2);
     }
@@ -3485,15 +3491,15 @@ mod tests {
         // Exhaust `a` entirely.
         while a.allocate().is_ok() {}
         assert!(a.allocate().is_err());
-        // `b` must be completely unaffected.
+        // `b` must be completely unaffected: it hands out a full id space of its own.
         let mut from_b = Vec::new();
-        for _ in 0..254 {
+        for _ in 0..crate::net::MAX_VMID {
             from_b.push(
                 b.allocate()
                     .expect("independent allocator must not be coupled"),
             );
         }
-        assert_eq!(from_b.len(), 254);
+        assert_eq!(from_b.len(), crate::net::MAX_VMID as usize);
     }
 
     // H-ORCH-4: the cross-process lock dir is now injectable (`shared_at`), so the
@@ -3561,7 +3567,7 @@ mod tests {
     // `try_claim` used to collapse every I/O failure into `false` — the discarded
     // `create_dir_all`, an `EACCES` open, a failed `flock`, a failed write — and a full
     // sweep of `false`s is exactly what `allocate` renders as
-    // `Exhaustion("No available VMIDs (limit 254)")`. An operator whose lock directory is
+    // `Exhaustion("No available VMIDs (limit …)")`. An operator whose lock directory is
     // unusable therefore chased a phantom capacity limit.
     //
     // BOTH arms are pinned here. The I/O arm makes the lock directory path a REGULAR FILE,
@@ -3607,13 +3613,13 @@ mod tests {
     }
 
     // The other half of `m3`'s distinction: a genuinely full id space must STILL report
-    // exhaustion. Every id in `1..=254` is locked by a live owner (this very process), so
+    // exhaustion. Every id in `1..=MAX_VMID` is locked by a live owner (this very process), so
     // the sweep legitimately finds nothing — and no I/O ever fails. Without this leg the
     // fix above could be "make everything an I/O error" and still look green.
     #[test]
     fn a_genuinely_full_id_space_still_reports_exhaustion() {
         let dir = tempfile::tempdir().expect("tempdir");
-        for id in 1..=254u32 {
+        for id in 1..=crate::net::MAX_VMID {
             std::fs::write(
                 dir.path().join(format!("{id}.lock")),
                 std::process::id().to_string(),
@@ -3726,14 +3732,26 @@ mod tests {
             "two processes' fresh segid allocators must not deterministically pick the same id"
         );
 
-        // One law, not a second copy: the vmid allocator on the same seed starts in the same
-        // place (both id spaces are 254 wide).
+        // One law, not a second copy. The two id spaces are no longer the same WIDTH — the H2
+        // widening moved `net::MAX_VMID` to 9999 while segids stay at 254 — so the shared law is
+        // asserted where it actually lives: each allocator's first id is `seeded_id_order`'s first
+        // id over that allocator's own ceiling. (Comparing the two allocators' outputs to each
+        // other, as this leg used to, only ever held because the widths happened to match.)
+        assert_eq!(
+            a,
+            seeded_id_order(&*at(5_000_000), crate::net::MAX_SEGMENT_ID)
+                .next()
+                .expect("the seeded order is non-empty"),
+            "the segid allocator must order its search through the ONE seeded law"
+        );
         assert_eq!(
             VmidAllocator::with_clock(at(5_000_000))
                 .allocate()
                 .expect("vmid allocates"),
-            a,
-            "both allocators must order their search through the ONE seeded law"
+            seeded_id_order(&*at(5_000_000), crate::net::MAX_VMID)
+                .next()
+                .expect("the seeded order is non-empty"),
+            "the vmid allocator must order its search through the ONE seeded law"
         );
 
         // Seeding rotates the search; it never shrinks it. Every id stays reachable, so the
@@ -3837,14 +3855,14 @@ mod tests {
             Err(crate::error::Error::Config(_))
         ));
         assert!(matches!(
-            alloc.reserve(255),
+            alloc.reserve(crate::net::MAX_VMID + 1),
             Err(crate::error::Error::Config(_))
         ));
     }
 
     // ORCH-8. The search-start seed comes from the INJECTED clock, not
     // `SystemTime::now()` directly. On an empty allocator `allocate()` returns
-    // exactly the seeded start `(subsec_nanos % 254) + 1`, so a fixed `FakeClock`
+    // exactly the seeded start `(subsec_nanos % MAX_VMID) + 1`, so a fixed `FakeClock`
     // makes the first allocation deterministic. Buggy impl (seeding from
     // `SystemTime::now()`) ignores the injected clock and returns a wall-clock
     // value instead — reddening these exact-value assertions.
@@ -3856,11 +3874,11 @@ mod tests {
             })
         };
         let a = VmidAllocator::with_clock(at(1000));
-        assert_eq!(a.allocate().unwrap(), (1000 % 254) + 1);
+        assert_eq!(a.allocate().unwrap(), (1000 % crate::net::MAX_VMID) + 1);
         // A different fixed time yields a different starting vmid → the seed is
         // genuinely clock-derived, not a constant.
         let b = VmidAllocator::with_clock(at(2000));
-        assert_eq!(b.allocate().unwrap(), (2000 % 254) + 1);
+        assert_eq!(b.allocate().unwrap(), (2000 % crate::net::MAX_VMID) + 1);
     }
 
     // ---- Full teardown-order assertion (design §13, Cross-cutting invariants) ----
@@ -5038,7 +5056,7 @@ mod tests {
     }
 
     // The fail-loud arm, and the ORDERING clause with it: a snapshot whose baked CID is outside the
-    // guest range `3..=254` names no legal vsock identity, so the restore is refused — BEFORE the
+    // guest range names no legal vsock identity, so the restore is refused — BEFORE the
     // resume ("a squatting VM must not be brought back up"), which the untouched call record proves
     // directly. Residue is zero on that path, like every other mid-restore failure.
     //
@@ -5064,7 +5082,7 @@ mod tests {
         .await;
         assert!(
             matches!(res, Err(crate::error::Error::Vmm(_))),
-            "a baked CID outside 3..=254 must fail loud, got {res:?}"
+            "a baked CID outside the guest range must fail loud, got {res:?}"
         );
 
         let calls = vmm.recorded();

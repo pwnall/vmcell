@@ -50,9 +50,9 @@ use crate::vmm::CidAllocator;
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct HostEnv {
-    /// The CID allocator (guest vsock context IDs, `3..=254`).
+    /// The CID allocator (guest vsock context IDs, `vmm::MIN_GUEST_CID..=vmm::MAX_GUEST_CID`).
     pub cids: Arc<CidAllocator>,
-    /// The VMID allocator (`1..=254`; `shared()` for cross-process uniqueness, `new()` hermetic).
+    /// The VMID allocator (`1..=net::MAX_VMID`; `shared()` for cross-process uniqueness, `new()` hermetic).
     pub vmids: VmidAllocator,
     /// The segment-id allocator (`1..=254`, §6.5 VM-to-VM segments) — its **own** id space, over
     /// the same cross-process claim law as `vmids` (an additive field: this bundle grows by field,

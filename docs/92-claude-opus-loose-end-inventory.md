@@ -124,6 +124,21 @@ needles and the scan then scooped unrelated strings — it printed `ok: 11 signa
 eleven of the wrong ones and letting a real inline `contains("Kernel panic")` through. The self-test
 now pins both rustfmt layouts, and that leg is the one that reddens on the old extractor.
 
+**Waves 7–8 finished Tier E.** The daemon got its periodic sweeper (deferring entirely while any
+launch is in flight — a booting VM's netns exists under a vmid the table does not list yet), a UDS
+transport that still requires the bearer key, an artifact GC that collects only the daemon's own
+provable crash residue, and copy-on-attach writable disks. The proxy got cassettes and transparent-path
+MITM. The segment got a typed impairment API, with §17's blocker re-verified against the lockfile
+rather than believed. The vsock↔TCP forwarder puts the non-portable half-close in the type.
+`experiment-fuse` finally enforces read-only, closing the tree's one literal `TODO` — and the
+workaround register's row V1 turned out to be **stale**, which is what unblocked it.
+
+And the per-host VM ceiling moved **252 → 9999**. The order was the finding: the address map was never
+the binding limit — `CidAllocator` was `3..=254`, a notch *below* the map — so widening the `/16`
+first would have bought exactly zero. The roster also turned up a **sixth** home the analysis had
+missed, `VmConfigBuilder::build`'s own `vmid > 254`, which refused loudly rather than wrapping, which
+is precisely why five review passes had walked past it.
+
 ## Tier F — roadmap, needs design first
 
 UFFD/demand-paged `lazy_restore` on any backend. The thin broker + fd-passing (and the

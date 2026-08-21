@@ -138,6 +138,77 @@ pub(crate) fn clone_tree_cow_blocking(src: &Path, dst: &Path) -> Result<CowSuppo
     Ok(support)
 }
 
+/// Copy-on-write-clones the single regular file at `src` into `dst`.
+///
+/// The **file-level** door beside [`clone_tree_cow_blocking`]'s directory-level one, and the same
+/// primitive underneath: `FICLONE` where the host filesystem gives it, a full byte copy everywhere
+/// else, reported honestly as [`CowSupport`]. What it exists for is a writable-scratch extra disk
+/// copied-on-attach from an immutable store artifact (§11.5, The HTTP REST API and its OpenAPI
+/// document): a daemon extra disk is **one file** sitting in the store directory beside every other
+/// artifact, so there is no directory to hand [`clone_tree_cow_blocking`] — cloning the store
+/// directory to materialize one disk would copy the whole store, and handing it the file itself is
+/// its `InvalidInput` arm.
+///
+/// `dst` must not already exist; its parent directory is created if needed. The copy is faithful and
+/// **independent** — writing it never touches `src`, which is what keeps the create-only store
+/// immutable while the guest writes its private copy.
+///
+/// Returns [`CowSupport::Reflink`] when the copy shared blocks with `src` and
+/// [`CowSupport::FullCopy`] when it paid a byte copy. Both are success: a host without reflink still
+/// gets a correct writable copy, just a more expensive one, and the caller is told which it got
+/// rather than left to assume.
+///
+/// This is the low-level primitive behind
+/// [`ReflinkOverlayStore::clone_file`](crate::overlay::ReflinkOverlayStore). Like its directory
+/// sibling it runs synchronously and may copy a whole disk image, so callers invoke it on a blocking
+/// thread; reaching it goes through the [`OverlayStore`](crate::overlay::OverlayStore) seam (S4),
+/// never directly.
+///
+/// # Errors
+/// [`Error::Io`] with [`io::ErrorKind::AlreadyExists`] if `dst` exists,
+/// [`io::ErrorKind::InvalidInput`] if `src` is not a regular file (a directory, a device node), and
+/// the underlying error if `src` cannot be read or `dst` cannot be written. A `src`/`dst` split
+/// across two filesystems still succeeds via the full-copy fallback.
+pub(crate) fn clone_file_cow_blocking(src: &Path, dst: &Path) -> Result<CowSupport> {
+    if dst.exists() {
+        return Err(Error::Io(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "copy-on-write clone target already exists: {}",
+                dst.display()
+            ),
+        )));
+    }
+    // `metadata` (not `symlink_metadata`): a symlink TO a regular file is a regular file for the
+    // purposes of copying its contents, and that is what `reflink_or_copy` will read.
+    let meta = std::fs::metadata(src).map_err(Error::Io)?;
+    if !meta.is_file() {
+        return Err(Error::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "copy-on-write clone source is not a regular file: {}",
+                src.display()
+            ),
+        )));
+    }
+    // The parent is created for the same reason `clone_tree_cow_blocking` creates `dst` itself: the
+    // caller names where the private copy goes, and a per-VM scratch directory that does not exist
+    // yet is the normal case, not a typo. `dst` itself is still never overwritten.
+    if let Some(parent) = dst.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).map_err(Error::Io)?;
+    }
+    // `reflink_or_copy` returns `None` for a block-level reflink and `Some(bytes)` when it fell back
+    // to a full copy — the same two-arm reading `clone_tree_cow_blocking` folds over a whole tree.
+    Ok(
+        match reflink_copy::reflink_or_copy(src, dst).map_err(Error::Io)? {
+            None => CowSupport::Reflink,
+            Some(_bytes) => CowSupport::FullCopy,
+        },
+    )
+}
+
 /// Probes whether `dir`'s filesystem supports reflink, by reflinking a tiny
 /// sentinel file inside a private **sibling scratch directory** (never inside
 /// `dir` itself) and observing the outcome.
@@ -498,6 +569,143 @@ mod tests {
         assert!(
             matches!(res, Err(Error::Io(ref e)) if e.kind() == io::ErrorKind::InvalidInput),
             "a non-directory src must be rejected with InvalidInput, got {res:?}"
+        );
+    }
+
+    // THE FILE-LEVEL DOOR (§11.5, the daemon's copy-on-attach writable scratch disk): the copy
+    // carries the source's bytes, and writing the COPY leaves the source byte-identical. That
+    // second half is the whole point — the source is a create-only store artifact other VMs are
+    // reading, and a clone that shared its inode (a hardlink) would let one guest's write reach
+    // every other cell. RED on that inverse (`std::fs::hard_link` in place of `reflink_or_copy`):
+    // the source's bytes change under it.
+    #[test]
+    fn clone_file_is_faithful_and_independent() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let artifact = root.path().join("data.img");
+        let mut bytes = vec![0u8; 4096];
+        bytes[..9].copy_from_slice(b"VMCELLAPI");
+        std::fs::write(&artifact, &bytes).expect("seed artifact");
+
+        let copy = root.path().join("scratch").join("0-data.img");
+        let support = clone_file_cow_blocking(&artifact, &copy).expect("clone_file");
+        assert!(
+            matches!(support, CowSupport::Reflink | CowSupport::FullCopy),
+            "both arms are success; the caller is told which it got"
+        );
+        assert_eq!(
+            std::fs::read(&copy).expect("read the copy"),
+            bytes,
+            "the copy must carry the artifact's bytes"
+        );
+
+        // The guest's write, modelled: rewrite the copy, and the store artifact must not move.
+        std::fs::write(&copy, vec![0xEEu8; 4096]).expect("write the copy");
+        assert_eq!(
+            std::fs::read(&artifact).expect("read the artifact"),
+            bytes,
+            "writing the copy-on-attach copy must not mutate the store artifact"
+        );
+    }
+
+    // The parent of `dst` is created — a per-VM scratch directory that does not exist yet is the
+    // normal case for the daemon's first writable disk. RED on the inverse (drop the
+    // `create_dir_all`): `reflink_or_copy` fails with `NotFound` on the missing directory.
+    #[test]
+    fn clone_file_creates_the_missing_parent_directory() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let src = root.path().join("a.img");
+        std::fs::write(&src, b"payload").expect("src");
+        let dst = root
+            .path()
+            .join("does")
+            .join("not")
+            .join("exist")
+            .join("a.img");
+        clone_file_cow_blocking(&src, &dst).expect("clone into a fresh scratch dir");
+        assert_eq!(std::fs::read(&dst).expect("read"), b"payload");
+    }
+
+    // A DIRECTORY source is the not-a-file arm — the exact mistake the directory-level door makes
+    // when handed a file, in the other direction, and the one a caller reaching for the wrong door
+    // will make. The guard is OURS rather than the copy crate's: RED on the inverse (drop the
+    // `is_file` guard) is measured, and it is the message half — `reflink_or_copy` also refuses a
+    // directory, but with its own wording, which is a contract this module does not control and
+    // which says nothing about the path that was wrong.
+    #[test]
+    fn clone_file_rejects_a_directory_source() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let dir_src = root.path().join("a-dir");
+        std::fs::create_dir_all(&dir_src).expect("mk dir src");
+        let res = clone_file_cow_blocking(&dir_src, &root.path().join("out.img"));
+        assert!(
+            matches!(res, Err(Error::Io(ref e)) if e.kind() == io::ErrorKind::InvalidInput),
+            "a directory source must be rejected with InvalidInput, got {res:?}"
+        );
+        assert!(
+            format!("{res:?}").contains("not a regular file"),
+            "the refusal must name what was wrong: {res:?}"
+        );
+    }
+
+    // A missing source is a hard error, never a silently-empty copy the guest would then see as a
+    // zeroed disk.
+    #[test]
+    fn clone_file_rejects_a_missing_source() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let res =
+            clone_file_cow_blocking(&root.path().join("nope.img"), &root.path().join("o.img"));
+        assert!(
+            matches!(res, Err(Error::Io(ref e)) if e.kind() == io::ErrorKind::NotFound),
+            "a missing source must Io-error with NotFound, got {res:?}"
+        );
+    }
+
+    // A pre-existing target is a hard error — a second VM's copy never overwrites a live one's.
+    #[test]
+    fn clone_file_rejects_an_existing_target() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let src = root.path().join("s.img");
+        std::fs::write(&src, b"x").expect("src");
+        let dst = root.path().join("d.img");
+        std::fs::write(&dst, b"someone else's copy").expect("pre-existing target");
+        let res = clone_file_cow_blocking(&src, &dst);
+        assert!(
+            matches!(res, Err(Error::Io(ref e)) if e.kind() == io::ErrorKind::AlreadyExists),
+            "an existing target must be rejected, got {res:?}"
+        );
+        assert_eq!(
+            std::fs::read(&dst).expect("read"),
+            b"someone else's copy",
+            "and it must not have been touched"
+        );
+    }
+
+    // THE HONESTY ORACLE, the same argument `probe_agrees_with_actual_clone_outcome` makes for the
+    // directory door: the reported `CowSupport` must agree with what this filesystem actually does.
+    // A hardcoded `Ok(CowSupport::Reflink)` (the "assume it was cheap" inverse) reddens here on
+    // ext4/tmpfs; a hardcoded `FullCopy` (the "never claim reflink" inverse) reddens on XFS/Btrfs.
+    // Exactly one of the two goes red on whatever filesystem the test runs on, and a caller sizing a
+    // pool of writable scratch disks is reading a measured answer rather than an assumption.
+    #[test]
+    fn clone_file_reports_the_support_this_filesystem_actually_gives() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let dir = root.path().join("store");
+        std::fs::create_dir_all(&dir).expect("mk store");
+        let src = dir.join("data.img");
+        std::fs::write(&src, vec![0x5Au8; 4096]).expect("src");
+        let file_support =
+            clone_file_cow_blocking(&src, &dir.join("copy.img")).expect("clone_file");
+        assert_eq!(
+            file_support,
+            probe_reflink(&dir),
+            "clone_file must report the CoW support this filesystem actually gives"
+        );
+        // …and it must agree with the DIRECTORY door on the same filesystem: one primitive, two
+        // shapes, never two different answers about the same host.
+        assert_eq!(
+            file_support,
+            clone_tree_cow_blocking(&dir, &root.path().join("tree-copy")).expect("clone_tree"),
+            "the file-level and directory-level doors must agree about the same filesystem"
         );
     }
 }

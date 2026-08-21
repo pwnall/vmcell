@@ -485,7 +485,7 @@ async fn test_snapshot_restore_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
 
         let new_cid = vm.instance().guest_cid();
         assert!(
-            (3..=254).contains(&new_cid),
+            (vmcell::vmm::MIN_GUEST_CID..=vmcell::vmm::MAX_GUEST_CID).contains(&new_cid),
             "restored VM must have a valid guest CID, got {new_cid}"
         );
 

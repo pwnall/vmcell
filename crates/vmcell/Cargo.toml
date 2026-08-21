@@ -857,7 +857,30 @@ name = "vmcell"
 #     Hypervisor or crosvm. The REVERSE direction (a guest dialling out through a host listener) is
 #     deliberately not shipped: it is two different mechanisms on the two transport families, one of
 #     which `VsockEndpoint` does not model.
-version = "0.23.2"
+# 0.23.2 → 0.23.3: ADDITIVE — the `OverlayStore` seam grows a second door, `clone_file`, beside
+# `clone_tree` (docs/92 Tier E, H1: the daemon's copy-on-attach writable scratch disk, §11.5). A
+# PATCH edge for the reason the 0.23.0 → 0.23.1 edge names: no existing signature moves, so the
+# fourteen sibling manifests pinning `vmcell = "0.23.0"` (a `^0.23.0` requirement) keep resolving
+# without an edit.
+#
+#   * ADDITIVE: `OverlayStore::clone_file(&self, src: &Path, dst: &Path) -> Result<CowSupport>`
+#     copy-on-write-copies ONE regular file into a fresh private copy (parent created, existing
+#     `dst` refused), reporting the same honest `CowSupport` `clone_tree` does.
+#     `ReflinkOverlayStore` implements it over the same `reflink`/full-copy primitive.
+#
+#     It carries a DEFAULT body, which is what keeps this edge a patch rather than a 0.24.0 that
+#     would strand those pins: an existing out-of-tree `OverlayStore` still compiles untouched. The
+#     default REFUSES with `Error::CapabilityUnavailable` naming the store and the copy asked for
+#     (§7.2's absent-facility contract), because the only alternatives are worse — improvising a
+#     host-filesystem copy behind the injected store's back is the second materialization path S4
+#     forbids, and a silent `Ok` would hand a caller a disk that is not there. A consumer whose
+#     store is asked for a file-level clone therefore implements the door; one that is never asked
+#     (nothing in `vmcell` itself calls it — the caller is `vmcell-daemon`) is unaffected.
+#
+#     Why a second door instead of reusing `clone_tree`: the thing being copied is a single store
+#     artifact sitting in a directory full of other artifacts, so handing `clone_tree` that
+#     directory would copy the whole store, and handing it the file is its `InvalidInput` arm.
+version = "0.23.3"
 edition = "2024"
 # MSRV is the single workspace floor (`[workspace.package] rust-version`, in lockstep with
 # rust-toolchain.toml via the `just ci` sync assertion) — currently the latest stable, 1.98.0.

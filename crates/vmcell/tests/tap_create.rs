@@ -68,9 +68,10 @@ impl Drop for NetnsFixture {
 
 /// The vmid this suite's fixtures are named after.
 ///
-/// It is **not** protected by being high: `VmidAllocator::allocate` walks `seeded_id_order(clock,
-/// 254)`, a nanosecond-seeded rotation over the whole `1..=254` space precisely so no id is tried
-/// first, so 231 is exactly as likely to be handed out as 1. What protects these legs is that
+/// It is **not** protected by being high: `VmidAllocator::allocate` walks
+/// `seeded_id_order(clock, net::MAX_VMID)`, a nanosecond-seeded rotation over the whole
+/// `1..=MAX_VMID` space precisely so no id is tried first, so 231 is exactly as likely to be handed
+/// out as 1. What protects these legs is that
 /// nextest's `serial-host` group runs them one at a time — `.config/nextest.toml`'s
 /// `package(~vmcell) & kind(test) & !binary(proptests)` override selects this binary — and that
 /// every leg sweeps `clean_vmcell_netns()` first, so a crashed earlier run cannot collide either.

@@ -5098,14 +5098,32 @@ runs its KVM-free gates in `just ci`; `just test-crosvm` is the opt-in live suit
 
 **Storage & shares.** A per-share service-uid allocator for `virtiofsd` (§4.5). `fuse-backend-rs` as an
 in-process share backend is gated behind `experiment-fuse` but must enforce read-only before it can
-graduate (today a RO share on it is a typed `Unsupported`, §4.5). A writable-scratch extra disk
-copied-on-attach from a store artifact (the daemon's read-only-disk limitation, §11.5).
+graduate (today a RO share on it is a typed `Unsupported`, §4.5). A writable-scratch extra disk copied-on-attach from a store artifact is
+**CLOSED** (2026-08-21): `OverlayStore::clone_file` is the file-level door on the S4 seam (a default
+body that refuses as `CapabilityUnavailable`, so an injected store cannot have a host copy improvised
+behind it), and `ExtraDiskSpec.writable` attaches a private per-VM clone that dies with the VM. The
+store artifact is never attached writable whatever the flag says. Recorded limitation: the copies live
+under `<artifacts-dir>/.vmcell-scratch/` (reflink is filesystem-local, so anywhere else forces a byte
+copy) and are **excluded** from the store's usage accounting, so `--max-store-bytes` bounds uploads
+only — an operator provisions quota *plus* concurrent writable disks, and a per-VM ceiling is the
+obvious next knob and is not shipped.
 
 **Networking.** `Egress::Open` provides no *arbitrary* outbound egress in either mode — closing it needs
 real destination re-origination (or a typed `Unsupported`), §6.2. Per-VM network byte counters need a new
 netns-scoped usage type reading `/sys/class/net/<if>/statistics` (§7.1). Privileged-path `host_services`
 wiring (a TPROXY accept rule + a host binding) would re-add the `host_services_port` field on the
-privileged variant (§6.2). The ≈254-VM-per-`/16` ceiling from the `(vmid % 254) + 1` octet map (§9.3). A
+privileged variant (§6.2). The per-host VM ceiling is **CLOSED** (2026-08-21 loose-end pass): it moved
+252 → **9999**. The binding limit was never the address map — `CidAllocator` was `3..=254`, a notch
+*below* the map's own 254, and `MicroVm::start` allocates a guest CID unconditionally, so widening the
+`/16` first would have raised the concurrent count by exactly zero. The CID space moved first
+(`vmm::MAX_GUEST_CID` is now **derived** from `net::MAX_VMID`), then `ip_math` gained a second
+dimension (`sub = (vmid-1)/254`, host `4·sub+1`, guest `4·sub+2`, third octet unchanged) — a strict
+**superset** that agrees byte-for-byte with the old map on `1..=254`, so this section's own statement
+and every pinned golden stay true. 9999 is the `IFNAMSIZ` ceiling, not a round number:
+`<prefix>-tap-<vmid>` at `MAX_RESOURCE_PREFIX_LEN = 6` is exactly 15 bytes at four digits, and two
+`const` asserts hold both that and the codomain bound. The roster found a **sixth** home the analysis
+had missed — `VmConfigBuilder::build`'s own `vmid > 254`, which refused loudly rather than wrapping,
+which is precisely why five review passes walked past it. A
 fully-automatic periodic orphan sweeper (the daemon already closes its own crash-restart case, §11.4).
 The **smoltcp NAT bring-up flake** (recorded 2026-07-15): ~10% of networked boots, the VMM's wait for
 the vhost-user-net UDS does not succeed within its 2 s ceiling. **The flake is real; its mechanism is

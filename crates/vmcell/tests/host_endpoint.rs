@@ -80,7 +80,7 @@ async fn dial_host_endpoint<V: vmcell::vmm::Vmm>(vmm: &V, egress: Egress, port: 
     // IP-PNP check below fails with `eth0 is not up` on that backend alone.
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
-    // The IP-PNP contract (guest eth0 carries its (vmid%254)+1 /30 address, zero-netlink, via
+    // The IP-PNP contract (guest eth0 carries its `ip_math(vmid)` /30 address, zero-netlink, via
     // the `ip=` cmdline) is the extracted `checks::net_ip_pnp` the validator runs
     // (§5.3, The kernel command line / §13, Cross-cutting invariants).
     //

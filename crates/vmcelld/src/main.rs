@@ -308,7 +308,8 @@ fn run_broker_child_inner(
             Ok(a) => a,
             Err(_) => return 1,
         };
-        let launcher = match MicroVmLauncher::new(ch_bin, &cli.resource_prefix) {
+        let launcher = match MicroVmLauncher::new(ch_bin, &cli.resource_prefix, &cli.artifacts_dir)
+        {
             Ok(l) => l,
             Err(e) => {
                 tracing::error!("vmcelld: {e}");
@@ -452,7 +453,7 @@ fn run_single_process(
         );
     }
 
-    let launcher = match MicroVmLauncher::new(ch_bin, &cli.resource_prefix) {
+    let launcher = match MicroVmLauncher::new(ch_bin, &cli.resource_prefix, &cli.artifacts_dir) {
         Ok(l) => l,
         Err(e) => {
             tracing::error!("vmcelld: {e}");

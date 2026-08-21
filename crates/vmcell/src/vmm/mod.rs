@@ -1104,11 +1104,53 @@ pub fn config_has_vhost_user_device(cfg: &VmConfig, res: &PerVmResources) -> boo
     )
 }
 
+/// The lowest guest vsock context ID. The AF_VSOCK ABI reserves 0, 1 and 2
+/// (`VMADDR_CID_HYPERVISOR`, `VMADDR_CID_LOCAL`, `VMADDR_CID_HOST`), so guests start at 3.
+pub const MIN_GUEST_CID: u32 = 3;
+
+/// The highest guest vsock context ID this host hands out — **derived** from
+/// [`crate::net::MAX_VMID`], never spelled as its own number.
+///
+/// `MicroVm::start` allocates a guest CID unconditionally, so a CID space narrower than the vmid
+/// space is the *binding* ceiling on concurrent VMs per host. It was: the range was a literal
+/// `3..=254`, which is 252 CIDs — below the address map's own 254 — so widening the `/16` map alone
+/// would have raised the concurrent-VM count by exactly zero (design §17, Networking). Sizing this
+/// off `MAX_VMID` makes the two move together by construction, and home 4 of
+/// `the_vmid_ceiling_is_one_law_with_five_other_homes` drains a real allocator to prove the
+/// derivation reaches the allocator and not just the constant.
+///
+/// A vsock CID is a `u32` with only 0/1/2 and `u32::MAX` (`VMADDR_CID_ANY`) reserved, so the old
+/// 254 was policy rather than an ABI limit and there is headroom far beyond this.
+pub const MAX_GUEST_CID: u32 = MIN_GUEST_CID + crate::net::MAX_VMID - 1;
+
+/// The guest CID range's own ABI precondition, as a compile error: it must start above the three
+/// reserved low CIDs and stop below `VMADDR_CID_ANY`. Not implied by the derivation above — a
+/// `MIN_GUEST_CID` lowered to 2 would hand a guest the host's own CID, and a `MAX_VMID` near
+/// `u32::MAX` would hand one `VMADDR_CID_ANY`.
+const _: () = assert!(
+    MIN_GUEST_CID > 2 && MAX_GUEST_CID < u32::MAX,
+    "the guest CID range escaped the AF_VSOCK reserved values (0/1/2 and u32::MAX)"
+);
+
+/// The live guest CIDs plus the search hint that keeps [`CidAllocator::allocate`] linear.
+#[derive(Debug)]
+struct CidPool {
+    /// Every CID currently handed out or reserved.
+    active: std::collections::BTreeSet<u32>,
+    /// Invariant: every CID in `MIN_GUEST_CID..next_free` is in [`Self::active`], so a search may
+    /// start here instead of at [`MIN_GUEST_CID`].
+    ///
+    /// This exists because the space is now ~10⁴ wide rather than 252: rescanning from
+    /// `MIN_GUEST_CID` on every call made filling the pool quadratic, and filling the pool is
+    /// precisely what the exhaustion gates do.
+    next_free: u32,
+}
+
 /// Allocates unique Context IDs (CIDs) for vsock connections.
-/// CIDs >= 3 are available for guests.
+/// CIDs in [`MIN_GUEST_CID`]`..=`[`MAX_GUEST_CID`] are available for guests.
 #[derive(Debug)]
 pub struct CidAllocator {
-    active: std::sync::Mutex<std::collections::BTreeSet<u32>>,
+    active: std::sync::Mutex<CidPool>,
 }
 
 impl CidAllocator {
@@ -1116,7 +1158,10 @@ impl CidAllocator {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            active: std::sync::Mutex::new(std::collections::BTreeSet::new()),
+            active: std::sync::Mutex::new(CidPool {
+                active: std::collections::BTreeSet::new(),
+                next_free: MIN_GUEST_CID,
+            }),
         }
     }
 }
@@ -1130,59 +1175,75 @@ impl Default for CidAllocator {
 impl CidAllocator {
     /// Allocates and returns a unique Context ID (CID) for VSOCK communication.
     ///
+    /// Hands out the lowest free CID, so a released CID is reused before an untouched one.
+    ///
     /// # Errors
-    /// Returns an error if all 252 guest CIDs are in use.
+    /// Returns an error if every CID in [`MIN_GUEST_CID`]`..=`[`MAX_GUEST_CID`] is in use.
     pub fn allocate(&self) -> Result<u32> {
         // Recover from a poisoned lock instead of panicking: the guarded value is
-        // a plain `BTreeSet` of live CIDs with no cross-field invariant, so a
-        // panic mid-mutation cannot leave it in an unusable state — adopting the
-        // inner set is sound.
-        let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
-        for i in 3..=254 {
-            if !active.contains(&i) {
-                active.insert(i);
-                return Ok(i);
+        // a live-CID set plus a hint derived from it, with no invariant a panic
+        // mid-mutation can leave broken — `next_free` is only ever lowered by
+        // `release`, so adopting the inner value is sound.
+        let mut pool = self.active.lock().unwrap_or_else(|e| e.into_inner());
+        // Walk the contiguous live run starting at the hint. By `CidPool::next_free`'s invariant
+        // everything below the hint is live, so this finds the same lowest free CID a scan from
+        // `MIN_GUEST_CID` would, in time proportional to the run rather than to the whole space.
+        let mut cid = pool.next_free;
+        for &live in pool.active.range(cid..) {
+            if live > cid {
+                break;
             }
+            cid = live + 1;
         }
-        Err(crate::error::Error::Vmm(
-            "CID allocator exhausted".to_string(),
-        ))
+        if cid > MAX_GUEST_CID {
+            return Err(crate::error::Error::Vmm(
+                "CID allocator exhausted".to_string(),
+            ));
+        }
+        pool.active.insert(cid);
+        pool.next_free = cid + 1;
+        Ok(cid)
     }
 
-    /// Reserves a specific guest CID (`3..=254`), so a test — or a caller that must
-    /// pin a CID — can force a later [`allocate`](CidAllocator::allocate) to hand a
-    /// *different* one. Mirrors [`VmidAllocator::reserve`](crate::orchestrator::VmidAllocator::reserve);
+    /// Reserves a specific guest CID ([`MIN_GUEST_CID`]`..=`[`MAX_GUEST_CID`]), so a test — or a
+    /// caller that must pin a CID — can force a later [`allocate`](CidAllocator::allocate) to hand
+    /// a *different* one. Mirrors
+    /// [`VmidAllocator::reserve`](crate::orchestrator::VmidAllocator::reserve);
     /// CIDs are in-process only (no cross-process FS claim, unlike VMIDs).
     ///
     /// # Errors
     /// Returns [`Error::Vmm`](crate::error::Error::Vmm) if `cid` is out of the guest
-    /// range `3..=254`, or [`Error::Exhaustion`](crate::error::Error::Exhaustion) if it
+    /// range, or [`Error::Exhaustion`](crate::error::Error::Exhaustion) if it
     /// is already reserved.
     pub fn reserve(&self, cid: u32) -> Result<u32> {
-        if !(3..=254).contains(&cid) {
+        if !(MIN_GUEST_CID..=MAX_GUEST_CID).contains(&cid) {
             return Err(crate::error::Error::Vmm(format!(
-                "cid {cid} out of range (must be 3..=254)"
+                "cid {cid} out of range (must be {MIN_GUEST_CID}..={MAX_GUEST_CID})"
             )));
         }
-        // Recover from a poisoned lock instead of panicking: the guarded `BTreeSet`
-        // of live CIDs has no cross-field invariant, so adopting the inner set is sound.
-        let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
-        if active.contains(&cid) {
+        // Recover from a poisoned lock instead of panicking, for the reason `allocate` gives.
+        let mut pool = self.active.lock().unwrap_or_else(|e| e.into_inner());
+        if pool.active.contains(&cid) {
             return Err(crate::error::Error::Exhaustion(format!(
                 "CID {cid} already reserved"
             )));
         }
-        active.insert(cid);
+        // No `next_free` adjustment: a `cid` below the hint is live by the hint's own invariant and
+        // was refused above, so anything reaching here is at or above it.
+        pool.active.insert(cid);
         Ok(cid)
     }
 
     /// Releases a previously allocated CID.
     pub fn release(&self, cid: u32) {
-        // Recover from a poisoned lock instead of panicking: the guarded `BTreeSet`
-        // of live CIDs has no cross-field invariant, so adopting the inner set is
-        // sound.
-        let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
-        active.remove(&cid);
+        // Recover from a poisoned lock instead of panicking, for the reason `allocate` gives.
+        let mut pool = self.active.lock().unwrap_or_else(|e| e.into_inner());
+        pool.active.remove(&cid);
+        // Restore `CidPool::next_free`'s invariant: this CID is no longer live, so the hint may not
+        // claim everything below it is. Skipping this leaks the freed CID until the pool empties.
+        if cid >= MIN_GUEST_CID && cid < pool.next_free {
+            pool.next_free = cid;
+        }
     }
 }
 
@@ -2111,8 +2172,8 @@ mod tests {
             .await
             .expect("the fake restore must succeed");
 
-        // Every id except this VM's own is still available: 254 ids, one held.
-        let held: Vec<u32> = (1..=254)
+        // Every id except this VM's own is still available: the whole space, one held.
+        let held: Vec<u32> = (1..=crate::net::MAX_VMID)
             .filter(|id| env.vmids.reserve(*id).is_err())
             .collect();
         assert_eq!(
@@ -3143,12 +3204,29 @@ mod tests {
         // Releasing the reservation frees it for reuse.
         alloc.release(7);
         assert_eq!(alloc.reserve(7).expect("reserve after release"), 7);
-        // Out-of-range CIDs (the reserved 0..=2 and > 254) are rejected.
-        assert!(matches!(alloc.reserve(2), Err(crate::error::Error::Vmm(_))));
+        // Out-of-range CIDs (the ABI-reserved `0..=2` and anything past `MAX_GUEST_CID`) are
+        // rejected. Both boundaries are read off the consts, so the range moving with
+        // `net::MAX_VMID` cannot leave this leg asserting a stale refusal.
         assert!(matches!(
-            alloc.reserve(255),
+            alloc.reserve(MIN_GUEST_CID - 1),
             Err(crate::error::Error::Vmm(_))
         ));
+        assert!(matches!(
+            alloc.reserve(MAX_GUEST_CID + 1),
+            Err(crate::error::Error::Vmm(_))
+        ));
+        // …and the boundaries themselves are ACCEPTED, so an over-strict range (one that shrank
+        // the space by a notch at either end) reddens here rather than passing the negatives.
+        // On a fresh allocator: `alloc` has already handed out the low CIDs above.
+        let fresh = CidAllocator::new();
+        assert_eq!(
+            fresh.reserve(MIN_GUEST_CID).expect("the lowest guest CID"),
+            MIN_GUEST_CID
+        );
+        assert_eq!(
+            fresh.reserve(MAX_GUEST_CID).expect("the highest guest CID"),
+            MAX_GUEST_CID
+        );
     }
 
     // Guards VMM-7: a poisoned mutex must be recovered, not panicked on. The buggy
@@ -3163,7 +3241,7 @@ mod tests {
         }));
         // The lock is now poisoned; both operations must still work.
         let cid = alloc.allocate().expect("allocate after poison");
-        assert!(cid >= 3);
+        assert!(cid >= MIN_GUEST_CID);
         alloc.release(cid);
     }
 
@@ -3179,17 +3257,29 @@ mod tests {
             for _ in 0..n {
                 match alloc.allocate() {
                     Ok(cid) => {
-                        // Reserved CIDs 0/1/2 are never handed out, and the
-                        // ceiling is 254.
-                        prop_assert!(cid >= 3, "cid {} is in the reserved range", cid);
-                        prop_assert!(cid <= 254, "cid {} exceeds the ceiling", cid);
+                        // The ABI-reserved 0/1/2 are never handed out, and nothing above the
+                        // derived ceiling is either.
+                        prop_assert!(cid >= MIN_GUEST_CID, "cid {} is in the reserved range", cid);
+                        prop_assert!(cid <= MAX_GUEST_CID, "cid {} exceeds the ceiling", cid);
                         // Uniqueness: a live CID is never handed out twice.
                         prop_assert!(!allocated.contains(&cid), "duplicate cid {}", cid);
                         allocated.push(cid);
                     }
-                    Err(_) => {
-                        // Exhaustion only after all 252 guest CIDs (3..=254) are live.
-                        prop_assert_eq!(allocated.len(), 252);
+                    Err(e) => {
+                        // `n` is far below the space's width, so refusing here is never
+                        // exhaustion — it is an allocator that gave up early. Exhaustion itself is
+                        // proved by the two tests that actually fill the pool
+                        // (`cid_allocator_reuses_freed_and_wraps_without_colliding_with_live` in
+                        // tests/proptests.rs, and home 4 of net's ceiling roster); driving it from
+                        // here would cost ~10^4 allocations per proptest case.
+                        prop_assert!(
+                            false,
+                            "the allocator refused CID #{} of a {}-wide space with {} live: {:?}",
+                            allocated.len() + 1,
+                            MAX_GUEST_CID - MIN_GUEST_CID + 1,
+                            allocated.len(),
+                            e
+                        );
                     }
                 }
             }
@@ -3233,8 +3323,8 @@ mod tests {
         // api.sock/vsock.sock/serial.log paths.
         #[test]
         fn test_per_vm_paths_injective_in_pid_vmid(
-            pid1 in 0u32..100_000, vmid1 in 0u32..=254u32,
-            pid2 in 0u32..100_000, vmid2 in 0u32..=254u32,
+            pid1 in 0u32..100_000, vmid1 in 0u32..=crate::net::MAX_VMID,
+            pid2 in 0u32..100_000, vmid2 in 0u32..=crate::net::MAX_VMID,
         ) {
             prop_assume!((pid1, vmid1) != (pid2, vmid2));
             let base = Path::new("/tmp");

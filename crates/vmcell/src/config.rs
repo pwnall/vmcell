@@ -1746,7 +1746,7 @@ impl VmConfigBuilder {
     /// - `vcpus == 0` (at least one vCPU is required);
     /// - `mem_mib` below the 64 MiB floor;
     /// - an empty or relative kernel path (every host path this config names must be absolute);
-    /// - an explicit `vmid` outside the `1..=254` window used by the `/30`
+    /// - an explicit `vmid` outside the `1..=`[`crate::net::MAX_VMID`] window used by the `/30`
     ///   host-IP math;
     /// - a share with an empty mount tag, or two shares sharing a mount tag;
     /// - `snapshotting` combined with any vhost-user device — a virtio-fs
@@ -1980,8 +1980,15 @@ impl VmConfigBuilder {
             if vmid == 0 {
                 return Err(crate::error::Error::Config("vmid must be >= 1".into()));
             }
-            if vmid > 254 {
-                return Err(crate::error::Error::Config("vmid must be <= 254".into()));
+            // Home 6 of `crate::net::MAX_VMID`'s roster (`net::mod`'s
+            // `the_vmid_ceiling_is_one_law_with_five_other_homes`). Read from the address map
+            // rather than restated: a caller-pinned vmid this boundary refuses but the map and the
+            // allocator both admit is a second, narrower ceiling on one input path.
+            if vmid > crate::net::MAX_VMID {
+                return Err(crate::error::Error::Config(format!(
+                    "vmid must be <= {}",
+                    crate::net::MAX_VMID
+                )));
             }
         }
 
@@ -2442,10 +2449,14 @@ mod tests {
                 image: PathBuf::from("/rootfs.erofs"),
             },
         )
-        .vmid(255)
+        .vmid(crate::net::MAX_VMID + 1)
         .build()
         .unwrap_err();
-        assert!(err.to_string().contains("vmid must be <= 254"));
+        assert!(
+            err.to_string()
+                .contains(&format!("vmid must be <= {}", crate::net::MAX_VMID)),
+            "the refusal must name the one ceiling, not a stale copy of it: {err}"
+        );
     }
 
     // L-ORCH-6: the negative tests pin {0, 255, 32, 0-vcpu}, but an over-strict
@@ -2464,6 +2475,7 @@ mod tests {
         };
         mk(&|b| b.vmid(1)).expect("vmid 1 is in range");
         mk(&|b| b.vmid(254)).expect("vmid 254 is in range");
+        mk(&|b| b.vmid(crate::net::MAX_VMID)).expect("the highest addressable vmid is in range");
         mk(&|b| b.mem_mib(64)).expect("mem_mib 64 is at the floor");
     }
 

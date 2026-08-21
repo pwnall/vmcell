@@ -389,7 +389,7 @@ pub async fn rootfs_overlay_writable(steward: &mut StewardClient) -> Result<(), 
 
 /// The kernel's IP-PNP configured `eth0` at boot from the `ip=` cmdline — **no guest netlink**
 /// (← `host_endpoint.rs`, §5.3, The kernel command line/§13, Cross-cutting invariants). Asserts, via guest-tools `ip`, that `eth0` is `state up`
-/// carrying the **exact** `(vmid%254)+1` /30 address the orchestrator's `ip_math` expects (a
+/// carrying the **exact** `ip_math(vmid)` /30 address the orchestrator expects (a
 /// kernel that configured a wrong/default address, or a cmdline/`ip_math` desync, reddens), and
 /// that a non-empty routing table exists (IP-PNP installs the default route).
 ///

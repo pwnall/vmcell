@@ -533,7 +533,7 @@ fn dispatch_setup_network_nft_failure_reclaims_netns() {
 }
 
 // broker-hostip: an out-of-range vmid makes host_ip() (via ip_math, valid range
-// 1..=254) error; the broker must FAIL LOUD (BrokerReply::Error "host ip: ...")
+// 1..=`net::MAX_VMID`) error; the broker must FAIL LOUD (BrokerReply::Error "host ip: ...")
 // rather than mask it into an empty gateway with unwrap_or_default(). RED on the
 // pre-fix unwrap_or_default(), which returned NetworkReady{host_ip:""}. proxy_port is
 // None so this isolates the NetworkReady host_ip path (not emit_proxy_rules), and the

@@ -290,7 +290,9 @@ one breaking release; 1 lands first and alone. These conventions bind:
   request); the served OpenAPI and the mounted routes are one parity-gated table (P5); `DaemonError`
   maps to status once, a config error is 400 not 500; DTOs are single-sourced (client links
   `default-features = false`). `restore_from` goes via CoW so the store snapshot stays
-  re-restorable. Daemon extra disks are read-only (recorded, don't re-flag); the
+  re-restorable. A daemon extra disk is read-only by default and `writable: true` attaches a
+  **private copy-on-attach clone** through `env.overlay.clone_file` — the store artifact is never
+  attached writable, and the copy dies with the VM; the
   no-`init=`-over-REST rule is scoped by v33 delta 10 — `Service` placement + a custom init becomes
   expressible (it keeps the control plane, the rule's own rationale), while placement `None` stays
   unexpressible over REST.

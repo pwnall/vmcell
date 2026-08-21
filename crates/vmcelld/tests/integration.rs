@@ -224,7 +224,7 @@ enum Auth {
 /// port. Killed on `Drop`.
 struct Daemon {
     child: Child,
-    _store: tempfile::TempDir,
+    store: tempfile::TempDir,
     base: String,
     log_path: PathBuf,
 }
@@ -305,12 +305,19 @@ impl Daemon {
         let base = format!("http://127.0.0.1:{port}");
         let daemon = Daemon {
             child,
-            _store: store,
+            store,
             base,
             log_path,
         };
         daemon.wait_healthz().await;
         daemon
+    }
+
+    /// This daemon's `--artifacts-dir`. The store is a per-daemon temp directory, so a test can
+    /// inspect what the daemon put beside the artifacts it seeded — the writable-disk scratch, in
+    /// particular, which is where residue would show up.
+    fn store_dir(&self) -> &Path {
+        self.store.path()
     }
 
     async fn wait_healthz(&self) {
@@ -529,6 +536,7 @@ async fn extra_disk_io_limit_over_api_throttles_the_guest_read() {
                 ExtraDiskSpec {
                     name: "fast.img".to_string(),
                     io_limit: None,
+                    writable: false,
                 },
                 ExtraDiskSpec {
                     name: "slow.img".to_string(),
@@ -536,6 +544,7 @@ async fn extra_disk_io_limit_over_api_throttles_the_guest_read() {
                         bandwidth_bytes_per_sec: Some(MIB as u64),
                         iops: None,
                     }),
+                    writable: false,
                 },
             ],
             ..CreateVmRequest::create("vmlinux", "rootfs.erofs")
@@ -582,6 +591,205 @@ async fn extra_disk_io_limit_over_api_throttles_the_guest_read() {
     );
 
     c.destroy(&vm.id).await.expect("destroy");
+}
+
+/// The scratch-disk copies this daemon is holding right now: `(directory, [copy paths])` under the
+/// reserved subdirectory of its artifacts dir (`vmcell_daemon::scratch::SCRATCH_DIR_NAME`, read from
+/// the daemon's own const rather than re-spelled here).
+fn writable_disk_copies(store_dir: &Path) -> Vec<(PathBuf, Vec<PathBuf>)> {
+    let base = store_dir.join(vmcell_daemon::scratch::SCRATCH_DIR_NAME);
+    std::fs::read_dir(&base)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| {
+            let copies: Vec<PathBuf> = std::fs::read_dir(e.path())
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|c| c.path())
+                .collect();
+            (e.path(), copies)
+        })
+        .collect()
+}
+
+// design §11.5 (The HTTP REST API and its OpenAPI document) / §17: **copy-on-attach writable scratch
+// disks**, the whole path over the API — upload → `ExtraDiskSpec.writable` → the `OverlayStore`
+// file-level door → a private copy under the VM's scratch → the guest writing it.
+//
+// ONE VM, TWO DEVICES BACKED BY THE SAME ARTIFACT: `/dev/vdb` read-only (the artifact itself) and
+// `/dev/vdc` writable (a copy). That pairing is the point — the negative control is not a different
+// host on a different day, it is the same artifact in the same cell in the same second, so "the
+// guest could write" is attributable to the copy and to nothing else. (It also proves the two are
+// genuinely different files: `VmConfigBuilder` refuses two devices with the same image path, so a
+// writable arm that handed out the artifact could not even boot.)
+//
+// The second half is the one that makes this feature worth anything: the STORE ARTIFACT IS
+// UNCHANGED afterwards, asserted on its bytes AND on the digest the daemon reports for it. A leg
+// that only proved the guest could write would equally describe the defect where the guest wrote
+// straight into the create-only store, corrupting a fixture every other cell reads.
+//
+// RED ON THE INVERSE (run these against the tree before accepting):
+//   * `vmcell::BlockDevice::read_write(disk.source.clone())` in `attach_extra_disks`' writable arm —
+//     the guest's write reaches the artifact and the two "unchanged" assertions fail (in fact the
+//     boot fails first, on the duplicate image path).
+//   * `read_only(...)` in that arm — the guest's write to `/dev/vdc` fails and the positive control
+//     goes red.
+//   * delete `impl Drop for VmScratch` — the residue assertion after `destroy` fails.
+#[tokio::test]
+#[ignore = "boots a real VM; needs KVM + blessed runner + artifacts (run via `just test-daemon`)"]
+async fn writable_extra_disk_is_a_private_copy_and_the_store_artifact_is_unchanged() {
+    let d = Daemon::start(Auth::Open).await;
+    let c = d.client("");
+
+    // A 1 MiB image whose first bytes are a recognizable marker.
+    const ORIGINAL: &[u8; 9] = b"ORIGINALS";
+    let mut img = vec![0u8; 1 << 20];
+    img[..ORIGINAL.len()].copy_from_slice(ORIGINAL);
+    c.upload_artifact("scratch.img", img.clone())
+        .await
+        .expect("upload the disk artifact");
+    let digest_before = c
+        .get_artifact("scratch.img")
+        .await
+        .expect("artifact info")
+        .sha256;
+
+    let created = c
+        .create_vm(
+            CreateVmRequest::create("vmlinux", "rootfs.erofs")
+                .with_extra_disk("scratch.img") // /dev/vdb — the artifact, read-only
+                .with_writable_extra_disk("scratch.img"), // /dev/vdc — a private copy
+        )
+        .await
+        .expect("create with a writable extra disk");
+    let vm = created.vm;
+
+    // The copy carries the artifact's bytes: a writable disk is a COPY, not a blank image.
+    let out = c
+        .exec(
+            &vm.id,
+            ExecRequestDto::new(vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "head -c 9 /dev/vdc".into(),
+            ]),
+        )
+        .await
+        .expect("read /dev/vdc");
+    assert_eq!(out.code, 0, "read of the writable copy failed: {out:?}");
+    assert_eq!(
+        out.stdout().expect("decode"),
+        ORIGINAL,
+        "a writable extra disk must start as a faithful copy of its artifact"
+    );
+
+    // THE POSITIVE CONTROL: the guest writes the copy. `conv=notrunc,fsync` so the write lands in
+    // the host file rather than sitting in the guest's page cache, which is what lets the host-side
+    // assertion below distinguish "the copy took the write" from "the guest cached it".
+    let out = c
+        .exec(
+            &vm.id,
+            ExecRequestDto::new(vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "printf GUESTWROTE | dd of=/dev/vdc bs=1 count=10 conv=notrunc,fsync 2>/dev/null"
+                    .into(),
+            ]),
+        )
+        .await
+        .expect("write /dev/vdc");
+    assert_eq!(
+        out.code, 0,
+        "the guest must be able to WRITE its copy: {out:?}"
+    );
+    let out = c
+        .exec(
+            &vm.id,
+            ExecRequestDto::new(vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "head -c 10 /dev/vdc".into(),
+            ]),
+        )
+        .await
+        .expect("re-read /dev/vdc");
+    assert_eq!(
+        out.stdout().expect("decode"),
+        b"GUESTWROTE",
+        "the guest's write must be visible in the guest"
+    );
+
+    // THE NEGATIVE CONTROL, same cell, same artifact: the read-only device refuses the same write.
+    let out = c
+        .exec(
+            &vm.id,
+            ExecRequestDto::new(vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "printf GUESTWROTE | dd of=/dev/vdb bs=1 count=10 conv=notrunc 2>/dev/null".into(),
+            ]),
+        )
+        .await
+        .expect("attempt to write /dev/vdb");
+    assert_ne!(
+        out.code, 0,
+        "a read-only extra disk must REFUSE the guest's write; it succeeded: {out:?}"
+    );
+
+    // HOST SIDE, while the VM lives: the copy took the write, and it lives in this VM's scratch
+    // directory rather than anywhere a client can name.
+    let copies = writable_disk_copies(d.store_dir());
+    assert_eq!(
+        copies.len(),
+        1,
+        "exactly one VM's writable-disk scratch dir should exist: {copies:?}"
+    );
+    let (scratch_dir, files) = copies.into_iter().next().expect("the scratch dir");
+    assert_eq!(files.len(), 1, "one writable disk, one copy: {files:?}");
+    let copy = files.into_iter().next().expect("the copy");
+    let copied_bytes = std::fs::read(&copy).expect("read the copy host-side");
+    assert_eq!(
+        &copied_bytes[..10],
+        b"GUESTWROTE",
+        "the guest's write must have landed in the private copy on the host"
+    );
+
+    // …AND THE STORE ARTIFACT IS UNTOUCHED — the whole point of copy-on-attach.
+    let artifact = d.store_dir().join("scratch.img");
+    assert_eq!(
+        std::fs::read(&artifact).expect("read the store artifact"),
+        img,
+        "the create-only store artifact must be byte-identical after the guest wrote its copy"
+    );
+    assert_eq!(
+        c.get_artifact("scratch.img")
+            .await
+            .expect("artifact info")
+            .sha256,
+        digest_before,
+        "and the daemon must report the same digest for it as before the VM ran"
+    );
+
+    // RESIDUE: the copy existed (asserted above), and teardown removes it with the VM.
+    c.destroy(&vm.id).await.expect("destroy");
+    assert!(
+        !copy.exists() && !scratch_dir.exists(),
+        "the writable-disk copy and its scratch dir must be gone after destroy (ordered teardown); \
+         {} still there",
+        scratch_dir.display()
+    );
+    assert!(
+        writable_disk_copies(d.store_dir()).is_empty(),
+        "no writable-disk scratch may survive the VM that owned it"
+    );
+
+    // The artifact is still deletable — the pin released with the VM, exactly as for a read-only
+    // disk (the pin law does not fork on the mode).
+    c.delete_artifact("scratch.img")
+        .await
+        .expect("delete after the VM is gone");
 }
 
 #[tokio::test]
@@ -701,7 +909,7 @@ async fn stats_limits_enforced_matches_delegation() {
 #[ignore = "creates a netns + spawns vmcelld; run via `just test-daemon` (needs caps)"]
 async fn startup_sweep_reclaims_orphan_netns() {
     require_preconditions();
-    // A vmid well outside the 1..=254 allocation range so it can never belong to a live VM.
+    // A vmid well outside the 1..=`net::MAX_VMID` allocation range so it can never belong to a live VM.
     let orphan = "vmcell-net-60001";
     // Best-effort clean any leftover from a prior aborted run, then create the orphan (needs caps).
     let _ = Command::new("ip")

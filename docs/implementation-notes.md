@@ -6856,3 +6856,35 @@ Two findings worth carrying forward, both discovered by trying to break my own g
 2. rustdoc resolves a module's intra-doc links in TWO scopes if the module has both an outer `///` doc on `pub mod x;` and inner `//!` docs in `x.rs` — the failures surface as "unresolved link" with the CRATE ROOT's span (lib.rs:150, the deny attribute), naming no file. Keep module docs in one place; `steward/mod.rs` now carries a plain `//` comment saying so.
 
 Also recorded in-code: the pump's count law needs an ASYMMETRIC test pipe (roomy source, tiny sink). My first cut used 64 bytes on both sides, which made every read exactly 64 bytes and every write whole — and BOTH count inverses passed against it. That note is in the test's own comment so the next person does not re-introduce the symmetric shape.
+
+
+## Wave 8 — the two Tier E items that were blocked on scope
+
+For `docs/implementation-notes.md` (docs/** is forbidden to me — hand this to whoever owns the reconciliation):
+
+**H2 — the ≈254-VM-per-/16 ceiling is retired; §17's Networking entry should be struck.** The concurrent-VM ceiling per host moved 252 -> 9999. Recorded specifics a future pass must not "fix":
+
+1. **The order was load-bearing.** The binding ceiling was NOT the address map. `CidAllocator` was `3..=254` = 252 CIDs, and `MicroVm::start` allocates one unconditionally, so the CID space bound the host a notch BELOW the map's own 254. Widening the /16 first would have raised the concurrent-VM count by exactly zero. `vmm::MAX_GUEST_CID` is now DERIVED from `net::MAX_VMID`; do not re-literalise it.
+
+2. **The map is a strict superset, not a renumbering.** `sub = (vmid-1)/254`, `base = 4*sub`. For every vmid in 1..=254 `sub` is 0 and the addresses are byte-identical to the pre-widening map, so design §9.3's statement, every pinned golden, and every already-running host stay true. `the_widened_map_agrees_with_the_one_dimensional_map_it_replaced` is the gate, and it deliberately contains the ONLY sanctioned second copy of the old formula in the tree — the property under test is equality with a formula production no longer has.
+
+3. **9999 is the IFNAMSIZ ceiling, not a round number.** `<prefix>-tap-<vmid>` at `MAX_RESOURCE_PREFIX_LEN = 6` is exactly 15 bytes = `IFNAMSIZ - 1` at four digits — zero slack. A fifth digit costs prefix budget or a new tap-name scheme. Two `const` asserts hold it: the codomain bound (254 x 64 = 16256, so the address space is NOT what stops the next widening) and the four-digit bound. `naming::MAX_RESOURCE_PREFIX_LEN`'s rustdoc was rewritten from "6 lands on 14, one byte inside the limit" to record the new zero-slack situation.
+
+4. **The roster found a SIXTH home the prior analysis missed** — `config::VmConfigBuilder::build`'s `vmid > 254`, on the caller-pinned-vmid path. It refused loudly rather than wrapping, so it was never a data-plane defect, which is precisely why five review passes walked past it. It is now home 6 with its own roster leg.
+
+5. **`CidAllocator` gained a search hint** (`CidPool { active, next_free }`, invariant: every CID below `next_free` is live). Not a micro-optimisation — a rescan-from-`MIN_GUEST_CID` per call is quadratic at 10^4 wide, and filling the pool is what the exhaustion gates do. `release` restores the invariant; skipping that restore leaks the freed CID and reddens four tests. `VmidAllocator::allocate` needed no such change: `seeded_id_order` re-seeds from the clock per call, so the expected contiguous run is short (n·H_n total, ~92K steps for a full drain) rather than quadratic — measured, not assumed.
+
+6. **`orchestrator::segment_id_search_start_is_clock_seeded_like_the_vmid_search` was rewritten, not just renumbered.** It used to assert the vmid and segid allocators return the SAME first id, which only ever held because both spaces were 254 wide. They now differ by a decimal digit. The shared law is asserted where it actually lives: each allocator's first id equals `seeded_id_order`'s first id over that allocator's OWN ceiling. Do not restore the equality form.
+
+7. `vmcell::vmm::{MIN_GUEST_CID, MAX_GUEST_CID}` are new public consts; not on the §10.4 contract surface, no ledgered bump taken (see `ledger_touched`).
+
+
+FOR docs/implementation-notes.md (I could not write it — docs/** is off-limits in my brief). Suggested entry:
+
+"H1, copy-on-attach writable scratch disks (landed). The daemon's read-only-extra-disk limitation is retired; §11.5's and §17's records of it, and AGENTS.md's 'Daemon extra disks are read-only (recorded, don't re-flag)', are now stale and must be rewritten to the copy-on-attach rule: the client asks with `ExtraDiskSpec.writable`, the STORE ARTIFACT IS STILL NEVER ATTACHED WRITABLE, and what the guest gets is a private per-VM copy made through `OverlayStore::clone_file` and deleted with the VM.
+
+Two recorded deviations from the sketched design worth carrying:
+(a) `OverlayStore::clone_file` ships with a DEFAULT body (a typed `CapabilityUnavailable`) rather than as a required method. Not a softening of S4 — the refusal is what forbids an injected store from having a host-filesystem copy improvised behind its back — but a deliberate consequence of the pin arithmetic: a required method forces 0.24.0 and strands fourteen `^0.23.0` sibling requirements.
+(b) The per-VM copies live under `<artifacts-dir>/.vmcell-scratch/`, inside the store directory, NOT under `$XDG_RUNTIME_DIR`. Reflink is filesystem-local, so any other location makes every writable disk a full byte copy — and on tmpfs, a copy in RAM. The leading `.` makes the directory unnameable by `validate_artifact_name` on every verb. `ArtifactStore::usage` skips it, with the trade-off stated at both ends: those bytes are real and NOT counted, so `--max-store-bytes` bounds uploads only and an operator provisions quota + (concurrent cells × their writable disks). A per-VM or per-daemon writable-disk ceiling is the obvious next knob and is NOT shipped.
+
+Open for a future pass: these copies are keyed on the daemon's pid (they are minted before the VM has a vmid), so `vmcell::orchestrator::sweep_orphans` structurally cannot see them; `scratch::reclaim_orphan_scratch` is their start-up counterpart and is retain-on-doubt — a recycled pid that now belongs to another process leaves a bounded leak rather than risking a live daemon's copies."

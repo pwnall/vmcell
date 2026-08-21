@@ -122,7 +122,47 @@ name = "vmcell-daemon"
 #     reachable from a `default-features = false` client.
 #   * COMPANION, in `vmcell-daemon-client` (0.1.0, unbumped — it has no ledger and the edge is
 #     additive): a `store_usage()` verb, and `vmcelld-ctl` gains a `store` subcommand.
-version = "0.7.0"
+# 0.7.0 → 0.8.0: **copy-on-attach writable scratch disks** (docs/92 Tier E, H1; design §11.5, §17).
+# The daemon's "extra disks are read-only" limitation is lifted — it was recorded rather than
+# accidental, so this line is where it stops being true. As with every entry above,
+# `cargo semver-checks` does not cover this crate, so nothing else will tell a consumer.
+#   * WIRE-ADDITIVE: `ExtraDiskSpec` grows `writable: bool`, `#[serde(default)]` false. An existing
+#     client's body decodes unchanged and still produces a read-only, shared attachment — the
+#     pre-H1 cell, byte for byte. `writable: true` attaches a PRIVATE COPY of the named artifact
+#     instead: copied at create time (a reflink where the host filesystem gives one, a byte copy
+#     otherwise), writable by the guest, deleted with the VM. Nothing reads it back — it is scratch,
+#     not an output channel; a client that wants the result out of the cell reads it over `exec`.
+#   * THE STORE ARTIFACT IS NEVER ATTACHED WRITABLE, whatever the flag says, because the store is
+#     create-only and other cells may be reading the same file. That is why this is a copy rather
+#     than a mode, and it is what the live leg
+#     `writable_extra_disk_is_a_private_copy_and_the_store_artifact_is_unchanged` asserts.
+#   * A writable disk still PINS its source artifact (`DELETE` → 409 while the VM lives), exactly
+#     like a read-only one: the delete-in-use law does not fork on the mode.
+#   * NEW ON-DISK LAYOUT, inside `--artifacts-dir`: a reserved `.vmcell-scratch/` subdirectory
+#     (`scratch::SCRATCH_DIR_NAME`) holds one directory of copies per VM. It lives beside the store
+#     so a copy can actually reflink — that is a filesystem-local property — and its leading `.`
+#     makes it unnameable by any client artifact name on any verb. It is EXCLUDED from
+#     `GET /v1/store`: those bytes are real, but counting them would report per-VM scratch as
+#     snapshot prefixes and make an upload's 413 depend on which VMs happen to be running. An
+#     operator sizing that filesystem must account for the writable disks their cells ask for.
+#     A hard-killed daemon leaks these copies like it leaks netns/cgroup/scratch; the next daemon
+#     reclaims them at start-up, retaining anything whose owning pid is still alive.
+#   * SOURCE-BREAKING for an out-of-tree Rust caller (none of it reachable from a
+#     `default-features = false` client except the first): `ExtraDiskSpec` is not
+#     `#[non_exhaustive]`, so a struct literal must add `writable` — use
+#     `CreateVmRequest::with_extra_disk` / the new `with_writable_extra_disk` instead;
+#     `LaunchSpec::extra_disks` is now `Vec<launcher::ExtraDisk>` rather than
+#     `Vec<vmcell::BlockDevice>` (a `BlockDevice` names the image the guest is handed, and a
+#     writable disk's image does not exist until the launcher makes it, so carrying the store path
+#     in one would make "the artifact, attached read-write" representable); and
+#     `MicroVmLauncher::new` takes a third argument, the artifacts directory it puts that scratch
+#     under.
+#   * NEEDS `vmcell` 0.23.3, whose `OverlayStore` seam grew the file-level `clone_file` door every
+#     copy is materialized through (invariant S4: no second CoW path). The dependency requirement
+#     below stays `^0.23.0`, as every sibling's does — the workspace resolves it by path, and
+#     tightening one pin while thirteen others stayed loose would say something about resolution
+#     that is not true.
+version = "0.8.0"
 edition = "2024"
 rust-version.workspace = true
 license = "MIT OR Apache-2.0"

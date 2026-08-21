@@ -704,6 +704,19 @@ gates:
     # through `just --show`, so an interpolated `{{{{just_executable()}}}}` call reads as it runs.
     ./scripts/ban-orphan-recipe.sh
     ./scripts/test-ban-orphan-recipe.sh
+    # H2 / design §17 (Networking): the vmid ceiling had SIX homes, five of them bare literals, and
+    # the guest CID space had already drifted a notch BELOW the address map — 252 concurrent VMs
+    # against a map admitting 254 — so widening the /16 alone would have bought nothing. Every home
+    # now reads `net::MAX_VMID` (or `vmm::MAX_GUEST_CID`, derived from it), and
+    # `net::tests::the_vmid_ceiling_is_one_law_with_five_other_homes` drives all six end to end.
+    # This scanner is that roster's COMPLEMENT: it catches a SEVENTH home added by spelling the
+    # number inline, which no compiler and no roster can see. It reads both numbers OUT OF the law's
+    # own file so the needle follows the law, NAMES its in-source delegate and fails loud if that
+    # delegate or either const is gone. The self-test drives nine cases: all five historical inline
+    # homes, the widened value, the needle following a moved ceiling, four near-miss classes that
+    # must stay clean, and every vacuity arm including the empty tree (docs/90 G4).
+    ./scripts/ban-inline-vmid-ceiling.sh
+    ./scripts/test-ban-inline-vmid-ceiling.sh
     # G4/§17: the netem argv is ONE law (`Impairment::netem_args`), and its drift is not a compile
     # error — the law's output is a `Vec<String>` handed to a subprocess, so a second hand-spelled
     # `["qdisc","add",…,"netem",…]` runs perfectly and diverges silently. The home is held to an

@@ -140,6 +140,14 @@ impl ArtifactStore {
     /// subset a client can name. Symlinks are counted as links and never followed, so the walk
     /// cannot leave the store.
     ///
+    /// The **one** exclusion is the daemon's own per-VM writable-disk scratch
+    /// ([`crate::scratch::SCRATCH_DIR_NAME`], recognized through the one layout composer): it is
+    /// neither an artifact nor a snapshot prefix but live VM state that appears and vanishes with
+    /// cells the operator did not upload. Counting it would report per-VM scratch as snapshot
+    /// prefixes and make an upload's 413 depend on which VMs happen to be running — a number nobody
+    /// can act on by deleting an artifact. The trade-off is stated in [`crate::scratch`]: those
+    /// bytes are real, and they are not in this figure.
+    ///
     /// # Errors
     /// [`DaemonError::Internal`] if the directory cannot be read or the tree is deeper than
     /// `MAX_STORE_WALK_DEPTH` — a measurement that could not be completed is an error, never a
@@ -157,6 +165,10 @@ impl ArtifactStore {
                 continue;
             }
             if file_type.is_dir() {
+                // The daemon's own writable-disk scratch is not stored content; see the doc above.
+                if path == crate::scratch::scratch_base(&self.dir) {
+                    continue;
+                }
                 snapshot_prefix_count += 1;
                 used_bytes = used_bytes.saturating_add(dir_bytes(&path, MAX_STORE_WALK_DEPTH)?);
                 continue;
@@ -808,6 +820,42 @@ mod tests {
         assert_eq!(
             usage.quota_bytes, None,
             "an unconfigured store is unbounded"
+        );
+    }
+
+    // §11.5: the daemon's own per-VM writable-disk scratch is NOT stored content. It is neither a
+    // snapshot prefix nor bytes an operator can free by deleting an artifact — it appears and
+    // vanishes with the cells that hold it — so it is excluded from both figures, and the exclusion
+    // is recognized through `scratch::scratch_base`, the one layout composer, rather than a second
+    // spelling of the directory name here.
+    //
+    // The snapshot prefix beside it is the positive control: a REAL prefix still counts, so an
+    // exclusion that swallowed every directory would fail on the same assertion.
+    //
+    // RED on the inverse: drop the `scratch_base` skip in `usage` — `snapshot_prefix_count` becomes
+    // 2 and `used_bytes` grows by the disk copy, so an upload's 413 starts depending on which VMs
+    // happen to be running.
+    #[test]
+    fn per_vm_writable_disk_scratch_is_not_store_content() {
+        let (dir, store) = store();
+        store.create("k1", b"0123456789").expect("create");
+        std::fs::create_dir(dir.path().join("snap")).expect("prefix");
+        std::fs::write(dir.path().join("snap").join("state"), b"abc").expect("snapshot file");
+
+        let before = store.usage().expect("usage");
+        let scratch =
+            crate::scratch::VmScratch::create(&crate::scratch::scratch_base(dir.path()), 0)
+                .expect("scratch");
+        std::fs::write(scratch.path().join("0-data.img"), vec![0u8; 4096]).expect("a disk copy");
+
+        let after = store.usage().expect("usage");
+        assert_eq!(
+            after, before,
+            "a live VM's writable-disk copies must not move the store's usage figures"
+        );
+        assert_eq!(
+            after.snapshot_prefix_count, 1,
+            "the real snapshot prefix beside it still counts (the positive control)"
         );
     }
 

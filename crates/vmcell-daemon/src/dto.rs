@@ -173,9 +173,9 @@ pub struct DiskIoLimitDto {
 }
 
 /// An extra virtio-blk device for a created VM (design §11, The control-plane daemon (vmcelld)), backed by an artifact
-/// in the store. The store is **immutable** (create-only, no update), so an extra disk
-/// is attached **read-only** — a shared store artifact must not be mutated out from
-/// under other VMs (a writable-scratch-from-artifact copy is forward work). An optional
+/// in the store. The store is **immutable** (create-only, no update), so the artifact itself is
+/// never attached writable; [`writable`](ExtraDiskSpec::writable) asks instead for a private
+/// **copy-on-attach** copy of it (§11.5, The HTTP REST API and its OpenAPI document). An optional
 /// `io_limit` injects disk-I/O faults (§4.6, Extra virtio-blk devices and disk-I/O throttling).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExtraDiskSpec {
@@ -184,6 +184,22 @@ pub struct ExtraDiskSpec {
     /// Optional I/O rate limit (disk-I/O fault injection).
     #[serde(default)]
     pub io_limit: Option<DiskIoLimitDto>,
+    /// Attach a **writable private copy** of the artifact instead of the artifact itself
+    /// (design §11.5, The HTTP REST API and its OpenAPI document; §17, Open gaps and future
+    /// capabilities).
+    ///
+    /// Default `false`: the artifact is attached read-only and shared, which is what a fixture disk
+    /// several cells read wants. `true` copies the artifact — copy-on-write where the host
+    /// filesystem gives it, a byte copy otherwise — into the VM's own scratch directory at create
+    /// time and attaches **that**, so the guest may write it freely. The copy is per-VM and
+    /// **ephemeral**: it is deleted with the VM, nothing reads it back, and the store artifact it
+    /// came from is left byte-identical.
+    ///
+    /// The store artifact is *never* attached writable, whatever this says — the create-only store
+    /// must not be mutated out from under the other cells reading it. That is the whole reason this
+    /// is a copy rather than a mode.
+    #[serde(default)]
+    pub writable: bool,
 }
 
 /// Create-and-boot a VM (`POST /v1/vms`). Mirrors `vmcell run`/`create` (design §11.5, The HTTP REST API and its OpenAPI document), but
@@ -220,8 +236,10 @@ pub struct CreateVmRequest {
     /// the registry. Ignored when `command` is absent.
     #[serde(default)]
     pub ephemeral: bool,
-    /// Extra read-only virtio-blk devices from the store, enumerated in the guest as
-    /// `/dev/vdb`, `/dev/vdc`, … (design §11, The control-plane daemon (vmcelld)). A live VM pins these artifacts (delete
+    /// Extra virtio-blk devices from the store, enumerated in the guest as
+    /// `/dev/vdb`, `/dev/vdc`, … (design §11, The control-plane daemon (vmcelld)). Read-only by
+    /// default; [`ExtraDiskSpec::writable`] asks for a private copy-on-attach copy instead. A live
+    /// VM pins these artifacts (delete
     /// is refused while in use). Optionally throttled for disk-I/O fault injection (§4.6, Extra virtio-blk devices and disk-I/O throttling).
     #[serde(default)]
     pub extra_disks: Vec<ExtraDiskSpec>,
@@ -299,6 +317,20 @@ impl CreateVmRequest {
         self.extra_disks.push(ExtraDiskSpec {
             name: name.into(),
             io_limit: None,
+            writable: false,
+        });
+        self
+    }
+
+    /// Attaches an extra disk artifact as a **writable private copy** (builder-style, §11.5, The
+    /// HTTP REST API and its OpenAPI document): the guest may write it, and the store artifact it
+    /// was copied from is untouched. See [`ExtraDiskSpec::writable`].
+    #[must_use]
+    pub fn with_writable_extra_disk(mut self, name: impl Into<String>) -> Self {
+        self.extra_disks.push(ExtraDiskSpec {
+            name: name.into(),
+            io_limit: None,
+            writable: true,
         });
         self
     }
@@ -842,5 +874,85 @@ mod tests {
             })
         );
         assert_eq!(req.extra_kernel_args, vec!["mitigations=off"]);
+    }
+
+    // §11.5, the copy-on-attach writable scratch disk — the PRESENCE-ATTRIBUTE round trip on the
+    // codec this DTO actually ships over (AGENTS.md "Writing tests"; Appendix A reversal 10). JSON
+    // is the codec on BOTH hops: the REST body a client sends, and the length-prefixed frame the
+    // HTTP parent forwards to the cap-holding broker child. A `#[serde(default)]` bool collapses in
+    // ONE direction, so the legs are asymmetric on purpose — absent, explicit `false`, explicit
+    // `true` — and each is asserted after a full encode→decode, not just a decode.
+    //
+    // RED on the inverse: drop `#[serde(default)]` (the absent leg stops parsing at all) or make
+    // `writable` non-serialized (the `true` leg comes back `false` — a client that asked for a
+    // writable disk silently gets a read-only one, which is the exact shape reversal 10 records).
+    #[test]
+    fn extra_disk_writable_round_trips_on_the_json_codec() {
+        let req: CreateVmRequest = serde_json::from_str(
+            r#"{"kernel":"k","rootfs":"r","extra_disks":[
+                 {"name":"shared.img"},
+                 {"name":"explicit-ro.img","writable":false},
+                 {"name":"scratch.img","writable":true},
+                 {"name":"slow-scratch.img","writable":true,
+                  "io_limit":{"iops":128}}
+               ]}"#,
+        )
+        .expect("parse");
+        assert_eq!(req.extra_disks.len(), 4);
+        assert!(
+            !req.extra_disks[0].writable,
+            "an absent `writable` is the pre-H1 read-only default: an old client's body must still \
+             produce the cell it used to"
+        );
+        assert!(!req.extra_disks[1].writable);
+        assert!(req.extra_disks[2].writable, "an explicit true must survive");
+        assert!(req.extra_disks[3].writable);
+        assert_eq!(
+            req.extra_disks[3].io_limit,
+            Some(DiskIoLimitDto {
+                bandwidth_bytes_per_sec: None,
+                iops: Some(128),
+            }),
+            "writable composes with an io_limit; neither field eats the other"
+        );
+
+        // The full round trip: re-encode and re-decode, field-for-field on the whole value. A field
+        // dropped on encode is dropped identically on the second encode, so a byte comparison would
+        // stay green while the value changed — the comparison is on the VALUE.
+        let back: CreateVmRequest =
+            serde_json::from_str(&serde_json::to_string(&req).expect("encode")).expect("decode");
+        assert_eq!(
+            back, req,
+            "the request must survive a JSON round trip intact"
+        );
+        assert!(back.extra_disks[2].writable);
+        assert!(!back.extra_disks[0].writable);
+    }
+
+    // The two builders differ in exactly the one field, so a caller cannot reach a writable disk by
+    // accident and cannot fail to reach it when it asks.
+    //
+    // RED on the inverse: have `with_writable_extra_disk` push `writable: false`.
+    #[test]
+    fn the_writable_builder_is_the_only_way_to_ask_for_a_copy() {
+        let req = CreateVmRequest::create("k", "r")
+            .with_extra_disk("shared.img")
+            .with_writable_extra_disk("scratch.img");
+        assert_eq!(
+            req.extra_disks[0],
+            ExtraDiskSpec {
+                name: "shared.img".to_string(),
+                io_limit: None,
+                writable: false,
+            }
+        );
+        assert_eq!(
+            req.extra_disks[1],
+            ExtraDiskSpec {
+                name: "scratch.img".to_string(),
+                io_limit: None,
+                writable: true,
+            }
+        );
     }
 }

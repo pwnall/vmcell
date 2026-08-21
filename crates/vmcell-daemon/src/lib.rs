@@ -68,6 +68,8 @@ pub mod openapi;
 #[cfg(feature = "server")]
 pub mod registry;
 #[cfg(feature = "server")]
+pub mod scratch;
+#[cfg(feature = "server")]
 pub mod server;
 #[cfg(feature = "server")]
 pub mod sweep;

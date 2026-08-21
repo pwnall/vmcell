@@ -36,12 +36,14 @@ pub const DEFAULT_RESOURCE_PREFIX: &str = "vmcell";
 const MAX_INTERFACE_NAME_LEN: usize = 15;
 
 /// The maximum prefix length. Bounded by the **longest** composed interface name,
-/// `<prefix>-tap-<vmid>` ([`tap_name`]): at the highest vmid the addressing math admits (254, three
-/// digits) that is `prefix + 8` bytes, and it must fit `MAX_INTERFACE_NAME_LEN` — so 6 lands on 14,
-/// one byte inside the limit. The segment bridge (`<prefix>-br-<segid>`, [`segment_bridge_name`]) is
-/// shorter and rides the same budget; the netns, cgroup-slice and scratch-dir names carry no such
-/// limit. `interface_names_fit_ifnamsiz` is the gate that measures both interface classes at this
-/// prefix length and the highest id.
+/// `<prefix>-tap-<vmid>` ([`tap_name`]): at the highest vmid the addressing math admits (9999, four
+/// digits) that is `prefix + 9` bytes, and it must fit `MAX_INTERFACE_NAME_LEN` — so 6 lands on
+/// exactly 15, with **no** slack left. That is why the vmid ceiling stops at four decimal digits
+/// (`net::MAX_VMID`'s roster, home 3): a fifth digit has to be bought from this budget or from a
+/// new tap-name scheme. The segment bridge (`<prefix>-br-<segid>`, [`segment_bridge_name`]) carries
+/// the narrower segment id and rides the same budget with room to spare; the netns, cgroup-slice
+/// and scratch-dir names carry no such limit. `interface_names_fit_ifnamsiz` is the gate that
+/// measures both interface classes at this prefix length and each class's own highest id.
 pub const MAX_RESOURCE_PREFIX_LEN: usize = 6;
 
 /// Validates a resource prefix: non-empty, ≤ [`MAX_RESOURCE_PREFIX_LEN`], and only
@@ -229,17 +231,26 @@ mod tests {
             "MAX_INTERFACE_NAME_LEN must be IFNAMSIZ minus the NUL terminator ifr_name must hold"
         );
 
-        // The widest id either interface class can embed. `net::MAX_SEGMENT_ID` documents itself as
-        // "the highest segment id (and the highest vmid) the addressing math can carry", so it is
-        // the one law for both classes; it lives behind `host-common`, hence the mirror plus the
-        // equality assert wherever both are compiled.
-        let max_id: u32 = 254;
+        // The widest id each interface class can embed. The two classes carry DIFFERENT id
+        // spaces — the tap embeds a vmid, the bridge a segment id — and since the H2 widening those
+        // ceilings differ by a decimal digit, so one shared `max_id` would measure the tap at the
+        // segment's narrower id and miss the class that actually sets this budget. Both live behind
+        // `host-common`, hence the mirrors plus the equality asserts wherever both are compiled.
+        let max_vmid: u32 = 9999;
+        let max_segid: u32 = 254;
         #[cfg(feature = "host-common")]
-        assert_eq!(
-            max_id,
-            crate::net::MAX_SEGMENT_ID,
-            "the id ceiling this budget assumes must be the addressing math's own ceiling"
-        );
+        {
+            assert_eq!(
+                max_vmid,
+                crate::net::MAX_VMID,
+                "the vmid ceiling this budget assumes must be the addressing math's own ceiling                  (net::MAX_VMID's roster, home 3)"
+            );
+            assert_eq!(
+                max_segid,
+                crate::net::MAX_SEGMENT_ID,
+                "the segment-id ceiling this budget assumes must be the addressing math's own"
+            );
+        }
 
         // The longest prefix `validate_resource_prefix` accepts — asserted accepted, so this is the
         // real worst case and not a hypothetical one.
@@ -252,8 +263,8 @@ mod tests {
         // Every composed name that becomes a network interface. A new interface composer added to
         // this module belongs in this list — nothing else in the KVM-free suite measures it.
         for (class, name) in [
-            ("tap", tap_name(&longest, max_id)),
-            ("segment bridge", segment_bridge_name(&longest, max_id)),
+            ("tap", tap_name(&longest, max_vmid)),
+            ("segment bridge", segment_bridge_name(&longest, max_segid)),
         ] {
             assert!(
                 name.len() <= MAX_INTERFACE_NAME_LEN,

@@ -297,20 +297,24 @@ impl Registry {
             }
             None => None,
         };
-        // Resolve each extra-disk artifact name to a read-only BlockDevice (the store is
-        // immutable, §11.4, The VM registry and the start-up sweep), translating any io_limit (§4.6, Extra virtio-blk devices and disk-I/O throttling). The names are pinned on the
-        // slot below so `is_artifact_in_use` refuses to delete a disk a live VM uses.
+        // Resolve each extra-disk artifact name to its STORE path, carrying the client's
+        // `writable` request and any io_limit (§4.6, Extra virtio-blk devices and disk-I/O
+        // throttling) through untranslated. The registry deliberately does not decide how the disk
+        // is attached: the store is immutable (§11.4, The VM registry and the start-up sweep), so a
+        // writable disk is a private copy, and the launcher is where that copy is made — one place,
+        // beside the scratch directory that owns its lifetime (§11.5). The names are pinned on the
+        // slot below so `is_artifact_in_use` refuses to delete a disk a live VM uses; a writable
+        // disk pins its source too, because the VM is a copy OF that artifact and a delete-in-use
+        // that depended on which mode the client picked would be a second law.
         let mut extra_disks = Vec::with_capacity(req.extra_disks.len());
         for spec in &req.extra_disks {
-            let path = self.resolve_existing(&spec.name, "disk")?;
-            let mut disk = vmcell::BlockDevice::read_only(path);
-            if let Some(limit) = &spec.io_limit {
-                disk = disk.with_io_limit(vmcell::config::DiskIoLimit::new(
-                    limit.bandwidth_bytes_per_sec,
-                    limit.iops,
-                ));
-            }
-            extra_disks.push(disk);
+            extra_disks.push(crate::launcher::ExtraDisk {
+                source: self.resolve_existing(&spec.name, "disk")?,
+                writable: spec.writable,
+                io_limit: spec.io_limit.as_ref().map(|limit| {
+                    vmcell::config::DiskIoLimit::new(limit.bandwidth_bytes_per_sec, limit.iops)
+                }),
+            });
         }
         let pinned_disks: Vec<String> = req.extra_disks.iter().map(|d| d.name.clone()).collect();
 
@@ -1261,6 +1265,76 @@ mod tests {
             !reg.is_artifact_in_use("data.img").await,
             "the extra-disk pin releases on teardown"
         );
+    }
+
+    // §11.5, the copy-on-attach hop the fakes exist to observe: what the REST client asked for
+    // reaches `LaunchSpec` — the artifact resolved to its STORE path, `writable` carried verbatim,
+    // and the io_limit translated. `FakeLauncher` never materializes anything, so this is the last
+    // place the request is visible before the launcher turns it into devices.
+    //
+    // RED on the inverse: hardcode `writable: false` in `create`'s extra-disk loop (the writable
+    // assertion fails), or resolve the name to something other than the store path (the source
+    // assertion fails).
+    #[tokio::test]
+    async fn a_writable_extra_disk_request_reaches_the_launch_spec() {
+        let (reg, _s, log, _d) = registry_capturing(SnapshotBehavior::Normal);
+        for name in ["shared.img", "scratch.img"] {
+            reg.artifacts()
+                .create(name, b"diskbytes")
+                .unwrap_or_else(|e| panic!("seed {name}: {e}"));
+        }
+        let req = CreateVmRequest {
+            extra_disks: vec![
+                crate::dto::ExtraDiskSpec {
+                    name: "shared.img".to_string(),
+                    io_limit: None,
+                    writable: false,
+                },
+                crate::dto::ExtraDiskSpec {
+                    name: "scratch.img".to_string(),
+                    io_limit: Some(crate::dto::DiskIoLimitDto {
+                        bandwidth_bytes_per_sec: Some(1 << 20),
+                        iops: None,
+                    }),
+                    writable: true,
+                },
+            ],
+            ..create_req()
+        };
+        let created = reg.create(req).await.expect("create");
+
+        let specs = log.lock().expect("launch log").clone();
+        assert_eq!(specs.len(), 1);
+        let disks = &specs[0].extra_disks;
+        assert_eq!(disks.len(), 2, "both disks reached the spec");
+        assert!(!disks[0].writable, "an unmarked disk stays read-only");
+        assert_eq!(
+            disks[0].source,
+            reg.artifacts().path_for("shared.img").expect("path"),
+            "the launcher is handed the STORE path, resolved by the registry"
+        );
+        assert!(
+            disks[1].writable,
+            "the client's `writable: true` must survive"
+        );
+        assert_eq!(
+            disks[1].source,
+            reg.artifacts().path_for("scratch.img").expect("path")
+        );
+        assert_eq!(
+            disks[1].io_limit,
+            Some(vmcell::config::DiskIoLimit::bandwidth(1 << 20)),
+            "the io_limit is translated field-for-field, not dropped by the writable arm"
+        );
+
+        // A writable disk pins its source artifact exactly like a read-only one: the pin law does
+        // not fork on the mode (see `Registry::create`).
+        assert!(
+            reg.is_artifact_in_use("scratch.img").await,
+            "a writable disk's source artifact is pinned while the VM lives"
+        );
+        reg.destroy(&created.info.id).await.expect("destroy");
+        assert!(!reg.is_artifact_in_use("scratch.img").await);
     }
 
     // §11.4 (The VM registry and the start-up sweep): a missing extra-disk artifact is a fail-loud BadRequest at create (the same

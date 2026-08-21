@@ -138,7 +138,7 @@ async fn test_lifecycle_fake_vmm() {
 
     let vmid1 = vm.vmid();
     assert!(
-        (1..=254).contains(&vmid1),
+        (1..=vmcell::net::MAX_VMID).contains(&vmid1),
         "vmid must be a valid /30 host id"
     );
     // start() allocated the lowest guest CID (3); the next free is therefore 4. A
@@ -187,7 +187,7 @@ async fn test_lifecycle_fake_vmm() {
     }
 
     let vmid2 = restore_vm.vmid();
-    assert!((1..=254).contains(&vmid2));
+    assert!((1..=vmcell::net::MAX_VMID).contains(&vmid2));
     // A fresh VMID allocation must not collide with the live restored VM's VMID.
     let probe_vmid = env.vmids.allocate().expect("vmid available");
     assert_ne!(probe_vmid, vmid2, "a live VMID must not be re-handed-out");

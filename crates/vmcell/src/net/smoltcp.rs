@@ -234,10 +234,13 @@ pub mod backend {
     /// MAC address for the host side of the unprivileged NAT.
     ///
     /// The third octet (`0xff`) is chosen so this address lies outside the range
-    /// `crate::net::mac_math` can ever produce for a valid vmid (1..=254), whose
-    /// third octet is always `0`. This guarantees the host NAT MAC can never
-    /// collide with a guest MAC (NET-2). The old `02:00:00:00:00:fe` collided
-    /// with `mac_math(254)`, silently wedging that link.
+    /// `crate::net::mac_math` can ever produce for a valid vmid
+    /// (`1..=`[`crate::net::MAX_VMID`]), whose third octet — `(vmid >> 16) & 0xff` — is `0` for
+    /// every vmid below 2^16. This guarantees the host NAT MAC can never collide with a guest MAC
+    /// (NET-2). The old `02:00:00:00:00:fe` collided with `mac_math(254)`, silently wedging that
+    /// link. `host_nat_mac_never_collides_with_guest_mac` is the gate, and it iterates the whole
+    /// vmid range rather than trusting that reasoning — so a `MAX_VMID` widened past 2^16 reddens
+    /// there instead of shipping a collision.
     const HOST_NAT_MAC: [u8; 6] = [0x02, 0x00, 0xff, 0x00, 0x00, 0xfe];
 
     /// Upper bound on dynamically-created NAT sockets (proxy interception).
@@ -1980,9 +1983,13 @@ pub mod backend {
         #[test]
         fn run_network_vmid_is_validated_by_ip_math() {
             assert!(nat_addrs(0).is_err());
-            assert!(nat_addrs(255).is_err());
+            assert!(nat_addrs(crate::net::MAX_VMID + 1).is_err());
 
-            for vmid in [1u32, 2, 127, 253, 254] {
+            // Interior vmids on BOTH sides of the old 254 ceiling: 255 and 508 are the first two
+            // vmids the H2 widening's second dimension reaches, and they are exactly where a
+            // `nat_addrs` that re-derived the `/30` from the third octet alone would diverge from
+            // `ip_math` while every vmid below 255 still agreed.
+            for vmid in [1u32, 2, 127, 253, 254, 255, 508, crate::net::MAX_VMID] {
                 let (host_gw, guest_gw) = nat_addrs(vmid).expect("in-range vmid must resolve");
                 let (host_std, guest_std, _) = crate::net::ip_math(vmid).unwrap();
                 // Byte-for-byte equality with the shared /30 math.
@@ -1996,12 +2003,19 @@ pub mod backend {
                     guest_std.octets(),
                     "guest gw drifted for vmid {vmid}"
                 );
-                // The host gateway is the /30 `.1` and the guest is the `.2`.
-                assert_eq!(host_gw.octets()[3], 1, "host gw must be the .1 of the /30");
+                // The host gateway is the `.1` of its /30 and the guest is the `.2` — measured
+                // from the /30's own base, which the H2 widening's second dimension moves off
+                // zero for any vmid past the first block.
+                let base = u32::from(guest_gw.octets()[3]) & !3;
                 assert_eq!(
-                    guest_gw.octets()[3],
-                    2,
-                    "guest gw must be the .2 of the /30"
+                    u32::from(host_gw.octets()[3]),
+                    base + 1,
+                    "host gw must be the .1 of its /30 (vmid {vmid})"
+                );
+                assert_eq!(
+                    u32::from(guest_gw.octets()[3]),
+                    base + 2,
+                    "guest gw must be the .2 of its /30 (vmid {vmid})"
                 );
             }
         }
@@ -2255,9 +2269,9 @@ pub mod backend {
 
         /// The vmid whose `/30` the C7 legs run on.
         ///
-        /// Every address below is derived from it through the shared `(vmid % 254) + 1` math
+        /// Every address below is derived from it through the shared two-dimensional `/30` math
         /// (`nat_addrs` → `crate::net::ip_math`, `crate::net::mac_math`) — never a test-local
-        /// literal, so an off-by-one in the octet map reddens these legs instead of hiding
+        /// literal, so an off-by-one in either dimension reddens these legs instead of hiding
         /// behind a hardcoded twin.
         const NAT_TEST_VMID: u32 = 7;
 

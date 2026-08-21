@@ -1434,7 +1434,10 @@ mod tests {
 
         // Out-of-range vmids overflow the /30 host math and must be rejected, not
         // silently wrapped into a colliding octet.
-        for vmid in [0u32, 255u32] {
+        // Read off the one ceiling rather than a literal: 255 stopped being out of range when
+        // the H2 widening gave the map its second dimension, and a test pinning the old number
+        // would have started asserting a refusal the product no longer owes.
+        for vmid in [0u32, crate::net::MAX_VMID + 1] {
             assert!(
                 crate::net::ip_math(vmid).is_err(),
                 "vmid {vmid} must be rejected by the /30 host-IP math"
