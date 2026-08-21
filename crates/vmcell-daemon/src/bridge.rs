@@ -38,6 +38,82 @@ use tokio::sync::{Mutex, oneshot};
 /// trusted, but a corrupt length prefix must still not drive an unbounded allocation).
 pub const MAX_BRIDGE_FRAME_BYTES: usize = 256 * 1024 * 1024;
 
+/// What [`MAX_EXEC_CAPTURE_B64_BYTES`] holds back from [`MAX_BRIDGE_FRAME_BYTES`] for everything in
+/// a capture-carrying reply that is **not** the capture: the 2-tuple, the `EngineReply` variant tag,
+/// `ExecOutcomeDto`'s field names and `code`, and — on the `create` path — the whole [`VmInfo`],
+/// whose `kernel`/`rootfs` are client-named artifacts bounded by `name::MAX_ARTIFACT_NAME_LEN`.
+///
+/// Far over the real envelope, because the slack costs a rounding error of the capture budget while
+/// under-reserving costs the wedge class this ceiling exists to remove. The figure is not quoted
+/// here — `capture_ceiling_tests::the_reserve_covers_the_real_reply_envelope` **measures** the
+/// shipped envelope against this reserve, and prints it when it reddens.
+const EXEC_REPLY_ENVELOPE_RESERVE: usize = 64 * 1024;
+
+/// The ceiling on the **base64** capture one reply may carry — the exact quantity the frame cap
+/// constrains, so the comparison in [`enforce_exec_capture_ceiling`] needs no rounding.
+const MAX_EXEC_CAPTURE_B64_BYTES: usize = MAX_BRIDGE_FRAME_BYTES - EXEC_REPLY_ENVELOPE_RESERVE;
+
+/// The one ceiling on a guest `exec` capture: the largest **raw** stdout+stderr an exec-carrying
+/// reply may return, in bytes (design §17, Open gaps and future capabilities — "capping the guest
+/// exec capture host-side").
+///
+/// **Derived, never a literal.** `stdout`/`stderr` cross the bridge base64'd (`ExecOutcomeDto`), so
+/// the raw budget is the frame budget less the envelope reserve, times 3/4. Re-tuning
+/// [`MAX_BRIDGE_FRAME_BYTES`] moves this with it, and
+/// `capture_ceiling_tests::the_reserve_covers_the_real_reply_envelope` reddens if the derivation
+/// stops fitting.
+///
+/// **Why a ceiling at all.** Without one, a command that captures more than the frame holds produced
+/// a reply that the frame writer refused, which the reply-write fallback degrades into a typed 500 —
+/// better than the hang it replaced, but it reads as a server bug when the truth is a client-side
+/// quantity the client can act on. With it, the same run is a 413 naming the size, the ceiling and
+/// the remedy.
+///
+/// **Refuse, not truncate.** A truncated capture the client cannot detect is the accepted-but-ignored
+/// hazard (AGENTS.md, the `curl` shim): every downstream assertion on those bytes — a digest, a
+/// parse, an exit-code-plus-output pair — silently reads a prefix as the whole. Flagging the
+/// truncation instead would mean a new presence-attribute field on [`ExecOutcomeDto`], which is
+/// single-sourced with `vmcell-daemon-client` and travels this JSON channel precisely because
+/// `#[serde(skip_serializing_if)]` fields do not survive a non-self-describing codec (Appendix A
+/// reversal 10) — a wire change owed to every consumer, for an outcome that is still lossy. A
+/// refusal is lossless: the capture stays in the guest, and the command re-runs redirecting to a
+/// file the client fetches.
+pub const MAX_EXEC_CAPTURE_BYTES: usize = MAX_EXEC_CAPTURE_B64_BYTES / 4 * 3;
+
+/// The one exec-capture ceiling check, applied by **every** reply that can carry a capture — the
+/// `exec` verb and the inline `command` of `create` (a ceiling honored on one of the two verbs that
+/// return an `ExecOutcomeDto` is not a ceiling).
+///
+/// It lives in the broker-side engine adapter rather than in [`dispatch`] or [`write_reply`] for two
+/// reasons. The adapter is the one place both deployments pass through — the broker child's engine
+/// **and** the single-process daemon's engine are this same `impl` — so the client sees one limit
+/// whether or not the operator ran the cutover, instead of a limit that depends on the transport.
+/// And it is the last point where the *cause* is still legible: by [`write_reply`] all that is left
+/// is a byte count, indistinguishable from a broker that cannot serialize.
+///
+/// `context` names the operation and its VM so the reply is actionable: on the `create` path the VM
+/// has already been created, and the refusal does not change its state.
+///
+/// # Errors
+/// [`DaemonError::PayloadTooLarge`] — a 413 through the single [`DaemonError`] status mapping (the
+/// same one the artifact-upload cap uses; no second mapping is introduced).
+fn enforce_exec_capture_ceiling(context: &str, outcome: &ExecOutcomeDto) -> DaemonResult<()> {
+    let encoded = outcome.stdout_b64.len() + outcome.stderr_b64.len();
+    if encoded <= MAX_EXEC_CAPTURE_B64_BYTES {
+        return Ok(());
+    }
+    // base64 is 4 characters per 3 bytes; `/ 4 * 3` is the raw size to within the two streams'
+    // padding, which is why the figure is reported as approximate rather than exact.
+    let captured = encoded / 4 * 3;
+    Err(DaemonError::PayloadTooLarge(format!(
+        "{context}: the command captured ~{captured} bytes of stdout+stderr, over the \
+         {MAX_EXEC_CAPTURE_BYTES}-byte exec-capture ceiling (the {MAX_BRIDGE_FRAME_BYTES}-byte \
+         bridge frame less its envelope reserve). The capture is refused rather than silently \
+         truncated: re-run the command redirecting its output to a file in the guest and fetch \
+         that file. The VM's own state is unchanged by this refusal."
+    )))
+}
+
 /// How long a `ShutdownAll` waits for the dispatch jobs already in flight before the broker stops
 /// serving (finding `shutdown-all-returns-while-dispatch-jobs-run`).
 ///
@@ -111,6 +187,12 @@ pub trait VmEngine: Send + Sync {
 impl VmEngine for Registry {
     async fn create(&self, req: CreateVmRequest) -> DaemonResult<CreateVmResponse> {
         let c = Registry::create(self, req).await?;
+        if let Some(outcome) = c.exec.as_ref() {
+            enforce_exec_capture_ceiling(
+                &format!("the inline command in vm {}", c.info.id.0),
+                outcome,
+            )?;
+        }
         Ok(CreateVmResponse {
             vm: c.info,
             exec: c.exec,
@@ -123,7 +205,9 @@ impl VmEngine for Registry {
         Registry::get(self, id).await
     }
     async fn exec(&self, id: &VmId, req: ExecRequestDto) -> DaemonResult<ExecOutcomeDto> {
-        Registry::exec(self, id, req).await
+        let outcome = Registry::exec(self, id, req).await?;
+        enforce_exec_capture_ceiling(&format!("exec in vm {}", id.0), &outcome)?;
+        Ok(outcome)
     }
     async fn stats(&self, id: &VmId) -> DaemonResult<ResourceUsageDto> {
         Registry::stats(self, id).await
@@ -356,10 +440,13 @@ async fn dispatch(engine: &dyn VmEngine, req: EngineRequest) -> EngineReply {
 /// compact typed `Err` frame for the same id** rather than dropping it (M8,
 /// `bridge-reply-drop-wedges-request`). Two failures are reachable: `serde_json` refusing the value,
 /// and a payload over [`MAX_BRIDGE_FRAME_BYTES`] — an `exec` reply carries the guest command's whole
-/// captured output, so a large enough capture overflows the cap in [`write_frame`]. The parent's
-/// `rx.await` has no timeout, so a dropped reply wedges that HTTP request **forever**; the fallback
-/// turns it into a `DaemonError::Internal` (500). (Capping the exec capture host-side is the
-/// separate recorded follow-up; this only makes the failure typed instead of a hang.)
+/// captured output. The parent's `rx.await` has no timeout, so a dropped reply wedges that HTTP
+/// request **forever**; the fallback turns it into a `DaemonError::Internal` (500).
+///
+/// This stays the **backstop**, not the capture's ceiling: [`enforce_exec_capture_ceiling`] refuses
+/// an oversized capture upstream with a typed, explained 413, so what still reaches here is a reply
+/// that is over the cap for some *other* reason — where "the broker could not send its reply" is
+/// the honest description and a 500 the honest status.
 ///
 /// Encoding happens outside the write lock so a large reply does not serialize the multiplex.
 async fn write_reply<W: AsyncWriteExt + Unpin>(wr: &Mutex<W>, id: u64, reply: EngineReply) {
@@ -812,3 +899,171 @@ mod shutdown_tests;
 mod tests;
 #[cfg(test)]
 mod write_reply_tests;
+
+/// KVM-free gates for the exec-capture ceiling (design §17, Open gaps and future capabilities).
+///
+/// In-file rather than a sibling module because the law, its two call sites and the call-site scan
+/// all live in `bridge.rs`, and the scan reads that file by `include_str!` of its own path.
+#[cfg(test)]
+mod capture_ceiling_tests {
+    use super::*;
+    use crate::dto::VmState;
+
+    /// The source of `bridge.rs` itself — the text the call-site scan reads.
+    const BRIDGE_SRC: &str = include_str!("bridge.rs");
+
+    fn vminfo_at_the_name_ceiling() -> VmInfo {
+        VmInfo {
+            id: VmId("vm-0123456789abcdef".to_string()),
+            state: VmState::Ready,
+            vmid: u32::MAX,
+            kernel: "k".repeat(crate::name::MAX_ARTIFACT_NAME_LEN),
+            rootfs: "r".repeat(crate::name::MAX_ARTIFACT_NAME_LEN),
+            vcpus: u8::MAX,
+            mem_mib: u32::MAX,
+        }
+    }
+
+    // The reserve is not a guess: the widest capture-carrying reply's envelope — a `Created` whose
+    // `VmInfo` names two artifacts at the name ceiling, plus the frame's own 4-byte length prefix —
+    // must fit inside `EXEC_REPLY_ENVELOPE_RESERVE`, and the ceiling must therefore be derived from
+    // `MAX_BRIDGE_FRAME_BYTES` rather than stated as a literal.
+    //
+    // Inverse (red): shrink `EXEC_REPLY_ENVELOPE_RESERVE` below the measured envelope, or replace
+    // `MAX_EXEC_CAPTURE_B64_BYTES` with a literal larger than the frame cap allows.
+    #[test]
+    fn the_reserve_covers_the_real_reply_envelope() {
+        let created = EngineReply::Created(CreateVmResponse {
+            vm: vminfo_at_the_name_ceiling(),
+            exec: Some(ExecOutcomeDto {
+                code: i32::MIN,
+                stdout_b64: String::new(),
+                stderr_b64: String::new(),
+            }),
+        });
+        let envelope = serde_json::to_vec(&(u64::MAX, created))
+            .expect("the reply envelope encodes")
+            .len()
+            + 4; // the length prefix `write_frame` puts in front of it
+        assert!(
+            envelope <= EXEC_REPLY_ENVELOPE_RESERVE,
+            "the envelope reserve ({EXEC_REPLY_ENVELOPE_RESERVE}) must cover the widest \
+             capture-carrying reply envelope ({envelope})"
+        );
+        // A capture exactly at the ceiling, plus that envelope, still fits the one frame cap.
+        assert!(
+            envelope + MAX_EXEC_CAPTURE_B64_BYTES <= MAX_BRIDGE_FRAME_BYTES,
+            "a ceiling-sized capture must fit the frame cap"
+        );
+        // And the raw figure quoted to the client is the base64 budget's 3/4, not a fresh number.
+        assert_eq!(MAX_EXEC_CAPTURE_BYTES, MAX_EXEC_CAPTURE_B64_BYTES / 4 * 3);
+    }
+
+    // The boundary, against the SHIPPED constants: a capture at the ceiling is accepted, and the
+    // smallest capture over it is refused as a typed 413. One allocation, grown in place, so the
+    // pair costs one ceiling-sized string rather than two.
+    //
+    // Inverse (red): drop the `encoded <= MAX_EXEC_CAPTURE_B64_BYTES` guard and the over-ceiling leg
+    // returns `Ok`; make the guard `<` instead of `<=` and the at-ceiling leg reddens.
+    #[test]
+    fn a_capture_at_the_ceiling_is_accepted_and_one_over_it_is_a_typed_413() {
+        let mut stdout_b64 = String::with_capacity(MAX_EXEC_CAPTURE_B64_BYTES + 4);
+        stdout_b64.extend(std::iter::repeat_n('A', MAX_EXEC_CAPTURE_B64_BYTES - 4));
+        let mut outcome = ExecOutcomeDto {
+            code: 0,
+            stdout_b64,
+            // The ceiling is on the SUM: a capture split across the two streams is one reply.
+            stderr_b64: "B".repeat(4),
+        };
+        enforce_exec_capture_ceiling("exec in vm vm-1", &outcome)
+            .expect("a capture exactly at the ceiling must be accepted");
+
+        outcome.stderr_b64.push('B');
+        let err = enforce_exec_capture_ceiling("exec in vm vm-1", &outcome)
+            .expect_err("one byte over the ceiling must be refused");
+        assert_eq!(
+            err.kind().status_code(),
+            413,
+            "an over-ceiling capture is a payload-too-large, not an internal error: {}",
+            err.message()
+        );
+        let msg = err.message();
+        assert!(
+            msg.contains("vm-1") && msg.contains(&MAX_EXEC_CAPTURE_BYTES.to_string()),
+            "the refusal names the VM and the ceiling: {msg}"
+        );
+        assert!(
+            msg.contains("refused rather than silently truncated"),
+            "the refusal states that nothing was truncated: {msg}"
+        );
+    }
+
+    // The client can TELL: the typed refusal survives the codec it actually ships over (JSON), so
+    // the parent reconstructs a 413 with the explanation intact instead of an opaque 500.
+    //
+    // Inverse (red): map the refusal to `ErrorKind::Internal` on the way out, or drop the message,
+    // and the reconstructed status/message assertions redden.
+    #[test]
+    fn the_refusal_reaches_the_client_as_a_413_across_the_bridge_codec() {
+        let outcome = ExecOutcomeDto {
+            code: 0,
+            stdout_b64: "A".repeat(MAX_EXEC_CAPTURE_B64_BYTES + 1),
+            stderr_b64: String::new(),
+        };
+        let refusal = enforce_exec_capture_ceiling("exec in vm vm-7", &outcome)
+            .expect_err("over the ceiling");
+        let frame = serde_json::to_vec(&(9u64, EngineReply::Err(WireError::from(&refusal))))
+            .expect("the refusal frame encodes");
+        assert!(
+            frame.len() < 4096,
+            "the refusal frame must be compact, not the capture it refused: {}",
+            frame.len()
+        );
+        let (id, reply) = serde_json::from_slice::<(u64, EngineReply)>(&frame)
+            .expect("the refusal frame decodes");
+        assert_eq!(id, 9, "the refusal answers the request that provoked it");
+        let EngineReply::Err(wire) = reply else {
+            panic!("expected a typed Err reply")
+        };
+        let seen = daemon_error_from_wire(wire);
+        assert_eq!(seen.kind().status_code(), 413);
+        assert_eq!(
+            seen.message(),
+            refusal.message(),
+            "the explanation must survive the boundary intact"
+        );
+    }
+
+    // The gate binds the CALL SITES, not just the predicate (AGENTS.md): every arm of the
+    // broker-side engine adapter that can return an `ExecOutcomeDto` routes through the one law.
+    //
+    // Inverse (red): delete the `enforce_exec_capture_ceiling` call from either the `exec` or the
+    // `create` arm and the count drops to one.
+    #[test]
+    fn both_capture_carrying_adapter_arms_route_through_the_one_ceiling() {
+        // A zero-length scan is a misconfigured gate, never a green verdict.
+        assert!(
+            BRIDGE_SRC.len() > 10_000,
+            "the call-site scan read nothing recognizable as bridge.rs"
+        );
+        let start = BRIDGE_SRC
+            .find("impl VmEngine for Registry {")
+            .expect("the broker-side engine adapter must be findable by the scan");
+        let body = BRIDGE_SRC
+            .get(start..)
+            .and_then(|rest| rest.find("\n}\n").map(|end| &rest[..end]))
+            .expect("the adapter block must be delimited");
+        assert_eq!(
+            body.matches("enforce_exec_capture_ceiling(").count(),
+            2,
+            "exactly the two capture-carrying arms (`create`'s inline command and `exec`) apply \
+             the ceiling; adapter body:\n{body}"
+        );
+        for arm in ["Registry::create(self", "Registry::exec(self"] {
+            assert!(
+                body.contains(arm),
+                "the scan must be looking at the real adapter (missing `{arm}`)"
+            );
+        }
+    }
+}

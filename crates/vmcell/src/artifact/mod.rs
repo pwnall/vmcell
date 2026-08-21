@@ -502,7 +502,109 @@ impl CacheKey {
 use async_trait::async_trait;
 
 #[async_trait]
-/// A building block of the artifact pipeline.
+/// A building block of the artifact pipeline: it names itself, keys its inputs purely, and
+/// publishes the artifact paths later stages read.
+///
+/// This is the one piece of the §10.4 contract surface a consumer **implements** rather than calls,
+/// so the example below is the shape to copy. A downstream stage is composed into a [`Pipeline`]
+/// beside [`ResolvePinsStage`] — see the [module docs](crate::artifact#assembling-a-pipeline) for
+/// the assembly.
+///
+/// [`Stage::cache_key`] is **pure**: [`Pipeline::build`] calls it to decide whether to run this
+/// stage at all, so it may not touch the output it is keying. The five §10.2 cache-key rules are
+/// what the example spends its body on — a stable hasher (never `DefaultHasher`, whose output is
+/// not portable across Rust versions), a deterministic input order, upstream **content** rather
+/// than `target/`-relative paths, and a per-stage version constant that a change to what
+/// [`Stage::run`] writes bumps. [`hash_artifacts_sorted`] does the first three for the consumed
+/// artifact set; it takes a `blake3::Hasher`, so an implementing crate depends on `blake3` directly.
+///
+/// The trait is `#[async_trait]`, so an out-of-crate implementation carries the attribute too.
+///
+/// # Example
+///
+/// A stage that publishes one artifact — a manifest naming the rootfs the pipeline built:
+///
+/// ```
+/// use std::path::{Path, PathBuf};
+///
+/// use vmcell::artifact::{CacheKey, Stage, StageInputs, StageOutputs, hash_artifacts_sorted};
+///
+/// /// Cache-key rule 4: bump this when `run` starts writing different bytes from the same inputs.
+/// const MANIFEST_STAGE_VERSION: u32 = 1;
+///
+/// /// The artifact key this stage publishes under, and the one later stages look it up by.
+/// const MANIFEST_ARTIFACT_KEY: &str = "acme-manifest";
+///
+/// struct ManifestStage {
+///     /// Folded into the key: two differently-configured stages must not share a sidecar.
+///     flavor: String,
+/// }
+///
+/// #[async_trait::async_trait]
+/// impl Stage for ManifestStage {
+///     fn name(&self) -> &str {
+///         // Stable: `Pipeline::reset_to` addresses this stage by this string.
+///         "acme-manifest"
+///     }
+///
+///     fn cache_key(&self, inputs: &StageInputs) -> CacheKey {
+///         // Rule 1: a stable hasher.
+///         let mut hasher = blake3::Hasher::new();
+///         // Rule 4: the per-stage version constant, then this stage's own configuration.
+///         hasher.update(&MANIFEST_STAGE_VERSION.to_le_bytes());
+///         hasher.update(self.flavor.as_bytes());
+///         hasher.update(b"\0");
+///         // Rules 2 and 3: sorted order, and the upstream artifacts' CONTENT hashes — never the
+///         // `PathBuf`s, which vary with where `target/` lives and do not change when an upstream
+///         // is rebuilt in place.
+///         hash_artifacts_sorted(&mut hasher, &inputs.artifacts);
+///         // `CacheKey::new` is the only constructor an out-of-crate impl has: the type is
+///         // `#[non_exhaustive]`.
+///         CacheKey::new(format!("acme-manifest-{}", hasher.finalize().to_hex()))
+///     }
+///
+///     fn out_path(&self, target_dir: &Path) -> PathBuf {
+///         target_dir.join("acme-manifest.json")
+///     }
+///
+///     async fn run(&self, inputs: &StageInputs, out: &Path) -> vmcell::Result<StageOutputs> {
+///         // Pins and upstream artifacts arrive through `StageInputs`, never through the
+///         // environment: stage 0 resolved them, and this stage reads them from memory.
+///         let rootfs = inputs.artifacts.get("rootfs").ok_or_else(|| {
+///             // Fail loud on a missing input rather than publishing a partial artifact.
+///             vmcell::Error::Artifact("acme-manifest: no `rootfs` artifact upstream".to_string())
+///         })?;
+///         let body = format!("{{\"flavor\":\"{}\",\"rootfs\":{:?}}}", self.flavor, rootfs);
+///         tokio::fs::write(out, body).await.map_err(vmcell::Error::Io)?;
+///
+///         // Publish exactly the one path this stage produced. `StageOutputs` is
+///         // `#[non_exhaustive]`, so it is built from `default()` and filled in.
+///         let mut outputs = StageOutputs::default();
+///         outputs
+///             .artifacts
+///             .insert(MANIFEST_ARTIFACT_KEY.to_string(), out.to_path_buf());
+///         Ok(outputs)
+///     }
+/// }
+///
+/// let stage = ManifestStage { flavor: "minimal".to_string() };
+/// assert_eq!(stage.name(), "acme-manifest");
+///
+/// let out = stage.out_path(Path::new("/var/lib/acme/artifacts"));
+/// assert_eq!(out, PathBuf::from("/var/lib/acme/artifacts/acme-manifest.json"));
+/// // The default sidecar REPLACES the payload's extension, so a stage sharing a filename stem with
+/// // another one overrides `cache_sidecar_path`. This stem is this stage's alone.
+/// assert_eq!(
+///     stage.cache_sidecar_path(&out),
+///     PathBuf::from("/var/lib/acme/artifacts/acme-manifest.cache_key")
+/// );
+///
+/// // Pure: the same inputs key the same, and this stage's own configuration moves the key.
+/// let inputs = StageInputs::default();
+/// assert_eq!(stage.cache_key(&inputs), stage.cache_key(&inputs));
+/// let other = ManifestStage { flavor: "full".to_string() };
+/// assert_ne!(stage.cache_key(&inputs), other.cache_key(&inputs));
+/// ```
 pub trait Stage: Send + Sync {
     /// The name of this stage.
     fn name(&self) -> &str;
@@ -2689,6 +2791,10 @@ pub(crate) fn guest_tools_closure_hash(ws_root: &Path) -> Result<String> {
 }
 
 /// A pipeline of stages to build all necessary test VM artifacts.
+///
+/// A worked assembly — [`ResolvePinsStage`] first, then a labelled rootfs — is in the
+/// [module docs](crate::artifact#assembling-a-pipeline). It lives there rather than here because a
+/// second copy of an example is a second copy to drift.
 ///
 /// The fields are private: a stage list is only assembled through
 /// [`Pipeline::new`] + [`Pipeline::add_stage`], so an external caller cannot
@@ -4969,5 +5075,97 @@ mod tests {
             features.cache_key(&inputs),
             crate::artifact::rootfs::RootfsFeaturesStage::labelled(None).cache_key(&inputs)
         );
+    }
+
+    /// Every `#`-fragment this module's rustdoc links point INTO the module page must name a
+    /// heading the module page actually renders.
+    ///
+    /// This is the COMPLEMENT of the `rustdoc::broken_intra_doc_links` gate the `ci` recipe runs
+    /// (`RUSTDOCFLAGS="-D warnings" cargo doc`), not a second copy of it: rustdoc resolves the ITEM
+    /// half of a `[text](crate::artifact` + `#anchor)` link and hard-errors on a bad one, but
+    /// appends the fragment verbatim without checking it. So the links `Stage` and `Pipeline`
+    /// carry to the module's worked examples — the whole point of not duplicating those examples
+    /// onto each item's own page — would rot silently the day a heading is reworded, landing the
+    /// reader at the top of a long module page with no sign anything is wrong.
+    #[test]
+    fn module_doc_anchors_name_headings_the_module_actually_renders() {
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/artifact/mod.rs"),
+        )
+        .expect("gate misconfigured: this module's own source must be readable");
+
+        /// Rustdoc's heading anchor: the rendered text, lowercased, punctuation dropped, spaces
+        /// hyphenated. Only inline links and code spans appear in this module's headings.
+        fn slug(heading: &str) -> String {
+            let mut text = String::new();
+            let mut depth = 0_u32;
+            let mut skipping_url = false;
+            for ch in heading.chars() {
+                match ch {
+                    '[' => depth += 1,
+                    ']' => depth = depth.saturating_sub(1),
+                    '(' if depth == 0 => skipping_url = true,
+                    ')' if skipping_url => skipping_url = false,
+                    '`' => {}
+                    _ if skipping_url => {}
+                    _ => text.push(ch),
+                }
+            }
+            text.trim()
+                .to_lowercase()
+                .chars()
+                .filter_map(|c| match c {
+                    ' ' => Some('-'),
+                    c if c.is_alphanumeric() || c == '-' => Some(c),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        // Fence-aware: a hidden doctest line (`//! # #[tokio::main]`) is not a heading.
+        let mut in_code = false;
+        let mut headings: Vec<String> = Vec::new();
+        for line in source.lines() {
+            let Some(doc) = line
+                .strip_prefix("//! ")
+                .or_else(|| line.strip_suffix("//!"))
+            else {
+                continue;
+            };
+            if doc.starts_with("```") {
+                in_code = !in_code;
+                continue;
+            }
+            if let Some(heading) = doc.strip_prefix("# ").filter(|_| !in_code) {
+                headings.push(slug(heading));
+            }
+        }
+        assert!(
+            !headings.is_empty(),
+            "gate misconfigured: the scan found no `//! # ` heading in this module"
+        );
+
+        // Composed, so this doc comment's own mention of the syntax is not the first finding.
+        let needle = format!("({}::artifact#", "crate");
+        let anchors: Vec<&str> = source
+            .match_indices(&needle)
+            .filter_map(|(at, _)| {
+                let rest = source.get(at + needle.len()..)?;
+                rest.split(')').next()
+            })
+            .collect();
+        assert!(
+            !anchors.is_empty(),
+            "gate misconfigured: no `crate::artifact#…` link left to check — if the links were \
+             deliberately removed, remove this gate with them"
+        );
+
+        for anchor in anchors {
+            assert!(
+                headings.iter().any(|h| h == anchor),
+                "the intra-doc link to `#{anchor}` names no heading of this module; \
+                 rustdoc renders these: {headings:?}"
+            );
+        }
     }
 }

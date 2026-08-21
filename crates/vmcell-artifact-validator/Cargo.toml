@@ -112,7 +112,43 @@ name = "vmcell-artifact-validator"
 #     `DoesNotWork`, so a broken restore cannot hide behind `Unverified`.
 #     `checks::snapshot_restore_roundtrip`, the `Level::Full` check, is unchanged; this is the
 #     conformance probe beside it.
-version = "0.6.0"
+# 0.6.0 → 0.6.1: design §17 (Open gaps and deferred work)'s backend hardcode, closed. `validate()`
+# booted Cloud Hypervisor and nothing else, though every check under it is already generic over
+# `Vmm`. PURELY ADDITIVE — `cargo semver-checks check-release -p vmcell-artifact-validator` reports
+# no edge at all — measured against `main`: `196 checks: 196 pass`, `no semver update required` —
+# which is exactly why the decision is written down here rather than left to a lint.
+#   * ADDITIVE: `validate_with(&vmm, &artifacts, &opts)` — `validate`'s body with the backend
+#     supplied by the caller: a secondary backend crate's (`vmcell-firecracker`, `vmcell-qemu`,
+#     `vmcell-crosvm`), a consumer's own out-of-tree one, or a test double. A PATCH bump, not a
+#     minor one: nothing moved and nothing broke, and the two in-workspace `^0.6.0` requirements
+#     (`vmcell`'s dev-dep and `vmcell-bench`'s) keep resolving without an edit.
+#   * THE SHAPE, and why it is not the one §17 sketched ("a backend knob on `ValidationOptions`").
+#     `Vmm` is not dyn-compatible — `create` and `restore` are `async fn`, so `dyn Vmm` is
+#     `error[E0038]` — which means no FIELD can hold an erased backend or an erased factory over
+#     one; and the enum-of-backends rustc itself suggests would make this contract crate depend on
+#     all three backend crates (they depend on `vmcell`, not the reverse) while STILL excluding the
+#     out-of-tree backend the knob exists for. So the backend travels with the call, the way
+#     `vmcell-bench`'s composition root and this crate's own `conformance::LiveProbe` already pass
+#     one. `ValidationOptions` gains NO field and stays `Clone + Debug` data: a consumer building it
+#     with a struct literal compiles unchanged, which is the whole reason this bump is a patch.
+#   * UNCHANGED, and pinned by tests rather than by this prose: `validate()` still boots Cloud
+#     Hypervisor (`the_default_backend_is_still_cloud_hypervisor` asserts the backend's `id()`, and
+#     a source scan pins that the crate constructs a backend in exactly ONE production site and that
+#     `validate` is `validate_with` on it), and its two refusals fire in the same order as before —
+#     missing artifact first, absent `/dev/kvm` second.
+#   * BEHAVIOR, scoped to the new door and stated because no lint can: `validate_with` does NOT
+#     probe `/dev/kvm`. The caller chose the backend, so the caller knows whether it needs one —
+#     every shipped backend does, and `harness::has_kvm()` is public for that preflight, while a
+#     test double does not. Refusing on the double's behalf would put this knob's own gate behind
+#     the facility the knob exists to be testable without. It DOES run the same artifact-existence
+#     refusal `validate` runs, through the one predicate, so a path typo is a typed
+#     `Error::Artifact` at either door instead of a report full of boot failures.
+#   * The other §10.4 (The downstream toolkit contract) entry point needed nothing:
+#     `conformance::run_battery` has always taken its backend from the caller
+#     (`LiveProbe::new(&vmm)`). The asymmetry §17 records for `run_budget` — bounded in the battery,
+#     unbounded in this older door — does not repeat here, and
+#     `only_the_default_door_names_a_concrete_backend` is what keeps it from starting to.
+version = "0.6.1"
 edition = "2024"
 rust-version.workspace = true
 license = "MIT OR Apache-2.0"

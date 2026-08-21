@@ -40,7 +40,22 @@ name = "vmcell-daemon"
 #     `Url::join` resolves a relative reference, so an unvalidated `../vms/vm-1` did not 404 — it
 #     retargeted the request at another endpoint. `upload_artifact` validated and the other seven did
 #     not.
-version = "0.4.0"
+# 0.4.0 → 0.5.0: the guest exec capture gets its own host-side ceiling (design §17, Open gaps and
+# future capabilities). Same reasoning as the entry above — `cargo semver-checks` does not cover this
+# crate and no signature a client links moved, so this line is the only thing that will tell them.
+#   * An `exec` — or a `create` carrying an inline `command` — whose captured stdout+stderr exceeds
+#     `bridge::MAX_EXEC_CAPTURE_BYTES` now returns 413 `payload_too_large`, naming the measured size,
+#     the ceiling and the remedy. Two client-visible edges: a capture in the narrow band that used to
+#     fit the bridge frame is now REFUSED, and a capture past the frame that used to return an opaque
+#     500 `internal` ("bridge frame … exceeds cap") now returns that explained 413. A client that
+#     treated 500 as retryable must handle 413 as terminal-until-the-command-changes.
+#   * The capture is REFUSED, never truncated: `ExecOutcomeDto` is unchanged, so no reply carries a
+#     silently shortened stdout/stderr a client could mistake for the whole. Re-run the command
+#     redirecting output to a file in the guest and fetch the file.
+#   * `bridge::MAX_EXEC_CAPTURE_BYTES` is public so a client can pre-size without a round trip. It is
+#     DERIVED from `MAX_BRIDGE_FRAME_BYTES` (less the reply-envelope reserve, times 3/4 for base64),
+#     so re-tuning the frame cap moves it; read the constant, never a number quoted anywhere.
+version = "0.5.0"
 edition = "2024"
 rust-version.workspace = true
 license = "MIT OR Apache-2.0"

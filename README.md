@@ -224,7 +224,7 @@ sudo apt update
 sudo apt install -y \
     build-essential flex bison bc libelf-dev libssl-dev \
     pkg-config libseccomp-dev libcap-ng-dev libcap2-bin \
-    nftables
+    nftables iproute2 util-linux python3 e2fsprogs bubblewrap
 ```
 
 What these are for:
@@ -236,9 +236,38 @@ What these are for:
   bootstrap tooling (and no `/bin/sh` → `bash` workaround) is required.
 - `pkg-config libseccomp-dev libcap-ng-dev` — build dependencies for the Cargo-installed
   `cloud-hypervisor` and `virtiofsd` binaries (§2).
-- `libcap2-bin` — provides `setcap`, used to bless the privileged test runner (§6).
+- `libcap2-bin` — provides `setcap`, which blesses the privileged test runner (§6), and `getcap`,
+  which `scripts/review-preflight-priv.sh` reads the blessing back with.
 - `nftables` — provides `nft`; the transparent egress proxy installs an `nft` TPROXY ruleset.
-  (Host networking otherwise uses `rtnetlink` directly, so the `ip` CLI / `iproute2` is not needed.)
+  Production host networking otherwise uses `rtnetlink` directly and spawns no CLI. The entries
+  below are the tools something else in the tree does spawn, by name — the suites, and (for
+  `mkfs.ext4`) the artifact pipeline itself.
+- `iproute2` — provides `ip` and `tc`. The privileged and daemon suites observe the host side of a
+  cell with `ip link show` / `ip netns exec` (a tap or netns still listed after teardown is the
+  residue assertion), and the segment battery injects netem delay and loss with `tc` — design §6.5
+  exposes the netns *names*, not a typed impairment API, so a test shells out exactly as a
+  downstream harness would.
+- `util-linux` — provides `nsenter`; the segment, tap and snapshot legs enter a cell's netns with
+  `nsenter --net=<netns>` to run those two inside it.
+- `python3` — the host-side peer for every data-plane assertion: `http.server` serves the bytes the
+  guest fetches, and the echo client/sink terminates the reverse direction of the NAT window-fill
+  transfers. Host-side only — nothing in the guest runs it.
+- `e2fsprogs` — provides `mkfs.ext4`, which the ext4 image producer spawns (design §4.7; the
+  default-on `ext4-producer` feature — with it off, the producer is a typed refusal and nothing
+  spawns), plus
+  `dumpe2fs`, `debugfs` and `e2fsck`, which the ext4 batteries read the produced image back with.
+  The `-d <tarball>` form the producer is built on needs an e2fsprogs at or above
+  `vmcell::artifact::ext4::MIN_E2FSPROGS_VERSION` **and** a `libarchive` its `mke2fs` can `dlopen`
+  (it is not linked, so no version check can see it). Below either, the producer's own probe reports
+  the facility absent and the batteries record a capability skip instead of failing — so a green
+  privileged run is not by itself evidence the ext4 legs ran; `just skip-manifest-show` is what
+  answers that. Ubuntu 24.04's package sits below the floor, which is why `ci.yml` builds a pinned,
+  checksum-verified e2fsprogs ahead of the suites (non-gating: a failed build degrades to that
+  recorded skip); Ubuntu 26.04's package is new enough as shipped.
+- `bubblewrap` — provides `bwrap`, which `just test-unit-undelegated` uses to bind an unwritable
+  `/sys/fs/cgroup` over the real one and reproduce a hosted runner's **non-delegated** cgroup
+  locally. That condition once reddened every cgroup-touching KVM-free test in CI, for weeks, while
+  `just test-unit` stayed green.
 
 ### 2. Cargo-installed subprocess binaries
 
@@ -430,7 +459,21 @@ cargo install cargo-nextest --locked         # test runner used by every `just t
 cargo install cargo-hack --locked            # feature-powerset clippy gate in `just ci`
 cargo install cargo-deny --locked            # license / advisory gate in `just ci`
 cargo install cargo-semver-checks --locked   # public-API semver gate (CI runs it on PRs)
+cargo install cargo-machete --locked         # unused-dependency gate in `just ci`
+cargo install typos-cli --locked             # prose typo gate in `just ci` (installs `typos`)
+cargo install zizmor --locked                # workflow-security gate in `just ci`
 ```
+
+Two of the gates are **not** cargo subcommands, and `just ci` runs both:
+
+```sh
+sudo apt install -y shellcheck   # the `gates` recipe lints every load-bearing script and the git hook
+```
+
+`actionlint` (workflow correctness, including the shell inside `run:` blocks) is neither a Debian
+package nor a crate — it is a Go binary from its own releases. Install the **pinned, checksum-verified
+release `ci.yml` installs**, by reading that step rather than a copy of its URL and digest here: a
+second copy of a pin is a pin that drifts.
 
 As with the binaries above, ensure `~/.cargo/bin` is in your `$PATH` so `cargo` and `just` can
 discover them.
@@ -555,4 +598,45 @@ sudo apt install -y linux-cpupower             # provides `cpupower` (applying a
 ```
 
 Benchmarks are *tracked metrics, not pass/fail gates* (design §16), so a missing package degrades
-an experiment to "not measured here," never a build or test failure.
+an experiment to "not measured here," never a build or test failure (§10).
+
+### 10. Benchmarks
+
+`bench-vm` (in `vmcell-bench`) is the macro-harness behind design §16, and this section quotes **no
+measured number**. Two places own one: `docs/benchmark-results.md` is canonical for every figure and
+states its own substrate and method per section, and design §16 carries the condensed narrative plus
+the refuted-lever table to read before proposing an optimization. What is written here instead is the
+*shape* of a measurement and the command that produces it — the part of a benchmark that does not go
+stale.
+
+**The shape of a run.** One `--backend` crossed with one `--mode`, repeated `--iterations` times
+after `--warmup` discarded ones, reported as percentiles over the sample through the one `pcts`
+helper (nearest-rank), with any dropped or warmup-failed iterations surfaced beside them rather than
+silently shrinking the sample. The header echoes every knob the run actually used and the VMM binary
+it resolved through the `$VMCELL_*_BIN` contract vars, so a results table can be attributed to the
+build it measured instead of to whatever was first on `PATH`. All four backends are wired —
+`vmcell-bench` is the composition root with an edge to every one of them — and a backend prints why
+it is skipping a mode its capabilities cannot serve instead of dropping it quietly. The mode roster
+is deliberately **not** copied here: it is `VALID_MODES` in
+`crates/vmcell-bench/src/bin/bench-vm.rs`, which is also what `--mode` is validated against, so read
+it there and it cannot go stale here.
+
+**Producing the matrix.** `scripts/perf-matrix.sh` runs every applicable mode on every backend
+through `scripts/run-bench.sh`, the one place the substrate is fixed: a delegated cgroup subtree
+(`systemd-run --user --scope -p Delegate=yes`) and the blessed **release** runner (§6), whose
+`CAP_DAC_OVERRIDE` is what lets `bench-vm` pin the CPU frequency — unpinned, the report says so
+rather than quietly measuring a drifting clock. It needs a release `bench-vm` and the built artifacts
+(§8).
+
+**Proving the wiring.** `just test-bench` is not the matrix; it is the harness's own
+can-it-go-red gate, one short `--mode latency` run per backend whose whole assertion is that a
+report comes out at all. Its argument is a **features list**, not a test filter, defaulting to the
+three backends CI has binaries for. A list omitting `cloud-hypervisor` is refused by name up front:
+that is `bench-vm`'s `required-features`, so cargo would build no binary while still pointing the
+harness at whatever stale one an earlier build left behind. crosvm is opt-in through the explicit
+list (`just test-bench cloud-hypervisor,crosvm`) for the §5 reason — CI has no crosvm binary.
+
+**Why none of it is a gate.** A benchmark here is a *tracked metric* (design §16): only
+**relative** invariants graduate to a CI guard, because only they survive a substrate change, and an
+absolute latency would redden on any slower box. Evidence for a lever is an interleaved same-session
+A/B delta and nothing else.

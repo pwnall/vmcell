@@ -547,6 +547,21 @@ gates:
     # and both directions gated (an exemption nobody names, and one that now resolves, both fail).
     ./scripts/check-docs-pointers.sh
     ./scripts/test-check-docs-pointers.sh
+    # The pointer-over-figure rule for the FRONT DOOR (AGENTS.md, "Docs and dependencies"). The README
+    # carried an embedded crosvm pass/total that had gone stale by the time anyone read it; docs/90
+    # deleted it and wrote a pointer at the recipe instead — and nothing gated the class, so the next
+    # pasted p50, boot time or image size would land exactly the same way. Two arms, because the answer
+    # depends on where the number sits: NO performance unit (ns/µs/ms, a fractional second, a rate, a
+    # percentile bound to a value) anywhere in README.md — narrow enough that a pinned version, a file
+    # mode, a port and a `.mem_mib(512)` config example all stay clean — and, INSIDE the benchmark
+    # section, no unit-bearing number at all, which is where a size or a percentage becomes a figure.
+    # Code fences are deliberately in scope: pasting a bench-vm report block is how this lands. The
+    # section is FOUND (exactly one heading naming a benchmark), so the gate also holds that section in
+    # place. A clean README yields zero hits, so proof of life is a CANARY each arm must match plus a
+    # collapse check that ARM 1 must NOT match ARM 2's; the self-test drives every arm, both marker
+    # directions, and all four vacuity arms.
+    ./scripts/ban-benchmark-figure-in-readme.sh
+    ./scripts/test-ban-benchmark-figure-in-readme.sh
     # The SAME pointer class everywhere OUTSIDE the markdown — the follow-up the script above records.
     # docs/90 D2 was `design §D` (allow-dangling-design-ref: quoted defect) in the daemon's served
     # OpenAPI `description`: a dangling pointer in a document the daemon hands to CLIENTS.

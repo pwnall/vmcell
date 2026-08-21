@@ -1872,9 +1872,15 @@ with a pointer to the §5.4 contract checklist — the residual class fails name
 newly-understood signature grows the classifier, never the timeout path. `await_kernel_banner(path,
 budget)` computes one `tokio::time::Instant` deadline and bounds its whole loop (which is also what
 makes its failure path unit-drivable on a 50 ms budget); the steward budgets are `Duration`s that
-`connect_framed` turns into an `Instant` one layer down. There is deliberately **no overall wall-clock
-budget on `validate()`** — a `Full` run boots several VMs sequentially — so "fails loudly, not by
-hanging" holds per check, not per battery (§17).
+`connect_framed` turns into an `Instant` one layer down. `validate()` carries **`run_budget`**, which
+bounds the WHOLE run — every level, every boot, end to end — defaulting to `Some(DEFAULT_RUN_BUDGET)`;
+per-check deadlines are unchanged and each still fails loud, and this bounds their sum, so "fails
+loudly, not by hanging" now holds per battery as well as per check. Exceeded is `Error::Timeout`
+naming the budget, the level that outran it, and the checks that completed first — never a hang, and
+never a green report with its tail missing. `None` opts out explicitly, for a caller that bounds the
+run itself. It is deliberately its own constant rather than a reuse of the conformance battery's
+`DEFAULT_BATTERY_BUDGET` (§10.6): the two bound different rosters, and one const for both would
+silently re-budget one when the other's roster grew.
 
 **Kept honest by an out-of-tree example (v30 delta 5).** The pattern's proof is a small example
 workspace, **`examples/downstream-kernel/`** — its own Cargo workspace, deliberately *outside* the

@@ -147,3 +147,20 @@ unguarded `mkdir` that aborted where its four siblings degrade), B7 (`just insta
 
 Still open from Tier B: **B8**, the release-half runner CI builds and `setcap`s unconditionally for
 a consumer only the hand-run bench workflow has. It is a cost, not a defect, and is left deliberate.
+
+**Wave 2 — Tier C:** the `Stage` worked doctest and the intra-doc links from `Pipeline`/`PackOptions`
+into the module examples (plus the two anchor gates the pass discovered were needed — rustdoc
+resolves an intra-doc link's *item* half and appends its `#fragment` unchecked, so every such link in
+this tree was silently unguarded); README's benchmark section, written as pointer-plus-shape with a
+gate that keeps a figure out of the front door; `validate_with`, retiring the Cloud Hypervisor
+hardcode as a *parameter* rather than the `ValidationOptions` field §17 sketched — a recorded shift,
+because the field shape would have forced the validator to depend on the backend crates and invert
+the layering; the `am-fs-erofs`-off pack arm's typed `CapabilityUnavailable`, whose gate had to be a
+source scan because **no configuration cargo can build compiles that arm** (`rootfs` requires
+`pipeline`, and `pipeline` enables `am-fs-erofs`); and the guest exec capture's own host-side
+ceiling, refusing with an explained 413 rather than truncating, placed at the one engine seam both
+the broker and single-process deployments traverse.
+
+Also closed: **A10**, the design sentence outside §17 still asserting `validate()` had no overall
+wall-clock budget. §18's delta-register premise record still describes the pre-delta state, correctly
+and deliberately — that is what a recorded premise is, and editing it would falsify the register.

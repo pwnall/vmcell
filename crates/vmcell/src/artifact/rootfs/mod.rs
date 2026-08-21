@@ -204,6 +204,12 @@ pub use crate::artifact::RootfsFormat;
 /// v33 alone hands it two new ones (delta 6's applet roster, delta 7's xattr policy); two more
 /// parameters would be two more ledgered signature breaks, and the third one would be somebody
 /// else's problem.
+///
+/// A worked example — building one and handing it to the tail — is the
+/// [module docs](crate::artifact#repacking-through-the-one-inject-and-pack-tail)' second doctest.
+/// **Linked, not repeated**: an example copied onto the item is a second copy of the same
+/// walkthrough, and this file's own history is a list of second copies that diverged. A reader who
+/// lands on this page from `docs.rs` search would otherwise see the fields and never the call.
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct PackOptions {
@@ -1791,7 +1797,16 @@ fn rootfs_injection_manifest<'a>(
     (files, symlinks)
 }
 
-/// Shared logic to take a tar stream, inject the steward and CA, and pack it into erofs.
+/// The `am-fs-erofs`-off form of the erofs door: it **delegates**, so both entry points give the
+/// one refusal below rather than each spelling its own.
+///
+/// Deliberately not a second refusal site. The enabled form of this door is a format-*checking*
+/// wrapper, and checking `options.format` ahead of a packer that does not exist would answer the
+/// wrong question: with `am-fs-erofs` compiled out no format is packable, [`RootfsFormat::Erofs`]
+/// included.
+///
+/// # Errors
+/// Always [`Error::CapabilityUnavailable`], exactly as [`pack_rootfs_with_injection`].
 #[cfg(not(feature = "am-fs-erofs"))]
 pub async fn pack_erofs_with_injection(
     tar_streams: Vec<Box<dyn Read + Send>>,
@@ -1802,8 +1817,30 @@ pub async fn pack_erofs_with_injection(
     pack_rootfs_with_injection(tar_streams, inputs, out, options).await
 }
 
-/// Shared logic to take a tar stream, inject the steward and CA, and pack it into the declared
-/// format.
+/// The `am-fs-erofs`-off form of the one inject+pack tail: rootfs packing is a capability this
+/// build was compiled **without**, refused with the typed error and never substituted.
+///
+/// A feature gate may REMOVE a capability, never change semantics (AGENTS.md), and §7.2 reserves
+/// [`Error::CapabilityUnavailable`] for an **absent facility** — which an emitter that was compiled
+/// out is. Phrased like the `ext4-producer`-off route one emitter over, so a caller matches one
+/// typed shape for both. It refused with a stringly `Error::Artifact` until this arm was typed
+/// (docs/92 C5): the sentence said the same thing, but the only way to act on it was a substring
+/// match on a message.
+///
+/// The refusal names *rootfs packing*, not a format, because the merge every emitter consumes lives
+/// behind this same feature (§18 delta 8): with it off the ext4 route is gone too, whatever the
+/// feature's crate-shaped name suggests.
+///
+/// **The `mkfs.erofs` shell fallback is not the fix here, and adding it would reverse a settled
+/// reversal.** Design Appendix B row 1 records the shell tool as superseded — *"graduated — the only
+/// wired erofs writer"* — and §17 records the fallback as designed, unimplemented, and fail-loud on
+/// a missing packer input today (§4.2). Re-introducing a substitution the design records as
+/// graduated is the move AGENTS.md tells a reader to cite rather than re-argue; the honest close is
+/// this typed refusal.
+///
+/// # Errors
+/// Always [`Error::CapabilityUnavailable`] — the `Ok` arm is unreachable by construction, since
+/// nothing in this configuration can produce a packed image.
 #[cfg(not(feature = "am-fs-erofs"))]
 pub async fn pack_rootfs_with_injection(
     _tar_streams: Vec<Box<dyn Read + Send>>,
@@ -1811,13 +1848,18 @@ pub async fn pack_rootfs_with_injection(
     _out: &Path,
     _options: &PackOptions,
 ) -> Result<StageOutputs> {
-    // The MERGE lives behind `am-fs-erofs`, and both emitters consume it (§18 delta 8), so the
-    // ext4 route needs that feature too — it is not an "erofs-only" gate any more, whatever its
-    // name says. mkfs.erofs as a fallback would require extracting the tar to a directory, adding
-    // the files, and running mkfs.erofs. We assume am-fs-erofs is used for now.
-    Err(Error::Artifact(
-        "am-fs-erofs feature is required for rootfs building".into(),
-    ))
+    // NOTHING CARGO CAN BUILD COMPILES THIS ARM, which is why its gate is a source scan and not a
+    // test: `rootfs` is `#[cfg(feature = "pipeline")]` and the manifest's `pipeline` feature turns
+    // `am-fs-erofs` ON, so the cfg above is unsatisfiable in every configuration of this workspace.
+    // That is the exact inverse of the `ext4-producer` arm one emitter over — the reason THAT
+    // feature sits in `default` instead of inside `pipeline`. `mod tests`'
+    // `the_erofs_off_pack_arm_is_a_typed_capability_refusal` reads this body out of the file and is
+    // the only instrument that can see it; a compiler never will.
+    Err(Error::CapabilityUnavailable {
+        op: "rootfs pack (§4.2)".to_string(),
+        needed: "the `am-fs-erofs` feature, which this build of `vmcell` was compiled without"
+            .to_string(),
+    })
 }
 
 /// Materialize the shared proxy CA ONCE, before a test packs an image or folds a cache key.
@@ -1868,6 +1910,167 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::path::PathBuf;
+
+    /// The `am-fs-erofs`-OFF pack arms refuse with the TYPED capability error, and the door keeps
+    /// no second copy of that refusal.
+    ///
+    /// **A source scan, because no compiler can reach those arms.** `rootfs` is
+    /// `#[cfg(feature = "pipeline")]` and the manifest's `pipeline` feature enables `am-fs-erofs`,
+    /// so their cfg is unsatisfiable in every configuration cargo can build here — proven by
+    /// putting a `compile_error!` in that body and watching
+    /// `cargo check -p vmcell --lib --no-default-features --features pipeline` finish green. That is
+    /// the exact inverse of the `ext4-producer` arm above, whose feature sits in `default` for
+    /// precisely this reason, and it leaves a scan of this file's own text as the only instrument
+    /// that can see the law — the shape the tree uses wherever a law's drift is not a compile error.
+    /// A scan is blind to whether the arm would still *compile*, which is the honest cost of code
+    /// no configuration builds; it is not blind to what the arm returns.
+    ///
+    /// RED on the inverse, on either leg: restore the pre-docs/92 body
+    /// (a stringly `Error::Artifact` naming the feature) and the tail leg reddens; give the door its
+    /// own refusal instead of delegating and the door leg reddens.
+    #[test]
+    fn the_erofs_off_pack_arm_is_a_typed_capability_refusal() {
+        const SOURCE: &str = include_str!("mod.rs");
+        // Composed rather than written as a literal, so this test's own text is not one of the
+        // hits it counts.
+        let marker = format!("#[cfg(not(feature = {q}am-fs-erofs{q}))]", q = '"');
+
+        let starts: Vec<usize> = SOURCE.match_indices(&marker).map(|(i, _)| i).collect();
+        // Non-vacuity, the zero-hit rule: a scan that found nothing has been pointed at nothing.
+        // Both arms are named because the pair IS the law — one refuses, the other delegates to it.
+        assert_eq!(
+            starts.len(),
+            2,
+            "expected exactly the two `am-fs-erofs`-off pack arms (the erofs door and the one \
+             tail); found {} — this scan is now pointed at the wrong text",
+            starts.len()
+        );
+        let arm = |start: usize| -> &str {
+            let rest = &SOURCE[start..];
+            let end = rest
+                .find("\n}\n")
+                .expect("every scanned arm is a function with a closing brace at column 0");
+            &rest[..end]
+        };
+        let (door, tail) = (arm(starts[0]), arm(starts[1]));
+
+        assert!(
+            tail.contains("pub async fn pack_rootfs_with_injection"),
+            "the SECOND off arm must be the one tail; found:\n{tail}"
+        );
+        assert!(
+            tail.contains("Error::CapabilityUnavailable"),
+            "a compiled-out emitter is an ABSENT facility (§7.2), so the tail's off arm refuses \
+             with the typed error:\n{tail}"
+        );
+        assert!(
+            !tail.contains("Error::Artifact"),
+            "a stringly refusal is only actionable by substring-matching a message:\n{tail}"
+        );
+        assert!(
+            tail.contains("am-fs-erofs` feature"),
+            "the refusal names the feature that was compiled out, or its reader cannot act on \
+             it:\n{tail}"
+        );
+        // Appendix B row 1 records the shell `mkfs.erofs` as SUPERSEDED by the in-process writer.
+        // Re-adding it here would reverse a settled reversal, so the arm spawns nothing.
+        assert!(
+            !tail.contains("Command"),
+            "the `mkfs.erofs` shell fallback is a graduated substitution (design Appendix B row \
+             1), not this arm's fix:\n{tail}"
+        );
+
+        assert!(
+            door.contains("pub async fn pack_erofs_with_injection"),
+            "the FIRST off arm must be the erofs door; found:\n{door}"
+        );
+        assert!(
+            door.contains("pack_rootfs_with_injection(tar_streams, inputs, out, options)"),
+            "the door delegates to the one tail:\n{door}"
+        );
+        assert!(
+            !door.contains("Error::"),
+            "one law, one predicate: the door carries no refusal of its own, or the two arms drift \
+             into two answers to `why can this build not pack a rootfs?`:\n{door}"
+        );
+    }
+
+    /// [`PackOptions`]' pointer at the module's worked example names a heading that still exists.
+    ///
+    /// The example lives on [`crate::artifact`] and the item links to it rather than repeating it
+    /// (docs/92 tier C), which trades one drift for another: rustdoc resolves the *item* half of an
+    /// intra-doc link and reddens on a misspelled module path, but it never checks the `#fragment`,
+    /// so renaming that heading leaves a green build and a link that lands at the top of a very long
+    /// page. Nothing in the tree could see that — the two older `#assembling-a-pipeline` links carry
+    /// the same silent hole — so the anchor is checked here, against the headings of the file that
+    /// owns it.
+    ///
+    /// RED on the inverse: change either half — the fragment here or the `//! # Repacking …`
+    /// heading in `artifact/mod.rs` — and this reddens naming the anchor and the headings it found.
+    #[test]
+    fn the_pack_options_example_pointer_lands_on_a_real_module_heading() {
+        const SELF_SOURCE: &str = include_str!("mod.rs");
+        const MODULE_SOURCE: &str = include_str!("../mod.rs");
+
+        let link_start = SELF_SOURCE.find("(crate::artifact#").expect(
+            "`PackOptions` points at the module example; the pointer is the item under test",
+        );
+        let anchor: String = SELF_SOURCE[link_start..]
+            .trim_start_matches("(crate::artifact#")
+            .chars()
+            .take_while(|c| *c != ')')
+            .collect();
+
+        // rustdoc's slug for a `# Heading`: lowercased, whitespace to `-`, punctuation dropped.
+        // Fenced regions are skipped: inside a doctest, `//! # ` is the HIDDEN-LINE marker, not a
+        // heading, and folding `# #[tokio::main]` into the roster would let a typo'd anchor match
+        // a line that renders no anchor at all.
+        let mut fenced = false;
+        let headings: Vec<String> = MODULE_SOURCE
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("//!").map(str::trim_start))
+            .filter(|l| {
+                if l.starts_with("```") {
+                    fenced = !fenced;
+                    return false;
+                }
+                !fenced
+            })
+            .filter_map(|l| l.strip_prefix("# "))
+            .map(|h| {
+                // `[text](target)` renders as `text`, so a link TARGET is not part of the anchor —
+                // the neighbouring `# Assembling a [`Pipeline`](crate::artifact::Pipeline)` heading
+                // is exactly that shape, and a roster that folded its target in would misreport the
+                // one anchor a reader is most likely to reuse.
+                let mut rendered = h.to_string();
+                while let Some(open) = rendered.find("](") {
+                    let Some(close) = rendered[open..].find(')') else {
+                        break;
+                    };
+                    rendered.replace_range(open..open + close + 1, "");
+                }
+                rendered
+                    .chars()
+                    .filter_map(|c| match c {
+                        c if c.is_alphanumeric() => Some(c.to_ascii_lowercase()),
+                        ' ' | '-' => Some('-'),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .collect();
+        // Non-vacuity: an extractor that finds no heading would make the membership test below
+        // pass for nothing, which is the zero-hit failure this repo treats as a misconfiguration.
+        assert!(
+            !headings.is_empty(),
+            "no `//! # ` headings found in `artifact/mod.rs`; this scan is pointed at the wrong text"
+        );
+        assert!(
+            headings.contains(&anchor),
+            "`PackOptions` links to `crate::artifact#{anchor}`, which is no heading of that module: \
+             {headings:?}"
+        );
+    }
 
     /// Both feature configurations of the format→emitter law, each compiled only where it applies.
     ///

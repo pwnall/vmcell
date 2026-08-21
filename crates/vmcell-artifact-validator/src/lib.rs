@@ -3,7 +3,8 @@
 //! and the bootstrap seed, §13, Cross-cutting invariants) by booting real test micro-VMs.
 //!
 //! A developer pairs a custom artifact with a known-good counterpart — a custom `vmlinux`
-//! with a trusted `rootfs.erofs`, or vice versa — and calls [`validate`]. It boots micro-VMs
+//! with a trusted `rootfs.erofs`, or vice versa — and calls [`validate`] (or [`validate_with`],
+//! which takes the backend instead of picking Cloud Hypervisor). It boots micro-VMs
 //! via `vmcell`, drives the steward to probe the guest, and returns a
 //! [`ValidationReport`] listing every check's outcome. **Success is an empty failure list**
 //! ([`ValidationReport::is_ok`] / [`ValidationReport::into_result`]).
@@ -280,6 +281,14 @@ impl Level {
 pub const DEFAULT_RUN_BUDGET: Duration = Duration::from_secs(20 * 60);
 
 /// Knobs for a validation run.
+///
+/// **Data only**, deliberately: there is no backend field here, and the backend is a parameter of
+/// [`validate_with`] instead. [`vmcell::vmm::Vmm`] is not dyn-compatible, so a field could hold
+/// neither an erased backend nor an erased factory, and the enum-of-backends alternative would make
+/// this crate depend on every backend crate while still excluding a consumer's own (the full
+/// reasoning, with the compiler's verdict, is on [`validate_with`]). Keeping this struct plain
+/// `Clone + Debug` data is what lets a caller build it from a config file or a CLI flag and clone it
+/// across runs.
 #[derive(Clone, Debug)]
 pub struct ValidationOptions {
     /// The deepest level of checks to run (default [`Level::Core`]).
@@ -480,7 +489,13 @@ impl ValidationReport {
     }
 }
 
-/// Validate an artifact pair against the contract up to `opts.level`, booting real micro-VMs.
+/// Validate an artifact pair against the contract up to `opts.level`, booting real micro-VMs on
+/// Cloud Hypervisor.
+///
+/// This is [`validate_with`] on `default_backend`, plus the `/dev/kvm` precondition that backend
+/// needs. A caller with a backend of its own — a secondary backend crate, or an out-of-tree one —
+/// calls [`validate_with`] directly; that function's rustdoc records why the knob is a parameter
+/// rather than a field on [`ValidationOptions`].
 ///
 /// Returns a [`ValidationReport`]; contract violations — **including "the kernel did not
 /// boot"** — are [`CheckStatus::Fail`] entries, not the outer `Err`. The outer `Err` is
@@ -496,6 +511,47 @@ pub async fn validate(
     artifacts: &ArtifactSet,
     opts: &ValidationOptions,
 ) -> vmcell::Result<ValidationReport> {
+    // Before the host probe, so a caller who typo'd a path hears about the path rather than about
+    // the host. `validate_with` runs the same predicate again for its own inputs.
+    ensure_artifacts_exist(artifacts)?;
+    if !harness::has_kvm() {
+        // Core is unconditional; without KVM we cannot verify a single contract property, so
+        // we refuse rather than return an all-`Skip` report that `is_ok()` would call green.
+        // This probe belongs to THIS door, not to `validate_with`: it is the door that chose a
+        // backend, so it is the one that knows the backend needs `/dev/kvm`.
+        return Err(vmcell::Error::CapabilityUnavailable {
+            op: "artifact validation".into(),
+            needed: "/dev/kvm (no VM can boot to verify the contract)".into(),
+        });
+    }
+
+    validate_with(&default_backend(), artifacts, opts).await
+}
+
+/// The backend [`validate`] picks: Cloud Hypervisor — the primary backend, the only one in the
+/// `vmcell` lib — on the binary the §10.4 (The downstream toolkit contract) `VMCELL_CH_BIN`
+/// resolver names.
+///
+/// Its own function rather than an expression inside [`validate`], so the default is a **value a
+/// test can interrogate** without KVM: `the_default_backend_is_still_cloud_hypervisor` asserts its
+/// [`Vmm::id`]. A default that exists only as an expression in the middle of an entry point can be
+/// checked by reading the source and in no other way, and this one has to survive the knob below
+/// unchanged.
+fn default_backend() -> CloudHypervisor {
+    CloudHypervisor::new(harness::ch_bin())
+}
+
+/// Both artifact files exist — the one input-validation predicate, called by **both** doors.
+///
+/// Two call sites, each with its own reason: [`validate`] runs it ahead of its `/dev/kvm` probe to
+/// order the two refusals, and [`validate_with`] runs it because it is an entry point of its own —
+/// a door that trusts another door's check is one refactor away from not being checked at all. The
+/// cost of the second call is two `Path::exists` calls; the cost of the alternative is a public
+/// entry point that accepts a path it never looks at.
+///
+/// # Errors
+/// [`vmcell::Error::Artifact`] naming the file that does not exist.
+fn ensure_artifacts_exist(artifacts: &ArtifactSet) -> vmcell::Result<()> {
     if !artifacts.kernel.exists() {
         return Err(vmcell::Error::Artifact(format!(
             "kernel artifact does not exist: {}",
@@ -508,29 +564,80 @@ pub async fn validate(
             artifacts.rootfs.display()
         )));
     }
-    if !harness::has_kvm() {
-        // Core is unconditional; without KVM we cannot verify a single contract property, so
-        // we refuse rather than return an all-`Skip` report that `is_ok()` would call green.
-        return Err(vmcell::Error::CapabilityUnavailable {
-            op: "artifact validation".into(),
-            needed: "/dev/kvm (no VM can boot to verify the contract)".into(),
-        });
-    }
-
-    let vmm = CloudHypervisor::new(harness::ch_bin());
-    validate_on(&vmm, artifacts, opts).await
+    Ok(())
 }
 
-/// [`validate`]'s body, generic over the backend so the run budget is drivable without KVM.
+/// Validate an artifact pair on a **caller-supplied backend**: [`validate`]'s body, with the
+/// backend chosen by the caller instead of by this crate.
 ///
-/// Private: the shipped entry point hardcodes cloud-hypervisor by design (a backend knob on
-/// [`ValidationOptions`] is design §17's *other* recorded gap, and closing it is not this
-/// function's business).
-async fn validate_on<V: Vmm>(
+/// [`validate`] is this function on `default_backend` — Cloud Hypervisor, unchanged — so a
+/// consumer that never names a backend sees exactly what it saw before.
+///
+/// # Why the knob is a parameter and not a field on [`ValidationOptions`]
+/// Design §17 (Open gaps and deferred work) records the hardcode and sketches "a backend knob on
+/// `ValidationOptions`". That shape does not hold, and a sketched signature is advisory where the
+/// behavior and its gate bind (AGENTS.md), so the shift is recorded here and in
+/// `docs/implementation-notes.md` rather than being silent. Two structural reasons:
+///
+/// 1. **[`Vmm`] is not dyn-compatible.** `create` and `restore` are `async fn`, so `dyn Vmm` does
+///    not compile at all (`error[E0038]: the trait `vmcell::Vmm` is not dyn compatible … because
+///    method `create` is `async``). A *field* holding an erased backend — or an erased factory
+///    over one — is therefore not expressible. What remains is a generic `ValidationOptions<V>`,
+///    which routes the same type parameter through the configuration type, infects every signature
+///    that carries one, and buys nothing this parameter does not.
+/// 2. **The alternative rustc itself suggests, "an enum where each variant holds one of these
+///    types", inverts the layering.** Those variants live in `vmcell-firecracker`, `vmcell-qemu`
+///    and `vmcell-crosvm`, and every one of them depends on `vmcell`; a validator enumerating them
+///    would drag all three into a contract crate — and a consumer's own out-of-tree backend, the
+///    caller this knob exists for, would still be unreachable.
+///
+/// So the backend travels with the call, as it does at every other composition root in this
+/// workspace: `vmcell-bench`'s `bench-vm` picks the concrete backend in `main` (cargo features
+/// decide which backend crates are linked at all) and hands it to one generic `run_mode<V: Vmm>`,
+/// and this crate's own [`conformance::run_battery`] already takes its backend from the caller
+/// through [`conformance::LiveProbe`]. [`ValidationOptions`] stays what it is: `Clone + Debug`
+/// data, with no field a caller must now fill in.
+///
+/// # The other entry point
+/// [`conformance::run_battery`] needs no knob added — it never had the hardcode. The two §10.4
+/// doors are symmetric **after** this change rather than because of it, so the asymmetry design
+/// §17 records for `run_budget` (the battery bounded, this door not) does not repeat here.
+///
+/// # What this door does not check
+/// It does **not** probe `/dev/kvm`. The caller chose the backend, so the caller is the one who
+/// knows whether it needs one: every shipped backend does — [`harness::has_kvm`] is public for
+/// exactly that preflight, and [`validate`] performs it for the Cloud Hypervisor it picks — while a
+/// test double does not. Refusing on the double's behalf would put this knob's own gate behind the
+/// facility the knob exists to be testable without. It does run the same artifact-existence
+/// refusal, through the one predicate (`ensure_artifacts_exist`).
+///
+/// ```no_run
+/// use vmcell::vmm::cloud_hypervisor::CloudHypervisor;
+/// use vmcell_artifact_validator::{ArtifactSet, Level, ValidationOptions, harness, validate_with};
+///
+/// # #[tokio::main]
+/// # async fn main() -> vmcell::Result<()> {
+/// // Any `Vmm`: a secondary backend crate's, or a consumer's own. This one is the default spelled
+/// // out — `validate` is precisely this call.
+/// assert!(harness::has_kvm(), "every shipped backend boots on /dev/kvm");
+/// let vmm = CloudHypervisor::new(harness::ch_bin());
+/// let artifacts = ArtifactSet::new(harness::get_vmlinux(), harness::get_rootfs());
+/// let report = validate_with(&vmm, &artifacts, &ValidationOptions::level(Level::Core)).await?;
+/// eprintln!("{} checks", report.outcomes.len());
+/// # Ok(())
+/// # }
+/// ```
+///
+/// # Errors
+/// - [`vmcell::Error::Artifact`] if `artifacts.kernel` or `artifacts.rootfs` does not exist.
+/// - [`vmcell::Error::Timeout`] if the run outran [`ValidationOptions::run_budget`], naming the
+///   level that outran it and the checks that completed first.
+pub async fn validate_with<V: Vmm>(
     vmm: &V,
     artifacts: &ArtifactSet,
     opts: &ValidationOptions,
 ) -> vmcell::Result<ValidationReport> {
+    ensure_artifacts_exist(artifacts)?;
     let outcomes = match run_levels_bounded(opts.level, opts.run_budget, |level| async move {
         let mut level_outcomes: Vec<CheckOutcome> = Vec::new();
         run_level(level, vmm, artifacts, &mut level_outcomes).await;
@@ -938,23 +1045,46 @@ mod tests {
         assert_eq!(ValidationOptions::level(Level::Full).level, Level::Full);
     }
 
-    // The wiring, behaviorally: `validate_on` runs exactly the levels its options ask for, through
+    /// A backend that records every call and creates nothing — what keeps every gate in this
+    /// module KVM-free.
+    fn recording_backend() -> vmcell::vmm::FakeVmm {
+        vmcell::vmm::FakeVmm::with_faults(vmcell::vmm::FaultMenu {
+            fail_create: true,
+            ..vmcell::vmm::FaultMenu::default()
+        })
+    }
+
+    /// An artifact pair that EXISTS, since both doors refuse one that does not. The bytes are
+    /// never read — a backend that cannot create a VM never opens them — so the fixture is two
+    /// files and their tempdir.
+    ///
+    /// The `TempDir` is returned rather than dropped here: it owns its cleanup on the panic path as
+    /// well as the success path (AGENTS.md, "a test's own fixtures are residue too"), and a
+    /// caller that drops it early would delete the very files the precondition then looks for.
+    fn artifact_fixture() -> (tempfile::TempDir, ArtifactSet) {
+        let dir = tempfile::tempdir().expect("a tempdir for the artifact fixture");
+        let kernel = dir.path().join("vmlinux");
+        let rootfs = dir.path().join("rootfs.erofs");
+        std::fs::write(&kernel, b"not a kernel").expect("write the fixture kernel");
+        std::fs::write(&rootfs, b"not a rootfs").expect("write the fixture rootfs");
+        let artifacts = ArtifactSet::new(kernel, rootfs);
+        (dir, artifacts)
+    }
+
+    // The wiring, behaviorally: `validate_with` runs exactly the levels its options ask for, through
     // the bounded sequencer, and returns a report. `fail_create` keeps it KVM-free — every check
     // records or skips its id on every path, so the rosters are enumerable against a backend that
     // cannot create a VM.
     #[tokio::test]
-    async fn validate_on_runs_exactly_the_levels_its_options_ask_for() {
-        let vmm = vmcell::vmm::FakeVmm::with_faults(vmcell::vmm::FaultMenu {
-            fail_create: true,
-            ..vmcell::vmm::FaultMenu::default()
-        });
-        let artifacts = ArtifactSet::new("/nonexistent/vmlinux", "/nonexistent/rootfs.erofs");
+    async fn validate_with_runs_exactly_the_levels_its_options_ask_for() {
+        let vmm = recording_backend();
+        let (_fixture, artifacts) = artifact_fixture();
         for (deepest, expected) in [
             (Level::Core, vec![Level::Core]),
             (Level::Extended, vec![Level::Core, Level::Extended]),
             (Level::Full, vec![Level::Core, Level::Extended, Level::Full]),
         ] {
-            let report = validate_on(&vmm, &artifacts, &ValidationOptions::level(deepest))
+            let report = validate_with(&vmm, &artifacts, &ValidationOptions::level(deepest))
                 .await
                 .expect("a run inside its budget reports");
             let mut levels: Vec<Level> = report.outcomes.iter().map(|o| o.level).collect();
@@ -969,6 +1099,196 @@ mod tests {
                 report.outcomes
             );
         }
+    }
+
+    // THE KNOB, behaviorally: `validate_with` boots on the backend the CALLER handed it, not on
+    // the one `validate` picks. `FakeVmm` records every `create` it is asked for, so "the caller's
+    // backend was the one driven" is an assertion and not an inference — and the fake needs no
+    // `/dev/kvm`, which is exactly why that probe stayed on `validate` and did not move into this
+    // door.
+    //
+    // RED on the inverse (verified): ignore the `vmm` argument in `validate_with` and run on
+    // `default_backend()` instead — the fake's call log stays empty and this fails, on a host with
+    // KVM and on one without.
+    //
+    // WHAT THIS FAKE CANNOT SEE, and the live leg that does (AGENTS.md): it boots nothing and
+    // touches no filesystem, so it proves the dispatch and not that a real backend still comes up
+    // through this door. `tests/smoke.rs`'s `#[ignore]`d legs are that half — they run `validate`,
+    // which IS `validate_with` on the default backend, against real artifacts under
+    // `just test-validator`.
+    #[tokio::test]
+    async fn validate_with_runs_on_the_caller_supplied_backend() {
+        let vmm = recording_backend();
+        let (_fixture, artifacts) = artifact_fixture();
+
+        let report = validate_with(&vmm, &artifacts, &ValidationOptions::level(Level::Core))
+            .await
+            .expect("a run inside its budget reports");
+
+        let calls = vmm.calls.lock().expect("the fake's call log").clone();
+        assert!(
+            calls.iter().any(|c| c == "create"),
+            "the caller's backend must be the one driven, but it was never asked to create a VM: \
+             {calls:?}"
+        );
+        // …and the report is that backend's story, not another's: the scripted failure the caller
+        // handed in is what the boot check reports back.
+        assert!(
+            report.outcomes.iter().any(|o| matches!(
+                &o.status,
+                CheckStatus::Fail(m) if m.contains("scripted create failure")
+            )),
+            "the failure text must trace to the caller's backend: {:?}",
+            report.outcomes
+        );
+    }
+
+    // Both doors reject an artifact pair that does not exist, through the ONE predicate — including
+    // `validate_with`, the door a caller reaches without passing `validate`'s checks first. With the
+    // positive control: the same call on an existent pair gets past the precondition and runs.
+    //
+    // RED on the inverse (verified): drop `ensure_artifacts_exist` from `validate_with`'s body and
+    // both legs return `Ok` with a report full of boot failures instead of the typed refusal.
+    #[tokio::test]
+    async fn validate_with_refuses_an_artifact_pair_that_does_not_exist() {
+        let vmm = recording_backend();
+        let (_fixture, good) = artifact_fixture();
+        for (artifacts, missing) in [
+            (
+                ArtifactSet::new("/nonexistent/vmlinux", &good.rootfs),
+                "kernel artifact does not exist",
+            ),
+            (
+                ArtifactSet::new(&good.kernel, "/nonexistent/rootfs.erofs"),
+                "rootfs artifact does not exist",
+            ),
+        ] {
+            let err = validate_with(&vmm, &artifacts, &ValidationOptions::default())
+                .await
+                .expect_err(
+                    "a missing artifact is a typed refusal, never a report of boot failures",
+                );
+            assert!(
+                matches!(&err, vmcell::Error::Artifact(m) if m.contains(missing)),
+                "expected an Artifact error naming {missing}, got {err:?}"
+            );
+        }
+
+        validate_with(&vmm, &good, &ValidationOptions::level(Level::Core))
+            .await
+            .expect("the positive control: an existent pair gets past the precondition");
+    }
+
+    // THE DEFAULT, which the knob must not have moved: `validate` still boots Cloud Hypervisor.
+    // Two halves, because neither is enough alone — the identity of the value, and the fact that
+    // `validate` is what runs on it. The `/dev/kvm` refusal makes `validate` itself unrunnable here,
+    // so the second half is source-scanned, in the shape
+    // `every_level_runner_is_called_only_through_run_level` uses.
+    //
+    // RED on the inverse (verified): point `default_backend` at another backend and the id assert
+    // fails; inline the construction back into `validate` and the delegation assert fails.
+    #[test]
+    fn the_default_backend_is_still_cloud_hypervisor() {
+        assert_eq!(
+            default_backend().id(),
+            "cloud-hypervisor",
+            "the shipped default is the primary backend; changing it changes every consumer's run"
+        );
+
+        let code = production_statements();
+        let body = code
+            .split_once("pub async fn validate(")
+            .expect("`validate` is this crate's default door")
+            .1;
+        let end = body
+            .find("\n}\n")
+            .expect("the function has a closing brace");
+        let body = body.get(..end).expect("a char boundary at a newline");
+        assert!(
+            body.contains("validate_with(&default_backend(), artifacts, opts)"),
+            "`validate` must BE `validate_with` on the default backend — a second body is a second \
+             place the default can drift: {body}"
+        );
+    }
+
+    // The symmetry `validate_with`'s rustdoc claims, gated instead of asserted in prose: no OTHER
+    // door in this crate names a concrete backend. `conformance::run_battery` takes the caller's
+    // through `LiveProbe`, and every `checks::` arm is generic over `Vmm`; a later "default it to
+    // cloud-hypervisor here too" re-opens the gap this change closed, one file over, where no test
+    // of this door would see it.
+    #[test]
+    fn only_the_default_door_names_a_concrete_backend() {
+        const SOURCES: [(&str, &str); 5] = [
+            (
+                "src/lib.rs",
+                include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs")),
+            ),
+            (
+                "src/checks.rs",
+                include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/checks.rs")),
+            ),
+            (
+                "src/conformance.rs",
+                include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/conformance.rs")),
+            ),
+            (
+                "src/harness.rs",
+                include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/harness.rs")),
+            ),
+            (
+                "src/kconfig.rs",
+                include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/kconfig.rs")),
+            ),
+        ];
+        // VACUITY, the arm every scan in this repo carries: a roster that reads nothing reports a
+        // clean tree. Each file must have production text, and `lib.rs`'s must still hold the door
+        // this test is about.
+        let mut total = 0usize;
+        for (name, source) in SOURCES {
+            let production = strip_doc_comments(production_half(source));
+            assert!(
+                !production.trim().is_empty(),
+                "gate misconfigured: {name} yielded no production text"
+            );
+            total += production.matches("CloudHypervisor::new(").count();
+            if name != "src/lib.rs" {
+                assert!(
+                    !production.contains("CloudHypervisor"),
+                    "{name} names a concrete backend; every door but `validate` takes the caller's"
+                );
+            }
+        }
+        assert!(
+            strip_doc_comments(production_half(SOURCES[0].1))
+                .contains("pub async fn validate_with"),
+            "gate misconfigured: the scan no longer reads the file holding the knob"
+        );
+        assert_eq!(
+            total, 1,
+            "exactly ONE production site constructs a backend, and it is `default_backend`"
+        );
+    }
+
+    /// Everything in `source` before its test module — the half that ships.
+    fn production_half(source: &str) -> &str {
+        source
+            .split_once("\n#[cfg(test)]")
+            .map_or(source, |(production, _)| production)
+    }
+
+    /// `text` without its comment lines. A construction shown in a rustdoc EXAMPLE is documentation,
+    /// not a call site, and a scan that counts construction sites must not count it — this crate's
+    /// front door documents the default by spelling it out.
+    fn strip_doc_comments(text: &str) -> String {
+        text.lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<&str>>()
+            .join("\n")
+    }
+
+    /// This file's production statements: [`production_code`] with the comment lines dropped.
+    fn production_statements() -> String {
+        strip_doc_comments(production_code())
     }
 
     /// This file's production text — everything before the test module.
