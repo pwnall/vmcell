@@ -173,7 +173,13 @@ check_blessing_fresh() {
   local r
   for r in "${reasons[@]}"; do note "             - $r"; done
   local joined; joined="$(printf '%s; ' "${reasons[@]}")"
-  bless_problems+=("Blessed capability runner $path is STALE: ${joined%; }. Ask the maintainer to run \`just bless\` (one sudo) and rerun this preflight BEFORE the suites: nextest wraps every privileged test in this exact binary, so running them now would certify an older runner than the tree under review — including the gate on the runner's own capability posture, which asserts about whichever binary happens to be blessed.")
+  # Deliberately NOT "one sudo": that overstated the cost and operators noticed. Reason 2 is an mtime
+  # proxy, so the common STALE is a `Cargo.lock` move that touched nothing in the runner's own thin
+  # closure — the recipe then hashes the build it just made, finds the stable copy identical, takes
+  # its idempotence skip, re-dates the stamp and sets no caps at all. A sudo happens only when the
+  # binary genuinely changed. Promising one either way teaches the operator to read STALE as noise,
+  # which is the signal this probe exists to protect.
+  bless_problems+=("Blessed capability runner $path is STALE: ${joined%; }. Ask the maintainer to run \`just bless\` and rerun this preflight BEFORE the suites. That is cheap and usually sudo-free: the recipe hashes the runner it just built against the stable copy, so an mtime-only move (a Cargo.lock bump touching nothing in vmcell-test-runner's own closure is the usual one) re-dates the stamp and skips the setcap entirely; a sudo is needed only if the binary actually changed. Do not skip it either way — nextest wraps every privileged test in this exact binary, so running them now would certify an older runner than the tree under review, including the gate on the runner's own capability posture, which asserts about whichever binary happens to be blessed.")
 }
 
 # ONE LAW, ONE PREDICATE: `just bless`'s idempotence skip asks the same question this probe does —

@@ -91,6 +91,49 @@ fn listed_in_host_netns(name: &str) -> bool {
         .any(|line| line.split_whitespace().nth(1) == Some(&format!("{name}:")))
 }
 
+/// Reaps `name` from the **host** namespace if it is there, reporting whether it had to.
+///
+/// The host namespace is the one place [`NetnsFixture`] cannot clean, and it is exactly where a
+/// broken build puts the tap: the failure this file's namespace leg exists to catch *is* "the
+/// interface went to the host namespace instead", and the tap it leaves there is `TUNSETPERSIST`'d,
+/// so it outlives the run. Without this, one red run poisons every later one — the next run's own
+/// precheck trips over the previous run's residue and reports a pre-existing interface rather than
+/// the defect. Measured while proving the namespace leg can go red, which is the only way to reach
+/// this path.
+///
+/// `ip` inherits `CAP_NET_ADMIN` from the blessed runner's **ambient** set, so no elevation is
+/// needed beyond what the suite already runs with.
+fn reap_from_host_netns(name: &str) -> bool {
+    if !listed_in_host_netns(name) {
+        return false;
+    }
+    let out = std::process::Command::new("ip")
+        .args(["link", "delete", name])
+        .output()
+        .expect("ip link delete must be runnable");
+    assert!(
+        out.status.success(),
+        "leaked host-namespace interface {name} could not be reaped: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    true
+}
+
+/// Reaps a host-namespace leak of `name` on the way out, **including the panic path**.
+struct HostTapReaper<'a>(&'a str);
+
+impl Drop for HostTapReaper<'_> {
+    fn drop(&mut self) {
+        if reap_from_host_netns(self.0) {
+            eprintln!(
+                "tap_create: reaped {} from the HOST namespace — the tap was created outside \
+                 in_netns",
+                self.0
+            );
+        }
+    }
+}
+
 /// The tap comes up as a **layer-2, no-packet-info, persistent** interface — the three properties
 /// the `TUNSETIFF` flag word and the `TUNSETPERSIST` that follows it exist to produce.
 ///
@@ -168,10 +211,18 @@ fn tap_lands_in_the_target_netns_and_not_the_host() {
     ));
     let tap = vmcell::naming::tap_name(vmcell::naming::DEFAULT_RESOURCE_PREFIX, FIXTURE_VMID);
 
+    // Sweep first, then assert the sweep worked — the same shape `clean_vmcell_netns` uses at the
+    // top of every leg here. Reaping is what keeps one red run from poisoning the next; the
+    // assertion is what proves the reap actually took, so this is not the vacuous
+    // "delete-then-check-it-is-gone" it would be if the reaper were unconditional.
+    if reap_from_host_netns(&tap) {
+        eprintln!("tap_create: reaped a stale host-namespace {tap} left by an earlier run");
+    }
     assert!(
         !listed_in_host_netns(&tap),
-        "{tap} must not already exist in the host namespace before the test creates it"
+        "{tap} must not exist in the host namespace before the test creates it"
     );
+    let _reaper = HostTapReaper(&tap);
 
     vmcell::net::tap::RtNetlink
         .setup_tap(&netns.name, &tap, FIXTURE_VMID)
@@ -197,8 +248,16 @@ fn tap_lands_in_the_target_netns_and_not_the_host() {
 /// interface exists on either name afterwards — which is the part a fake cannot see.
 ///
 /// The truncated name is checked too, and deliberately: it is the only spelling under which the old
-/// behavior would leave residue, so a leg that checked the requested name alone would pass against
+/// behavior leaves residue, so a leg that checked the requested name alone would pass against
 /// exactly the defect it exists to catch.
+///
+/// RED on: removing **both** the length check and the read-back — which is precisely the shape
+/// `tun-tap` shipped, since its shim had neither. `vmcell-tap-far-` then exists and this leg says
+/// so. Removing either one alone leaves it green, and that is worth stating rather than claiming a
+/// tighter inverse than it has: the length check refuses first, and if it did not, the read-back
+/// would refuse before `TUNSETPERSIST` so the interface would die with the fd. The read-back's own
+/// gate is `a_tap_name_the_kernel_expands_is_refused_and_leaves_nothing_behind`; the length check's
+/// is `net_sys`'s `an_over_long_or_unencodable_tap_name_is_refused_not_truncated`.
 #[test]
 #[ignore = "needs CAP_NET_ADMIN"]
 fn an_over_long_tap_name_creates_no_interface_under_any_name() {
@@ -237,5 +296,67 @@ fn an_over_long_tap_name_creates_no_interface_under_any_name() {
     assert!(
         link_details_in(&netns.path(), &ok_name).is_some(),
         "positive control: {ok_name} must be created"
+    );
+}
+
+/// A name the kernel **expands** rather than takes verbatim is refused by the read-back.
+///
+/// This is the leg that gates the read-back comparison, and it exists because nothing else does:
+/// dropping the read-back alone is invisible to every other test here (measured), since the length
+/// check in front of it already refuses the truncation case. `%d` is the reachable input that slips
+/// past the length check — `"vmcell-tap-%d"` is 13 bytes — and that the kernel then renames:
+/// `dev_get_valid_name` substitutes the first free index, so a caller asking for one name silently
+/// gets another, and the VMM would later be pointed at an interface that does not exist.
+///
+/// The residue half matters as much as the error: `TUNSETIFF` really did create `vmcell-tap-0`, and
+/// what removes it is that the read-back fails **before** `TUNSETPERSIST`, so the interface dies
+/// with the fd. Asserting only on the error would pass while leaking an interface per call.
+///
+/// RED on: dropping the read-back comparison in `create_tap_in_current_netns` — the call returns
+/// `Ok` and `vmcell-tap-0` is left persisted in the namespace.
+#[test]
+#[ignore = "needs CAP_NET_ADMIN"]
+fn a_tap_name_the_kernel_expands_is_refused_and_leaves_nothing_behind() {
+    let _unused = env_logger::builder().is_test(true).try_init();
+    common::clean_vmcell_netns();
+    require_privileged_net();
+
+    let netns = NetnsFixture::create(vmcell::naming::netns_name(
+        vmcell::naming::DEFAULT_RESOURCE_PREFIX,
+        FIXTURE_VMID,
+    ));
+    let pattern = "vmcell-tap-%d";
+    assert!(
+        pattern.len() < 16,
+        "the pattern must be short enough to pass the length check, or this leg gates that instead"
+    );
+
+    let err = vmcell::net::tap::RtNetlink
+        .setup_tap(&netns.name, pattern, FIXTURE_VMID)
+        .expect_err("a name the kernel would expand must be refused");
+    match &err {
+        vmcell::error::Error::Network(msg) => assert!(
+            msg.contains("vmcell-tap-0") && msg.contains(pattern),
+            "the error must name both what the kernel chose and what was asked for: {msg}"
+        ),
+        other => panic!("expected a typed Network error, got {other:?}"),
+    }
+
+    // The expanded interface was genuinely created by the ioctl; refusing before TUNSETPERSIST is
+    // what removes it. Nothing but `lo` may remain.
+    let out = std::process::Command::new("nsenter")
+        .arg(format!("--net={}", netns.path().display()))
+        .args(["ip", "-o", "link", "show"])
+        .output()
+        .expect("nsenter ip link must be runnable");
+    let links = String::from_utf8_lossy(&out.stdout);
+    let names: Vec<&str> = links
+        .lines()
+        .filter_map(|l| l.split_whitespace().nth(1))
+        .collect();
+    assert_eq!(
+        names,
+        vec!["lo:"],
+        "a refused expansion must leave the namespace with nothing but lo: {links}"
     );
 }

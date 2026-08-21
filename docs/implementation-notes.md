@@ -6215,11 +6215,57 @@ While confirming the above, the `setup_tap_on_bridge` comment claiming an `EEXIS
 interface is someone else's" was corrected: `EEXIST` is not reachable from this call site at all — the
 kernel returns it only for a second `TUNSETIFF` on the *same* fd.
 
-**Gates.** `net_sys`'s four unit tests (ABI pin, the name law, the read-back, the device path), each
-proven red by mutation; `tests/tap_create.rs`'s three live legs (flags + persistence off `ip -d`, the
-namespace law with its positive control, the refused-name leg with its truncated-name spelling and
-positive control) — no VM, `CAP_NET_ADMIN` only, so they run on the blessed runner and close the gap
-that `Netlink::setup_tap` had no live leg of its own; `deny.toml`'s by-name ban; and
-`unused-ignored-advisory = "deny"`, which turns a stale advisory ignore from a
-`warning[advisory-not-detected]` that exits 0 into a red gate — the reason every stale ignore this
-repo has carried was caught by review or not at all.
+**Gates.** `net_sys`'s four KVM-free unit tests (the ABI pin, the name law, the read-back helper, the
+device path) and `tests/tap_create.rs`'s four live legs — no VM, `CAP_NET_ADMIN` only, so they run on
+the blessed runner and close the gap that `Netlink::setup_tap`, reached on every privileged boot, had
+no live leg of its own. Plus `deny.toml`'s by-name ban and `unused-ignored-advisory = "deny"`, which
+turns a stale advisory ignore from a `warning[advisory-not-detected]` that exits 0 into a red gate —
+the reason every stale ignore this repo has carried was caught by review or not at all.
+
+**Two of those gates only exist because the mutation pass refused to take the first answer**, which is
+the part worth recording:
+
+- The live truncation leg's *stated* inverse was wrong. Restoring `tun-tap`'s `strncpy` truncation
+  alone leaves it **green**: the read-back then refuses, and it refuses *before* `TUNSETPERSIST`, so
+  the truncated interface dies with the fd and no residue exists to assert on. Only removing the
+  length check **and** the read-back — which is exactly the shape `tun-tap` shipped, since its shim
+  had neither — turns it red, with `vmcell-tap-far-` present in the namespace. The comment now says
+  that, instead of claiming a tighter inverse than the leg has.
+- That in turn exposed a law with **no** gate: dropping the read-back on its own was invisible to
+  every test in the tree, because the length check refuses first. The reachable input that slips past
+  the length check is a name the kernel *expands* — `"vmcell-tap-%d"` is 13 bytes, and
+  `dev_get_valid_name` substitutes the first free index, so the caller asks for one interface and
+  silently gets another. `a_tap_name_the_kernel_expands_is_refused_and_leaves_nothing_behind` is that
+  gate; it asserts the typed error names both spellings *and* that nothing but `lo` remains, because
+  `TUNSETIFF` really does create `vmcell-tap-0` and only the refuse-before-persist ordering removes
+  it. Asserting on the error alone would pass while leaking an interface per call.
+
+**A test-fixture residue hole, found the same way.** `NetnsFixture` cannot clean the host namespace,
+and the host namespace is precisely where a broken build puts the tap — so proving the namespace leg
+can go red left a persisted `vmcell-tap-231` on the host, which then made the *next* run report a
+pre-existing interface instead of the defect. One red run poisoned every later one. `HostTapReaper`
+reaps it on the way out including the panic path, and the leg sweeps-then-asserts at entry.
+
+### The preflight's STALE verdict overstated its own remedy
+
+Surfaced by this change and worth separating from it, because the first reading — "the preflight
+false-alarmed" — is wrong and the real defect is one level over.
+
+Removing `tun-tap` moved `Cargo.lock`, and `Cargo.lock` is one of the three mtime roots
+`review-preflight-priv.sh`'s freshness proxy compares the blessed runner against. So it reported
+STALE. That is the probe **working as designed**: signal 2 is explicitly "conservative in the safe
+direction — it can call a touched-but-unchanged tree stale; it cannot call a genuinely stale blessing
+current", and the alternative (a false CURRENT) is the recorded incident where a whole privileged
+review certified a binary nobody was reviewing. `Cargo.lock` is a broad root for a runner whose
+closure is only `vmcell-privilege` + `rustix`, but narrowing it cargo-free would mean hand-parsing the
+lockfile's dependency graph in shell, and a parser wrong in the permissive direction buys exactly the
+catastrophic failure the conservative choice avoids. Left as is, deliberately.
+
+What was actually wrong is the **remediation text**: it said "run `just bless` (one sudo)", and
+`AGENTS.md` said the same. In this case — and in the common case, since a dependency bump anywhere in
+the workspace moves `Cargo.lock` while the thin runner closure rarely moves — the recipe hashes the
+build it just made against the stable copy, finds them identical, takes its idempotence skip,
+re-dates the stamp and **sets no caps at all**. No sudo occurs. Promising one either way is how STALE
+gets read as routine noise, which erodes the signal the probe exists to give. Both the script's
+message and the `AGENTS.md`/`docs/86` pair now say the bless is cheap and sudo-free unless the binary
+genuinely changed, while keeping "do not skip it" unambiguous.

@@ -492,7 +492,9 @@ fragment is the one defended exception shape and never carries a consumer's usbi
 - Preflight green → run `just test-privileged`, the unprivileged suite, `just test-daemon`, and
   `just test-validator` yourself.
 - Preflight failing only on blessing (runner missing, stale stamp, not `+ep`) → ask the maintainer
-  to run `just bless` (one sudo), then rerun preflight and the suites. Never attempt the bless
+  to run `just bless` (cheap, and sudo-free unless the runner binary actually changed — an
+  mtime-only `Cargo.lock` move re-dates the stamp and skips the setcap), then rerun preflight and
+  the suites. Never attempt the bless
   yourself; never silently skip.
 - Only a genuinely absent facility (`/dev/kvm`, a missing backend binary) downgrades you to
   static-only — say so explicitly and mark every runtime claim unverified. The crosvm matrix is an
