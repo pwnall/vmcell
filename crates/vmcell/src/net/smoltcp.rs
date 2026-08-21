@@ -702,6 +702,10 @@ pub mod backend {
                 // Best-effort guest notification: a signal failure only forgoes a
                 // wakeup this tick (the guest still drains on its next kick), so it
                 // is logged nowhere and non-fatal here.
+                #[expect(
+                    clippy::let_underscore_must_use,
+                    reason = "virtio hot loop: a failed used-queue signal forgoes one wakeup and the guest drains on its next kick"
+                )]
                 let _ = vring_state.signal_used_queue();
             }
 
@@ -890,6 +894,10 @@ pub mod backend {
         }
         // The thread has finished; reap it. A panic payload is intentionally
         // discarded because Drop must not unwind.
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "Drop must not unwind: a finished worker's panic payload is dropped, never resumed"
+        )]
         let _ = handle.join();
     }
 
@@ -907,6 +915,13 @@ pub mod backend {
                 // `into_std` can fail if the stream is mid-operation; on failure
                 // the owned stream is dropped here, which still closes the fd.
                 if let Ok(std_stream) = s.into_std() {
+                    // An explicit FIN so the upstream connection tears down promptly instead of lingering.
+                    // The owned stream is dropped at the end of this arm either way, which closes the fd —
+                    // so the shutdown is a promptness optimization, not the teardown itself.
+                    #[expect(
+                        clippy::let_underscore_must_use,
+                        reason = "promptness optimization: dropping the owned stream at the end of this arm closes the fd regardless"
+                    )]
                     let _ = std_stream.shutdown(std::net::Shutdown::Both);
                 }
                 true
@@ -972,6 +987,10 @@ pub mod backend {
             // already open; neither holds here (forward ports are non-zero and the
             // socket is Closed), and a spurious failure is retried next tick — so
             // the result is deliberately ignored.
+            #[expect(
+                clippy::let_underscore_must_use,
+                reason = "listen on a just-closed socket fails only for port 0 or an already-open socket, neither of which holds for a permanent forward port"
+            )]
             let _ = socket.listen(listen);
             false
         } else {
@@ -1082,6 +1101,10 @@ pub mod backend {
             // which case the fresh socket is simply added un-listening and later
             // reclaimed (the SYN is effectively dropped) — so the result is
             // deliberately ignored rather than propagated.
+            #[expect(
+                clippy::let_underscore_must_use,
+                reason = "dst_port is guest-controlled: a listen failure means port 0, and the un-listening socket is reclaimed (the SYN is dropped)"
+            )]
             let _ = socket.listen(dst_port);
             let handle = sockets.add(socket);
             port_mappings.push((dst_port, pxy_port, handle, None::<tokio::net::TcpStream>));
@@ -1095,6 +1118,10 @@ pub mod backend {
                 .store(true, std::sync::atomic::Ordering::Relaxed);
             // Best-effort wakeups so the workers observe the stop flag promptly;
             // errors here are non-fatal (the bounded joins below still apply).
+            #[expect(
+                clippy::let_underscore_must_use,
+                reason = "wakeup poke on a Drop path: the bounded joins below are what actually end the workers"
+            )]
             let _ = self.kill_notifier.notify();
             // Connect to the socket to unblock listener.accept() if it's stuck. Retried over a
             // short bounded window because the vhost worker now serves connections in a loop: a
@@ -1105,6 +1132,13 @@ pub mod backend {
                 if self.vhost_thread.as_ref().is_none_or(|t| t.is_finished()) {
                     break;
                 }
+                // A self-connect to unblock a worker parked in `accept()`. Failing to connect is one of
+                // the expected outcomes — the worker may be between listeners — which is exactly why this
+                // is a bounded retry loop and not a single checked shot.
+                #[expect(
+                    clippy::let_underscore_must_use,
+                    reason = "self-connect wakeup: a failure is an expected outcome of firing between listeners, which is why this is a bounded retry loop"
+                )]
                 let _ = std::os::unix::net::UnixStream::connect(&self.socket_path);
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
@@ -1555,6 +1589,10 @@ pub mod backend {
                                 // Best-effort guest notification: a signal failure
                                 // only forgoes a wakeup this tick (the guest drains
                                 // on its next kick), so the result is ignored.
+                                #[expect(
+                                    clippy::let_underscore_must_use,
+                                    reason = "same virtio notification on the guest-facing drain: one forgone wakeup, never a lost descriptor"
+                                )]
                                 let _ = vring_state.signal_used_queue();
                             }
                         }
@@ -1630,6 +1668,10 @@ pub mod backend {
                                     // setsockopt fails the connection still works
                                     // (merely with Nagle enabled), so the result is
                                     // deliberately ignored.
+                                    #[expect(
+                                        clippy::let_underscore_must_use,
+                                        reason = "TCP_NODELAY is a latency optimization: a failed setsockopt leaves a working connection with Nagle enabled"
+                                    )]
                                     let _ = stream.set_nodelay(true);
                                     *tcp_stream = Some(stream);
                                 }

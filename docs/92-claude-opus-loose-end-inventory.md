@@ -145,6 +145,28 @@ change to vmcell's own public API), B6 (`test-unit-undelegated`'s vacuity guard)
 (`ban-orphan-recipe.sh` + self-test), B3 (`test-with-delegated-scope.sh`, which surfaced an
 unguarded `mkdir` that aborted where its four siblings degrade), B7 (`just install-hooks`).
 
+**Wave 5 — B1**, the class AGENTS.md's "Fail loud" rule names and nothing could see. All 268
+`clippy::let_underscore_must_use` sites were triaged; the lint is now denied in every crate root's
+`not(test)` block, and `crates/vmcell/tests/lint_roster.rs` closes the one hole a per-crate lint
+leaves — a **new crate**, born without the line, with every existing gate green.
+
+What the item was actually worth was the **four real defects** the triage found, not the lint:
+`vmcelld::shutdown_signal` discarded the signal *registration* result, so a handler that could not be
+installed made its `select!` arm complete — the daemon shut itself down the instant it started
+serving, reporting nothing; the in-guest `curl` shim discarded both socket deadlines, so the
+`--max-time` its own comment promises to honor did not bound the read loop, and a quiet proxy hung it
+past any deadline (the accepted-but-ignored hazard AGENTS.md singles out for this exact shim); the
+same function discarded its response-body write while its rustdoc contracts "body to stdout" and the
+egress battery asserts on that body — exit 0 with no output; and the interactive CLI ate keystrokes
+in silence after its session transport died. A fifth find was a consolidation: `vmcell-qemu` held the
+last copy of the negated-pgid kill law outside `vmcell`, hand-rolled twice, and now travels as a
+`VmmProcessGroup` with the reaped-flag guard the copies never had.
+
+Eleven helpers absorbed 88 legitimate sites and **nine of them report rather than discard**, which is
+what "fail loud" is reaching for where propagation is impossible; 62 statements keep a per-statement
+reason. Recorded residual: the rule's other half — "or on an accepted input" — is *not* covered,
+because `let _ = cfg.field;` is not `#[must_use]` and no clippy lint sees it.
+
 Still open from Tier B: **B8**, the release-half runner CI builds and `setcap`s unconditionally for
 a consumer only the hand-run bench workflow has. It is a cost, not a defect, and is left deliberate.
 

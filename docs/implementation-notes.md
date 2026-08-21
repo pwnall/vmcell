@@ -6606,3 +6606,78 @@ For `docs/implementation-notes.md` (I could not touch docs/):
 **The L2 payload is Firecracker, carried in over virtio-fs, and this is deliberate.** `nested_virt_l2_boot` boots a real L2 inside the L1 using the host's `firecracker` binary as an in-guest payload (`static-pie`, 3.4 MB, needs only `/dev/kvm` + two files); CH and crosvm are dynamically linked and QEMU is not a single file. `vmcell-firecracker` is not involved and FC's own arm skips through `require_cap!`. The kernel and rootfs are exported from the artifact directories rather than copied into the test's TempTree: 150 MB per run under the host tmpfs is the shape that produced the `EDQUOT` daemon-suite red. Alternative deliberately not taken: a guest-tools KVM-ioctl applet (`KVM_CREATE_VM`/`KVM_CREATE_VCPU`/`KVM_RUN`) — it would prove less (no L2 kernel, no L2 userspace) and would couple this leg to a `vmcell build --kernel-source host-make` rebuild, which the shipped route needs none of.
 
 **Also update** `docs/92-claude-opus-loose-end-inventory.md` Tier D ("Nested virtualization is validated by opening `/dev/kvm` in the L1 guest; no L2 guest is ever booted") and the `docs/todo.md` entry pointing at `crates/vmcell/tests/nested_virt.rs` once the live legs pass.
+
+
+## docs/92 Tier B, B1 — the fail-loud class gets a gate (as built)
+
+**What landed.** `clippy::let_underscore_must_use` is now denied in the `#![cfg_attr(not(test),
+deny(…))]` block of all **20** crate roots, closing AGENTS.md's "Fail loud" rule — *no bare `let _ =`
+on a `Result`* — which until now had no lint, no script and no test that could go red. The 268 sites
+the lint reported (the 259 in docs/92, re-measured) split 166 production / 102 test.
+
+**Four real defects, which is what the item was worth.**
+1. `vmcelld::shutdown_signal` turned a signal-**registration** failure into an immediate shutdown:
+   both arms discarded the registration result, so a handler that could not be installed *completed*,
+   `select!` fired, and `serve` returned the instant it started. Now `unregistered_signal(..) ->
+   Infallible` logs at `error!` and parks; the uninhabited return type makes falling out of it a
+   compile error. Latent under `#[tokio::main]`, severe when it fires. Gate:
+   `vmcelld::shutdown_signal_gate` (never-resolves leg + resolving positive control), red on the
+   inverse.
+2. `vmcell-guest-tools`' `curl` shim (`probe_connect`) discarded both socket deadlines, so the
+   `--max-time` its own comment promises to honor did not bound the read loop — a quiet proxy hung
+   the shim past any deadline. Now `bound_stream_by` refuses loud. Gate:
+   `a_socket_deadline_that_cannot_be_applied_is_reported` (injects `Duration::ZERO`, a real
+   `setsockopt` refusal per `std`'s documented contract, plus a positive control).
+3. The same function discarded its response-body write to stdout while its rustdoc contracts "body to
+   stdout" and the egress battery asserts on that body — exit 0 with no output. Now `emit_body`
+   refuses loud. Gate: `a_body_that_cannot_be_written_is_reported`.
+4. `vmcell-cli`'s interactive session discarded `write_stdin`/`close_stdin`, so a dead transport ate
+   keystrokes in silence while the arm stayed re-armed. Now reported, and forwarding stops — the same
+   handling the local-read-error arm beside it already had.
+
+**One consolidation.** `vmcell-qemu`'s external `vhost-device-vsock` daemon was the last copy of the
+negated-pgid kill law outside `vmcell`, hand-rolled in both `kill()` and `Drop`. It now travels as a
+`vmcell::vmm::VmmProcessGroup`, which also gives it the M-VMM-1 reaped-flag guard the copies lacked.
+Validated live by `test-unprivileged`'s QEMU leg, with no daemon orphan afterwards.
+
+**Eleven helpers** absorb 88 legitimate sites, and nine of them **report** rather than discard
+(`best_effort::{shutdown,discard_dir}`, `shutdown_after_check`, `publish_startup`,
+`send_msg_best_effort`, `join_pump`, `publish_chunk`): the class went from silent to observable,
+which is what "fail loud" is reaching for where propagation is impossible. 62 statements keep a
+per-statement `#[expect(…, reason = "…")]`, each stating that site's own reason.
+
+**Scoping, deliberately.** `not(test)` — the same visible mechanism that already scopes
+`unwrap_used`/`panic`/`print_stdout`. Test code's discards are dominated by idempotent `try_init()`
+and Drop-guard reaps; 102 forced reasons there is the hollow-suppression theater rule 2 forbids. The
+lint is broader than the rule on one axis (any `#[must_use]`, e.g. a detached `JoinHandle`) and that
+breadth is kept: it is the same defect one step out, and it is the narrowest instrument clippy has.
+
+**The roster's own gate.** A per-crate lint leaves one hole — a **new crate**, born without the line,
+with every existing gate green. `crates/vmcell/tests/lint_roster.rs` closes it: it scans every crate
+root (conventional paths plus section-aware `[lib]`/`[[bin]]` `path =` declarations), requires the
+lint *inside* a `not(test)` deny block (a prose mention or a per-statement `#[expect]` does not
+count), and carries both the zero-file-scan guard and a scanner positive control. It is a test rather
+than a `scripts/ban-*.sh` because `ban-ci-script-handcopy.sh` ARM 4 fails on an orphan script and the
+`justfile` was out of scope for this change; an in-source scan needs no roster entry at all.
+
+**Deliberately NOT done, and why.** No new public API: a cross-crate `besteffort` module for the
+~13 fs-unlink sites in FC/QEMU/crosvm/CLI would have grown contract surface, required a ledger entry,
+and rippled a `vmcell` version bump through 14 sibling manifests — for an internal cleanup. Those
+sites carry per-statement suppressions instead. `cargo semver-checks` reports no update required for
+either contract crate.
+
+**Residual, recorded rather than implied.** (a) The rule's other half — "or on an accepted input" —
+is not covered: `let _ = cfg.field;` is not `#[must_use]` and no clippy lint sees it. (b) The lint has
+a one-token bypass (`drop(expr)`, `.ok();`); the tree carries neither idiom today, and nothing gates
+that. (c) `examples/downstream-kernel/` is out of scope by design (it is the consumer workspace).
+(d) `vmcell-qemu`'s `nix` dependency is now used only by its test module; moving it to
+`[dev-dependencies]` is a lockfile-touching follow-up, and `cargo machete` is silent on it.
+
+**Verification.** `just ci` green end to end (including the 298-config feature powerset, machete,
+actionlint, zizmor, typos, semver-checks, 1356 unit tests, doctests, and the whole `gates` roster).
+`just test-unprivileged` 4/4 with zero capability skips. The privileged suites were **not** run:
+`scripts/review-preflight-priv.sh` reports KVM/artifacts/cgroup-delegation all OK but
+**BLOCKED-ON-BLESS** — this change edits `vmcell-test-runner/src/main.rs` and
+`vmcell-privilege/src/lib.rs` (both crate roots took the preamble line), so the blessed runner is
+stale and needs `just bless` before `test-privileged`/`test-daemon`/`test-validator` can certify the
+tree under review.

@@ -30,6 +30,17 @@
         clippy::print_stdout,
         clippy::print_stderr,
         clippy::dbg_macro,
+        // AGENTS.md "Fail loud": no bare `let _ =` on a `Result`. `let_underscore_must_use` is the
+        // narrowest instrument rustc/clippy has for that rule — and it is deliberately BROADER on
+        // one axis, firing on any `#[must_use]` expression (a detached `JoinHandle`, a discarded
+        // `Instant`), which is the same defect one step out: the compiler said this matters and the
+        // code said nothing back. Scoped `not(test)` like every lint in this block: the rule's
+        // stated harms (a swallowed teardown failure, a lost write, a wedged session) are
+        // production harms, and forcing a reason onto a test's `try_init()` would manufacture the
+        // hollow suppressions AGENTS.md rule 2 calls theater. `crates/vmcell/tests/lint_roster.rs`
+        // is the gate that this line exists in EVERY crate root, so a new crate cannot opt out by
+        // being new.
+        clippy::let_underscore_must_use,
         clippy::allow_attributes,               // B11: prefer #[expect] over #[allow] in prod code
         clippy::allow_attributes_without_reason  // B11: every suppression states why
     )
@@ -289,6 +300,13 @@ async fn reject_live_baked_vsock(path: &Path) -> Result<()> {
             )));
         }
     }
+    // The refusal above is the gate: a probe that could not prove the socket dead has already
+    // returned. What reaches here is a path proven stale, and a removal failure leaves the
+    // next spawn's own bind to report it.
+    #[expect(
+        clippy::let_underscore_must_use,
+        reason = "the inconclusive-probe refusal above is the real gate; a stale path that will not unlink is reported by the next bind"
+    )]
     let _ = tokio::fs::remove_file(path).await;
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
@@ -355,6 +373,13 @@ impl Firecracker {
             );
         }
         if let Some(to_cache) = cache_decision(probe) {
+            // `OnceLock::set` fails only when another VM's `create()` raced us to the same probe
+            // result. Both racers computed the same DEFINITE outcome (the transient arm above is
+            // filtered out), so losing the race stores an identical value.
+            #[expect(
+                clippy::let_underscore_must_use,
+                reason = "OnceLock::set loses only to a concurrent create() that cached the same definite probe outcome"
+            )]
             let _ = self.cpu_template.set(to_cache);
         }
         Ok(self.cpu_template.get().cloned().flatten())
@@ -474,6 +499,10 @@ impl Firecracker {
         let serial_path = res.tmp_dir.join("serial.log");
 
         // Firecracker expects the socket to not exist before it creates it.
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "pre-clean whose expected outcome is NotFound; firecracker's own bind below is what reports a socket it cannot create"
+        )]
         let _ = tokio::fs::remove_file(&api_socket).await;
 
         // M11: the whole launch — seccomp flag, jail spec, netns, argv — is composed inside
@@ -785,6 +814,10 @@ fn build_fc_snapshot_load(snapshot_dir: &Path, tap: Option<&str>) -> SnapshotLoa
 /// sockets), then unlink, mirroring `FcInstance::drop`.
 fn reap_and_unlink_probe(process: &mut tokio::process::Child, pgid: Option<u32>, socket: &Path) {
     vmcell::vmm::reap_process_group(process, pgid);
+    #[expect(
+        clippy::let_underscore_must_use,
+        reason = "probe-socket unlink after the group is reaped; the per-VM scratch dir's guard removes whatever is left"
+    )]
     let _ = std::fs::remove_file(socket);
 }
 
@@ -1425,7 +1458,18 @@ impl Drop for FcInstance {
         // Unlink our own sockets. The per-VM directory itself is owned and removed
         // once by the orchestrator's `VmTempDir` guard (after this instance and the
         // smoltcp process are dropped), not here. Mirrors CH.
+        // Drop cannot report. These are our own sockets inside the per-VM scratch dir, which the
+        // orchestrator's `VmTempDir` guard removes wholesale afterwards — so a failure here costs
+        // nothing and is undone by the guard.
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "Drop cannot report, and the VmTempDir guard removes the whole per-VM dir afterwards"
+        )]
         let _ = std::fs::remove_file(&self.api_socket);
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "same Drop path, same guard-owned directory: an unlink failure is undone by VmTempDir"
+        )]
         let _ = std::fs::remove_file(&self.vsock_path);
         // A RESTORED instance adopts the snapshot's baked vsock path, whose parent
         // dir `restore()` resurrected (it belongs to the long-gone base VM, so no
@@ -1435,6 +1479,10 @@ impl Drop for FcInstance {
         // (still holding api.sock/serial.log at this point, and removed by the
         // guard anyway).
         if let Some(parent) = self.vsock_path.parent() {
+            #[expect(
+                clippy::let_underscore_must_use,
+                reason = "non-recursive by design: it succeeds only once empty, and the VmTempDir guard owns the directory either way"
+            )]
             let _ = std::fs::remove_dir(parent);
         }
     }

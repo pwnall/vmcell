@@ -24,6 +24,17 @@
         clippy::unimplemented,
         clippy::indexing_slicing,
         clippy::dbg_macro,
+        // AGENTS.md "Fail loud": no bare `let _ =` on a `Result`. `let_underscore_must_use` is the
+        // narrowest instrument rustc/clippy has for that rule — and it is deliberately BROADER on
+        // one axis, firing on any `#[must_use]` expression (a detached `JoinHandle`, a discarded
+        // `Instant`), which is the same defect one step out: the compiler said this matters and the
+        // code said nothing back. Scoped `not(test)` like every lint in this block: the rule's
+        // stated harms (a swallowed teardown failure, a lost write, a wedged session) are
+        // production harms, and forcing a reason onto a test's `try_init()` would manufacture the
+        // hollow suppressions AGENTS.md rule 2 calls theater. `crates/vmcell/tests/lint_roster.rs`
+        // is the gate that this line exists in EVERY crate root, so a new crate cannot opt out by
+        // being new.
+        clippy::let_underscore_must_use,
         clippy::allow_attributes,               // B11: prefer #[expect] over #[allow] in prod code
         clippy::allow_attributes_without_reason  // B11: every suppression states why
     )
@@ -248,8 +259,18 @@ fn relay_and_code(
     let stderr = outcome
         .stderr()
         .map_err(|e| format!("bad stderr base64: {e}"))?;
-    // Best-effort relay; a broken pipe must not mask the guest's exit code.
+    // Best-effort relay; a broken pipe must not mask the guest's exit code, which is what this
+    // function contracts to return. Two statements, two reasons, because there is no third site to
+    // route through a helper — the class has exactly these members in this crate.
+    #[expect(
+        clippy::let_underscore_must_use,
+        reason = "EPIPE on the consumer side must not mask the guest's exit code returned below"
+    )]
     let _ = std::io::stdout().write_all(&stdout);
+    #[expect(
+        clippy::let_underscore_must_use,
+        reason = "same: a closed stderr consumer must not turn a completed guest command into an error"
+    )]
     let _ = std::io::stderr().write_all(&stderr);
     Ok(outcome.code)
 }

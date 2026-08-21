@@ -49,6 +49,17 @@
         clippy::unimplemented,
         clippy::indexing_slicing,
         clippy::dbg_macro,
+        // AGENTS.md "Fail loud": no bare `let _ =` on a `Result`. `let_underscore_must_use` is the
+        // narrowest instrument rustc/clippy has for that rule — and it is deliberately BROADER on
+        // one axis, firing on any `#[must_use]` expression (a detached `JoinHandle`, a discarded
+        // `Instant`), which is the same defect one step out: the compiler said this matters and the
+        // code said nothing back. Scoped `not(test)` like every lint in this block: the rule's
+        // stated harms (a swallowed teardown failure, a lost write, a wedged session) are
+        // production harms, and forcing a reason onto a test's `try_init()` would manufacture the
+        // hollow suppressions AGENTS.md rule 2 calls theater. `crates/vmcell/tests/lint_roster.rs`
+        // is the gate that this line exists in EVERY crate root, so a new crate cannot opt out by
+        // being new.
+        clippy::let_underscore_must_use,
         clippy::allow_attributes,               // B11: prefer #[expect] over #[allow] in prod code
         clippy::allow_attributes_without_reason  // B11: every suppression states why
     )
@@ -1496,6 +1507,10 @@ fn set_mac(dev: &str, mac: [u8; 6]) -> std::io::Result<()> {
         // deliberately discarded: a driver that refuses the down-transition may
         // still accept the hwaddr change, and the SIOCSIFHWADDR below is the check
         // that actually decides the outcome.
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "a driver that refuses the down-transition may still accept the hwaddr change; the SIOCSIFHWADDR below is what decides"
+        )]
         let _ = set_link_up(fd, dev, false);
 
         let mut ifr = hwaddr_ifreq(dev, mac)?;
@@ -1507,6 +1522,10 @@ fn set_mac(dev: &str, mac: [u8; 6]) -> std::io::Result<()> {
             // failure path so a failed (best-effort) MAC change never strands the
             // restored guest's eth0 administratively DOWN with no one to re-raise
             // it. The re-up is itself best-effort — the original error is returned.
+            #[expect(
+                clippy::let_underscore_must_use,
+                reason = "M-GUEST-2 re-up on the failure path: the ORIGINAL error is what is returned, and a second one would mask it"
+            )]
             let _ = set_link_up(fd, dev, true);
             return Err(err);
         }
@@ -2057,6 +2076,33 @@ fn tunnel_established_exit(insecure: bool) -> i32 {
     if insecure { 0 } else { 60 }
 }
 
+/// Applies `timeout` as the socket's read **and** write deadline, naming which `setsockopt` failed
+/// so the caller can refuse instead of running unbounded.
+///
+/// Separated from [`probe_connect`] so the refusal branch is reachable without a broken host:
+/// `std` documents a zero [`Duration`] as an `Err` for both setters, which is what the gate
+/// (`a_socket_deadline_that_cannot_be_applied_is_reported`) injects.
+fn bound_stream_by(stream: &std::net::TcpStream, timeout: Duration) -> Result<(), String> {
+    stream
+        .set_read_timeout(Some(timeout))
+        .map_err(|e| format!("cannot bound the proxy CONNECT read by --max-time: {e}"))?;
+    stream
+        .set_write_timeout(Some(timeout))
+        .map_err(|e| format!("cannot bound the proxy CONNECT write by --max-time: {e}"))
+}
+
+/// Writes a proxy `CONNECT` response `body` to `out` and flushes it, naming the failure instead of
+/// discarding it.
+///
+/// Takes the sink as a parameter purely so the failure branch is drivable in a unit test: the
+/// production call passes `std::io::stdout()`, and closing *that* to prove the branch would take
+/// the test harness's own stdout with it.
+fn emit_body(out: &mut impl std::io::Write, body: &[u8]) -> Result<(), String> {
+    out.write_all(body)
+        .and_then(|()| out.flush())
+        .map_err(|e| format!("proxy CONNECT response body could not be written to stdout: {e}"))
+}
+
 /// Performs a raw HTTP `CONNECT` to `proxy` for `host:port`, prints the proxy's
 /// response — status line + headers to stderr (verbose), body to stdout — the way
 /// curl does, and returns whether the tunnel was **established** (a 2xx status).
@@ -2065,6 +2111,23 @@ fn tunnel_established_exit(insecure: bool) -> i32 {
 /// test can observe it, but returns `false` so the caller surfaces the failure as
 /// a non-zero exit instead of collapsing every https-via-proxy failure to exit 0
 /// (H-GUEST-1: the banned any-error-to-success probe).
+///
+/// TWO FAILURES THIS USED TO SWALLOW, both `let _ =` on a `Result`, and both landing as the same
+/// hazard AGENTS.md names for this shim ("an accepted-but-ignored flag is the same hazard one step
+/// removed", the one that "silently voided a data-plane assertion"):
+///
+///   * the socket **timeouts**. `--max-time` is bounded here by `connect_timeout` *and* by the
+///     read/write timeouts — the comment two lines below the connect says so. A discarded
+///     `set_read_timeout` leaves the read loop below with the OS default (i.e. none), so a proxy
+///     that accepts the TCP connection and then says nothing hangs the shim past any deadline the
+///     caller named. `--max-time` cannot be honored, so the shim refuses instead of pretending.
+///   * the **body write**. This function's contract, one paragraph up, is "body to stdout", and the
+///     egress battery asserts on that body. A discarded `write_all`/`flush` emits nothing while a
+///     2xx still returns `true` — exit 0 with no output, which is an in-guest assertion passing on
+///     a transfer that never happened.
+///
+/// Both now print the reason to stderr (where the rest of this function's diagnostics go) and
+/// return `false`, which the caller turns into a non-zero exit.
 fn probe_connect(proxy: &str, host: &str, port: u16, max_time: Option<u64>, verbose: bool) -> bool {
     use std::io::{Read, Write};
     use std::net::ToSocketAddrs;
@@ -2086,8 +2149,12 @@ fn probe_connect(proxy: &str, host: &str, port: u16, max_time: Option<u64>, verb
     let Ok(mut stream) = std::net::TcpStream::connect_timeout(&paddr, timeout) else {
         return false;
     };
-    let _ = stream.set_read_timeout(Some(timeout));
-    let _ = stream.set_write_timeout(Some(timeout));
+    // Honor-or-refuse, never honor-or-shrug: without these the read loop below is unbounded and
+    // `--max-time` is a lie.
+    if let Err(why) = bound_stream_by(&stream, timeout) {
+        eprintln!("curl: {why}");
+        return false;
+    }
     let req = format!("CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n\r\n");
     if stream.write_all(req.as_bytes()).is_err() {
         return false;
@@ -2128,8 +2195,12 @@ fn probe_connect(proxy: &str, host: &str, port: u16, max_time: Option<u64>, verb
         // Ensure the status (e.g. "403") is observable even without -v.
         eprintln!("< {status_line}");
     }
-    let _ = std::io::stdout().write_all(body);
-    let _ = std::io::stdout().flush();
+    // The body IS the observable this function exists to produce; a write that failed must not be
+    // reported as a tunnel that worked.
+    if let Err(why) = emit_body(&mut std::io::stdout(), body) {
+        eprintln!("curl: {why}");
+        return false;
+    }
     // Success is a 2xx tunnel establishment ONLY. Returning `true` for any
     // response (the pre-fix behaviour) let a blocked domain's 403, a TLS failure,
     // or a mid-body RST collapse to exit 0 (H-GUEST-1).
@@ -3515,6 +3586,57 @@ mod tests {
         // One under IFNAMSIZ is the longest accepted name (the NUL terminator).
         assert!(IfReq::new(&"x".repeat(libc::IFNAMSIZ - 1)).is_ok());
         assert!(IfReq::new("eth0").is_ok());
+    }
+
+    // THE TWO SWALLOWED RESULTS in `probe_connect`, gated (AGENTS.md "Fail loud").
+    //
+    // RED ON THE INVERSE for both: put `let _ =` back on the setter / the write inside
+    // `bound_stream_by` / `emit_body` and make each return `Ok(())` unconditionally — the
+    // zero-`Duration` leg and the failing-sink leg both flip to `Ok` and these fail.
+    #[test]
+    fn a_socket_deadline_that_cannot_be_applied_is_reported() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a loopback server");
+        let addr = listener.local_addr().expect("local addr");
+        let stream = std::net::TcpStream::connect(addr).expect("connect to the loopback server");
+
+        // `std` documents a zero Duration as an error for both setters, so this is a real
+        // `setsockopt` refusal and not a mock.
+        let refused = bound_stream_by(&stream, Duration::ZERO)
+            .expect_err("a zero deadline must be refused, not silently dropped");
+        assert!(
+            refused.contains("--max-time"),
+            "the refusal must name the flag it could not honor, got {refused:?}"
+        );
+
+        // Positive control: a deadline that CAN be applied is applied, so the assertion above is
+        // about the failure and not about the helper always refusing.
+        bound_stream_by(&stream, Duration::from_secs(1))
+            .expect("a one-second deadline must apply on a freshly connected TCP socket");
+    }
+
+    #[test]
+    fn a_body_that_cannot_be_written_is_reported() {
+        struct ClosedSink;
+        impl std::io::Write for ClosedSink {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let refused = emit_body(&mut ClosedSink, b"BODY")
+            .expect_err("a body that could not be written must be reported, not dropped");
+        assert!(
+            refused.contains("body"),
+            "the refusal must say what was lost, got {refused:?}"
+        );
+
+        // Positive control: the same call against a working sink delivers every byte, so the
+        // refusal above is about the sink and not about `emit_body` never writing.
+        let mut good: Vec<u8> = Vec::new();
+        emit_body(&mut good, b"BODY").expect("a working sink must accept the body");
+        assert_eq!(good, b"BODY", "the body must reach the sink verbatim");
     }
 
     // H-GUEST-1: probe_connect treats ONLY a 2xx CONNECT as success. RED on the

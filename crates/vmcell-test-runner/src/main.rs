@@ -37,6 +37,17 @@
         clippy::unimplemented,
         clippy::indexing_slicing,
         clippy::dbg_macro,
+        // AGENTS.md "Fail loud": no bare `let _ =` on a `Result`. `let_underscore_must_use` is the
+        // narrowest instrument rustc/clippy has for that rule — and it is deliberately BROADER on
+        // one axis, firing on any `#[must_use]` expression (a detached `JoinHandle`, a discarded
+        // `Instant`), which is the same defect one step out: the compiler said this matters and the
+        // code said nothing back. Scoped `not(test)` like every lint in this block: the rule's
+        // stated harms (a swallowed teardown failure, a lost write, a wedged session) are
+        // production harms, and forcing a reason onto a test's `try_init()` would manufacture the
+        // hollow suppressions AGENTS.md rule 2 calls theater. `crates/vmcell/tests/lint_roster.rs`
+        // is the gate that this line exists in EVERY crate root, so a new crate cannot opt out by
+        // being new.
+        clippy::let_underscore_must_use,
         clippy::allow_attributes,               // B11: prefer #[expect] over #[allow] in prod code
         clippy::allow_attributes_without_reason  // B11: every suppression states why
     )

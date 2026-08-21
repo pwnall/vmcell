@@ -627,6 +627,10 @@ fn sigkill_process_group(pgid: u32) {
     // actionable on a teardown path, and every caller's next step (waitpid / Child::wait)
     // establishes the real outcome. This is the ONE site in the crate that discards a
     // `kill(-pgid)` result, which is why it is a named function rather than an idiom.
+    #[expect(
+        clippy::let_underscore_must_use,
+        reason = "the ONE site in this crate that discards kill(-pgid): ESRCH means the group is already gone, and every caller's next step establishes the real outcome"
+    )]
     let _ = nix::sys::signal::kill(
         nix::unistd::Pid::from_raw(-(pgid as i32)),
         nix::sys::signal::Signal::SIGKILL,
@@ -644,6 +648,10 @@ pub fn reap_process_group(process: &mut tokio::process::Child, pgid: Option<u32>
     };
     sigkill_process_group(pgid);
     if let Some(pid) = process.id() {
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "reaping a leader that is already gone (ECHILD) is the wanted outcome on an error path that is about to report something else"
+        )]
         let _ = nix::sys::wait::waitpid(nix::unistd::Pid::from_raw(pid as i32), None);
     }
 }
@@ -712,6 +720,13 @@ impl VmmProcessGroup {
         }
         // Await the leader unconditionally: on the already-reaped path this returns the
         // cached status immediately, and on the signalled path it is what actually reaps.
+        // Awaited unconditionally: on the already-reaped path this returns the cached status
+        // immediately, and on the signalled path it is what actually reaps. The exit STATUS is not
+        // the question — `reaped` below is — and a SIGKILLed VMM's status is never informative.
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "this await exists to reap, not to read a status: a SIGKILLed VMM's exit status carries nothing the caller can act on"
+        )]
         let _ = process.wait().await;
         // The leader is reaped now; `Drop` must not re-signal a possibly-recycled pgid.
         self.reaped = true;

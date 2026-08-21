@@ -80,6 +80,10 @@ fn join_thread_with_timeout(handle: std::thread::JoinHandle<()>, timeout: std::t
     }
     // Finished; reap it. A panic payload is intentionally discarded because Drop
     // must not unwind.
+    #[expect(
+        clippy::let_underscore_must_use,
+        reason = "Drop must not unwind: a finished worker's panic payload is dropped, never resumed"
+    )]
     let _ = handle.join();
 }
 
@@ -114,10 +118,42 @@ fn enter_netns(ns: &std::fs::File, what: &str) -> std::result::Result<(), String
     crate::net_sys::setns_net(ns.as_raw_fd()).map_err(|e| format!("{what}: {e}"))
 }
 
+/// The proxy worker thread's ONE way to answer its parent's readiness channel — every startup
+/// outcome, success and failure alike, leaves through here.
+///
+/// WHY DISCARDING THE SEND `Result` IS CORRECT, once, instead of at sixteen call sites (AGENTS.md
+/// "Fail loud", and its Suppressions rule: *route repeated legitimate sites through one helper so
+/// one suppression covers the class*): a `oneshot::Sender` fails only when the receiver is **gone**,
+/// and the only receiver is [`EgressProxy::start_impl`]'s `rx.await`. If that has been dropped, the
+/// task awaiting startup was cancelled — there is no one left to tell, and the outcome this
+/// function was handed is the last thing anybody wanted. The failure is *not* silent even so: the
+/// unsent outcome is logged, so a startup error that arrived after cancellation is still readable in
+/// a trace rather than vanishing.
+///
+/// Consuming `tx` is deliberate: the readiness channel answers exactly once, and taking ownership is
+/// what makes a second answer a compile error rather than a runtime no-op.
+fn publish_startup(
+    tx: tokio::sync::oneshot::Sender<std::result::Result<(u16, String), String>>,
+    outcome: std::result::Result<(u16, String), String>,
+) {
+    if let Err(unsent) = tx.send(outcome) {
+        tracing::debug!(
+            "EgressProxy: startup outcome had no listener (the awaiting task was cancelled): {unsent:?}"
+        );
+    }
+}
+
 impl Drop for EgressProxy {
     fn drop(&mut self) {
         tracing::info!("EgressProxy dropping!");
         if let Some(tx) = self.kill_tx.take() {
+            // A different channel from the readiness one: this is the graceful-shutdown poke, and
+            // its receiver is the worker's own `kill_rx`. A send failure means the worker already
+            // exited — which is the state this signal was asking for.
+            #[expect(
+                clippy::let_underscore_must_use,
+                reason = "the shutdown poke's receiver is gone only when the worker already exited, which is the outcome asked for"
+            )]
             let _ = tx.send(());
         }
         if let Some(thread) = self.thread.take() {
@@ -199,7 +235,7 @@ impl EgressProxy {
                 match std::fs::File::open("/proc/thread-self/ns/net") {
                     Ok(f) => Some(f),
                     Err(e) => {
-                        let _ = tx.send(Err(format!("Failed to open host netns: {e}")));
+                        publish_startup(tx, Err(format!("Failed to open host netns: {e}")));
                         return;
                     }
                 }
@@ -219,15 +255,15 @@ impl EgressProxy {
                         // the namespace entered here. A failure aborts startup
                         // rather than silently binding in the wrong netns.
                         if let Err(e) = enter_netns(&file, "Failed to setns") {
-                            let _ = tx.send(Err(e));
+                            publish_startup(tx, Err(e));
                             return;
                         }
                     }
                     Err(e) => {
-                        let _ = tx.send(Err(format!(
-                            "Failed to open netns file {}: {e}",
-                            path.display()
-                        )));
+                        publish_startup(
+                            tx,
+                            Err(format!("Failed to open netns file {}: {e}", path.display())),
+                        );
                         return;
                     }
                 }
@@ -239,7 +275,7 @@ impl EgressProxy {
             {
                 Ok(rt) => rt,
                 Err(e) => {
-                    let _ = tx.send(Err(format!("Failed to build tokio runtime: {e}")));
+                    publish_startup(tx, Err(format!("Failed to build tokio runtime: {e}")));
                     return;
                 }
             };
@@ -261,7 +297,7 @@ impl EgressProxy {
                     match bind_transparent_listener(addr) {
                         Ok(std_listener) => {
                             if let Err(e) = std_listener.set_nonblocking(true) {
-                                let _ = tx.send(Err(format!(
+                                publish_startup(tx, Err(format!(
                                     "Failed to set transparent listener non-blocking: {e}"
                                 )));
                                 return;
@@ -269,7 +305,7 @@ impl EgressProxy {
                             match TcpListener::from_std(std_listener) {
                                 Ok(l) => l,
                                 Err(e) => {
-                                    let _ = tx.send(Err(format!(
+                                    publish_startup(tx, Err(format!(
                                         "Failed to adopt transparent listener: {e}"
                                     )));
                                     return;
@@ -277,7 +313,7 @@ impl EgressProxy {
                             }
                         }
                         Err(e) => {
-                            let _ = tx.send(Err(format!(
+                            publish_startup(tx, Err(format!(
                                 "Failed to bind transparent listener on {addr}: {e:?}"
                             )));
                             return;
@@ -287,7 +323,7 @@ impl EgressProxy {
                     match TcpListener::bind(addr).await {
                         Ok(l) => l,
                         Err(e) => {
-                            let _ = tx.send(Err(format!("Failed to bind to {addr}: {e}")));
+                            publish_startup(tx, Err(format!("Failed to bind to {addr}: {e}")));
                             return;
                         }
                     }
@@ -296,7 +332,7 @@ impl EgressProxy {
                 let port = match listener.local_addr() {
                     Ok(addr) => addr.port(),
                     Err(e) => {
-                        let _ = tx.send(Err(format!("Failed to get local address: {e}")));
+                        publish_startup(tx, Err(format!("Failed to get local address: {e}")));
                         return;
                     }
                 };
@@ -318,7 +354,7 @@ impl EgressProxy {
                         host_ns,
                         "Failed to re-enter host netns for upstream re-origination",
                     ) {
-                        let _ = tx.send(Err(e));
+                        publish_startup(tx, Err(e));
                         return;
                     }
                 }
@@ -327,7 +363,7 @@ impl EgressProxy {
                 let ca_manager = match tls::CaManager::new() {
                     Ok(cm) => cm,
                     Err(e) => {
-                        let _ = tx.send(Err(format!("Failed to initialize CA: {e:?}")));
+                        publish_startup(tx, Err(format!("Failed to initialize CA: {e:?}")));
                         return;
                     }
                 };
@@ -335,7 +371,7 @@ impl EgressProxy {
                 let authority = match ca_manager.authority() {
                     Ok(auth) => auth,
                     Err(e) => {
-                        let _ = tx.send(Err(format!("Failed to build CA authority: {e:?}")));
+                        publish_startup(tx, Err(format!("Failed to build CA authority: {e:?}")));
                         return;
                     }
                 };
@@ -350,6 +386,13 @@ impl EgressProxy {
                 // Use `with_listener` directly instead of dropping and binding again.
                 // hudsucker takes ownership of the listener and uses it.
                 let shutdown_signal = async {
+                    // The graceful-shutdown trigger. BOTH outcomes mean "shut down": a delivered `()` from
+                    // `EgressProxy::drop`, and a `RecvError` from the sender being dropped without sending —
+                    // which is the same event seen from the other side. There is no third case to report.
+                    #[expect(
+                        clippy::let_underscore_must_use,
+                        reason = "both outcomes are the shutdown trigger: a delivered () and a dropped sender mean the same thing here"
+                    )]
                     let _ = kill_rx.await;
                 };
 
@@ -363,12 +406,12 @@ impl EgressProxy {
                 {
                     Ok(p) => p,
                     Err(e) => {
-                        let _ = tx.send(Err(format!("Proxy builder failed: {e:?}")));
+                        publish_startup(tx, Err(format!("Proxy builder failed: {e:?}")));
                         return;
                     }
                 };
 
-                let _ = tx.send(Ok((port, ca_cert_pem)));
+                publish_startup(tx, Ok((port, ca_cert_pem)));
 
                 if let Err(e) = proxy.start().await {
                     tracing::error!("Proxy failed: {:?}", e);

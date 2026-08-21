@@ -474,6 +474,10 @@ async fn write_reply<W: AsyncWriteExt + Unpin>(wr: &Mutex<W>, id: u64, reply: En
             // The fallback frame is a few hundred bytes, so this write can only fail on a dead
             // socket — the parent is gone, and its reply reader already fails every in-flight
             // request on EOF, so there is no request left to wedge. Dropping it here is terminal.
+            #[expect(
+                clippy::let_underscore_must_use,
+                reason = "terminal by construction: this write can only fail on a dead socket, whose EOF already failed every in-flight request"
+            )]
             let _ = write_frame(&mut *w, &bytes).await;
         }
         // Unreachable in practice (an enum around two owned `String`s always encodes), but logged
@@ -678,6 +682,13 @@ impl BrokerClientEngine {
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .remove(&id)
                 {
+                    // The oneshot receiver is the caller's `rx.await`, dropped when its request's deadline
+                    // expired or its task was cancelled — `forget()` clears the slot on both paths. A reply
+                    // with no receiver is a reply nobody is waiting for.
+                    #[expect(
+                        clippy::let_underscore_must_use,
+                        reason = "the reply's oneshot receiver is gone only when the request already expired or was cancelled"
+                    )]
                     let _ = tx.send(reply);
                 }
             }
@@ -686,6 +697,12 @@ impl BrokerClientEngine {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             for (_, tx) in map.drain() {
+                // Same channel, the connection-closed sweep: every remaining slot is failed so nothing
+                // hangs. A receiver already gone needs no telling.
+                #[expect(
+                    clippy::let_underscore_must_use,
+                    reason = "connection-closed sweep: a slot whose receiver already went away needs no failure delivered"
+                )]
                 let _ = tx.send(EngineReply::Err(WireError {
                     kind: ErrorKind::Internal,
                     message: "broker connection closed".to_string(),

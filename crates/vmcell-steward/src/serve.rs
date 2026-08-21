@@ -446,6 +446,39 @@ pub(crate) fn send_msg(writer: &Writer, msg: &Message) -> std::io::Result<()> {
     send_framed(&mut *stream, &bytes)
 }
 
+/// [`send_msg`] on a path that has **no way to report** — a terminal frame, or a frame emitted
+/// while the connection is already unwinding.
+///
+/// WHY DISCARDING IS CORRECT HERE, once, instead of at each call site (AGENTS.md "Fail loud" plus
+/// its Suppressions rule): the only failure mode is a dead vsock connection, i.e. **the host is
+/// gone**. The frames routed through here are the ones that exist to tell the host something
+/// (`SessionStderr`+`SessionExit{127}` for a session that could not open, the terminal
+/// `SessionExit`), so a failure means the recipient of the news no longer exists. Propagating it
+/// would ask the caller to report a failure to a party that is not there.
+///
+/// It is not silent: the failure is traced, so a host that stopped reading mid-session leaves a
+/// record instead of a gap. The steward runs as PID 1 under the `Pid1` placement, where an
+/// unhandled panic aborts the guest, so this path must not grow one.
+pub(crate) fn send_msg_best_effort(writer: &Writer, msg: &Message) {
+    if let Err(e) = send_msg(writer, msg) {
+        tracing::debug!("vmcell-steward: frame not delivered (host gone?): {}", e);
+    }
+}
+
+/// Joins an output-pump or reader thread whose payload is deliberately dropped.
+///
+/// WHY DISCARDING IS CORRECT: `JoinHandle::join` yields `Err` only when the thread **panicked**,
+/// and every caller is on a teardown path that must complete — the exec waiter joining its
+/// stdout/stderr pumps before emitting `Exit`, the session waiter joining its pumps before emitting
+/// `SessionExit`. Resuming the payload there would unwind a thread that is finishing a connection,
+/// and under the `Pid1` placement an unwind that reaches the top aborts the guest. The panic is
+/// logged instead of resumed, so it stops being invisible.
+pub(crate) fn join_pump(handle: std::thread::JoinHandle<()>) {
+    if handle.join().is_err() {
+        tracing::error!("vmcell-steward: an output pump thread panicked; its output may be short");
+    }
+}
+
 /// Serves one accepted connection: sends `Ready`, runs the dispatch loop, and —
 /// however the loop ends — tears down every session it left open (§13, Cross-cutting invariants).
 ///

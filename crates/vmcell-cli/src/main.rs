@@ -23,6 +23,17 @@
         clippy::unimplemented,
         clippy::indexing_slicing,
         clippy::dbg_macro,
+        // AGENTS.md "Fail loud": no bare `let _ =` on a `Result`. `let_underscore_must_use` is the
+        // narrowest instrument rustc/clippy has for that rule — and it is deliberately BROADER on
+        // one axis, firing on any `#[must_use]` expression (a detached `JoinHandle`, a discarded
+        // `Instant`), which is the same defect one step out: the compiler said this matters and the
+        // code said nothing back. Scoped `not(test)` like every lint in this block: the rule's
+        // stated harms (a swallowed teardown failure, a lost write, a wedged session) are
+        // production harms, and forcing a reason onto a test's `try_init()` would manufacture the
+        // hollow suppressions AGENTS.md rule 2 calls theater. `crates/vmcell/tests/lint_roster.rs`
+        // is the gate that this line exists in EVERY crate root, so a new crate cannot opt out by
+        // being new.
+        clippy::let_underscore_must_use,
         clippy::allow_attributes,               // B11: prefer #[expect] over #[allow] in prod code
         clippy::allow_attributes_without_reason  // B11: every suppression states why
     )
@@ -1440,12 +1451,8 @@ async fn dispatch(command: &Commands) -> vmcell::Result<()> {
             } else {
                 let steward = vm.steward(None).await?;
                 let outcome = steward.exec(vmcell::ExecRequest::new(argv)).await?;
-                use std::io::Write as _;
-                // Best-effort relay of the guest command's captured output. A broken pipe
-                // (the consumer closed stdout/stderr) must not abort the run or mask the
-                // guest's real exit code, which we propagate below via `process::exit`.
-                let _ = std::io::stdout().write_all(&outcome.stdout);
-                let _ = std::io::stderr().write_all(&outcome.stderr);
+                relay_guest_output(&mut std::io::stdout(), &outcome.stdout);
+                relay_guest_output(&mut std::io::stderr(), &outcome.stderr);
                 outcome.code
             };
             vm.shutdown().await?;
@@ -1631,6 +1638,26 @@ fn validate_oci_digest(digest: &str) -> vmcell::Result<()> {
     Ok(())
 }
 
+/// Relays a chunk of the guest command's captured output to a host stream, best-effort.
+///
+/// WHY THE `Result` IS DISCARDED, once, instead of at six call sites (AGENTS.md "Fail loud" plus
+/// its Suppressions rule): the only realistic failure is `EPIPE` — the consumer on the other side
+/// of this CLI's stdout/stderr closed it, which is what `head`, a closed pager, or a killed
+/// pipeline reader all look like. Aborting the run there would be wrong twice over: the guest
+/// command has already run, and its exit code is what this CLI contracts to propagate
+/// (`std::process::exit(code)` at the one-shot site, `Ok(code)` at the interactive one). A relay
+/// failure must never become the guest's answer.
+///
+/// The flush is part of the same statement rather than a second discarded `Result`: stdout is line
+/// buffered, and interactive output that arrives only at the next newline is not interactive.
+fn relay_guest_output(out: &mut impl std::io::Write, data: &[u8]) {
+    #[expect(
+        clippy::let_underscore_must_use,
+        reason = "EPIPE on the consumer side must not abort the run or mask the guest's exit code, which is this CLI's contract"
+    )]
+    let _ = out.write_all(data).and_then(|()| out.flush());
+}
+
 /// Runs `argv` in an interactive session (§3, The control plane: vsock, the host clients, and the steward), streaming this CLI's
 /// stdin into the guest command and relaying its output, and returns the guest
 /// exit code.
@@ -1645,7 +1672,6 @@ async fn run_interactive_session(
     argv: Vec<String>,
     tty: bool,
 ) -> vmcell::Result<i32> {
-    use std::io::Write as _;
     use tokio::io::AsyncReadExt as _;
     use vmcell::steward::session::{SessionEvent, SessionSpecBuilder};
 
@@ -1664,14 +1690,10 @@ async fn run_interactive_session(
         tokio::select! {
             event = session.recv() => match event {
                 Some(SessionEvent::Stdout(data)) => {
-                    let mut out = std::io::stdout();
-                    let _ = out.write_all(&data);
-                    let _ = out.flush();
+                    relay_guest_output(&mut std::io::stdout(), &data);
                 }
                 Some(SessionEvent::Stderr(data)) => {
-                    let mut err = std::io::stderr();
-                    let _ = err.write_all(&data);
-                    let _ = err.flush();
+                    relay_guest_output(&mut std::io::stderr(), &data);
                 }
                 Some(SessionEvent::Exit(code)) => return Ok(code),
                 // The connection dropped before an exit — surface the sentinel -1.
@@ -1682,12 +1704,24 @@ async fn run_interactive_session(
             read = stdin.read(&mut buf), if stdin_open => match read {
                 // Local EOF (Ctrl-D / piped input exhausted): close the guest stdin.
                 Ok(0) => {
-                    let _ = session.close_stdin().await;
+                    if let Err(e) = session.close_stdin().await {
+                        eprintln!("vmcell: stdin close was not delivered to the guest: {e}");
+                    }
                     stdin_open = false;
                 }
                 Ok(n) => {
                     // `read` guarantees n <= buf.len(); `get(..n)` is the non-panicking form.
-                    let _ = session.write_stdin(buf.get(..n).unwrap_or_default()).await;
+                    //
+                    // A failed `write_stdin` means the session transport is gone. Discarding it
+                    // (the pre-fix `let _ =`) kept this arm re-armed, so every subsequent keystroke
+                    // was read off the local terminal and thrown away in silence until the output
+                    // side happened to notice the same death. Stop forwarding and say so — the same
+                    // handling as the local read error below, which is the same situation from the
+                    // other end.
+                    if let Err(e) = session.write_stdin(buf.get(..n).unwrap_or_default()).await {
+                        eprintln!("vmcell: stdin is no longer reaching the guest: {e}");
+                        stdin_open = false;
+                    }
                 }
                 // A local stdin read error: stop forwarding, keep relaying output.
                 Err(_) => stdin_open = false,
@@ -1870,6 +1904,13 @@ impl StagingTree {
     /// pulled, not a failure discovered by a stage minutes later.
     fn compose_under(parent: &std::path::Path) -> vmcell::Result<Self> {
         let path = parent.join(format!("oci2erofs-stage-{}", std::process::id()));
+        // Pre-clean of a stale tree from an aborted run of THIS pid. The expected outcome is
+        // `NotFound`; anything else is caught immediately by the `create_dir_all` below, which is
+        // fallible and reports.
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "pre-clean whose expected outcome is NotFound; the fallible create_dir_all below is the real check"
+        )]
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path).map_err(vmcell::Error::Io)?;
         Ok(StagingTree { path })
@@ -1886,6 +1927,10 @@ impl Drop for StagingTree {
         // Best-effort, and deliberately so: `Drop` cannot report, and a leftover scratch tree is
         // not worth aborting a run that otherwise succeeded. The gate is that it RUNS on every
         // path, which a `?` on the build call is what defeated.
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "Drop cannot report; a leftover scratch tree must not abort a run that otherwise succeeded"
+        )]
         let _ = std::fs::remove_dir_all(&self.path);
     }
 }

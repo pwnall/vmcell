@@ -83,10 +83,22 @@ pub(crate) mod backend {
 
                     match vring_state.needs_notification() {
                         Err(_) => {
+                            // Best-effort guest notification on the event-idx path: a failed signal
+                            // forgoes ONE wakeup, and the guest still drains on its next kick. This
+                            // is the virtio hot loop, so reporting per-descriptor would be a flood,
+                            // not a diagnosis.
+                            #[expect(
+                                clippy::let_underscore_must_use,
+                                reason = "virtio hot loop: a failed used-queue signal forgoes one wakeup and the guest drains on its next kick"
+                            )]
                             let _ = vring_state.signal_used_queue();
                         }
                         Ok(needs_notification) => {
                             if needs_notification {
+                                #[expect(
+                                    clippy::let_underscore_must_use,
+                                    reason = "same event-idx notification, needs-notification arm: one forgone wakeup, never a lost descriptor"
+                                )]
                                 let _ = vring_state.signal_used_queue();
                             }
                         }
@@ -95,6 +107,10 @@ pub(crate) mod backend {
                     if vring_state.add_used(head_index, 0).is_err() {
                         tracing::error!("Couldn't return used descriptors to the ring");
                     }
+                    #[expect(
+                        clippy::let_underscore_must_use,
+                        reason = "same notification on the non-event-idx path: one forgone wakeup, never a lost descriptor"
+                    )]
                     let _ = vring_state.signal_used_queue();
                 }
             }
@@ -226,6 +242,13 @@ pub(crate) mod backend {
 
             if lock_recover(&self.backend).event_idx {
                 loop {
+                    // Masking notifications is an interrupt-rate optimization around the drain loop. If the
+                    // mask does not take, the loop simply runs with notifications enabled — slower, never
+                    // incorrect — and `enable_notification` below is the arm whose value IS read.
+                    #[expect(
+                        clippy::let_underscore_must_use,
+                        reason = "notification masking is an interrupt-rate optimization; the enable_notification below is the arm whose value is read"
+                    )]
                     let _ = vring_state.disable_notification();
                     lock_recover(&self.backend).process_queue(&mut vring_state)?;
                     if !vring_state.enable_notification().unwrap_or(false) {
@@ -306,6 +329,13 @@ pub(crate) mod backend {
                 Err(e) => {
                     // Report the failure instead of panicking, so the caller
                     // returns a typed error rather than a false-ready daemon.
+                    // The readiness receiver is `recv_timeout`-bounded below. If it already timed out there
+                    // is no one to hand the construction error to, and the caller has already turned the
+                    // timeout into its own typed error.
+                    #[expect(
+                        clippy::let_underscore_must_use,
+                        reason = "the readiness receiver is bounded by recv_timeout; a send that fails means the caller already reported the timeout"
+                    )]
                     let _ = ready_tx.send(Err(std::io::Error::other(format!(
                         "failed to construct vhost-user daemon: {e:?}"
                     ))));
@@ -317,10 +347,21 @@ pub(crate) mod backend {
             // as the frontend only connects after `VirtioFsDaemon::start_paced` returns —
             // this is the same readiness point as the external daemon's listening
             // socket (bound, about to accept).
+            #[expect(
+                clippy::let_underscore_must_use,
+                reason = "same bounded readiness channel: a receiver that already timed out has reported its own typed error"
+            )]
             let _ = ready_tx.send(Ok(()));
             if let Err(e) = vu_daemon.start(&mut listener) {
                 tracing::error!("in-process virtiofsd: serve loop failed: {e:?}");
             }
+            // The serve loop above has already returned and its failure was logged. This `wait` only
+            // reaps the daemon's internal workers on the way out of a detached thread that has no
+            // caller to answer.
+            #[expect(
+                clippy::let_underscore_must_use,
+                reason = "post-serve-loop reap on a detached thread: the serve loop's own failure was already logged above"
+            )]
             let _ = vu_daemon.wait();
         });
 

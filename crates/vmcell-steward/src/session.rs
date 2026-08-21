@@ -16,7 +16,7 @@ use std::time::Duration;
 use vmcell_protocol::{self as protocol, Message, SessionId, SessionSpec};
 
 use crate::exec::build_command;
-use crate::serve::{Sessions, Writer, poll_timeout, send_msg};
+use crate::serve::{Sessions, Writer, join_pump, poll_timeout, send_msg, send_msg_best_effort};
 use crate::{ReaperCoordinator, ServeContext};
 
 // ===========================================================================
@@ -206,6 +206,13 @@ pub(crate) fn winsize_from(rows: u16, cols: u16) -> rustix::termios::Winsize {
 pub(crate) fn kill_group(pid: u32) {
     use rustix::process::{Pid, Signal, kill_process_group};
     if let Some(p) = Pid::from_raw(pid.cast_signed()) {
+        // This IS the one shared group-kill law, so the discard lives here and nowhere else. A
+        // failure is `ESRCH` (the group is already gone — the outcome wanted) or `EPERM`; neither
+        // is actionable, and every caller is on a teardown path with no channel to report on.
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "the one shared group-kill law: ESRCH is the wanted outcome and no caller has a channel to report on"
+        )]
         let _ = kill_process_group(p, Signal::KILL);
     }
 }
@@ -216,14 +223,14 @@ pub(crate) fn kill_group(pid: u32) {
 /// `SessionExit{127}`.
 pub(crate) fn open_failed(writer: &Writer, session: SessionId, msg: &str) {
     tracing::warn!("vmcell-steward: session {:?} open failed: {}", session, msg);
-    let _ = send_msg(
+    send_msg_best_effort(
         writer,
         &Message::SessionStderr {
             session,
             data: msg.as_bytes().to_vec(),
         },
     );
-    let _ = send_msg(writer, &Message::SessionExit { session, code: 127 });
+    send_msg_best_effort(writer, &Message::SessionExit { session, code: 127 });
 }
 
 /// Registers a session's handle in the per-connection table, **rejecting** a
@@ -349,9 +356,9 @@ pub(crate) fn spawn_session_waiter(
         let code = reaper.wait_for(pid);
         has_exited.store(true, Ordering::Relaxed);
         for pump in pumps {
-            let _ = pump.join();
+            join_pump(pump);
         }
-        let _ = send_msg(&writer, &Message::SessionExit { session, code });
+        send_msg_best_effort(&writer, &Message::SessionExit { session, code });
         sessions
             .lock()
             .unwrap_or_else(|e| e.into_inner())

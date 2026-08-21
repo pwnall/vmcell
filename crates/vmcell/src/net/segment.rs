@@ -400,6 +400,10 @@ impl NetSegment {
                 Ok(sock)
             })();
             // The receiver is dropped only if the caller was cancelled; nothing to report.
+            #[expect(
+                clippy::let_underscore_must_use,
+                reason = "the receiver is dropped only when the caller was cancelled, and rx.await already maps that to a typed error"
+            )]
             let _ = tx.send(result);
         });
 

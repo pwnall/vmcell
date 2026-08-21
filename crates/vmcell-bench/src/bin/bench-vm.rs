@@ -23,13 +23,23 @@
         clippy::unimplemented,
         clippy::indexing_slicing,
         clippy::dbg_macro,
+        // AGENTS.md "Fail loud": no bare `let _ =` on a `Result`. `let_underscore_must_use` is the
+        // narrowest instrument rustc/clippy has for that rule — and it is deliberately BROADER on
+        // one axis, firing on any `#[must_use]` expression (a detached `JoinHandle`, a discarded
+        // `Instant`), which is the same defect one step out: the compiler said this matters and the
+        // code said nothing back. Scoped `not(test)` like every lint in this block: the rule's
+        // stated harms (a swallowed teardown failure, a lost write, a wedged session) are
+        // production harms, and forcing a reason onto a test's `try_init()` would manufacture the
+        // hollow suppressions AGENTS.md rule 2 calls theater. `crates/vmcell/tests/lint_roster.rs`
+        // is the gate that this line exists in EVERY crate root, so a new crate cannot opt out by
+        // being new.
+        clippy::let_underscore_must_use,
         clippy::allow_attributes,               // B11: prefer #[expect] over #[allow] in prod code
         clippy::allow_attributes_without_reason  // B11: every suppression states why
     )
 )]
 
 use clap::Parser;
-use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -246,6 +256,75 @@ fn report(name: &str, latencies: &mut [u128], dropped: usize, warmup_failed: usi
     }
 }
 
+/// The three ways this harness discards a `Result` on purpose, as three named functions instead of
+/// fifty-odd bare `let _ =` statements (AGENTS.md "Fail loud", and its Suppressions rule: *route
+/// repeated legitimate sites through one helper so one suppression covers the class*).
+///
+/// Each is a real class, not a spelling convenience. Two of the three stop discarding altogether
+/// and REPORT instead — a benchmark that silently failed to tear a VM down, or to remove the
+/// snapshot dir the next run's warm-restore reads, produces numbers nobody can explain, which is
+/// the harness-specific shape of the defect the rule is about. The third keeps the discard and
+/// carries the single suppression for its whole class, with the reason stated at the statement.
+mod best_effort {
+    use super::{MicroVm, Vmm};
+    use std::path::Path;
+
+    /// Tears a benchmark VM down on a path whose outcome is **already decided** — an error is
+    /// about to be reported, or the sample has already been taken.
+    ///
+    /// Discarding is correct because [`MicroVm`]'s `Drop` is the guaranteed teardown: a failed
+    /// `shutdown()` has not leaked anything, it has only skipped the graceful half. It is still
+    /// *reported*, because a run whose VMs all failed to shut down gracefully is a run whose
+    /// teardown numbers mean something different.
+    ///
+    /// One call site (`phase_budget_path`) times this call. Printing inside that window costs
+    /// microseconds — but only on the failure path, where the sample is already anomalous.
+    pub(super) async fn shutdown<V: Vmm>(vm: MicroVm<V>) {
+        if let Err(e) = vm.shutdown().await {
+            println!("warning: graceful VM shutdown failed ({e}); Drop is the real teardown");
+        }
+    }
+
+    /// Removes a scratch directory this harness owns — a snapshot dir, a zygote master — either
+    /// before creating it or after the numbers are collected.
+    ///
+    /// Discarding is correct because the expected outcome is `NotFound`: the pre-clean runs before
+    /// anything exists, and the post-run clean races nothing. Anything *else* is reported, so a
+    /// snapshot dir that could not be removed cannot silently make the next run's warm-restore
+    /// numbers a stale image's.
+    pub(super) fn discard_dir(dir: &Path) {
+        match std::fs::remove_dir_all(dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => println!("warning: could not remove {}: {e}", dir.display()),
+        }
+    }
+
+    /// Serves one canned HTTP response on `conn`, best-effort.
+    ///
+    /// Discarding is correct because the *client* is the measurement: curl in the guest reports
+    /// what it got, and a peer that hung up mid-response is a datum this side cannot improve on.
+    /// The read is bounded first so a peer that connects and says nothing cannot wedge the
+    /// responder thread.
+    pub(super) fn serve_canned_response(conn: &mut std::net::TcpStream, head: &str, body: &[u8]) {
+        use std::io::{Read, Write};
+        let mut scratch = [0u8; 1024];
+        // ONE suppression for the whole class, which is the point of the helper. Reporting here
+        // would print once per benchmarked request on a `Connection: close` responder — noise on
+        // stdout, which is where the measured tables go.
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "the guest-side curl is the measurement; a peer that hung up mid-response is a datum this side cannot improve on"
+        )]
+        let _ = conn
+            .set_read_timeout(Some(std::time::Duration::from_millis(500)))
+            .and_then(|()| conn.read(&mut scratch))
+            .and_then(|_| conn.write_all(head.as_bytes()))
+            .and_then(|()| conn.write_all(body))
+            .and_then(|()| conn.flush());
+    }
+}
+
 async fn run_bench<V: Vmm>(
     vmm: &V,
     name: &str,
@@ -284,7 +363,7 @@ async fn run_bench<V: Vmm>(
     }
     // Best-effort pre-clean of a stale snapshot dir left by a prior aborted run; a
     // missing dir (the common case) is not an error worth surfacing.
-    let _ = std::fs::remove_dir_all(&snap_dir);
+    best_effort::discard_dir(&snap_dir);
 
     if is_restore {
         println!("Creating baseline snapshot for restore benchmark...");
@@ -297,12 +376,12 @@ async fn run_bench<V: Vmm>(
         if let Err(e) = base_vm.steward(None).await {
             // Best-effort graceful teardown of the base VM; `MicroVm::Drop` is the
             // real, guaranteed teardown, so a shutdown error is not actionable here.
-            let _ = base_vm.shutdown().await;
+            best_effort::shutdown(base_vm).await;
             anyhow::bail!("{name}: failed to connect to base VM steward: {e}");
         }
         if let Err(e) = std::fs::create_dir_all(&snap_dir) {
             // Best-effort teardown of the booted base VM before bailing.
-            let _ = base_vm.shutdown().await;
+            best_effort::shutdown(base_vm).await;
             anyhow::bail!(
                 "{name}: cannot create snapshot dir {}: {e}",
                 snap_dir.display()
@@ -311,13 +390,13 @@ async fn run_bench<V: Vmm>(
         if let Err(e) = base_vm.snapshot(&snap_dir).await {
             // Best-effort cleanup on the snapshot-failure path: shut the base VM down
             // (Drop is the real teardown) and drop the partial snapshot dir.
-            let _ = base_vm.shutdown().await;
-            let _ = std::fs::remove_dir_all(&snap_dir);
+            best_effort::shutdown(base_vm).await;
+            best_effort::discard_dir(&snap_dir);
             anyhow::bail!("{name}: failed to take snapshot of base VM: {e}");
         }
         // Best-effort graceful shutdown of the base VM now that the snapshot is taken;
         // `MicroVm::Drop` guarantees the real teardown regardless.
-        let _ = base_vm.shutdown().await;
+        best_effort::shutdown(base_vm).await;
     }
 
     // Tracks whether every cold-boot iteration managed to drop the page cache.
@@ -367,7 +446,7 @@ async fn run_bench<V: Vmm>(
                 }
                 // Best-effort per-iteration teardown; `Drop` is the guaranteed path,
                 // and a shutdown error must not corrupt the latency sample above.
-                let _ = vm.shutdown().await;
+                best_effort::shutdown(vm).await;
             }
             Err(e) => {
                 println!("{name}: iteration {i} create/restore failed: {e}");
@@ -379,7 +458,7 @@ async fn run_bench<V: Vmm>(
     if is_restore {
         // Best-effort cleanup of the baseline snapshot dir after the run; a removal
         // failure is not worth aborting the (already-collected) report for.
-        let _ = std::fs::remove_dir_all(&snap_dir);
+        best_effort::discard_dir(&snap_dir);
     }
 
     report(
@@ -1292,7 +1371,7 @@ async fn run_footprint<V: Vmm>(
             println!("footprint: steward connect {i} failed: {e}");
             // Best-effort teardown of the just-booted guest before bailing; `Drop`
             // guarantees the real teardown, so a shutdown error is not actionable.
-            let _ = vm.shutdown().await;
+            best_effort::shutdown(vm).await;
             break;
         }
         vms.push(vm);
@@ -1477,7 +1556,7 @@ async fn run_footprint<V: Vmm>(
     // Best-effort teardown of every resident guest; `Drop` is the guaranteed path,
     // so a shutdown error on any one VM must not abort cleanup of the rest.
     for v in vms {
-        let _ = v.shutdown().await;
+        best_effort::shutdown(v).await;
     }
     Ok(())
 }
@@ -1507,7 +1586,7 @@ async fn run_suspend_size<V: Vmm>(
         std::process::id()
     ));
     // Best-effort pre-clean of a stale snapshot dir from a prior aborted run.
-    let _ = std::fs::remove_dir_all(&snap_dir);
+    best_effort::discard_dir(&snap_dir);
     if let Err(e) = std::fs::create_dir_all(&snap_dir) {
         anyhow::bail!(
             "suspend-size: cannot create snap dir {}: {e}",
@@ -1519,26 +1598,26 @@ async fn run_suspend_size<V: Vmm>(
         Ok(v) => v,
         Err(e) => {
             // Best-effort removal of the (empty) snapshot dir before bailing.
-            let _ = std::fs::remove_dir_all(&snap_dir);
+            best_effort::discard_dir(&snap_dir);
             anyhow::bail!("suspend-size: boot failed: {e}");
         }
     };
     if let Err(e) = vm.steward(None).await {
         // Best-effort teardown + snapshot-dir cleanup; `Drop` guarantees the real
         // teardown and neither cleanup error is actionable.
-        let _ = vm.shutdown().await;
-        let _ = std::fs::remove_dir_all(&snap_dir);
+        best_effort::shutdown(vm).await;
+        best_effort::discard_dir(&snap_dir);
         anyhow::bail!("suspend-size: steward connect failed: {e}");
     }
     if let Err(e) = vm.snapshot(&snap_dir).await {
         // Best-effort teardown + partial-snapshot cleanup on the failure path.
-        let _ = vm.shutdown().await;
-        let _ = std::fs::remove_dir_all(&snap_dir);
+        best_effort::shutdown(vm).await;
+        best_effort::discard_dir(&snap_dir);
         anyhow::bail!("suspend-size: snapshot failed: {e}");
     }
     // Best-effort graceful shutdown before we measure the on-disk snapshot; `Drop`
     // guarantees teardown regardless of this result.
-    let _ = vm.shutdown().await;
+    best_effort::shutdown(vm).await;
 
     let files = walk_files(&snap_dir);
     let total: u64 = files.iter().map(|(_, s)| *s).sum();
@@ -1578,7 +1657,7 @@ async fn run_suspend_size<V: Vmm>(
     }
 
     // Best-effort cleanup of the measured snapshot dir now that it's been reported.
-    let _ = std::fs::remove_dir_all(&snap_dir);
+    best_effort::discard_dir(&snap_dir);
     Ok(())
 }
 
@@ -1599,7 +1678,7 @@ async fn build_baseline_snapshot<V: Vmm>(
     // Best-effort graceful shutdown of the baseline VM once its snapshot is written;
     // `Drop` guarantees teardown, so a shutdown error must not fail the (successful)
     // snapshot build we return `Ok` for.
-    let _ = base.shutdown().await;
+    best_effort::shutdown(base).await;
     Ok(())
 }
 
@@ -1663,7 +1742,7 @@ async fn phase_budget_path<V: Vmm>(
         if !connect_ok {
             println!("phase-budget {label}: iter {i} connect failed");
             // Best-effort teardown before bailing; `Drop` guarantees teardown.
-            let _ = vm.shutdown().await;
+            best_effort::shutdown(vm).await;
             break;
         }
 
@@ -1678,6 +1757,10 @@ async fn phase_budget_path<V: Vmm>(
         if let Ok(steward) = vm.steward(None).await {
             // The exec *result* is intentionally unused: this phase measures the
             // exec-round-trip latency (t2..t_exec), not the command's exit/output.
+            #[expect(
+                clippy::let_underscore_must_use,
+                reason = "this phase measures the exec ROUND TRIP; the command's exit/output is not the sample"
+            )]
             let _ = steward.exec(ExecRequest::new(argv)).await;
         }
         let t_exec = t2.elapsed();
@@ -1685,7 +1768,7 @@ async fn phase_budget_path<V: Vmm>(
         let t3 = Instant::now();
         // Teardown is deliberately on the budget (§16, Performance): we time it, and `Drop`
         // still guarantees the real teardown if `shutdown` errors.
-        let _ = vm.shutdown().await;
+        best_effort::shutdown(vm).await;
         let t_teardown = t3.elapsed();
 
         if i >= args.warmup {
@@ -1737,7 +1820,7 @@ async fn run_phase_budget<V: Vmm>(
         let snap_dir = resolve_snap_dir(&args.snap_dir)
             .join(format!("phase-{backend}-{}", std::process::id()));
         // Best-effort pre-clean of a stale snapshot dir from a prior aborted run.
-        let _ = std::fs::remove_dir_all(&snap_dir);
+        best_effort::discard_dir(&snap_dir);
         if let Err(e) = std::fs::create_dir_all(&snap_dir) {
             anyhow::bail!("phase-budget: cannot create snap dir: {e}");
         }
@@ -1752,7 +1835,7 @@ async fn run_phase_budget<V: Vmm>(
         };
         // Best-effort cleanup of the baseline snapshot dir after the restore budget,
         // regardless of whether the restore path succeeded.
-        let _ = std::fs::remove_dir_all(&snap_dir);
+        best_effort::discard_dir(&snap_dir);
         restore_res?;
     } else {
         // Genuine capability skip → success; the cold path already ran.
@@ -1783,7 +1866,7 @@ async fn run_vsock_rtt<V: Vmm>(
     };
     if let Err(e) = vm.steward(None).await {
         // Best-effort teardown before bailing; `Drop` guarantees teardown.
-        let _ = vm.shutdown().await;
+        best_effort::shutdown(vm).await;
         anyhow::bail!("vsock-rtt: steward connect failed: {e}");
     }
     let argv = pick_exec_cmd(&mut vm).await;
@@ -1792,6 +1875,10 @@ async fn run_vsock_rtt<V: Vmm>(
         if let Ok(steward) = vm.steward(None).await {
             // Warmup iteration: the exec result is discarded on purpose (it primes
             // caches / the vsock path and is not part of the measured sample).
+            #[expect(
+                clippy::let_underscore_must_use,
+                reason = "warmup: primes the caches and the vsock path; it is not part of the measured sample"
+            )]
             let _ = steward.exec(ExecRequest::new(argv.clone())).await;
         }
     }
@@ -1821,7 +1908,7 @@ async fn run_vsock_rtt<V: Vmm>(
     }
     // Best-effort teardown after the run; `Drop` guarantees the real teardown, so a
     // shutdown error must not corrupt the collected RTT report below.
-    let _ = vm.shutdown().await;
+    best_effort::shutdown(vm).await;
 
     let acct = accounting_suffix(dropped, 0);
     println!(
@@ -1876,16 +1963,11 @@ impl HostResponder {
                     Ok((mut conn, _)) => {
                         // Drain one request chunk (a GET fits in 1 KiB) before replying,
                         // so curl doesn't take an RST on unread data; then a fixed 200.
-                        let mut buf = [0u8; 1024];
-                        let _ = conn.set_read_timeout(Some(std::time::Duration::from_millis(500)));
-                        let _ = conn.read(&mut buf);
                         let head = format!(
                             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                             BODY.len()
                         );
-                        let _ = conn.write_all(head.as_bytes());
-                        let _ = conn.write_all(BODY);
-                        let _ = conn.flush();
+                        best_effort::serve_canned_response(&mut conn, &head, BODY);
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         std::thread::sleep(std::time::Duration::from_millis(5));
@@ -1908,6 +1990,12 @@ impl Drop for HostResponder {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(h) = self.handle.take() {
+            // `Drop` must not unwind, so the responder thread's panic payload is deliberately
+            // dropped rather than resumed; the stop flag above is what actually ends it.
+            #[expect(
+                clippy::let_underscore_must_use,
+                reason = "Drop must not unwind: a responder-thread panic payload is dropped, never resumed"
+            )]
             let _ = h.join();
         }
     }
@@ -2024,7 +2112,7 @@ async fn run_net_egress_plain<V: Vmm>(
                             }
                         }
                     }
-                    let _ = vm.shutdown().await;
+                    best_effort::shutdown(vm).await;
                     break;
                 }
                 Err(e) => {
@@ -2076,7 +2164,7 @@ async fn run_net_egress_plain<V: Vmm>(
         }
     };
     if let Err(e) = vm.steward(None).await {
-        let _ = vm.shutdown().await;
+        best_effort::shutdown(vm).await;
         anyhow::bail!("net-egress: egress VM steward connect failed: {e}");
     }
     let (gateway_ip, _guest_ip, _cidr) = vmcell::net::ip_math(vm.vmid())
@@ -2100,7 +2188,7 @@ async fn run_net_egress_plain<V: Vmm>(
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
     if !warmed {
-        let _ = vm.shutdown().await;
+        best_effort::shutdown(vm).await;
         anyhow::bail!("net-egress: no successful egress request within the warm-up budget");
     }
 
@@ -2133,7 +2221,7 @@ async fn run_net_egress_plain<V: Vmm>(
             }
         }
     }
-    let _ = vm.shutdown().await;
+    best_effort::shutdown(vm).await;
     // `responder` stays alive until here; its Drop reaps the host thread.
 
     let acct = accounting_suffix(dropped, 0);
@@ -2291,7 +2379,7 @@ async fn run_net_egress_filtered<V: Vmm>(
                             }
                         }
                     }
-                    let _ = vm.shutdown().await;
+                    best_effort::shutdown(vm).await;
                     break;
                 }
                 Err(e) => {
@@ -2342,7 +2430,7 @@ async fn run_net_egress_filtered<V: Vmm>(
         }
     };
     if let Err(e) = vm.steward(None).await {
-        let _ = vm.shutdown().await;
+        best_effort::shutdown(vm).await;
         anyhow::bail!("net-egress[{label}]: egress VM steward connect failed: {e}");
     }
     let (gateway_ip, _guest_ip, _cidr) = vmcell::net::ip_math(vm.vmid())
@@ -2350,7 +2438,7 @@ async fn run_net_egress_filtered<V: Vmm>(
     let proxy_port = match vm.proxy() {
         Some(p) => p.port,
         None => {
-            let _ = vm.shutdown().await;
+            best_effort::shutdown(vm).await;
             anyhow::bail!("net-egress[{label}]: filtered egress did not start a proxy");
         }
     };
@@ -2394,7 +2482,7 @@ async fn run_net_egress_filtered<V: Vmm>(
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
     if !warmed {
-        let _ = vm.shutdown().await;
+        best_effort::shutdown(vm).await;
         if privileged {
             let _ = vmcell::net::cleanup_orphan_netns(&sweep_prefix);
         }
@@ -2431,7 +2519,7 @@ async fn run_net_egress_filtered<V: Vmm>(
             }
         }
     }
-    let _ = vm.shutdown().await;
+    best_effort::shutdown(vm).await;
     // Belt-and-suspenders netns sweep for any panic residue (privileged only; a clean
     // `shutdown()` already removes this VM's netns).
     if privileged {
@@ -2506,7 +2594,7 @@ async fn run_zygote<V: Vmm>(
     // --- Snapshot the base ONCE into the master zygote image ---
     let master =
         resolve_snap_dir(&args.snap_dir).join(format!("zygote-{backend}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&master);
+    best_effort::discard_dir(&master);
     std::fs::create_dir_all(&master).map_err(|e| {
         anyhow::anyhow!("zygote: cannot create master dir {}: {e}", master.display())
     })?;
@@ -2514,24 +2602,24 @@ async fn run_zygote<V: Vmm>(
     let mut base = match MicroVm::start(vmm, cfg.clone(), &env).await {
         Ok(v) => v,
         Err(e) => {
-            let _ = std::fs::remove_dir_all(&master);
+            best_effort::discard_dir(&master);
             anyhow::bail!("zygote: base VM start failed: {e}");
         }
     };
     if let Err(e) = base.steward(None).await {
-        let _ = base.shutdown().await;
-        let _ = std::fs::remove_dir_all(&master);
+        best_effort::shutdown(base).await;
+        best_effort::discard_dir(&master);
         anyhow::bail!("zygote: base VM steward connect failed: {e}");
     }
     let zygote = match vmcell::Zygote::suspend(&mut base, cfg.clone(), &master).await {
         Ok(z) => z,
         Err(e) => {
-            let _ = base.shutdown().await;
-            let _ = std::fs::remove_dir_all(&master);
+            best_effort::shutdown(base).await;
+            best_effort::discard_dir(&master);
             anyhow::bail!("zygote: suspend failed: {e}");
         }
     };
-    let _ = base.shutdown().await;
+    best_effort::shutdown(base).await;
     let cow = zygote.probe_cow_support();
     println!(
         "zygote master ready (fan-out={clone_count}); CoW support: {cow:?} \
@@ -2574,10 +2662,10 @@ async fn run_zygote<V: Vmm>(
             }
         }
         for c in clones {
-            let _ = c.shutdown().await;
+            best_effort::shutdown(c).await;
         }
     }
-    let _ = std::fs::remove_dir_all(&master);
+    best_effort::discard_dir(&master);
 
     let acct = accounting_suffix(dropped, 0);
     println!(
@@ -2636,7 +2724,7 @@ async fn run_session<V: Vmm>(
         Err(e) => anyhow::bail!("session: boot failed: {e}"),
     };
     if let Err(e) = vm.steward(None).await {
-        let _ = vm.shutdown().await;
+        best_effort::shutdown(vm).await;
         anyhow::bail!("session: steward connect failed: {e}");
     }
     let argv = pick_exec_cmd(&mut vm).await;
@@ -2651,6 +2739,8 @@ async fn run_session<V: Vmm>(
         if let Ok(mux) = vm.connect_sessions(None).await
             && let Ok(mut s) = mux.open_spec(SessionSpecBuilder::new(argv.clone())).await
         {
+            // Warmup: the session runs to completion to prime the path; its exit code is not a
+            // sample, and a session that failed to open was already filtered by the `if let`.
             let _ = s.wait().await;
         }
     }
@@ -2683,12 +2773,14 @@ async fn run_session<V: Vmm>(
     let mux = match vm.connect_sessions(None).await {
         Ok(m) => m,
         Err(e) => {
-            let _ = vm.shutdown().await;
+            best_effort::shutdown(vm).await;
             anyhow::bail!("session: mux connect failed: {e}");
         }
     };
     for _ in 0..args.warmup {
         if let Ok(mut s) = mux.open_spec(SessionSpecBuilder::new(argv.clone())).await {
+            // Warmup: the session runs to completion to prime the path; its exit code is not a
+            // sample, and a session that failed to open was already filtered by the `if let`.
             let _ = s.wait().await;
         }
     }
@@ -2712,7 +2804,7 @@ async fn run_session<V: Vmm>(
         }
     }
     drop(mux);
-    let _ = vm.shutdown().await;
+    best_effort::shutdown(vm).await;
 
     println!("=== SESSION (backend={backend} cmd={argv:?}) ===");
     let acct_c = accounting_suffix(conn_dropped, 0);
@@ -2776,7 +2868,18 @@ impl Drop for DaemonChild {
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
+        // The escalation after a 5 s SIGTERM grace. `Drop` cannot report and must not unwind; a
+        // `kill`/`wait` that fails here means the child is already gone, which is the outcome
+        // wanted anyway.
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "Drop-path SIGKILL escalation: a failure means the child is already reaped, which is the goal"
+        )]
         let _ = self.0.kill();
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "same Drop path: reaping a child that is already gone is not an actionable error"
+        )]
         let _ = self.0.wait();
     }
 }

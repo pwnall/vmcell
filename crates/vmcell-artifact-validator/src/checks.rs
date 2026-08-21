@@ -27,6 +27,30 @@ use crate::conformance::ProbeOutcome;
 use crate::harness::{cgroup_memory_delegated, try_start_vm};
 use crate::{ArtifactSet, CheckOutcome, Level};
 
+/// Tears a probe VM down once its check's verdict has already been decided, reporting a failure
+/// rather than discarding it.
+///
+/// WHY NOT PROPAGATING IS CORRECT HERE, and why this is a function rather than eleven bare
+/// `let _ =` statements (AGENTS.md "Fail loud", plus its Suppressions rule — *route repeated
+/// legitimate sites through one helper*):
+///
+///   * The verdict is **already recorded**. Every call site sits after a `record(…)`, a `return
+///     Err(…)`, or the last observation the check makes. Turning a teardown error into the check's
+///     answer would report a *host* problem as an *artifact* contract violation, which is the one
+///     thing this crate must never do.
+///   * Teardown is not skipped, only its graceful half: [`MicroVm`]'s `Drop` is the guaranteed,
+///     ordered path (AGENTS.md "Teardown is ownership"), so a failed `shutdown()` leaks nothing.
+///   * It is still **said out loud**, at `warn!`, because a run where every VM failed to shut down
+///     gracefully is a run whose host is in trouble — and that used to be invisible.
+async fn shutdown_after_check<V: Vmm>(vm: MicroVm<V>) {
+    if let Err(e) = vm.shutdown().await {
+        tracing::warn!(
+            "artifact-validator: graceful VM shutdown failed after a check ({e}); \
+             MicroVm::Drop is the guaranteed teardown"
+        );
+    }
+}
+
 /// The steward-handshake budget every check allows before it calls the boot failed (§9.4: deadlines
 /// are outer-bounds-inner — this is the outer bound `StewardClient` turns into its `Instant`).
 /// **One** statement of the number: an inline per-call 60-second literal anywhere in this module is
@@ -635,7 +659,7 @@ pub async fn xattr_preserved_probe<V: Vmm>(vmm: &V, a: &ArtifactSet) -> ProbeOut
     let req =
         ExecRequest::new(vec!["sh".into(), "-c".into(), program]).with_timeout(XATTR_SCAN_BUDGET);
     let outcome = steward.exec(req).await;
-    let _ = vm.shutdown().await;
+    shutdown_after_check(vm).await;
     match outcome {
         Ok(out) => classify_xattr_scan(
             out.code,
@@ -766,7 +790,7 @@ pub async fn concurrency_distinct_ids<V: Vmm>(vmm: &V, a: &ArtifactSet) -> Resul
         if out.code != 0 {
             return Err(format!("concurrent VM exec `true` exited {}", out.code));
         }
-        let _ = vm.shutdown().await;
+        shutdown_after_check(vm).await;
     }
     Ok(())
 }
@@ -875,7 +899,7 @@ async fn snapshot_restore_attempt<V: Vmm>(vmm: &V, a: &ArtifactSet) -> Result<()
     vm.snapshot(snap_dir.path())
         .await
         .map_err(|e| ProbeStop::Exercised(format!("snapshot() failed: {e}")))?;
-    let _ = vm.shutdown().await;
+    shutdown_after_check(vm).await;
 
     let mut restored = MicroVm::restore(vmm, snap_dir.path(), cfg, &env)
         .await
@@ -912,7 +936,7 @@ async fn snapshot_restore_attempt<V: Vmm>(vmm: &V, a: &ArtifactSet) -> Result<()
             out.code
         )));
     }
-    let _ = restored.shutdown().await;
+    shutdown_after_check(restored).await;
     Ok(())
 }
 
@@ -948,6 +972,14 @@ pub async fn metrics_mem_limit_ooms<V: Vmm>(
                 .await);
             }
         };
+        // The exec is EXPECTED to fail: `tail /dev/zero` is a runaway allocation whose whole job
+        // is to trip the host OOM killer, which usually takes the guest — and sometimes the VMM —
+        // with it. The binding signal is the host `memory.events` counter read below, never this
+        // call's outcome, so an error here is the check working.
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "the OOM probe is expected to die with its guest; the host memory.events counter below is the binding signal"
+        )]
         let _ = exec(steward, &["tail", "/dev/zero"]).await;
     }
     for _ in 0..50 {
@@ -1148,7 +1180,7 @@ async fn run_core_inner<V: Vmm>(
                 explain_boot_failure_for(&vm, &steward_handshake_base(&e, STEWARD_READY_BUDGET))
                     .await;
             record(outcomes, "boot.steward_ready", Level::Core, Err(msg));
-            let _ = vm.shutdown().await;
+            shutdown_after_check(vm).await;
             return Some(
                 "not attempted: the guest never reached steward-ready (see boot.steward_ready)"
                     .into(),
@@ -1164,7 +1196,7 @@ async fn run_core_inner<V: Vmm>(
         }
         Err(msg) => {
             record(outcomes, "steward.exec_roundtrip", Level::Core, Err(msg));
-            let _ = vm.shutdown().await;
+            shutdown_after_check(vm).await;
             return Some(
                 "not attempted: the steward connection was lost after the handshake (see \
                  steward.exec_roundtrip)"
@@ -1271,7 +1303,7 @@ async fn run_extended_inner<V: Vmm>(vmm: &V, a: &ArtifactSet, outcomes: &mut Vec
                         Level::Extended,
                         net_ip_pnp(&mut vm).await,
                     );
-                    let _ = vm.shutdown().await;
+                    shutdown_after_check(vm).await;
                 }
             },
         }
@@ -1340,7 +1372,7 @@ async fn run_extended_inner<V: Vmm>(vmm: &V, a: &ArtifactSet, outcomes: &mut Vec
                             .await),
                         };
                         record(outcomes, "nested.kvm_ok", Level::Extended, res);
-                        let _ = vm.shutdown().await;
+                        shutdown_after_check(vm).await;
                     }
                 }
             }
@@ -1388,7 +1420,7 @@ async fn run_extended_inner<V: Vmm>(vmm: &V, a: &ArtifactSet, outcomes: &mut Vec
                             )
                             .await,
                         );
-                        let _ = vm.shutdown().await;
+                        shutdown_after_check(vm).await;
                     }
                 }
             }
@@ -1486,7 +1518,7 @@ async fn run_shares_check<V: Vmm>(vmm: &V, a: &ArtifactSet, outcomes: &mut Vec<C
                 .await),
             };
             record(outcomes, "virtiofs.shares", Level::Extended, res);
-            let _ = vm.shutdown().await;
+            shutdown_after_check(vm).await;
         }
     }
 }
@@ -1568,7 +1600,7 @@ async fn run_full_inner<V: Vmm>(vmm: &V, a: &ArtifactSet, outcomes: &mut Vec<Che
                             Level::Full,
                             metrics_mem_limit_ooms(&mut vm, &resource_prefix).await,
                         );
-                        let _ = vm.shutdown().await;
+                        shutdown_after_check(vm).await;
                     }
                 }
             }

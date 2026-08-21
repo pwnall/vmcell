@@ -324,12 +324,27 @@ impl Drop for VirtioFsDaemon {
         #[cfg(feature = "experiment-fuse")]
         {
             if let Some(notifier) = self.kill_notifier.take() {
+                // A wakeup poke so the in-process worker observes the kill flag promptly. If the eventfd
+                // write fails the worker still exits via the bounded join below, so the poke is an
+                // optimization of teardown latency and never its correctness.
+                #[expect(
+                    clippy::let_underscore_must_use,
+                    reason = "wakeup poke on a Drop path: the bounded join below is what actually ends the worker"
+                )]
                 let _ = notifier.notify();
             }
             if let Some(h) = self.handle.take() {
+                #[expect(
+                    clippy::let_underscore_must_use,
+                    reason = "Drop must not unwind: the worker thread's panic payload is dropped, never resumed"
+                )]
                 let _ = h.join();
             }
         }
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "Drop cannot report, and the VmTempDir guard removes the whole per-VM dir afterwards"
+        )]
         let _ = std::fs::remove_file(&self.socket_path);
     }
 }

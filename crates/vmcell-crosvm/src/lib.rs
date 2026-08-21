@@ -49,6 +49,17 @@
         clippy::print_stdout,
         clippy::print_stderr,
         clippy::dbg_macro,
+        // AGENTS.md "Fail loud": no bare `let _ =` on a `Result`. `let_underscore_must_use` is the
+        // narrowest instrument rustc/clippy has for that rule — and it is deliberately BROADER on
+        // one axis, firing on any `#[must_use]` expression (a detached `JoinHandle`, a discarded
+        // `Instant`), which is the same defect one step out: the compiler said this matters and the
+        // code said nothing back. Scoped `not(test)` like every lint in this block: the rule's
+        // stated harms (a swallowed teardown failure, a lost write, a wedged session) are
+        // production harms, and forcing a reason onto a test's `try_init()` would manufacture the
+        // hollow suppressions AGENTS.md rule 2 calls theater. `crates/vmcell/tests/lint_roster.rs`
+        // is the gate that this line exists in EVERY crate root, so a new crate cannot opt out by
+        // being new.
+        clippy::let_underscore_must_use,
         clippy::allow_attributes,               // B11: prefer #[expect] over #[allow] in prod code
         clippy::allow_attributes_without_reason  // B11: every suppression states why
     )
@@ -728,6 +739,10 @@ impl Crosvm {
         // Re-spawn safety: `MicroVm::start`'s health-gate may recreate a VM on the SAME per-VM dir;
         // a stale bound control socket left in the dir would make crosvm fail to bind. Pre-clean
         // (a no-op, and thus harmless, on the first spawn when nothing exists yet).
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "re-spawn pre-clean whose expected outcome is NotFound; crosvm's own bind below reports a socket it cannot create"
+        )]
         let _ = tokio::fs::remove_file(&control_socket).await;
 
         let cmdline = vmcell::config::build_kernel_cmdline(cfg, res, "")?;
@@ -1161,6 +1176,10 @@ impl Drop for CrosvmInstance {
         self.group.reap_now(&mut self.process);
         // Unlink our own control socket; the per-VM directory itself is owned and removed once by
         // the orchestrator's `VmTempDir` guard after this instance is dropped. Mirrors CH/QEMU.
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "Drop cannot report, and the VmTempDir guard removes the whole per-VM dir afterwards"
+        )]
         let _ = std::fs::remove_file(&self.control_socket);
     }
 }

@@ -31,6 +31,17 @@
         clippy::print_stdout,
         clippy::print_stderr,
         clippy::dbg_macro,
+        // AGENTS.md "Fail loud": no bare `let _ =` on a `Result`. `let_underscore_must_use` is the
+        // narrowest instrument rustc/clippy has for that rule — and it is deliberately BROADER on
+        // one axis, firing on any `#[must_use]` expression (a detached `JoinHandle`, a discarded
+        // `Instant`), which is the same defect one step out: the compiler said this matters and the
+        // code said nothing back. Scoped `not(test)` like every lint in this block: the rule's
+        // stated harms (a swallowed teardown failure, a lost write, a wedged session) are
+        // production harms, and forcing a reason onto a test's `try_init()` would manufacture the
+        // hollow suppressions AGENTS.md rule 2 calls theater. `crates/vmcell/tests/lint_roster.rs`
+        // is the gate that this line exists in EVERY crate root, so a new crate cannot opt out by
+        // being new.
+        clippy::let_underscore_must_use,
         clippy::allow_attributes,               // B11: prefer #[expect] over #[allow] in prod code
         clippy::allow_attributes_without_reason  // B11: every suppression states why
     )
@@ -99,7 +110,18 @@ pub struct QemuInstance {
     /// `has_exited` and `Drop` all route through it, so no copy can forget the M-VMM-1
     /// guard and SIGKILL a pgid the kernel has since recycled.
     group: vmcell::vmm::VmmProcessGroup,
-    vsock_pgid: Option<u32>,
+    /// The **external `vhost-device-vsock` daemon's** process group, carried in the same shared
+    /// type as the VMM leader's above rather than as a bare `Option<u32>` beside a hand-rolled
+    /// `kill(-pgid)`/`wait` pair.
+    ///
+    /// The pair was the last copy of the negated-pgid law outside `vmcell` (two spellings, one in
+    /// `kill()` and one in `Drop`), and `vmcell::vmm`'s own rustdoc calls its single site "the ONE
+    /// site in the crate that discards a `kill(-pgid)` result" — true of that crate, and this is
+    /// what makes it true of the workspace. Routing through [`vmcell::vmm::VmmProcessGroup`] also
+    /// buys the M-VMM-1 guard the hand-rolled copies never had: once the daemon is reaped the
+    /// kernel may recycle its pgid, and the flag is what stops a second signal landing on an
+    /// unrelated group.
+    vsock_group: vmcell::vmm::VmmProcessGroup,
     /// The guest's RAM size, carried from [`vmcell::config::VmConfig::mem_mib`] at
     /// construction, because the snapshot's migration stream is a function of it
     /// ([`vmcell::vmm::snapshot_request_timeout`], M6): the stream is guest RAM plus
@@ -274,7 +296,7 @@ impl QemuInstance {
             has_vhost_user_device,
             snapshot_restore_capable,
             group: vmcell::vmm::VmmProcessGroup::new(pgid),
-            vsock_pgid,
+            vsock_group: vmcell::vmm::VmmProcessGroup::new(vsock_pgid),
             mem_mib,
             usb_claim,
         }
@@ -813,6 +835,10 @@ impl Qemu {
         // fail to bind. Pre-clean like FC does for its api socket; a no-op (and thus
         // harmless) on the first spawn, when nothing exists yet.
         for stale in [&qmp_socket, &vsock_path, &vhost_vsock] {
+            #[expect(
+                clippy::let_underscore_must_use,
+                reason = "pre-clean whose expected outcome is NotFound; the fresh daemon/QEMU bind below is what reports a socket it cannot create"
+            )]
             let _ = tokio::fs::remove_file(stale).await;
         }
 
@@ -1511,6 +1537,14 @@ impl VmInstance for QemuInstance {
     }
 
     async fn kill(&mut self) -> Result<()> {
+        // A courtesy `quit` so QEMU can flush before the SIGKILL below. Both arms of the discard
+        // are expected: the QMP socket may already be dead, and the 500 ms cap may elapse on a
+        // wedged monitor. `kill_and_wait` immediately after is the guaranteed teardown, so the
+        // graceful attempt owes nobody an answer.
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "courtesy QMP quit before the guaranteed SIGKILL below; both a dead monitor and an elapsed cap are expected"
+        )]
         let _ = tokio::time::timeout(
             std::time::Duration::from_millis(500),
             self.qmp_command("{\"execute\": \"quit\"}"),
@@ -1527,13 +1561,10 @@ impl VmInstance for QemuInstance {
         self.usb_claim.restore();
 
         if let Some(mut d) = self._vsock_daemon.take() {
-            if let Some(v_pgid) = self.vsock_pgid {
-                let _ = nix::sys::signal::kill(
-                    nix::unistd::Pid::from_raw(-(v_pgid as i32)),
-                    nix::sys::signal::Signal::SIGKILL,
-                );
-            }
-            let _ = d.wait().await;
+            // Same shared signal/wait/flag sequence as the VMM leader above (L1), applied to the
+            // external vhost-device-vsock daemon: SIGKILL the group unless it was already reaped,
+            // await the leader, record the reap.
+            self.vsock_group.kill_and_wait(&mut d).await;
         }
         Ok(())
     }
@@ -1647,16 +1678,11 @@ impl Drop for QemuInstance {
         // vhost-user daemons next: the external vhost-device-vsock and each virtiofsd
         // own sockets that live inside `tmp_dir`, so they must be reaped before that
         // directory is removed.
-        if let Some(d) = self._vsock_daemon.as_mut()
-            && let Some(v_pgid) = self.vsock_pgid
-        {
-            let _ = nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(-(v_pgid as i32)),
-                nix::sys::signal::Signal::SIGKILL,
-            );
-            if let Some(pid) = d.id() {
-                let _ = nix::sys::wait::waitpid(nix::unistd::Pid::from_raw(pid as i32), None);
-            }
+        if let Some(d) = self._vsock_daemon.as_mut() {
+            // The synchronous form of the same helper `kill()` uses, and idempotent with it: if
+            // `kill()` already reaped this daemon the flag makes this a no-op instead of a SIGKILL
+            // to a pgid the kernel may since have recycled (M-VMM-1).
+            self.vsock_group.reap_now(d);
         }
         // Dropping each virtiofsd kills it and removes its own socket before the
         // orchestrator removes the shared per-VM directory.
@@ -1664,7 +1690,17 @@ impl Drop for QemuInstance {
         // Unlink our own sockets. The per-VM directory itself is owned and removed
         // once by the orchestrator's `VmTempDir` guard (after this instance and the
         // smoltcp process are dropped), not here. Mirrors CH.
+        // Drop cannot report. These are our own sockets inside the per-VM scratch dir, which the
+        // orchestrator's `VmTempDir` guard removes wholesale afterwards.
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "Drop cannot report, and the VmTempDir guard removes the whole per-VM dir afterwards"
+        )]
         let _ = std::fs::remove_file(&self.qmp_socket);
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "same Drop path, same guard-owned directory: an unlink failure is undone by VmTempDir"
+        )]
         let _ = std::fs::remove_file(&self.vsock_path);
     }
 }
@@ -2835,7 +2871,7 @@ mod tests {
             usb_claim: vmcell::vmm::usb::UsbHostClaim::default(),
             snapshot_restore_capable: true,
             group: vmcell::vmm::VmmProcessGroup::new(pgid),
-            vsock_pgid: None,
+            vsock_group: vmcell::vmm::VmmProcessGroup::new(None),
             mem_mib,
         }
     }
@@ -3038,7 +3074,7 @@ mod tests {
             // The recycled-pgid state, which only the `test-support` constructor can
             // fabricate: no production path can mark a group reaped over a foreign pgid.
             group: vmcell::vmm::VmmProcessGroup::already_reaped_for_test(Some(decoy_pid as u32)),
-            vsock_pgid: None,
+            vsock_group: vmcell::vmm::VmmProcessGroup::new(None),
             mem_mib: 128,
         };
         // `kill()` first tries a QMP `quit` against an absent socket; that fails fast and

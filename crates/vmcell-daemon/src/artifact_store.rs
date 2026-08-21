@@ -303,6 +303,13 @@ fn hex_sha256(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(64);
     for b in digest {
         use std::fmt::Write as _;
+        // `fmt::Write` on a `String` is infallible — `String`'s impl returns `Ok` unconditionally.
+        // The `Result` exists only because the trait is shared with fallible sinks, and the
+        // capacity is reserved above, so there is nothing here that can fail or be reported.
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "fmt::Write on a String cannot fail: the impl returns Ok unconditionally and the capacity is pre-reserved"
+        )]
         let _ = write!(s, "{b:02x}");
     }
     s

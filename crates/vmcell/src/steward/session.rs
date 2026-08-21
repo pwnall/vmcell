@@ -300,6 +300,10 @@ impl SessionMux {
     async fn kill_writer_for_test(&mut self) {
         self.writer.abort();
         let old = std::mem::replace(&mut self.writer, tokio::spawn(async {}));
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "awaiting an aborted JoinHandle: the Cancelled error IS the wanted outcome, since the point is that the task has unwound"
+        )]
         let _ = old.await;
     }
 }
@@ -451,6 +455,13 @@ fn deliver(registry: &Registry, session: SessionId, ev: SessionEvent) {
     // unknown session, never a panic: only the reader task delivers, and it does
     // so strictly before its own terminal close, so this arm is belt-and-braces.
     if let Some(tx) = reg.as_ref().and_then(|sessions| sessions.get(&session)) {
+        // The session's own event channel. A send fails only when the `Session` handle was
+        // dropped while a frame was still in flight — the else-arm below already debug-drops the
+        // same class for an unknown/closed session, and this is that case one instant later.
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "the Session handle was dropped mid-flight; the else-arm below debug-drops the identical class"
+        )]
         let _ = tx.send(ev);
     } else {
         tracing::debug!(

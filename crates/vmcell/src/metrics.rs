@@ -335,6 +335,14 @@ fn try_apply_limit_at(
             .map(|s| controller_listed(&s, controller))
             .unwrap_or(false);
         if !already_delegated {
+            // Deliberate, and load-bearing: a constrained or non-delegated cgroup layout silently
+            // IGNORES this write, so its success would prove nothing. The read-back immediately below
+            // is the authoritative check and returns a typed `CapabilityUnavailable` when the
+            // controller is still absent — never this write's Result.
+            #[expect(
+                clippy::let_underscore_must_use,
+                reason = "a non-delegated layout silently ignores this write, so the read-back below is the authoritative check, not the write"
+            )]
             let _ = std::fs::write(&subtree, format!("+{controller}"));
         }
         let delegated = std::fs::read_to_string(&subtree)

@@ -35,6 +35,17 @@
         clippy::print_stdout,                   // v3: a daemon logs via tracing, never stdout
         clippy::print_stderr,                   // v3: a daemon logs via tracing, never stderr
         clippy::dbg_macro,
+        // AGENTS.md "Fail loud": no bare `let _ =` on a `Result`. `let_underscore_must_use` is the
+        // narrowest instrument rustc/clippy has for that rule — and it is deliberately BROADER on
+        // one axis, firing on any `#[must_use]` expression (a detached `JoinHandle`, a discarded
+        // `Instant`), which is the same defect one step out: the compiler said this matters and the
+        // code said nothing back. Scoped `not(test)` like every lint in this block: the rule's
+        // stated harms (a swallowed teardown failure, a lost write, a wedged session) are
+        // production harms, and forcing a reason onto a test's `try_init()` would manufacture the
+        // hollow suppressions AGENTS.md rule 2 calls theater. `crates/vmcell/tests/lint_roster.rs`
+        // is the gate that this line exists in EVERY crate root, so a new crate cannot opt out by
+        // being new.
+        clippy::let_underscore_must_use,
         clippy::allow_attributes,               // B11: prefer #[expect] over #[allow] in prod code
         clippy::allow_attributes_without_reason  // B11: every suppression states why
     )
@@ -452,17 +463,47 @@ fn auth_policy(cli: &Cli) -> Result<AuthPolicy, i32> {
     }
 }
 
-/// Resolves when the process receives SIGINT (Ctrl-C) or SIGTERM.
+/// The one law both arms of [`shutdown_signal`] obey: a signal source that could **not be
+/// registered** must never resolve.
+///
+/// WHY THIS IS A FUNCTION AND NOT A `let _ =`. Both arms used to discard their registration
+/// `Result` — `let _ = tokio::signal::ctrl_c().await` and an `if let Ok(..)` whose else-arm simply
+/// fell out of the `async` block. In both spellings a failure to *install the handler* completes
+/// the future immediately, `select!` fires, and `serve` returns: the daemon shuts itself down the
+/// instant it starts serving, reporting nothing. That is the inverse of what the caller asked for
+/// — "resolve when the signal arrives" — and it is precisely the failure a discarded `Result`
+/// hides (AGENTS.md "Fail loud").
+///
+/// So the failure is logged at `error!` (the operator learns that this signal will no longer stop
+/// the daemon) and the future then parks forever: the daemon keeps serving, and the *other* arm,
+/// or a hard kill, is what stops it. Never-resolving is the honest answer, because no signal has
+/// been delivered.
+async fn unregistered_signal(name: &str, err: &std::io::Error) -> std::convert::Infallible {
+    tracing::error!(
+        "vmcelld: cannot listen for {name} ({err}); this signal will NOT stop the daemon. \
+         Shut it down with the other signal, or kill the process."
+    );
+    std::future::pending().await
+}
+
+/// Resolves when the process receives SIGINT (Ctrl-C) or SIGTERM — and **only** then. A signal
+/// source that cannot be registered parks forever via [`unregistered_signal`] rather than
+/// completing, so a registration failure can never masquerade as a delivered signal.
 async fn shutdown_signal() {
     let ctrl_c = async {
-        let _ = tokio::signal::ctrl_c().await;
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            unregistered_signal("SIGINT", &e).await;
+        }
     };
     #[cfg(unix)]
     let term = async {
-        if let Ok(mut sig) =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        {
-            sig.recv().await;
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(e) => {
+                unregistered_signal("SIGTERM", &e).await;
+            }
         }
     };
     #[cfg(not(unix))]
@@ -592,5 +633,55 @@ mod blessing_precondition_gate {
             full.add(c);
         }
         assert_eq!(blessing_verdict(0, &full, &PRIVILEGED_CAPS), Ok(()));
+    }
+}
+
+/// The gate for [`unregistered_signal`] (AGENTS.md rule 1: a fix lands with its gate).
+///
+/// RED ON THE INVERSE, verified: change the return type to `()` and drop the
+/// `std::future::pending().await` — i.e. let the arm complete, which is exactly what the pre-fix
+/// `let _ = tokio::signal::ctrl_c().await` did — and
+/// `a_signal_that_could_not_be_registered_never_resolves` fails while the positive control below
+/// stays green. The shipped defect was that completion: an un-installable handler resolving at
+/// once, `select!` firing, and `serve` returning the instant it started.
+///
+/// TWO HALVES, TWO GATES, because a green unit test beside an unchanged call site proves nothing.
+/// The `-> Infallible` return type makes falling out of [`unregistered_signal`] a **compile**
+/// error, this test proves it parks, and re-introducing `let _ = tokio::signal::ctrl_c().await` at
+/// the call site is now caught by `clippy::let_underscore_must_use` in this crate's `not(test)`
+/// deny block.
+#[cfg(test)]
+mod shutdown_signal_gate {
+    use std::time::Duration;
+
+    /// A registration failure must park forever, never complete. `select!` treats *completion* as
+    /// "the signal arrived", so a completing failure arm is an unrequested shutdown.
+    #[tokio::test]
+    async fn a_signal_that_could_not_be_registered_never_resolves() {
+        let err = std::io::Error::from_raw_os_error(libc::EPERM);
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(150),
+            super::unregistered_signal("SIGTEST", &err),
+        )
+        .await;
+        assert!(
+            outcome.is_err(),
+            "an unregistrable signal source must never resolve; it resolved, which is what makes \
+             `select!` shut the daemon down without anyone asking"
+        );
+    }
+
+    /// The positive control, so the assertion above is about *never resolving* and not about
+    /// `timeout` always elapsing: a future that does complete is observed completing under the same
+    /// budget and the same harness.
+    #[tokio::test]
+    async fn the_control_future_does_resolve_under_the_same_budget() {
+        let outcome =
+            tokio::time::timeout(Duration::from_millis(150), std::future::ready(())).await;
+        assert!(
+            outcome.is_ok(),
+            "positive control: a resolving future must be seen to resolve, or the never-resolves \
+             assertion above is vacuous"
+        );
     }
 }

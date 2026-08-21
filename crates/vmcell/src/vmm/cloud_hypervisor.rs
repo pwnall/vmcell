@@ -1016,7 +1016,15 @@ impl Drop for ChInstance {
         // Unlink our own sockets. The per-VM directory itself is owned and removed
         // once by the orchestrator's `VmTempDir` guard (after this instance and the
         // smoltcp process are dropped), not here.
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "Drop cannot report, and the VmTempDir guard removes the whole per-VM dir afterwards"
+        )]
         let _ = std::fs::remove_file(&self.api_socket);
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "same Drop path, same guard-owned directory: an unlink failure is undone by VmTempDir"
+        )]
         let _ = std::fs::remove_file(&self.vsock_path);
     }
 }

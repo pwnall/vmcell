@@ -17,8 +17,27 @@ use vmcell_protocol::{self as protocol, ExecRequest, Message};
 
 use crate::ServeContext;
 use crate::netif;
-use crate::serve::{Writer, send_msg};
+use crate::serve::{Writer, join_pump, send_msg};
 use crate::session::kill_group;
+
+/// Publishes one output/terminal frame on the one-shot exec's collector channel, best-effort.
+///
+/// WHY DISCARDING IS CORRECT, once, instead of at four call sites (AGENTS.md "Fail loud" plus its
+/// Suppressions rule): the receiver is the `for msg in rx` loop below, which **breaks on
+/// `Message::Exit`** and then drops `rx`. Every send that fails is therefore a chunk produced after
+/// the exec already reported its exit — a stdout pump still draining a pipe, or the timeout thread
+/// firing against a child that exited first. There is no consumer left, and creating one would mean
+/// holding the connection open past the answer it already gave.
+///
+/// Traced rather than dropped in silence, so a pump that kept producing after `Exit` is visible.
+/// The steward runs as PID 1 under the `Pid1` placement, so this path must not panic.
+fn publish_chunk(tx: &std::sync::mpsc::Sender<Message>, msg: Message) {
+    if tx.send(msg).is_err() {
+        tracing::debug!(
+            "vmcell-steward: exec output produced after the collector closed; dropping the frame"
+        );
+    }
+}
 
 pub(crate) fn handle_put_file(
     dst: &str,
@@ -258,7 +277,7 @@ pub(crate) fn handle_exec(
                             // `read` guarantees n <= buf.len(); `get(..n)` is the non-panicking
                             // spelling of that (indexing_slicing is denied in PID-1 code).
                             let chunk = buf.get(..n).unwrap_or_default().to_vec();
-                            let _ = tx_out.send(Message::Stdout(chunk));
+                            publish_chunk(&tx_out, Message::Stdout(chunk));
                         }
                         Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                         Err(_) => break,
@@ -273,7 +292,7 @@ pub(crate) fn handle_exec(
                         Ok(0) => break,
                         Ok(n) => {
                             let chunk = buf.get(..n).unwrap_or_default().to_vec();
-                            let _ = tx_err.send(Message::Stderr(chunk));
+                            publish_chunk(&tx_err, Message::Stderr(chunk));
                         }
                         Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                         Err(_) => break,
@@ -316,7 +335,10 @@ pub(crate) fn handle_exec(
                 std::thread::sleep(timeout);
                 if !has_exited_clone.load(std::sync::atomic::Ordering::Relaxed) {
                     kill_group(pid);
-                    let _ = tx_timeout.send(Message::Stderr(b"Command timed out\n".to_vec()));
+                    publish_chunk(
+                        &tx_timeout,
+                        Message::Stderr(b"Command timed out\n".to_vec()),
+                    );
                 }
             });
 
@@ -327,9 +349,9 @@ pub(crate) fn handle_exec(
                 // stolen (the false-127 race).
                 let code = waiter_reaper.wait_for(pid);
                 has_exited.store(true, std::sync::atomic::Ordering::Relaxed);
-                let _ = out_handle.join();
-                let _ = err_handle.join();
-                let _ = tx.send(Message::Exit(code));
+                join_pump(out_handle);
+                join_pump(err_handle);
+                publish_chunk(&tx, Message::Exit(code));
             });
 
             for msg in rx {
