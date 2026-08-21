@@ -75,40 +75,20 @@ pub struct VirtioFsDaemon {
 }
 
 impl VirtioFsDaemon {
-    /// Starts a virtiofs daemon for the given share, paced by the **default**
-    /// [`Timeouts`](crate::config::Timeouts) profile.
-    ///
-    /// Deprecated, and with no production caller left: §9.4 makes `api_socket_poll` pace **every**
-    /// daemon readiness wait, so a second entry point that can only supply the default cadence
-    /// *is* the divergence "one law, one predicate" forbids — a future caller reaching for the
-    /// shorter name would silently re-pin virtiofsd's wait to the default under `low_latency()`
-    /// or `throughput()` (finding `virtiofsd-socket-wait-hardcoded-cadence`). Every shipped site
-    /// passes its VM's `&cfg.timeouts` to [`start_paced`](Self::start_paced).
-    ///
-    /// It survives as a shim rather than being deleted only because removing a `pub fn` is a
-    /// `vmcell` API break, and an API break belongs to a deliberate, ledgered version bump
-    /// (AGENTS.md, "The downstream toolkit contract"), not to a defect fix — measured, not
-    /// assumed, that break would slip past `cargo semver-checks` here, which for a `0.x` crate
-    /// assumes the minor bump that is allowed to break, so the ledger rule is the only thing
-    /// holding it. `#[deprecated]` is what keeps the shim from becoming an accidental twin: under
-    /// CI's `RUSTFLAGS=-D warnings` any new caller — in this crate or a downstream one — fails to
-    /// build, while an existing downstream caller gets a warning naming the replacement instead of
-    /// a surprise breakage. Delete it in the next `vmcell` version bump.
-    ///
-    /// # Errors
-    /// Returns an error if the daemon fails to spawn or create the socket.
-    #[cfg(not(feature = "experiment-fuse"))]
-    #[deprecated(
-        since = "0.13.0",
-        note = "use `VirtioFsDaemon::start_paced(share, vm_tmp, &cfg.timeouts)`: §9.4 paces every \
-                daemon readiness wait with the caller's profile, not the default one"
-    )]
-    pub async fn start(share: &Share, vm_tmp: &Path) -> crate::error::Result<Self> {
-        Self::start_paced(share, vm_tmp, &crate::config::Timeouts::default()).await
-    }
-
     /// Starts a virtiofs daemon (using the standalone `virtiofsd` binary) for the given share,
     /// pacing its socket-readiness wait with `timeouts.api_socket_poll` (§9.4).
+    ///
+    /// **The one entry point.** §9.4 makes `api_socket_poll` pace *every* daemon readiness wait,
+    /// so a second, shorter entry point that can only supply the default cadence *is* the
+    /// divergence "one law, one predicate" forbids: a caller reaching for it would silently re-pin
+    /// virtiofsd's wait to the default profile under `low_latency()` or `throughput()` (finding
+    /// `virtiofsd-socket-wait-hardcoded-cadence`). Such a shim — `start(share, vm_tmp)`, deprecated
+    /// since 0.13.0 — did sit here, kept alive only because removing a `pub fn` is a `vmcell` API
+    /// break that belongs to a ledgered version bump rather than to a defect fix; it was deleted on
+    /// the 0.22 → 0.23 edge (see that crate's contract ledger, and §10.4). Callers that want the
+    /// default cadence pass `&Timeouts::default()` explicitly, which is a visible choice rather
+    /// than an invisible one. `virtiofsd_declares_exactly_one_start_entry_point` is what keeps the
+    /// twin from growing back, since nothing about a second `pub async fn` is a compile error.
     ///
     /// # Errors
     /// Returns an error if the daemon fails to spawn or create the socket.
@@ -256,25 +236,6 @@ impl VirtioFsDaemon {
             #[cfg(not(feature = "experiment-fuse"))]
             process: Some(process),
         })
-    }
-
-    /// Starts a virtiofs daemon for the given share, paced by the **default**
-    /// [`Timeouts`](crate::config::Timeouts) profile.
-    ///
-    /// Deprecated under this feature for the same reason as under the `virtiofsd`-subprocess
-    /// build, and shaped identically (shim → [`start_paced`](Self::start_paced)) so the two
-    /// builds cannot disagree about which entry point owns the start sequence.
-    ///
-    /// # Errors
-    /// Returns an error if the virtiofs daemon fails to start or bind to the socket.
-    #[cfg(feature = "experiment-fuse")]
-    #[deprecated(
-        since = "0.13.0",
-        note = "use `VirtioFsDaemon::start_paced(share, vm_tmp, &cfg.timeouts)`: §9.4 paces every \
-                daemon readiness wait with the caller's profile, not the default one"
-    )]
-    pub async fn start(share: &Share, vm_tmp: &Path) -> crate::error::Result<Self> {
-        Self::start_paced(share, vm_tmp, &crate::config::Timeouts::default()).await
     }
 
     /// Starts an in-process virtiofs daemon for the given share, for API parity with the
@@ -658,9 +619,9 @@ mod pre_exec_tests {
         let spawning_parent = libc::pid_t::try_from(std::process::id()).unwrap_or(-1);
 
         if std::env::var_os(MIDDLE_ENV).is_some() {
-            // Middle role: spawn a long-lived daemon stand-in exactly the way `start` spawns
-            // virtiofsd, report its pid, and park until the driver SIGKILLs us. `sleep` outlives
-            // the whole test unless something kills it, which is the point.
+            // Middle role: spawn a long-lived daemon stand-in exactly the way `start_paced`
+            // spawns virtiofsd, report its pid, and park until the driver SIGKILLs us. `sleep`
+            // outlives the whole test unless something kills it, which is the point.
             let mut cmd = std::process::Command::new("sleep");
             cmd.arg("60");
             // SAFETY: `pre_exec` runs the closure in the forked child before `execve`; it only
@@ -669,8 +630,9 @@ mod pre_exec_tests {
             unsafe {
                 cmd.pre_exec(move || super::helper_daemon_pre_exec(spawning_parent));
             }
-            // Held (not dropped early) for the same reason `start` holds virtiofsd's `Child`: the
-            // pid must not be recycled while the driver is watching it. std does not kill on drop.
+            // Held (not dropped early) for the same reason `start_paced` holds virtiofsd's
+            // `Child`: the pid must not be recycled while the driver is watching it. std does not
+            // kill on drop.
             #[expect(
                 clippy::zombie_processes,
                 reason = "this middle process is SIGKILLed by the driver on purpose, so it can \
@@ -778,8 +740,8 @@ mod drop_reaps_tests {
         cmd.arg("10");
         let spawning_parent = libc::pid_t::try_from(std::process::id()).unwrap_or(-1);
         // Routed through the production `pre_exec` body rather than a hand-copied `setpgid` so the
-        // fixture cannot drift from what `start` actually spawns (it is a test fixture, not a
-        // helper daemon; inheriting PR_SET_PDEATHSIG is harmless — `Drop` kills it first).
+        // fixture cannot drift from what `start_paced` actually spawns (it is a test fixture,
+        // not a helper daemon; inheriting PR_SET_PDEATHSIG is harmless — `Drop` kills it first).
         // SAFETY: `pre_exec` runs the closure in the forked child before `execve`; it only calls
         // `helper_daemon_pre_exec`, which is async-signal-safe and non-allocating (proven at its
         // definition), on a captured scalar.
@@ -829,9 +791,9 @@ mod ro_share_tests {
     // `io::Error` was formerly wrapped into. This goes red if the refusal regresses to
     // `Subprocess` (or, worse, silently mounts the share read-write).
     //
-    // Driven through the paced entry point (not the deprecated `start` shim) for the same reason
-    // the production sites are: `start` is `#[deprecated]`, so under `-D warnings` a caller here
-    // would not compile.
+    // Driven through `start_paced` because it is the ONLY entry point: the unpaced `start` shim
+    // that used to sit beside it was deleted in the 0.22 -> 0.23 bump (ledgered), so a caller
+    // reaching for the shorter name is now a compile error rather than a deprecation warning.
     #[tokio::test]
     async fn ro_share_is_unsupported_not_subprocess() {
         let tmp = std::env::temp_dir().join(format!(
@@ -854,5 +816,153 @@ mod ro_share_tests {
             "expected a typed Unsupported naming virtio_fs_shares, got {err:?}"
         );
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+}
+
+/// Declaration-side gate for §9.4's "`api_socket_poll` paces **every** … daemon readiness wait":
+/// this module exposes exactly **one** way to start a virtiofs daemon, and it is the paced one.
+///
+/// Why a scan, and why on the declaration rather than the call. The two backends that start
+/// virtiofs daemons already gate their own *call sites*
+/// (`every_virtiofs_start_here_is_paced_by_the_vm_config`, once in `vmm::cloud_hypervisor` and
+/// once in `vmcell-qemu`), so an in-tree caller of an unpaced twin reddens there. Neither scan can
+/// see a twin that is *declared* and never called in-tree — which is exactly the shape the
+/// `#[deprecated]` `start(share, vm_tmp)` shim had across the ten releases from 0.13.0 to its
+/// deletion here: reachable only by a downstream consumer, where the mispacing would be invisible
+/// to this repo entirely. Adding a
+/// second `pub async fn` beside [`VirtioFsDaemon::start_paced`] is not a compile error and moves
+/// no signature `cargo semver-checks` reads, so a scan is the only thing that can go red on it
+/// (AGENTS.md, "One law, one predicate").
+///
+/// Vacuity: the roster is asserted to be **exactly** [`EXPECTED_DECLARATIONS`] entries, so a scan
+/// that matched nothing — a rename, a normalizer that ate the whole file — fails as a
+/// misconfigured gate instead of passing over an empty set, and
+/// [`the_scanner_reports_nothing_on_empty_source`] is the leg that proves that arm reachable.
+#[cfg(test)]
+mod one_start_entry_point_gate {
+    /// This module's own source text. `include_str!` resolves relative to this file's directory,
+    /// so a rename or a move of `fs.rs` is a compile error here rather than a silently empty scan,
+    /// and rustc records the read in its dep-info so a stale copy is unreachable.
+    const SOURCE: &str = include_str!("fs.rs");
+
+    /// The name of the one entry point (§9.4): it takes the caller's `&Timeouts`, so the cadence
+    /// is always the VM's own profile and never a default baked in by the callee.
+    const THE_PACED_ENTRY_POINT: &str = "start_paced";
+
+    /// How many declarations of it this file ships: one per `experiment-fuse` arm (the
+    /// `virtiofsd`-subprocess build and the in-process one), which is why the count is 2 and not 1
+    /// — the scan reads text, so both `#[cfg]` arms are always visible to it.
+    const EXPECTED_DECLARATIONS: usize = 2;
+
+    /// `source`'s production text: everything before its first test module, comment lines dropped
+    /// and whitespace collapsed.
+    ///
+    /// Dropping comments keeps a rustdoc mention of an entry point (this file's own
+    /// `start_paced` doc names the deleted shim, in prose) from being scanned as a declaration;
+    /// collapsing whitespace keeps a rustfmt line break from hiding half of one. The truncation
+    /// looks for both spellings this file uses — the plain `#[cfg(test)]` on the module below and
+    /// the `#[cfg(all(test, …))]` on the ones above it — because cutting at only the first would
+    /// leave several test modules inside the "production" half.
+    ///
+    /// Deliberately local rather than shared with `vmm::cloud_hypervisor`'s identically-shaped
+    /// normalizer: that one is `pub(super)` inside a `#[cfg(test)]` module of a
+    /// feature-gated backend, so it is unreachable from here, and it truncates on one marker where
+    /// this file needs two. This is a test-local reader of one law, not a second law.
+    fn production_code(source: &str) -> String {
+        let cut = ["#[cfg(test)]", "#[cfg(all(test"]
+            .iter()
+            .filter_map(|marker| source.find(marker))
+            .min()
+            .unwrap_or(source.len());
+        source[..cut]
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.starts_with("//"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// The name of every `pub async fn` declared in `code`.
+    fn public_async_fn_names(code: &str) -> Vec<&str> {
+        const DECL: &str = "pub async fn ";
+        code.match_indices(DECL)
+            .map(|(at, _)| {
+                let tail = &code[at + DECL.len()..];
+                &tail[..tail.find(['(', '<', ' ']).unwrap_or(tail.len())]
+            })
+            .collect()
+    }
+
+    /// The law, as a predicate over a scanned roster: every publicly declared start entry point is
+    /// the paced one, and the roster is **non-empty** — a scan that matched nothing is a
+    /// misconfigured gate, never a pass.
+    fn roster_is_only_the_paced_entry_point(names: &[&str]) -> bool {
+        !names.is_empty() && names.iter().all(|name| *name == THE_PACED_ENTRY_POINT)
+    }
+
+    #[test]
+    fn virtiofsd_declares_exactly_one_start_entry_point() {
+        let code = production_code(SOURCE);
+        let names = public_async_fn_names(&code);
+        assert_eq!(
+            names.len(),
+            EXPECTED_DECLARATIONS,
+            "gate misconfigured or the surface moved: expected {EXPECTED_DECLARATIONS} public \
+             async entry points (one `{THE_PACED_ENTRY_POINT}` per `experiment-fuse` arm), found \
+             {}: {names:?}. If one was legitimately added or removed, update \
+             EXPECTED_DECLARATIONS — do not delete the scan.",
+            names.len()
+        );
+        assert!(
+            roster_is_only_the_paced_entry_point(&names),
+            "§9.4: every public virtio-fs start entry point must be `{THE_PACED_ENTRY_POINT}`, \
+             which takes the caller's `&Timeouts`; found {names:?}. A convenience twin that bakes \
+             in the default cadence re-pins virtiofsd's readiness wait under `low_latency()` and \
+             `throughput()` — pass `&Timeouts::default()` at the call site instead."
+        );
+    }
+
+    /// The gate's own red-on-inverse: the predicate rejects the shim that was actually deleted on
+    /// the 0.22 → 0.23 edge, and rejects the empty roster a vacuous scan would produce.
+    #[test]
+    fn the_predicate_rejects_the_deleted_shim_and_an_empty_scan() {
+        assert!(!roster_is_only_the_paced_entry_point(&[
+            "start",
+            "start_paced"
+        ]));
+        assert!(!roster_is_only_the_paced_entry_point(&["start_unpaced"]));
+        assert!(!roster_is_only_the_paced_entry_point(&[]));
+        assert!(roster_is_only_the_paced_entry_point(&[
+            "start_paced",
+            "start_paced"
+        ]));
+    }
+
+    /// The scanner's controls: a rustdoc mention of an entry point is not a declaration, a
+    /// declaration split across rustfmt lines is still read whole, and a declaration inside a test
+    /// module is not production surface. Goes red if the normalizer stops stripping comments (the
+    /// prose `start(share, vm_tmp)` in this file's own rustdoc would then scan as a twin).
+    #[test]
+    fn the_scanner_reads_declarations_not_prose() {
+        let synthetic = "/// Such a shim — pub async fn start(share, vm_tmp) — did sit here.\n\
+             #[cfg(not(feature = \"experiment-fuse\"))]\n\
+             pub async fn start_paced(\n    share: &Share,\n) -> Result<Self> {}\n\
+             #[cfg(test)]\nmod tests { pub async fn start(x) {} }";
+        let code = production_code(synthetic);
+        let names = public_async_fn_names(&code);
+        assert_eq!(names, ["start_paced"], "got {names:?}");
+        assert!(roster_is_only_the_paced_entry_point(&names));
+    }
+
+    /// The zero-file leg, stated rather than implied: an empty scan yields an empty roster, which
+    /// is why [`virtiofsd_declares_exactly_one_start_entry_point`]'s exact-count assertion is what
+    /// makes a misconfigured gate red instead of green.
+    #[test]
+    fn the_scanner_reports_nothing_on_empty_source() {
+        assert!(public_async_fn_names(&production_code("")).is_empty());
+        assert!(
+            public_async_fn_names(&production_code("#[cfg(test)] pub async fn start(x) {}"))
+                .is_empty()
+        );
     }
 }

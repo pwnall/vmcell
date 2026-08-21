@@ -26,7 +26,7 @@ pub mod backend {
     use smoltcp::time::Instant;
     use smoltcp::wire::{
         EthernetAddress, EthernetFrame, EthernetProtocol, HardwareAddress, IpAddress, IpCidr,
-        IpProtocol, Ipv4Address, Ipv4Packet, TcpPacket,
+        IpListenEndpoint, IpProtocol, Ipv4Address, Ipv4Packet, TcpPacket,
     };
 
     const VIRTIO_F_VERSION_1: u32 = 32;
@@ -915,6 +915,37 @@ pub mod backend {
         }
     }
 
+    /// The **one** law for *where* a permanent NAT forward-port listener accepts: the VM's own
+    /// `/30` gateway address (`10.200.<n>.1`), never "any destination" (C7).
+    ///
+    /// [`Egress::Open`](crate::config::Egress::Open) selects "no interception proxy"; it is not
+    /// arbitrary outbound egress, and on this datapath the only destination it admits is the
+    /// §6.3 host endpoint the guest reaches *at its gateway*. The interface runs with
+    /// `set_any_ip(true)` — load-bearing for
+    /// [`Egress::Filtered`](crate::config::Egress::Filtered)'s transparent L4 interception
+    /// (§6.4), which must see a SYN addressed anywhere — and smoltcp's `TcpSocket::accepts`
+    /// treats a listen endpoint whose `addr` is `None` as matching **every** destination
+    /// address. Those two together made a bare `listen(port)` forward *arbitrary* destinations:
+    /// a guest dialing `93.184.216.34:<host_services_port>` was accepted by the NAT and spliced
+    /// onto `127.0.0.1:<host_services_port>`, the host's own service. That is neither the egress
+    /// the guest asked for nor the refusal `Open` documents — a silent destination substitution
+    /// standing in for the arbitrary outbound this datapath does not implement (§17). Pinning
+    /// `addr` to the gateway makes the unadmitted destination fall through to smoltcp's
+    /// `rst_reply`, so the guest is *refused* rather than mis-originated.
+    ///
+    /// Scope, deliberately: only the **permanent** forward mappings are pinned. The dynamic
+    /// mappings [`admit_syn`] arms exist to intercept a destination the guest chose, so they keep
+    /// the unpinned form — that asymmetry is exactly the difference between `Open` (refuse) and
+    /// `Filtered` (intercept). A `Filtered` VM's SYN to a foreign address *on a forwarded port*
+    /// is therefore refused rather than intercepted; it was never intercepted before either — it
+    /// was mis-originated — so the refusal removes a wrong answer without removing a right one.
+    fn nat_forward_endpoint(host_gw: Ipv4Address, port: u16) -> IpListenEndpoint {
+        IpListenEndpoint {
+            addr: Some(IpAddress::Ipv4(host_gw)),
+            port,
+        }
+    }
+
     /// Handles a NAT mapping whose guest TCP socket has gone `!is_open()`.
     ///
     /// The stale host stream is dropped **first** (H-NET-1/H-NET-2). A permanent
@@ -923,9 +954,14 @@ pub mod backend {
     /// closed for the NET-5 reclaimer. Returns `true` if the caller should skip
     /// the mapping (a closed dynamic mapping awaiting reclamation), `false` if it
     /// was re-armed.
+    ///
+    /// `listen` is the endpoint the permanent arm re-arms on, and it arrives as a whole
+    /// [`IpListenEndpoint`] rather than a bare port precisely so this — the NAT's only permanent
+    /// `listen` site — cannot spell the destination scope itself: it is composed once by
+    /// [`nat_forward_endpoint`] (C7).
     fn rearm_or_release_closed(
         socket: &mut TcpSocket<'_>,
-        listen_port: u16,
+        listen: IpListenEndpoint,
         stream: &mut Option<tokio::net::TcpStream>,
         is_permanent: bool,
     ) -> bool {
@@ -936,7 +972,7 @@ pub mod backend {
             // already open; neither holds here (forward ports are non-zero and the
             // socket is Closed), and a spurious failure is retried next tick — so
             // the result is deliberately ignored.
-            let _ = socket.listen(listen_port);
+            let _ = socket.listen(listen);
             false
         } else {
             // NET-5: leave the closed dynamic socket closed (stream cleared) so
@@ -1572,9 +1608,12 @@ pub mod backend {
                         // cross-wires the next guest connection onto the old host
                         // stream, and a closed dynamic mapping is counted "live"
                         // forever, defeating the NET-5 cap.
+                        // C7: the re-armed permanent listener is scoped to this VM's own
+                        // gateway through the one `nat_forward_endpoint` composer — never a
+                        // bare port, which under `set_any_ip(true)` accepts every destination.
                         if rearm_or_release_closed(
                             socket,
-                            *listen_port,
+                            nat_forward_endpoint(host_gw, *listen_port),
                             tcp_stream,
                             i < permanent_count,
                         ) {
@@ -2131,7 +2170,13 @@ pub mod backend {
             let mut socket = new_tcp_socket();
             assert!(!socket.is_open());
             let mut stream = Some(connected_host_stream());
-            let skip = rearm_or_release_closed(&mut socket, 8080, &mut stream, true);
+            let (gw, _guest) = nat_test_addrs();
+            let skip = rearm_or_release_closed(
+                &mut socket,
+                nat_forward_endpoint(gw, 8080),
+                &mut stream,
+                true,
+            );
             assert!(!skip, "permanent mapping must be re-armed, not skipped");
             assert!(socket.is_open(), "permanent listener must be re-armed");
             assert!(
@@ -2142,7 +2187,12 @@ pub mod backend {
             // Dynamic mapping: skipped for reclamation, stream cleared.
             let mut dsocket = new_tcp_socket();
             let mut dstream = Some(connected_host_stream());
-            let skip = rearm_or_release_closed(&mut dsocket, 9090, &mut dstream, false);
+            let skip = rearm_or_release_closed(
+                &mut dsocket,
+                nat_forward_endpoint(gw, 9090),
+                &mut dstream,
+                false,
+            );
             assert!(
                 skip,
                 "closed dynamic mapping must be skipped for reclamation"
@@ -2151,6 +2201,278 @@ pub mod backend {
             assert!(
                 dstream.is_none(),
                 "stale host stream must be cleared before continue (H-NET-2)"
+            );
+        }
+
+        // ---- C7: `Egress::Open` forwards what its mode admits, and refuses the rest ----------
+        //
+        // These legs drive the REAL smoltcp stack the NAT runs (`nat_test_iface` mirrors
+        // `run_network`'s interface configuration byte for byte, `set_any_ip(true)` included) and
+        // assert on the frames that come back out of the device — the data plane, not a
+        // descriptor or a proxy signal. No KVM, no vhost, no guest.
+
+        /// The vmid whose `/30` the C7 legs run on.
+        ///
+        /// Every address below is derived from it through the shared `(vmid % 254) + 1` math
+        /// (`nat_addrs` → `crate::net::ip_math`, `crate::net::mac_math`) — never a test-local
+        /// literal, so an off-by-one in the octet map reddens these legs instead of hiding
+        /// behind a hardcoded twin.
+        const NAT_TEST_VMID: u32 = 7;
+
+        /// This VM's `/30`: `(host gateway, guest address)`.
+        fn nat_test_addrs() -> (Ipv4Address, Ipv4Address) {
+            nat_addrs(NAT_TEST_VMID).expect("the /30 math must accept the C7 test vmid")
+        }
+
+        /// This VM's guest MAC, through the shared `mac_math`.
+        fn nat_test_guest_mac() -> EthernetAddress {
+            crate::net::mac_math(NAT_TEST_VMID)
+                .expect("mac_math must accept the C7 test vmid")
+                .parse()
+                .expect("mac_math emits a parseable MAC")
+        }
+
+        /// The NAT's interface, configured exactly as `run_network` configures it.
+        fn nat_test_iface(state: &Arc<Mutex<SharedState>>) -> Interface {
+            let (host_gw, guest_gw) = nat_test_addrs();
+            let mut device = SmoltcpDevice {
+                state: state.lock().unwrap_or_else(|e| e.into_inner()),
+            };
+            let mut iface = Interface::new(
+                Config::new(HardwareAddress::Ethernet(EthernetAddress(HOST_NAT_MAC))),
+                &mut device,
+                smoltcp::time::Instant::now(),
+            );
+            drop(device);
+            // Load-bearing for the negative leg's honesty: with AnyIP the foreign-destination
+            // SYN really is accepted by the IP layer, so what refuses it below is the socket's
+            // destination scope — not the interface quietly dropping an off-`/30` packet.
+            iface.set_any_ip(true);
+            iface.update_ip_addrs(|addrs| {
+                addrs
+                    .push(IpCidr::new(IpAddress::Ipv4(host_gw), 30))
+                    .expect("address storage");
+            });
+            iface
+                .routes_mut()
+                .add_default_ipv4_route(guest_gw)
+                .expect("default route");
+            iface
+        }
+
+        /// Queues one guest→host Ethernet frame the way the vhost TX pump does.
+        fn guest_sends(state: &Arc<Mutex<SharedState>>, frame: Vec<u8>) {
+            state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .tx_queue
+                .push_back(frame);
+        }
+
+        /// Polls the interface once and drains everything the NAT emitted toward the guest.
+        fn nat_replies(
+            iface: &mut Interface,
+            state: &Arc<Mutex<SharedState>>,
+            sockets: &mut SocketSet<'_>,
+        ) -> Vec<Vec<u8>> {
+            let mut device = SmoltcpDevice {
+                state: state.lock().unwrap_or_else(|e| e.into_inner()),
+            };
+            iface.poll(smoltcp::time::Instant::now(), &mut device, sockets);
+            drop(device);
+            let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+            guard.rx_queue.drain(..).collect()
+        }
+
+        /// Wraps `payload` in an Ethernet frame from the guest to the NAT.
+        fn guest_frame(ethertype: EthernetProtocol, payload: &[u8]) -> Vec<u8> {
+            let mut buf = vec![0u8; EthernetFrame::<&[u8]>::header_len() + payload.len()];
+            let mut frame = EthernetFrame::new_unchecked(&mut buf[..]);
+            frame.set_src_addr(nat_test_guest_mac());
+            frame.set_dst_addr(EthernetAddress(HOST_NAT_MAC));
+            frame.set_ethertype(ethertype);
+            frame.payload_mut().copy_from_slice(payload);
+            buf
+        }
+
+        /// An ARP request from the guest for the gateway — the neighbour-cache seed without which
+        /// the NAT could not put *any* reply on the wire, so the negative leg below would be
+        /// indistinguishable from an unreachable guest.
+        fn guest_arp_request() -> Vec<u8> {
+            let (host_gw, guest_ip) = nat_test_addrs();
+            let repr = smoltcp::wire::ArpRepr::EthernetIpv4 {
+                operation: smoltcp::wire::ArpOperation::Request,
+                source_hardware_addr: nat_test_guest_mac(),
+                source_protocol_addr: guest_ip,
+                target_hardware_addr: EthernetAddress([0; 6]),
+                target_protocol_addr: host_gw,
+            };
+            let mut payload = vec![0u8; repr.buffer_len()];
+            repr.emit(&mut smoltcp::wire::ArpPacket::new_unchecked(
+                &mut payload[..],
+            ));
+            guest_frame(EthernetProtocol::Arp, &payload)
+        }
+
+        /// A guest TCP SYN to `dst:dst_port` — the one frame the C7 legs differ in.
+        fn guest_syn(dst: Ipv4Address, dst_port: u16, src_port: u16) -> Vec<u8> {
+            let (_host_gw, guest_ip) = nat_test_addrs();
+            let checksum = smoltcp::phy::ChecksumCapabilities::default();
+            let tcp = smoltcp::wire::TcpRepr {
+                src_port,
+                dst_port,
+                control: smoltcp::wire::TcpControl::Syn,
+                seq_number: smoltcp::wire::TcpSeqNumber(0x1234_5678),
+                ack_number: None,
+                window_len: 65535,
+                window_scale: None,
+                max_seg_size: None,
+                sack_permitted: false,
+                sack_ranges: [None, None, None],
+                timestamp: None,
+                payload: &[],
+            };
+            let ip = smoltcp::wire::Ipv4Repr {
+                src_addr: guest_ip,
+                dst_addr: dst,
+                next_header: IpProtocol::Tcp,
+                payload_len: tcp.buffer_len(),
+                hop_limit: 64,
+            };
+            let mut payload = vec![0u8; ip.buffer_len() + tcp.buffer_len()];
+            let mut packet = Ipv4Packet::new_unchecked(&mut payload[..]);
+            ip.emit(&mut packet, &checksum);
+            tcp.emit(
+                &mut TcpPacket::new_unchecked(packet.payload_mut()),
+                &IpAddress::Ipv4(guest_ip),
+                &IpAddress::Ipv4(dst),
+                &checksum,
+            );
+            guest_frame(EthernetProtocol::Ipv4, &payload)
+        }
+
+        /// The `(src, dst, syn, ack, rst)` of the single TCP frame in `frames`.
+        fn sole_tcp_reply(frames: &[Vec<u8>]) -> (Ipv4Address, Ipv4Address, bool, bool, bool) {
+            let mut found = None;
+            for bytes in frames {
+                let frame = EthernetFrame::new_checked(&bytes[..]).expect("an ethernet frame");
+                if frame.ethertype() != EthernetProtocol::Ipv4 {
+                    continue;
+                }
+                let ipv4 = Ipv4Packet::new_checked(frame.payload()).expect("an ipv4 packet");
+                if ipv4.next_header() != IpProtocol::Tcp {
+                    continue;
+                }
+                let tcp = TcpPacket::new_checked(ipv4.payload()).expect("a tcp segment");
+                assert!(found.is_none(), "expected exactly one TCP reply");
+                found = Some((
+                    ipv4.src_addr(),
+                    ipv4.dst_addr(),
+                    tcp.syn(),
+                    tcp.ack(),
+                    tcp.rst(),
+                ));
+            }
+            found.expect("the NAT must answer the guest's SYN with a TCP segment")
+        }
+
+        // C7 (design §6.2 / §17, AGENTS.md "`Egress::Open` must actually forward what its mode
+        // admits — and is *not* arbitrary outbound"): a permanent NAT forward admits the §6.3
+        // host endpoint **at this VM's own gateway** and REFUSES every other destination on the
+        // same port, instead of silently splicing it onto the host's loopback service.
+        //
+        // The two legs are one socket, one forwarded port, one source guest, differing in
+        // exactly one field: the SYN's destination address. The negative runs first so its
+        // "still Listen" assertion cannot be an artifact of an already-consumed socket, and the
+        // positive control that follows proves the very same socket does answer the destination
+        // the mode admits — so the refusal is the scope working, not a dead NAT.
+        //
+        // RED ON THE INVERSE, observed: restoring the bare `socket.listen(*listen_port)` form
+        // (i.e. `nat_forward_endpoint` returning `addr: None`) makes the foreign-destination SYN
+        // be ACCEPTED — the reply is a SYN|ACK sourced from 93.184.216.34 and the socket leaves
+        // `Listen` — which is production splicing an arbitrary internet destination onto
+        // `127.0.0.1:<host_services_port>`.
+        #[test]
+        fn open_admits_the_gateway_endpoint_and_refuses_an_arbitrary_destination() {
+            let (host_gw, _guest_ip) = nat_test_addrs();
+            // An off-`/30` address the NAT has no business serving; the port is the forwarded
+            // one, which is what makes this the *silent substitution* case rather than a SYN to
+            // a port nothing listens on.
+            let foreign = Ipv4Address::new(93, 184, 216, 34);
+            const FORWARDED: u16 = 8080;
+
+            let state = Arc::new(Mutex::new(empty_state(None)));
+            let mut iface = nat_test_iface(&state);
+            let mut sockets = SocketSet::new(vec![]);
+
+            // Seed the neighbour cache, exactly as a booting guest does.
+            guest_sends(&state, guest_arp_request());
+            let arp = nat_replies(&mut iface, &state, &mut sockets);
+            assert_eq!(arp.len(), 1, "the NAT must answer the guest's ARP request");
+
+            // One permanent forward mapping, armed through the one composer — the shipped path.
+            let handle = sockets.add(new_tcp_socket());
+            let mut stream = None;
+            assert!(!rearm_or_release_closed(
+                sockets.get_mut::<TcpSocket>(handle),
+                nat_forward_endpoint(host_gw, FORWARDED),
+                &mut stream,
+                true,
+            ));
+            assert!(sockets.get::<TcpSocket>(handle).is_listening());
+
+            // ---- negative: an arbitrary outbound destination is REFUSED ---------------------
+            guest_sends(&state, guest_syn(foreign, FORWARDED, 40_001));
+            let refused = nat_replies(&mut iface, &state, &mut sockets);
+            let (src, _dst, syn, _ack, rst) = sole_tcp_reply(&refused);
+            assert!(
+                rst && !syn,
+                "a SYN to an arbitrary destination must be refused with a RST, not accepted: \
+                 syn={syn} rst={rst}"
+            );
+            assert_eq!(
+                src, foreign,
+                "the RST must come back from the dialled address"
+            );
+            assert!(
+                sockets.get::<TcpSocket>(handle).is_listening(),
+                "the forward-port listener must not have accepted a connection addressed \
+                 somewhere else — that is the silent destination substitution C7 removes"
+            );
+
+            // ---- positive control: the destination the mode DOES admit is served ------------
+            guest_sends(&state, guest_syn(host_gw, FORWARDED, 40_002));
+            let admitted = nat_replies(&mut iface, &state, &mut sockets);
+            let (src, _dst, syn, ack, rst) = sole_tcp_reply(&admitted);
+            assert!(
+                syn && ack && !rst,
+                "the §6.3 host endpoint at this VM's gateway must still be admitted: \
+                 syn={syn} ack={ack} rst={rst}"
+            );
+            assert_eq!(src, host_gw, "the SYN|ACK must be sourced from the gateway");
+            assert!(
+                !sockets.get::<TcpSocket>(handle).is_listening(),
+                "the admitted connection must have claimed the forward-port listener"
+            );
+        }
+
+        // The composer itself: a permanent forward is destination-scoped, and it is scoped to the
+        // gateway the shared `/30` math derives — not to whatever address a call site had handy.
+        #[test]
+        fn nat_forward_endpoint_pins_the_destination_to_this_vms_gateway() {
+            let (host_gw, guest_ip) = nat_test_addrs();
+            let ep = nat_forward_endpoint(host_gw, 8080);
+            assert_eq!(
+                ep.addr,
+                Some(IpAddress::Ipv4(host_gw)),
+                "an unscoped (`None`) listen address is what `TcpSocket::accepts` reads as \
+                 'every destination'"
+            );
+            assert_eq!(ep.port, 8080);
+            assert_ne!(
+                ep.addr,
+                Some(IpAddress::Ipv4(guest_ip)),
+                "the forward must be scoped to the host side of the /30, not the guest side"
             );
         }
 
@@ -3314,8 +3636,13 @@ pub mod backend {
     ///   `enable_notification()` at a fourth call site is a re-introduced discarded `Result` — and a
     ///   behavior test cannot see it unless that particular site happens to be driven against a
     ///   broken ring, which is precisely how the M7 fix shipped two of them.
+    /// * C7: the NAT's **permanent** forward listener is armed on the endpoint
+    ///   [`nat_forward_endpoint`] composes, never a bare port. The two spellings compile
+    ///   identically — `TcpSocket::listen` takes `impl Into<IpListenEndpoint>`, and `u16` converts
+    ///   into one whose `addr` is `None` — so nothing but a scan can see the day a call site drops
+    ///   the scope and re-opens `Egress::Open` onto every destination (§6.2).
     ///
-    /// All three read this file's own production text, the shape `orchestrator.rs`'s `nat_plan_gate`
+    /// All four read this file's own production text, the shape `orchestrator.rs`'s `nat_plan_gate`
     /// established, and share its limit: a scan sees spellings, not values.
     #[cfg(test)]
     mod exit_event_arming_gate {
@@ -3532,6 +3859,141 @@ pub mod backend {
                 )
                 .is_ok(),
                 "the correct shape must pass, or the gate is vacuous"
+            );
+        }
+
+        /// Checks that every permanent NAT forward is armed on a **composed**, destination-scoped
+        /// endpoint (C7). `Err` names the specific violation, so the self-test below can drive it
+        /// against buggy inputs (AGENTS.md rule 2).
+        ///
+        /// Three things have to hold at once, and each has its own failure text:
+        ///
+        /// 1. [`nat_forward_endpoint`] exists and has exactly **one** call site — a second one is
+        ///    a second spelling of the scope, which is how every duplicated law in this tree has
+        ///    drifted.
+        /// 2. That call site is the endpoint `rearm_or_release_closed` re-arms with, and the
+        ///    permanent arm listens on that parameter rather than re-deriving anything.
+        /// 3. Production text holds exactly **two** `listen(` sites: the permanent one above and
+        ///    `admit_syn`'s deliberately unscoped dynamic interception listener, which is what
+        ///    `Egress::Filtered` is for. A third is an un-reviewed shape — fail loud, don't guess.
+        fn permanent_forwards_are_gateway_scoped(code: &str) -> Result<(), String> {
+            if !code.contains("fn nat_forward_endpoint(") {
+                return Err(
+                    "`nat_forward_endpoint` is gone; the permanent forward's destination scope \
+                     has no owner"
+                        .to_string(),
+                );
+            }
+            let calls: Vec<usize> = code
+                .match_indices("nat_forward_endpoint(")
+                // The definition is not a call site.
+                .filter(|&(at, _)| !code[..at].ends_with("fn "))
+                .map(|(at, _)| at)
+                .collect();
+            if calls.len() != 1 {
+                return Err(format!(
+                    "expected exactly 1 `nat_forward_endpoint(` call site; found {}",
+                    calls.len()
+                ));
+            }
+            if !code.contains("rearm_or_release_closed( socket, nat_forward_endpoint(") {
+                return Err("the permanent re-arm no longer takes its endpoint from \
+                     `nat_forward_endpoint`; a bare port listens on EVERY destination under \
+                     `set_any_ip(true)`"
+                    .to_string());
+            }
+            if !code.contains("socket.listen(listen)") {
+                return Err(
+                    "the permanent arm does not listen on the endpoint it was handed; it is \
+                     re-deriving the scope at the call site"
+                        .to_string(),
+                );
+            }
+            match code.matches("socket.listen(").count() {
+                2 => {}
+                n => {
+                    return Err(format!(
+                        "expected exactly 2 `socket.listen(` sites (the composed permanent forward \
+                         and `admit_syn`'s dynamic interception listener); found {n}"
+                    ));
+                }
+            }
+            if !code.contains("socket.listen(dst_port)") {
+                return Err(
+                    "`admit_syn`'s dynamic interception listener is gone or renamed; the second \
+                     `listen` site this gate accounts for is no longer the one it reviewed"
+                        .to_string(),
+                );
+            }
+            Ok(())
+        }
+
+        #[test]
+        fn every_permanent_forward_is_armed_on_the_composed_gateway_endpoint() {
+            let code = production_code(SOURCE);
+            assert!(
+                code.contains("fn rearm_or_release_closed("),
+                "the gate must not pass vacuously on text it failed to find"
+            );
+            permanent_forwards_are_gateway_scoped(&code)
+                .expect("the shipped NAT scopes its permanent forwards to the VM's gateway");
+        }
+
+        #[test]
+        fn the_gateway_scope_gate_reddens_on_a_bare_port_listen() {
+            const SHIPPED: &str = "fn nat_forward_endpoint(host_gw, port) -> IpListenEndpoint { } \
+                                   fn rearm_or_release_closed(socket, listen, s, p) -> bool { \
+                                   let _ = socket.listen(listen); } \
+                                   fn admit_syn() { let _ = socket.listen(dst_port); } \
+                                   fn run() { if rearm_or_release_closed( socket, \
+                                   nat_forward_endpoint(host_gw, *listen_port), tcp_stream, x, ) {} }";
+            assert!(
+                permanent_forwards_are_gateway_scoped(SHIPPED).is_ok(),
+                "the shipped shape must pass, or the gate is vacuous"
+            );
+            // The pre-C7 shape: the permanent re-arm listens on a bare port, which
+            // `TcpSocket::accepts` reads as "every destination address".
+            assert!(
+                permanent_forwards_are_gateway_scoped(
+                    &SHIPPED
+                        .replace("socket.listen(listen)", "socket.listen(listen_port)")
+                        .replace(
+                            "nat_forward_endpoint(host_gw, *listen_port)",
+                            "*listen_port"
+                        )
+                )
+                .is_err(),
+                "a permanent forward re-armed on a bare port must be caught"
+            );
+            // A second composer call site — the duplicate-law shape.
+            assert!(
+                permanent_forwards_are_gateway_scoped(&format!(
+                    "{SHIPPED} fn other() {{ nat_forward_endpoint(gw, 80); }}"
+                ))
+                .is_err(),
+                "a second `nat_forward_endpoint` call site must be caught"
+            );
+            // A third `listen` site is a shape nobody reviewed.
+            assert!(
+                permanent_forwards_are_gateway_scoped(&format!(
+                    "{SHIPPED} fn extra() {{ let _ = socket.listen(9000); }}"
+                ))
+                .is_err(),
+                "an unreviewed number of listen sites must be caught"
+            );
+            // The composer itself deleted.
+            assert!(
+                permanent_forwards_are_gateway_scoped(
+                    &SHIPPED.replace("fn nat_forward_endpoint(", "fn gone(")
+                )
+                .is_err(),
+                "deleting the one composer must be caught"
+            );
+            // A gate pointed at nothing opens nothing: an empty scan is misconfiguration,
+            // never a green verdict.
+            assert!(
+                permanent_forwards_are_gateway_scoped("").is_err(),
+                "an empty production text must be a misconfigured gate, not a pass"
             );
         }
 

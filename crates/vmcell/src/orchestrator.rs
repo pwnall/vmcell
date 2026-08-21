@@ -186,6 +186,20 @@ fn seeded_id_order(clock: &dyn Clock, max: u32) -> impl Iterator<Item = u32> {
     (0..max).map(move |i| (start + i) % max + 1)
 }
 
+/// The host-global directory [`VmidAllocator::shared`] records vmid claims in.
+///
+/// Named once because it is read from **two** sides now: the allocator claims into it, and the
+/// sweeps ([`sweep_orphans`], [`crate::net::cleanup_orphan_netns`]) read it back to answer
+/// "does a live process own this id?" ([`IdClaim`]). A second spelling would let the writer and
+/// the reader drift onto two directories, which reads as "nothing is claimed" — the fail-open
+/// direction.
+pub(crate) const SHARED_VMID_CLAIM_DIR: &str = "/tmp/vmcell-vmid";
+
+/// The host-global directory [`SegmentIdAllocator::shared`] records segid claims in
+/// (§6.5, VM-to-VM segments). The segid sibling of [`SHARED_VMID_CLAIM_DIR`], and separate for
+/// the same reason the sweeps keep two id spaces: an id means nothing without the space it is in.
+pub(crate) const SHARED_SEGID_CLAIM_DIR: &str = "/tmp/vmcell-segid";
+
 /// The **one** cross-process id-claim law, shared by [`VmidAllocator`] and
 /// [`SegmentIdAllocator`] (§6.5, VM-to-VM segments; the H1 fix, extracted and parameterized by
 /// lock directory).
@@ -267,34 +281,26 @@ impl FsIdClaim {
 
         // Under the coordination lock. A lock file that exists blocks the claim only
         // while its owner is alive; a dead/empty (crashed-owner) lock is reclaimed.
-        if lock_path.exists() {
-            let owner_alive = match std::fs::read_to_string(&lock_path) {
-                Ok(contents) => contents
-                    .trim()
-                    .parse::<u32>()
-                    .ok()
-                    .is_some_and(|pid| std::path::Path::new(&format!("/proc/{pid}")).exists()),
-                // The lock vanished between `exists()` and the read: nobody owns it.
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-                // Anything else (EACCES on the lock file, EIO) means we cannot tell
-                // whether the owner is alive — never guess "dead" and steal the id.
-                Err(e) => {
+        // The liveness question itself is [`Self::owner_is_live`] — the one law, shared with the
+        // sweeps, which is why it is not inlined here.
+        match Self::owner_is_live(&lock_path) {
+            Ok(true) => return Ok(false),
+            Ok(false) => {
+                if let Err(e) = std::fs::remove_file(&lock_path)
+                    && e.kind() != std::io::ErrorKind::NotFound
+                {
                     return Err(Self::claim_io_error(
-                        "read the id lock owner",
+                        "remove the stale id lock",
                         &lock_path,
                         id,
                         &e,
                     ));
                 }
-            };
-            if owner_alive {
-                return Ok(false);
             }
-            if let Err(e) = std::fs::remove_file(&lock_path)
-                && e.kind() != std::io::ErrorKind::NotFound
-            {
+            // We cannot tell whether the owner is alive — never guess "dead" and steal the id.
+            Err(e) => {
                 return Err(Self::claim_io_error(
-                    "remove the stale id lock",
+                    "read the id lock owner",
                     &lock_path,
                     id,
                     &e,
@@ -303,6 +309,67 @@ impl FsIdClaim {
         }
         // The path is free and we exclusively hold the coordination lock: claim it.
         Self::atomic_claim(dir, &lock_path, id)
+    }
+
+    /// The **one** law answering "is the process that claimed this id still alive?".
+    ///
+    /// `Ok(true)` — the lock file names a pid with a live `/proc/<pid>`. `Ok(false)` — nobody
+    /// owns it: the file is absent, was removed between two of our own syscalls, is empty, or
+    /// names a pid that is gone (the crashed-owner shape the reclaim exists for). `Err` — the
+    /// registry could not be read (`EACCES` on the file, `EIO`), so the answer is **unknown** and
+    /// the errno is preserved for whoever renders it.
+    ///
+    /// Extracted because two very different callers must agree on it, and a second copy would let
+    /// them disagree in the one direction that costs: [`FsIdClaim::try_claim`] asks before stealing
+    /// an id, and the sweeps ([`sweep_orphans`], [`crate::net::cleanup_orphan_netns`]) ask before
+    /// **deleting the host resources named after it** — a same-prefix sibling's live netns, tap,
+    /// cgroup slice or scratch dir. The claim file is the only signal on the host that answers
+    /// "some process outside my own live set owns this id", which is precisely the question a
+    /// name-prefix sweep cannot answer for itself.
+    ///
+    /// Note what "live" means here and what it does not: the pid in the file, not the resource.
+    /// A process that claimed an id and then leaked a namespace *while still running* keeps that
+    /// namespace off the sweep — correctly, since it may still use it, and its own teardown owns it.
+    fn owner_is_live(lock_path: &std::path::Path) -> std::result::Result<bool, std::io::Error> {
+        match std::fs::read_to_string(lock_path) {
+            Ok(contents) => Ok(contents
+                .trim()
+                .parse::<u32>()
+                .ok()
+                .is_some_and(|pid| std::path::Path::new(&format!("/proc/{pid}")).exists())),
+            // No lock file at all (or it vanished mid-read): nobody owns it.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The sweeps' three-valued view of [`FsIdClaim::owner_is_live`], for id `id`.
+    ///
+    /// Distinct from `try_claim`'s `bool` because a sweep must not collapse "I cannot tell" into
+    /// either answer: collapsing it to `NoLiveOwner` deletes a live sibling's resources, and there
+    /// is no errno left to say why. An `Undeterminable` is warned here rather than at each call
+    /// site, since every call site's response to it is the same one — retain.
+    fn claim_state(&self, id: u32) -> IdClaim {
+        // A hermetic allocator (`dir: None`) registers nothing, so it can assert nothing. Reading
+        // that as `NoLiveOwner` is what keeps the fake-driven sweeps behaving exactly as they did
+        // before this law existed; only a claim-registered id can ever hold a resource back.
+        let Some(dir) = &self.dir else {
+            return IdClaim::NoLiveOwner;
+        };
+        match Self::owner_is_live(&dir.join(format!("{id}.lock"))) {
+            Ok(true) => IdClaim::LiveOwner,
+            Ok(false) => IdClaim::NoLiveOwner,
+            Err(e) => {
+                tracing::warn!(
+                    "id claim for {} in {} is undeterminable ({}); its resources are RETAINED \
+                     rather than swept",
+                    id,
+                    dir.display(),
+                    e
+                );
+                IdClaim::Undeterminable
+            }
+        }
     }
 
     /// The **one** renderer for an id-lock I/O failure: names the operation, the path
@@ -459,7 +526,7 @@ impl VmidAllocator {
     /// a crash does not erode capacity permanently.
     #[must_use]
     pub fn shared() -> Self {
-        Self::shared_at("/tmp/vmcell-vmid")
+        Self::shared_at(SHARED_VMID_CLAIM_DIR)
     }
 
     /// Like [`VmidAllocator::shared`] but with an injectable lock directory, so the
@@ -687,7 +754,7 @@ impl SegmentIdAllocator {
     /// `/tmp/vmcell-vmid` (deliberate, not swept).
     #[must_use]
     pub fn shared() -> Self {
-        Self::shared_at("/tmp/vmcell-segid")
+        Self::shared_at(SHARED_SEGID_CLAIM_DIR)
     }
 
     /// Like [`SegmentIdAllocator::shared`] but with an injectable lock directory, so the
@@ -2694,8 +2761,70 @@ fn shutdown_poll_step(grace: std::time::Duration) -> std::time::Duration {
 /// `vmcell-seg-7` as `7` exactly as happily as `vmcell-net-7`, so the *caller* must check each
 /// class against its own live set. Checking a segid against live vmids fails **open** — a dead
 /// segid colliding with a live vmid would never be reclaimed (§6.5, law F2).
-fn trailing_id(name: &str) -> Option<u32> {
+pub(crate) fn trailing_id(name: &str) -> Option<u32> {
     name.rsplit('-').next()?.parse().ok()
+}
+
+/// Which id space an id belongs to — the two the sweeps keep strictly apart (§6.5, law F2).
+///
+/// An id is meaningless without its space: `7` names a VM in one and a segment in the other, and
+/// checking one against the other fails **open** in one direction and destroys a live resource in
+/// the other. Carried as a parameter of [`OrphanScanner::id_claim`] rather than as two methods
+/// because the *question* is one question — "does a live process claim this?" — asked of two
+/// registries, and one method cannot answer it about the wrong registry by accident.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum IdSpace {
+    /// Per-VM ids: the `<prefix>-net-<vmid>` namespaces, `<prefix>-tap-<vmid>` interfaces,
+    /// `<prefix>-vm-<vmid>` cgroup slices and scratch dirs.
+    Vmid,
+    /// Segment ids (§6.5): the `<prefix>-seg-<segid>` namespaces and the bridge inside them.
+    Segid,
+}
+
+/// Whether a **live process on this host** claims an id — the sweeps' liveness test.
+///
+/// The signal is the cross-process id-claim lock file the shared allocators already write
+/// ([`VmidAllocator::shared`], [`SegmentIdAllocator::shared`]): `<dir>/<id>.lock` containing the
+/// owner's pid, created under an exclusive `flock` and released on `Drop`. Reusing it is not a
+/// convenience — it is the **only** liveness signal on this host that is (a) written by the same
+/// law that hands the id out, so it cannot drift from what the resources are named after, and
+/// (b) reclaimable after a crash, since a lock naming a dead pid reads as free.
+///
+/// The alternatives were weighed and rejected, and the reasons are worth keeping because each is
+/// a signal a future reader will reach for:
+///
+/// * **"the namespace has a process in it."** False for every healthy vmcell VM: the VMM runs in
+///   the *host* pid namespace and only its tap lives in the netns, so a live VM's namespace is
+///   empty of processes. It would reap everything it was asked about.
+/// * **"the tap has a carrier / an attached owner."** Times out in the other direction: a tap is
+///   created, configured and enslaved *before* the VMM opens it, so a correct, in-flight VM looks
+///   exactly like a stale tap for a whole start-up window.
+/// * **"the netns fd is still open somewhere."** Requires walking every `/proc/*/fd` on the host,
+///   is racy against a process that is about to open it, and answers about the *namespace* rather
+///   than about the *id* the four resource classes are keyed by.
+///
+/// **What it cannot see, stated so the claim does not age into fiction:** an id held by a
+/// *hermetic* allocator ([`VmidAllocator::new`], `HostEnv::hermetic`) is registered nowhere, so
+/// nothing can vouch for it and its resources sweep exactly as they did before this test existed.
+/// The protection is real for `HostEnv::shared` callers — every daemon, every CLI run, the live
+/// suites — and absent by construction for the rest. That is the same boundary the id space itself
+/// has: an allocator that arbitrates with nobody is not arbitrated for either.
+///
+/// Only [`IdClaim::NoLiveOwner`] permits removal. Both other answers retain, which is the
+/// fail-safe direction: retaining a genuine orphan costs one leaked resource that the next sweep
+/// (or a `--resource-prefix`-scoped operator) reclaims, while reaping a live sibling's resource
+/// destroys a running VM's network from under it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdClaim {
+    /// A live process holds the claim: `<id>.lock` names a pid with a live `/proc/<pid>`.
+    /// **Never sweep** — these resources belong to a running sibling.
+    LiveOwner,
+    /// No live process holds the claim: no lock file, or one naming a pid that is gone (the
+    /// crashed-owner shape). The only answer that permits a removal.
+    NoLiveOwner,
+    /// The claim registry could not be read, so liveness is **unknown**. Retained, never swept:
+    /// "I cannot tell" and "nobody owns it" are different answers and must not collapse.
+    Undeterminable,
 }
 
 /// Read-only enumeration seam for the orphan sweeper ([`sweep_orphans`]).
@@ -2721,6 +2850,31 @@ pub trait OrphanScanner: Send + Sync {
     fn scan_cgroup_slices(&self) -> Vec<String>;
     /// Per-VM scratch directories whose basename matches `vmcell-vm-*`.
     fn scan_scratch_dirs(&self) -> Vec<std::path::PathBuf>;
+
+    /// Whether a live process **outside this one** claims `id` in `space` — the liveness test
+    /// [`sweep_orphans`] applies to every candidate its own live sets do not already cover
+    /// ([`IdClaim`]).
+    ///
+    /// The default is [`IdClaim::NoLiveOwner`], and it is the honest answer for a scanner that
+    /// enumerates a world with **no cross-process claim registry** behind it: the unit-test fakes,
+    /// which invent their candidate names outright. It reproduces the historical, liveness-blind
+    /// behavior exactly, so a scanner that does not implement this method sweeps precisely what it
+    /// swept before. The production [`HostOrphanScanner`] overrides it with the real three-valued
+    /// answer, which is the only one that can retain anything.
+    fn id_claim(&self, space: IdSpace, id: u32) -> IdClaim {
+        let _unused = (space, id);
+        IdClaim::NoLiveOwner
+    }
+
+    /// The resource prefix whose names this scanner enumerates, when it knows it.
+    ///
+    /// Needed only by the member-tap arm of [`sweep_orphans`], which must recognise a
+    /// `<prefix>-tap-<vmid>` interface **through the one composer** ([`crate::naming::tap_name`])
+    /// rather than by re-spelling its layout. `None` — the default — means "I cannot name my
+    /// prefix", and that arm is then skipped entirely rather than guessed at.
+    fn resource_prefix(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// The production [`OrphanScanner`]: enumerates `/var/run/netns`, the cgroup-v2
@@ -2744,6 +2898,13 @@ pub struct HostOrphanScanner {
     prefix: String,
     /// The cgroup half of the scan's inputs (see [`CgroupScan`]).
     cgroup: CgroupScan,
+    /// The vmid claim registry this scanner answers [`OrphanScanner::id_claim`] from — the same
+    /// [`FsIdClaim`] law [`VmidAllocator::shared`] writes into, pointed at the same directory, so
+    /// the reader and the writer cannot drift.
+    vmid_claim: FsIdClaim,
+    /// The segid claim registry, the §6.5 sibling of `vmid_claim`. Two registries, never one:
+    /// see [`IdSpace`].
+    segid_claim: FsIdClaim,
 }
 
 /// What the cgroup arm of the sweep walks: the tree, and the composed slice name whose depth bounds
@@ -2786,7 +2947,35 @@ impl HostOrphanScanner {
                 slice_name: crate::metrics::vm_slice_name(&prefix, 0),
             },
             prefix,
+            vmid_claim: FsIdClaim {
+                dir: Some(std::path::PathBuf::from(SHARED_VMID_CLAIM_DIR)),
+            },
+            segid_claim: FsIdClaim {
+                dir: Some(std::path::PathBuf::from(SHARED_SEGID_CLAIM_DIR)),
+            },
         }
+    }
+
+    /// The same scanner reading its liveness answers from injected claim directories instead of
+    /// the host-global ones.
+    ///
+    /// The claim registries are host-global by design (a bare-`/tmp` cross-process rendezvous), so
+    /// this is how a test drives the real [`OrphanScanner::id_claim`] — and the real
+    /// [`sweep_orphans`] retention arm — without writing into the directory every other vmcell
+    /// process on the box is arbitrating through.
+    #[must_use]
+    pub fn with_claim_dirs(
+        mut self,
+        vmid_dir: impl Into<std::path::PathBuf>,
+        segid_dir: impl Into<std::path::PathBuf>,
+    ) -> Self {
+        self.vmid_claim = FsIdClaim {
+            dir: Some(vmid_dir.into()),
+        };
+        self.segid_claim = FsIdClaim {
+            dir: Some(segid_dir.into()),
+        };
+        self
     }
 
     /// The same scanner against an injected cgroup tree and slice-name composition — the unit gate's
@@ -2804,6 +2993,11 @@ impl HostOrphanScanner {
                 root: root.into(),
                 slice_name: slice_name.into(),
             },
+            // No claim directories: this constructor exists for the cgroup-depth gate, and a
+            // registry-less scanner answers `NoLiveOwner` for everything, which is the
+            // liveness-blind behavior those tests were written against.
+            vmid_claim: FsIdClaim { dir: None },
+            segid_claim: FsIdClaim { dir: None },
         }
     }
 
@@ -2900,6 +3094,19 @@ impl OrphanScanner for HostOrphanScanner {
             })
             .collect()
     }
+
+    fn id_claim(&self, space: IdSpace, id: u32) -> IdClaim {
+        // The space picks the registry, and nothing else in this function knows which is which —
+        // the one place the two id spaces meet, so the mapping is stated once (§6.5, law F2).
+        match space {
+            IdSpace::Vmid => self.vmid_claim.claim_state(id),
+            IdSpace::Segid => self.segid_claim.claim_state(id),
+        }
+    }
+
+    fn resource_prefix(&self) -> Option<&str> {
+        Some(&self.prefix)
+    }
 }
 
 /// What a [`sweep_orphans`] pass reclaimed, returned for logging and tests.
@@ -2915,6 +3122,201 @@ pub struct SweepReport {
     pub cgroup_slices: Vec<String>,
     /// Per-VM scratch directories removed (in sweep order).
     pub scratch_dirs: Vec<std::path::PathBuf>,
+    /// **Stale member taps** removed from segment namespaces the sweep kept (in sweep order).
+    ///
+    /// Its own list, not folded into any of the above, because it is the one class the sweep
+    /// removes from *inside* a resource it deliberately did **not** remove.
+    pub member_taps: Vec<String>,
+    /// Candidates the sweep **declined** to remove because a live process claims their id, or
+    /// because that claim could not be read ([`IdClaim`]) — rendered as
+    /// `"<name>: <IdClaim>"`.
+    ///
+    /// Reported rather than merely logged so a test can assert the retention *positively*. A leg
+    /// that only checks "the namespace is still there" cannot tell a sweep that saw it and kept it
+    /// from one that never scanned it at all — and the second is how a liveness gate rots into
+    /// theater.
+    pub retained: Vec<String>,
+}
+
+/// The host claim registries' answer for `id` **in either id space**, strongest retention first.
+///
+/// For the one caller that is handed a name filter instead of an id space:
+/// [`crate::net::cleanup_orphan_netns`] takes an opaque `starts_with` prefix, so it cannot know
+/// whether the `7` in the name it is looking at is a vmid or a segid. Asking both registries and
+/// keeping the most conservative answer is sound **because it can only ever retain**: it never
+/// grants a removal the id-space-precise [`OrphanScanner::id_claim`] would refuse. The cost is a
+/// coincidence — a dead `-net-7` kept alive because segid 7 is claimed — which leaks one namespace
+/// until the sibling exits, against the alternative of deleting a running VM's network. The
+/// precise, per-space check stays the rule everywhere the space *is* known ([`sweep_orphans`]);
+/// this is the strictly-safer fallback, never a second liveness law — both go through
+/// [`FsIdClaim::claim_state`].
+pub(crate) fn host_id_claim_any_space(id: u32) -> IdClaim {
+    strongest_claim([SHARED_VMID_CLAIM_DIR, SHARED_SEGID_CLAIM_DIR].map(|dir| {
+        FsIdClaim {
+            dir: Some(std::path::PathBuf::from(dir)),
+        }
+        .claim_state(id)
+    }))
+}
+
+/// The retention ordering over the two registries' [`IdClaim`]s: `LiveOwner` > `Undeterminable` >
+/// `NoLiveOwner`.
+///
+/// Split from [`host_id_claim_any_space`] so the ordering — the half that decides whether a
+/// resource lives or dies — is drivable without the host's `/tmp` registries, which by design have
+/// no injection seam.
+fn strongest_claim(states: [IdClaim; 2]) -> IdClaim {
+    if states.contains(&IdClaim::LiveOwner) {
+        IdClaim::LiveOwner
+    } else if states.contains(&IdClaim::Undeterminable) {
+        IdClaim::Undeterminable
+    } else {
+        IdClaim::NoLiveOwner
+    }
+}
+
+/// The **one** gate every removal in [`sweep_orphans`] passes through: may this resource, named
+/// after `id` in `space`, be destroyed?
+///
+/// Two questions, in the order that makes the cheap one authoritative:
+///
+/// 1. **Is it in the caller's own live set?** That set is what a running daemon knows about its
+///    own VMs and segments. It is complete for this process and says nothing about any other.
+/// 2. **Does another process claim the id?** Asked of the scanner ([`OrphanScanner::id_claim`]),
+///    which reads the cross-process claim registry — the half the live set structurally cannot
+///    see, and the whole of the recorded "both orphan sweeps are liveness-blind" hazard: a second
+///    vmcell process, or a second daemon sharing a `--resource-prefix`, has its own live set that
+///    this one cannot observe, so a name-prefix sweep was reaping running siblings' namespaces
+///    (reproduced live: a live `vmcell-net-207`, and a live `vmcell-seg-1` under its members).
+///
+/// Only [`IdClaim::NoLiveOwner`] permits removal; both other answers retain and are recorded in
+/// [`SweepReport::retained`]. Extracted rather than repeated at the four call sites for the usual
+/// reason — the class of defect this fixes is exactly "one arm learned a rule the others did not"
+/// — and every arm gets the retention *record* for free that way.
+fn may_reclaim(
+    scanner: &dyn OrphanScanner,
+    space: IdSpace,
+    id: u32,
+    live: &std::collections::BTreeSet<u32>,
+    name: &str,
+    report: &mut SweepReport,
+) -> bool {
+    if live.contains(&id) {
+        // Owned by this process's own live VM/segment — never sweep it. Not a "retention" in the
+        // reportable sense: the caller already knows it is live, since it is the caller that said so.
+        return false;
+    }
+    match scanner.id_claim(space, id) {
+        IdClaim::NoLiveOwner => true,
+        other => {
+            tracing::info!(
+                "sweep_orphans: retaining {} — id {} in {:?} reads {:?}",
+                name,
+                id,
+                space,
+                other
+            );
+            report.retained.push(format!("{name}: {other:?}"));
+            false
+        }
+    }
+}
+
+/// The member taps inside `links` that this sweep may reclaim: those whose name is exactly what
+/// [`crate::naming::tap_name`] composes for their own trailing id, and whose vmid has no live owner.
+///
+/// Pure, so the selection law is drivable without netlink. The identity check goes **through the
+/// composer** rather than through a hand-written `<prefix>-tap-` filter: the composer is the one
+/// law that says what a member tap is called, and matching its exact output also excludes the
+/// bridge, `lo`, and any interface an operator put in the namespace by hand — none of which this
+/// sweep has any business deleting.
+fn reclaimable_member_taps(
+    prefix: &str,
+    links: &[String],
+    live_vmids: &std::collections::BTreeSet<u32>,
+    claim: &dyn Fn(u32) -> IdClaim,
+) -> Vec<(String, u32, IdClaim)> {
+    links
+        .iter()
+        .filter_map(|link| {
+            let vmid = trailing_id(link)?;
+            (*link == crate::naming::tap_name(prefix, vmid)).then(|| {
+                let state = if live_vmids.contains(&vmid) {
+                    IdClaim::LiveOwner
+                } else {
+                    claim(vmid)
+                };
+                (link.clone(), vmid, state)
+            })
+        })
+        .collect()
+}
+
+/// Removes the taps of **dead members** from a segment namespace the sweep is keeping.
+///
+/// This arm exists because a segment namespace has many owners while a per-VM namespace has one:
+/// a per-VM netns is deleted whole (taking its tap with it) or retained whole for its one live
+/// owner, but a segment netns outlives any single member, so a member that was SIGKILLed leaves a
+/// persistent `<prefix>-tap-<vmid>` behind inside a namespace that must stay. Nothing reclaimed
+/// that before, and with `IFF_TUN_EXCL` (`net_sys`) nothing may adopt it either: the next member
+/// handed that recycled vmid now gets a loud `EBUSY` instead of silently taking over an interface
+/// it did not create. The two land together on purpose — the refusal is only safe because this
+/// sweep clears our own stale taps first.
+///
+/// Unlike [`may_reclaim`], this arm records the caller's OWN live members as retained too: a live
+/// set says "these vmids are mine", which is a fact about the taps in somebody else's namespace
+/// worth reading back in the report, not the tautology it is when the caller asks about a resource
+/// it already named.
+///
+/// Per-tap failures are warned, never propagated: one stuck interface must not stop the rest, and
+/// a `Netlink` that cannot enumerate (the default [`crate::net::tap::Netlink::list_links`]) makes
+/// this a no-op rather than a guess.
+fn sweep_member_taps(
+    scanner: &dyn OrphanScanner,
+    netlink: &dyn crate::net::tap::Netlink,
+    netns: &str,
+    live_vmids: &std::collections::BTreeSet<u32>,
+    report: &mut SweepReport,
+) {
+    let Some(prefix) = scanner.resource_prefix() else {
+        return; // cannot recognise a member tap without the composer's prefix — do nothing.
+    };
+    let links = match netlink.list_links(netns) {
+        Ok(links) => links,
+        Err(e) => {
+            tracing::warn!(
+                "sweep_orphans: cannot list links in the retained segment netns {}: {} — its \
+                 member taps are left alone",
+                netns,
+                e
+            );
+            return;
+        }
+    };
+    for (tap, vmid, state) in reclaimable_member_taps(prefix, &links, live_vmids, &|vmid| {
+        scanner.id_claim(IdSpace::Vmid, vmid)
+    }) {
+        if state != IdClaim::NoLiveOwner {
+            tracing::info!(
+                "sweep_orphans: retaining member tap {} in {} — vmid {} reads {:?}",
+                tap,
+                netns,
+                vmid,
+                state
+            );
+            report.retained.push(format!("{tap}: {state:?}"));
+            continue;
+        }
+        match netlink.delete_link(netns, &tap) {
+            Ok(()) => report.member_taps.push(tap),
+            Err(e) => tracing::warn!(
+                "sweep_orphans: failed to delete the stale member tap {} in {}: {}",
+                tap,
+                netns,
+                e
+            ),
+        }
+    }
 }
 
 /// Reclaims orphaned per-VM host resources left by a crashed run (ORCH-6).
@@ -2922,7 +3324,12 @@ pub struct SweepReport {
 /// Enumerates candidates through the injected [`OrphanScanner`] and removes each
 /// one whose trailing id is **not** live in **its own id space** — per-VM namespaces, cgroup
 /// slices, and scratch dirs against `live_vmids`; segment namespaces (§6.5) against
-/// `live_segids` — so a resource still owned by a running VM or segment is never swept, through
+/// `live_segids` — **and** whose id no live process outside this one claims
+/// (`may_reclaim`, [`IdClaim`]), so a resource owned by a running VM or segment is never swept,
+/// whether that owner is this process or a same-prefix sibling. A resource whose liveness cannot
+/// be determined is **retained**, not reaped. Segment namespaces the sweep keeps have their
+/// **dead members' taps** reclaimed instead (`sweep_member_taps`) — the one class that outlives
+/// the resource holding it. Removal goes through
 /// the injected
 /// [`Netlink`](crate::net::tap::Netlink) (netns) and
 /// [`CgroupFs`](crate::metrics::CgroupFs) (cgroup slice) seams, plus a direct
@@ -2948,8 +3355,8 @@ pub fn sweep_orphans(
         let Some(vmid) = trailing_id(&name) else {
             continue;
         };
-        if live_vmids.contains(&vmid) {
-            continue; // still owned by a live VM — never sweep it
+        if !may_reclaim(scanner, IdSpace::Vmid, vmid, live_vmids, &name, &mut report) {
+            continue;
         }
         match netlink.delete_netns(&name) {
             Ok(()) => report.netns.push(name),
@@ -2965,7 +3372,17 @@ pub fn sweep_orphans(
         let Some(segid) = trailing_id(&name) else {
             continue;
         };
-        if live_segids.contains(&segid) {
+        if !may_reclaim(
+            scanner,
+            IdSpace::Segid,
+            segid,
+            live_segids,
+            &name,
+            &mut report,
+        ) {
+            // Kept — but a segment namespace outlives its individual members, so it is the one
+            // resource here that can hold residue of its own. Reclaim the dead members' taps.
+            sweep_member_taps(scanner, netlink, &name, live_vmids, &mut report);
             continue;
         }
         match netlink.delete_netns(&name) {
@@ -2982,7 +3399,7 @@ pub fn sweep_orphans(
         let Some(vmid) = trailing_id(&name) else {
             continue;
         };
-        if live_vmids.contains(&vmid) {
+        if !may_reclaim(scanner, IdSpace::Vmid, vmid, live_vmids, &name, &mut report) {
             continue;
         }
         match cgroup_fs.delete_slice(&name) {
@@ -3005,7 +3422,14 @@ pub fn sweep_orphans(
         else {
             continue;
         };
-        if live_vmids.contains(&vmid) {
+        if !may_reclaim(
+            scanner,
+            IdSpace::Vmid,
+            vmid,
+            live_vmids,
+            &dir.display().to_string(),
+            &mut report,
+        ) {
             continue;
         }
         match std::fs::remove_dir_all(&dir) {
@@ -5919,11 +6343,17 @@ mod tests {
 
     // ---- ORCH-6: orphan sweeper (recording fakes) ----
 
+    #[derive(Default)]
     struct FakeOrphanScanner {
         netns: Vec<String>,
         segment_netns: Vec<String>,
         cgroups: Vec<String>,
         scratch: Vec<std::path::PathBuf>,
+        /// What a **same-prefix sibling process** claims, keyed by id space. Empty reproduces the
+        /// trait default (`NoLiveOwner` for everything), which is the historical blind behavior.
+        claims: std::collections::BTreeMap<(IdSpace, u32), IdClaim>,
+        /// `Some` enables the member-tap arm, exactly as [`HostOrphanScanner`] does.
+        prefix: Option<String>,
     }
     impl OrphanScanner for FakeOrphanScanner {
         fn scan_netns(&self) -> Vec<String> {
@@ -5938,11 +6368,24 @@ mod tests {
         fn scan_scratch_dirs(&self) -> Vec<std::path::PathBuf> {
             self.scratch.clone()
         }
+        fn id_claim(&self, space: IdSpace, id: u32) -> IdClaim {
+            self.claims
+                .get(&(space, id))
+                .copied()
+                .unwrap_or(IdClaim::NoLiveOwner)
+        }
+        fn resource_prefix(&self) -> Option<&str> {
+            self.prefix.as_deref()
+        }
     }
 
     #[cfg(feature = "net-privileged")]
+    #[derive(Default)]
     struct RecordingSweepNetlink {
         log: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        /// What `list_links` reports per namespace; an unlisted namespace answers `["lo"]`, the
+        /// shape a real empty namespace has.
+        links: std::collections::BTreeMap<String, Vec<String>>,
     }
     #[cfg(feature = "net-privileged")]
     impl crate::net::tap::Netlink for RecordingSweepNetlink {
@@ -5964,7 +6407,11 @@ mod tests {
         fn setup_tap_on_bridge(&self, _netns: &str, _tap: &str, _bridge: &str) -> Result<()> {
             Ok(())
         }
-        fn delete_link(&self, _netns: &str, _link: &str) -> Result<()> {
+        fn delete_link(&self, netns: &str, link: &str) -> Result<()> {
+            self.log
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(format!("link:{netns}/{link}"));
             Ok(())
         }
         fn delete_netns(&self, name: &str) -> Result<()> {
@@ -5976,6 +6423,13 @@ mod tests {
         }
         fn setup_tproxy_routing(&self, _netns: &str) -> Result<()> {
             Ok(())
+        }
+        fn list_links(&self, netns: &str) -> Result<Vec<String>> {
+            Ok(self
+                .links
+                .get(netns)
+                .cloned()
+                .unwrap_or_else(|| vec!["lo".to_string()]))
         }
     }
 
@@ -6023,7 +6477,10 @@ mod tests {
     #[test]
     fn test_sweep_orphans_reclaims_only_dead_ids_in_order() {
         let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-        let nl = RecordingSweepNetlink { log: log.clone() };
+        let nl = RecordingSweepNetlink {
+            log: log.clone(),
+            ..Default::default()
+        };
         let cg = RecordingSweepCgroupFs { log: log.clone() };
         let live: std::collections::BTreeSet<u32> = [7].into_iter().collect();
         let live_segids: std::collections::BTreeSet<u32> = [9].into_iter().collect();
@@ -6051,6 +6508,9 @@ mod tests {
             segment_netns: vec!["vmcell-seg-7".into(), "vmcell-seg-9".into()],
             cgroups: vec!["base/vmcell-vm-3".into(), "base/vmcell-vm-7".into()],
             scratch: vec![orphan_dir.clone(), live_dir.clone()],
+            // No sibling claims and no prefix: the historical, liveness-blind shape this test was
+            // written against, so it keeps gating the id-space rules and nothing else.
+            ..Default::default()
         };
 
         let report = sweep_orphans(&scanner, &nl, &cg, &live, &live_segids);
@@ -6087,6 +6547,401 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&live_dir);
+    }
+
+    // A6 — the recorded "both orphan sweeps are liveness-blind" hazard, at the seam.
+    //
+    // The live sets a sweeper is handed describe ITS OWN process. A second vmcell process, or a
+    // second daemon started with the same `--resource-prefix`, has its own live set that this one
+    // cannot see — so a sweep that decides by name prefix plus its own live set deletes a running
+    // sibling's namespace, cgroup slice and scratch dir. Observed twice on this host: a live
+    // `vmcell-net-207`, and a `vmcell-seg-1` removed out from under its members.
+    //
+    // Both live sets here are EMPTY, which is exactly how `vmcell-daemon`'s start-up sweep drives
+    // it ("nothing is live at start-up"), and the point is that the emptiness is no longer the end
+    // of the argument: the id claim is.
+    //
+    // RED on: dropping the `scanner.id_claim(..)` consultation from `may_reclaim` (the shipped,
+    // liveness-blind behavior) — every one of the four `assert!(…exists/kept…)` below fails, and
+    // the `retained` list is empty. Proven by mutation.
+    //
+    // FAKE-BLIND AXIS: this scanner INVENTS its candidate names and its claim answers, so it says
+    // nothing about whether the real `HostOrphanScanner` reads the registry the allocators write,
+    // or whether `RtNetlink` can actually delete what it is told to. `tests/tap_create.rs`'s
+    // `the_sweep_keeps_live_siblings_and_reclaims_our_own_stale_member_tap` is that leg: real
+    // namespaces, real lock files, real `/var/run/netns` before-and-after.
+    #[cfg(feature = "net-privileged")]
+    #[test]
+    fn sweep_retains_resources_a_live_sibling_process_claims() {
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let nl = RecordingSweepNetlink {
+            log: log.clone(),
+            ..Default::default()
+        };
+        let cg = RecordingSweepCgroupFs { log: log.clone() };
+
+        let base = std::env::temp_dir();
+        let pid = std::process::id();
+        let sibling_dir = base.join(format!("vmcell-a6test-vm-{pid}-11"));
+        let orphan_dir = base.join(format!("vmcell-a6test-vm-{pid}-12"));
+        std::fs::create_dir_all(&sibling_dir).expect("sibling dir");
+        std::fs::create_dir_all(&orphan_dir).expect("orphan dir");
+
+        let scanner = FakeOrphanScanner {
+            netns: vec!["vmcell-net-11".into(), "vmcell-net-12".into()],
+            segment_netns: vec!["vmcell-seg-11".into(), "vmcell-seg-12".into()],
+            cgroups: vec!["base/vmcell-vm-11".into(), "base/vmcell-vm-12".into()],
+            scratch: vec![sibling_dir.clone(), orphan_dir.clone()],
+            // vmid 11 and segid 11 are claimed by a live sibling; 12 is nobody's.
+            claims: [
+                ((IdSpace::Vmid, 11), IdClaim::LiveOwner),
+                ((IdSpace::Segid, 11), IdClaim::LiveOwner),
+            ]
+            .into_iter()
+            .collect(),
+            prefix: None,
+        };
+
+        let report = sweep_orphans(
+            &scanner,
+            &nl,
+            &cg,
+            &std::collections::BTreeSet::new(),
+            &std::collections::BTreeSet::new(),
+        );
+
+        assert_eq!(
+            report.netns,
+            vec!["vmcell-net-12".to_string()],
+            "only the unclaimed netns may be reclaimed"
+        );
+        assert_eq!(
+            report.segment_netns,
+            vec!["vmcell-seg-12".to_string()],
+            "the segment class asks the SEGID registry, and segid 11 is claimed"
+        );
+        assert_eq!(report.cgroup_slices, vec!["base/vmcell-vm-12".to_string()]);
+        assert_eq!(report.scratch_dirs, vec![orphan_dir.clone()]);
+        assert!(
+            sibling_dir.exists(),
+            "the live sibling's scratch dir must survive an empty-live-set sweep"
+        );
+        assert!(!orphan_dir.exists(), "the genuine orphan must be removed");
+
+        // The retention is asserted POSITIVELY: a leg that only checked "it is still there" cannot
+        // distinguish a sweep that saw it and kept it from one that never scanned it (§ the
+        // `SweepReport::retained` rustdoc).
+        assert_eq!(
+            report.retained,
+            vec![
+                "vmcell-net-11: LiveOwner".to_string(),
+                "vmcell-seg-11: LiveOwner".to_string(),
+                "base/vmcell-vm-11: LiveOwner".to_string(),
+                format!("{}: LiveOwner", sibling_dir.display()),
+            ],
+            "every arm must record what it declined to reap"
+        );
+
+        let _ = std::fs::remove_dir_all(&sibling_dir);
+    }
+
+    // A6, fail-safe half. "I cannot tell" is a THIRD answer and must not be spent as "nobody owns
+    // it": a claim registry that cannot be read (EACCES, EIO, a lock path that is a directory)
+    // means the sweep has no evidence, and deleting a live sibling's network is not a recoverable
+    // mistake while leaking one namespace is.
+    //
+    // RED on: mapping `IdClaim::Undeterminable` to a removal in `may_reclaim` (e.g. `matches!(…,
+    // NoLiveOwner | Undeterminable)`), which is the tempting shape because it preserves the old
+    // reclaim rate.
+    #[cfg(feature = "net-privileged")]
+    #[test]
+    fn an_undeterminable_claim_retains_rather_than_reaps() {
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let nl = RecordingSweepNetlink {
+            log: log.clone(),
+            ..Default::default()
+        };
+        let cg = RecordingSweepCgroupFs { log: log.clone() };
+        let scanner = FakeOrphanScanner {
+            netns: vec!["vmcell-net-21".into()],
+            claims: [((IdSpace::Vmid, 21), IdClaim::Undeterminable)]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+
+        let report = sweep_orphans(
+            &scanner,
+            &nl,
+            &cg,
+            &std::collections::BTreeSet::new(),
+            &std::collections::BTreeSet::new(),
+        );
+
+        assert!(
+            report.netns.is_empty(),
+            "an unreadable claim must NOT authorize a removal: {report:?}"
+        );
+        assert_eq!(report.retained, vec!["vmcell-net-21: Undeterminable"]);
+        assert!(
+            log.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+            "nothing may reach the netlink seam at all"
+        );
+    }
+
+    // A9's other half: the sweep reclaims OUR OWN stale member taps, which is what makes
+    // `IFF_TUN_EXCL` (net_sys) safe to set. A segment namespace outlives any single member, so a
+    // SIGKILLed member leaves a persistent `<prefix>-tap-<vmid>` inside a namespace that must stay
+    // up for the others. Nothing reclaimed that before; with the exclusive create, nothing may
+    // adopt it either, so the next member handed that recycled vmid would fail forever.
+    //
+    // Note which namespace this happens in: the one the sweep just DECLINED to delete. That is the
+    // whole shape — a removal from inside a retained resource.
+    //
+    // RED on: dropping the `sweep_member_taps` call from the retained-segment arm (no `link:`
+    // call at all), or reclaiming by a `<prefix>-tap-` prefix match instead of the composer
+    // identity (the bridge `vmcell-br-31` would then be deleted, which cuts the live segment's
+    // members off from each other — asserted below).
+    //
+    // FAKE-BLIND AXIS: the recording `Netlink` neither creates nor deletes an interface, so it
+    // cannot see that a persistent tap is really gone or that its name becomes creatable again —
+    // the join that makes `IFF_TUN_EXCL` safe. `tests/tap_create.rs`'s
+    // `the_sweep_keeps_live_siblings_and_reclaims_our_own_stale_member_tap` asserts both against
+    // the kernel.
+    #[cfg(feature = "net-privileged")]
+    #[test]
+    fn sweep_reclaims_a_dead_members_tap_from_a_retained_segment_netns() {
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let segment = crate::naming::segment_netns_name("vmcell", 31);
+        let dead_member = crate::naming::tap_name("vmcell", 41);
+        let live_member = crate::naming::tap_name("vmcell", 42);
+        let our_member = crate::naming::tap_name("vmcell", 43);
+        let bridge = crate::naming::segment_bridge_name("vmcell", 31);
+        let nl = RecordingSweepNetlink {
+            log: log.clone(),
+            links: [(
+                segment.clone(),
+                vec![
+                    "lo".to_string(),
+                    bridge.clone(),
+                    dead_member.clone(),
+                    live_member.clone(),
+                    our_member.clone(),
+                    // A foreign interface whose tail parses as an id but whose name is not what
+                    // the composer produces: not ours, never deleted.
+                    "eth-41".to_string(),
+                ],
+            )]
+            .into_iter()
+            .collect(),
+        };
+        let cg = RecordingSweepCgroupFs { log: log.clone() };
+        let scanner = FakeOrphanScanner {
+            segment_netns: vec![segment.clone()],
+            claims: [
+                ((IdSpace::Segid, 31), IdClaim::LiveOwner),
+                ((IdSpace::Vmid, 42), IdClaim::LiveOwner),
+            ]
+            .into_iter()
+            .collect(),
+            prefix: Some("vmcell".to_string()),
+            ..Default::default()
+        };
+
+        // vmid 43 is live in OUR OWN set, which must hold its tap back just as a sibling's claim does.
+        let report = sweep_orphans(
+            &scanner,
+            &nl,
+            &cg,
+            &[43].into_iter().collect(),
+            &std::collections::BTreeSet::new(),
+        );
+
+        assert!(
+            report.segment_netns.is_empty(),
+            "the segment namespace itself is claimed and must survive"
+        );
+        assert_eq!(
+            report.member_taps,
+            vec![dead_member.clone()],
+            "exactly the dead member's tap is reclaimed"
+        );
+        assert_eq!(
+            log.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+            vec![format!("link:{segment}/{dead_member}")],
+            "nothing else in the namespace may be touched — not the bridge, not lo, not a \
+             foreign interface"
+        );
+        assert!(
+            report
+                .retained
+                .contains(&format!("{live_member}: LiveOwner"))
+                && report
+                    .retained
+                    .contains(&format!("{our_member}: LiveOwner")),
+            "both live members' taps must be recorded as retained: {:?}",
+            report.retained
+        );
+    }
+
+    // The member-tap selection law on its own, without netlink: a link is a member tap only if it
+    // is EXACTLY what `naming::tap_name` composes for its own trailing id.
+    //
+    // RED on: replacing the composer identity with a `starts_with("<prefix>-tap-")` filter —
+    // `vmcell-tap-9x` (tail not an id) and `vmcell-tap-` are then candidates — or on dropping the
+    // live-vmid check, which would hand a running VM's tap to the deleter.
+    #[test]
+    fn member_tap_selection_goes_through_the_one_composer() {
+        let links: Vec<String> = [
+            "lo",
+            "vmcell-br-3",
+            "vmcell-tap-5",
+            "vmcell-tap-6",
+            "vmcell-tap-7",
+            "acme-tap-8",      // another prefix's member: not ours to reclaim
+            "vmcell-tap-9x",   // tail is not an id
+            "notvmcell-tap-5", // ends the same, composed differently
+        ]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+
+        let selected =
+            reclaimable_member_taps("vmcell", &links, &[6].into_iter().collect(), &|vmid| {
+                if vmid == 7 {
+                    IdClaim::Undeterminable
+                } else {
+                    IdClaim::NoLiveOwner
+                }
+            });
+
+        assert_eq!(
+            selected,
+            vec![
+                ("vmcell-tap-5".to_string(), 5, IdClaim::NoLiveOwner),
+                // Live in the caller's own set: reported, but not as reclaimable.
+                ("vmcell-tap-6".to_string(), 6, IdClaim::LiveOwner),
+                ("vmcell-tap-7".to_string(), 7, IdClaim::Undeterminable),
+            ],
+            "only names the composer produces are candidates, and only `NoLiveOwner` may be deleted"
+        );
+    }
+
+    // The one liveness law, against a real claim directory: the `<id>.lock` file the shared
+    // allocators write is what the sweeps read back, and the three answers are distinct.
+    //
+    // This drives `HostOrphanScanner`'s OWN `id_claim` — the production impl — rather than the
+    // predicate alone, because a green predicate beside a scanner that never calls it is the exact
+    // shape the call-site convention exists to catch.
+    //
+    // RED on: collapsing the `Err` arm of `FsIdClaim::owner_is_live` into `Ok(false)` (the
+    // Undeterminable leg goes NoLiveOwner), on ignoring `/proc/<pid>` (the dead-owner leg goes
+    // LiveOwner and a crashed run's ids would never be reclaimed), or on pointing `id_claim`'s two
+    // arms at one registry (the cross-space legs fail).
+    #[test]
+    fn the_host_scanner_reads_its_liveness_from_the_id_claim_registry() {
+        let vmid_dir = tempfile::tempdir().expect("vmid claim dir");
+        let segid_dir = tempfile::tempdir().expect("segid claim dir");
+        // A live owner: this very process, which is the same fact `FsIdClaim::atomic_claim` writes.
+        std::fs::write(
+            vmid_dir.path().join("1.lock"),
+            std::process::id().to_string(),
+        )
+        .expect("live lock");
+        // A crashed owner: `/proc/4294967295` can never exist.
+        std::fs::write(vmid_dir.path().join("2.lock"), u32::MAX.to_string()).expect("dead lock");
+        // An unreadable registry entry: a directory where a lock file belongs reads EISDIR, which
+        // is neither "absent" nor a pid. (A `chmod 000` file would be readable anyway under the
+        // blessed runner's CAP_DAC_OVERRIDE, so it would not prove this arm.)
+        std::fs::create_dir(vmid_dir.path().join("3.lock")).expect("unreadable lock");
+        // The segid space is a DIFFERENT registry: id 1 live there says nothing about vmid 1.
+        std::fs::write(
+            segid_dir.path().join("4.lock"),
+            std::process::id().to_string(),
+        )
+        .expect("live segid lock");
+
+        let scanner =
+            HostOrphanScanner::new("vmcell").with_claim_dirs(vmid_dir.path(), segid_dir.path());
+
+        assert_eq!(scanner.id_claim(IdSpace::Vmid, 1), IdClaim::LiveOwner);
+        assert_eq!(scanner.id_claim(IdSpace::Vmid, 2), IdClaim::NoLiveOwner);
+        assert_eq!(scanner.id_claim(IdSpace::Vmid, 3), IdClaim::Undeterminable);
+        assert_eq!(
+            scanner.id_claim(IdSpace::Vmid, 9),
+            IdClaim::NoLiveOwner,
+            "no lock file at all is nobody's id"
+        );
+        // Cross-space: each id space answers only from its own registry.
+        assert_eq!(scanner.id_claim(IdSpace::Segid, 4), IdClaim::LiveOwner);
+        assert_eq!(
+            scanner.id_claim(IdSpace::Segid, 1),
+            IdClaim::NoLiveOwner,
+            "a live VMID must not vouch for the segment of the same number (§6.5, law F2)"
+        );
+        assert_eq!(
+            scanner.id_claim(IdSpace::Vmid, 4),
+            IdClaim::NoLiveOwner,
+            "…and the converse"
+        );
+    }
+
+    // The claim law and the ALLOCATOR agree, because they are one function. A vmid an allocator
+    // holds reads `LiveOwner` to the sweep; the same vmid after `release` reads `NoLiveOwner`.
+    //
+    // This is the join that matters: the sweep's whole premise is that the file the allocator
+    // writes means what the sweep thinks it means. RED on: pointing the scanner at a different
+    // directory than the allocator claims into (the live leg goes NoLiveOwner and the sweep
+    // deletes a running VM's resources), which is precisely what two spellings of
+    // `/tmp/vmcell-vmid` would produce.
+    #[test]
+    fn a_vmid_an_allocator_holds_reads_live_to_the_sweep() {
+        let vmid_dir = tempfile::tempdir().expect("vmid claim dir");
+        let segid_dir = tempfile::tempdir().expect("segid claim dir");
+        let alloc = VmidAllocator::shared_at(vmid_dir.path());
+        let vmid = alloc.allocate().expect("allocate");
+        let scanner =
+            HostOrphanScanner::new("vmcell").with_claim_dirs(vmid_dir.path(), segid_dir.path());
+
+        assert_eq!(
+            scanner.id_claim(IdSpace::Vmid, vmid),
+            IdClaim::LiveOwner,
+            "a vmid this process holds must read live to the sweep"
+        );
+        alloc.release(vmid);
+        assert_eq!(
+            scanner.id_claim(IdSpace::Vmid, vmid),
+            IdClaim::NoLiveOwner,
+            "…and must be reclaimable again once released, or a sweep could never reclaim anything"
+        );
+    }
+
+    // `cleanup_orphan_netns` is handed a name filter, not an id space, so it asks both registries
+    // and keeps the strongest retention. The ordering is the whole decision, so it is pinned
+    // directly.
+    //
+    // RED on: returning the FIRST answer instead of the strongest (a live claim in the second
+    // registry is then ignored), or on ranking `Undeterminable` below `NoLiveOwner`.
+    #[test]
+    fn the_any_space_claim_keeps_the_strongest_retention() {
+        use IdClaim::{LiveOwner, NoLiveOwner, Undeterminable};
+        for (states, expected) in [
+            ([NoLiveOwner, NoLiveOwner], NoLiveOwner),
+            ([LiveOwner, NoLiveOwner], LiveOwner),
+            ([NoLiveOwner, LiveOwner], LiveOwner),
+            ([Undeterminable, NoLiveOwner], Undeterminable),
+            ([NoLiveOwner, Undeterminable], Undeterminable),
+            ([LiveOwner, Undeterminable], LiveOwner),
+            ([Undeterminable, LiveOwner], LiveOwner),
+            ([LiveOwner, LiveOwner], LiveOwner),
+            ([Undeterminable, Undeterminable], Undeterminable),
+        ] {
+            assert_eq!(
+                strongest_claim(states),
+                expected,
+                "{states:?} must resolve to {expected:?}"
+            );
+        }
     }
 
     // M4: the REAL `HostOrphanScanner::scan_cgroup_slices` must reach a slice at the depth a

@@ -694,7 +694,54 @@ name = "vmcell"
 #     snapshot cache key, closing design §17's "wired and idle" gap). A consumer overlay that named
 #     the old kernel labels resolves them no longer — that is a data edge, called out here because
 #     the schema gate cannot see a label rename either.
-version = "0.22.0"
+# 0.22.0 → 0.23.0: the deprecated unpaced `VirtioFsDaemon::start` shims are deleted. One breaking
+# edge, and it is the edge this ledger rule was invented to carry — `cargo semver-checks` will call
+# it clean, because a `0.x` minor bump is the slot pre-1.0 breakage is allowed to use, so nothing
+# but this entry tells a consumer their call site is gone.
+#
+#   * BREAKING `inherent_method_missing` — `fs::VirtioFsDaemon::start(share, vm_tmp)` is removed,
+#     under BOTH `experiment-fuse` arms. It has been `#[deprecated(since = "0.13.0")]` for ten
+#     releases with the deletion condition stated in its own rustdoc ("delete it in the next
+#     `vmcell` version bump"); this is that bump. MIGRATION is mechanical and mandatory rather than
+#     optional, which is the point: `VirtioFsDaemon::start_paced(share, vm_tmp, &cfg.timeouts)`,
+#     passing the VM's OWN `Timeouts`. A caller with no `VmConfig` in scope writes
+#     `&Timeouts::default()` and gets exactly the old behavior — the shim's body was that one line —
+#     but now writes it visibly. That visibility IS the change: §9.4 makes `api_socket_poll` pace
+#     every daemon readiness wait, and an entry point that can only supply the default cadence
+#     silently re-pinned virtiofsd's wait to it under `low_latency()` and `throughput()` (finding
+#     `virtiofsd-socket-wait-hardcoded-cadence`). No in-tree caller existed to migrate: all three
+#     shipped sites (CH create + restore, QEMU create) already passed `&cfg.timeouts`, and each
+#     backend gates that on its own source scan.
+#
+#   * NEW GATE, because the deletion is not self-enforcing:
+#     `fs::one_start_entry_point_gate::virtiofsd_declares_exactly_one_start_entry_point` scans this
+#     module's own source and reddens if a second `pub async fn` start entry point is DECLARED
+#     beside `start_paced`. The two backend call-site scans cannot see that shape — the deleted
+#     shim had exactly it, declared and never called in-tree, so its mispacing was reachable only
+#     by a downstream consumer and invisible to this repo. Nothing about adding a `pub async fn` is
+#     a compile error and no signature semver-checks reads moves, so a scan is the only thing that
+#     can go red on it.
+#
+#   * UNCHANGED on the contract surface: `fs::VirtioFsDaemon` is not on §10.4's listed surface at
+#     all (the pins schema + overlay, the stage/pipeline/build entry points, the pack surface, the
+#     `VMCELL_*` env table, the validator battery) — it is reachable public API, which is why it
+#     gets a ledgered bump, not listed contract. Nothing on the listed surface moves on this edge.
+#
+#   * ADDITIVE, and ledgered for the reason additions are invisible: `artifact::workspace_root()` is
+#     `pub` (it was `pub(crate)`). `cargo semver-checks` is SILENT by construction on an addition, so
+#     nothing but this line records that the workspace-root ascent now has an out-of-crate door —
+#     the same door `artifact::ch_binary_path()` has, and for the same reason. It closes design
+#     §17's last open "one law, one predicate" item: `bench-vm` hand-rolled the ascent because there
+#     was nothing to call, and the coupling §17 named — the `crates/vmcell-protocol/Cargo.toml`
+#     marker — is now spelled in one file and scanned by
+#     `scripts/ban-workspace-root-ascent-copies.sh`. Not on §10.4's LISTED surface (see the bullet
+#     above for what that list is), so this is reachable public API a consumer may call, not a
+#     contract entry vmcell owes them stability on beyond the usual semver of a `0.x` bump. It
+#     answers "where does this checkout's workspace root sit"; downstream, where there IS no vmcell
+#     checkout, the marker is never found and it falls back to the start dir — a consumer wanting a
+#     stable anchor sets `$VMCELL_ARTIFACTS_DIR` (the documented §10.4 route) rather than reading
+#     this.
+version = "0.23.0"
 edition = "2024"
 # MSRV is the single workspace floor (`[workspace.package] rust-version`, in lockstep with
 # rust-toolchain.toml via the `just ci` sync assertion) — currently the latest stable, 1.98.0.

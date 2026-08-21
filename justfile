@@ -704,6 +704,27 @@ gates:
     # through `just --show`, so an interpolated `{{{{just_executable()}}}}` call reads as it runs.
     ./scripts/ban-orphan-recipe.sh
     ./scripts/test-ban-orphan-recipe.sh
+    # A6/A9 ("one law, one predicate"): the cross-process id-claim law — WHERE the registry is
+    # (`SHARED_{VMID,SEGID}_CLAIM_DIR`) and HOW owner liveness is decided (`FsIdClaim::owner_is_live`'s
+    # `/proc/{pid}` probe). Both halves drift SILENTLY and fail OPEN: a second spelling compiles, passes
+    # every unit test (they inject their own directories), and makes the sweeps read an empty registry —
+    # which reaps a LIVE sibling's netns/tap/cgroup/scratch while logging a successful orphan reclaim.
+    # Comment-stripped, so the many rustdoc mentions and a `/proc/{pid}/stat` READ are not false
+    # positives. The self-test proves both arms, the const check inside the law's own home, the
+    # stale-exemption report (two rostered sites) and the empty-scan misconfiguration red.
+    ./scripts/ban-id-claim-law-copies.sh
+    ./scripts/test-ban-id-claim-law-copies.sh
+    # Design §17's LAST open "one law, one predicate" item, closed: `bench-vm` hand-rolled the
+    # library's workspace-root ascent for as long as `vmcell::artifact::workspace_root` was
+    # `pub(crate)`, and §17 named the coupling to watch — the `crates/vmcell-protocol/Cargo.toml`
+    # marker. It is watched here rather than remembered. A drifted ascent is not a compile error and
+    # not visible to the parity test beside it: a BYTE-IDENTICAL copy resolves the same root today
+    # and is free to drift tomorrow (both directions demonstrated when this landed). The roster names
+    # the one file that may still spell the marker — the guest-tools closure error that quotes it at
+    # an operator — and the home's count is split production vs `#[cfg(test)]`, because a production
+    # copy plus a deleted fixture keeps the file's total unchanged.
+    ./scripts/ban-workspace-root-ascent-copies.sh
+    ./scripts/test-ban-workspace-root-ascent-copies.sh
     # design §3.5 / AGENTS.md "a gate binds the CALL SITES, not just the extracted predicate":
     # `mini-init` is PID 1 in the service proof cell, and its restart loop spelled its pacing twice
     # and unevenly — a literal `Duration::from_millis(200)` on the spawn-failure arm, and NOTHING on

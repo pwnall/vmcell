@@ -157,15 +157,34 @@ where
 /// privileged test runs.
 ///
 /// Enumerates `/var/run/netns` and removes every namespace whose name starts
-/// with `prefix` (e.g. `vmcell-net-`). Intended to run at the start of a
-/// privileged/netns test so a namespace leaked by a prior aborted run cannot
+/// with `prefix` (e.g. `vmcell-net-`) **and whose trailing id no live process claims**. Intended to
+/// run at the start of a privileged/netns test so a namespace leaked by a prior aborted run cannot
 /// collide with this run's vmid (`netns add … Operation not permitted`). It runs
 /// under the capability runner's `CAP_SYS_ADMIN`+`CAP_DAC_OVERRIDE`, so it needs
 /// no `sudo`.
 ///
-/// Safe only when no live VM owns a matching namespace: the privileged suite
-/// serializes these tests (`serial-host`), and orphans have no live interfaces,
-/// so the removal does not hang. A per-namespace failure is logged and skipped
+/// **The liveness test, and why it is this one.** Matching by name prefix alone made this
+/// function reap a *live* sibling's namespace — recorded, and observed twice on this host: a live
+/// `vmcell-net-207`, and a `vmcell-seg-1` deleted out from under its running members. A second
+/// process's live set is invisible from here by construction, so the signal has to be one both
+/// processes write: the cross-process id-claim lock the shared allocators already keep
+/// ([`crate::orchestrator::IdClaim`], whose rustdoc weighs the alternatives that were rejected).
+/// A namespace is removed only when its id reads
+/// [`NoLiveOwner`](crate::orchestrator::IdClaim::NoLiveOwner); a live claim **or an unreadable
+/// registry** retains it, because "I cannot tell" must never be spent as "nobody owns it".
+///
+/// This function is handed a `starts_with` filter rather than an id space, so it asks both
+/// registries and keeps the more conservative answer
+/// (`orchestrator::host_id_claim_any_space`) — a rule that can
+/// only ever *retain* more than the id-space-precise check
+/// [`sweep_orphans`](crate::orchestrator::sweep_orphans) applies.
+///
+/// A name with no numeric tail belongs to no id space at all, so nothing can vouch for it either
+/// way; it is left alone. That is a change of posture for a hand-made `vmcell-net-scratch`, and
+/// the right one: this sweeper reclaims *ids*, and a name it cannot key to an id is not its
+/// residue to delete.
+///
+/// A per-namespace failure is logged and skipped
 /// rather than propagated, so one stuck namespace cannot block the rest. Returns
 /// the names of the namespaces it successfully removed.
 pub fn cleanup_orphan_netns(prefix: &str) -> Vec<String> {
@@ -176,6 +195,24 @@ pub fn cleanup_orphan_netns(prefix: &str) -> Vec<String> {
     for entry in dir.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
         if !name.starts_with(prefix) {
+            continue;
+        }
+        let Some(id) = crate::orchestrator::trailing_id(&name) else {
+            tracing::info!(
+                "cleanup_orphan_netns: retaining {} — it carries no id, so no claim registry can \
+                 vouch for it",
+                name
+            );
+            continue;
+        };
+        let claim = crate::orchestrator::host_id_claim_any_space(id);
+        if claim != crate::orchestrator::IdClaim::NoLiveOwner {
+            tracing::info!(
+                "cleanup_orphan_netns: retaining {} — id {} reads {:?}",
+                name,
+                id,
+                claim
+            );
             continue;
         }
         match netns_rs::NetNs::get(&name).and_then(netns_rs::NetNs::remove) {
@@ -316,6 +353,26 @@ pub trait Netlink: Send + Sync {
     /// # Errors
     /// Returns an error if the `rtnetlink` rule/route operations fail.
     fn setup_tproxy_routing(&self, netns: &str) -> Result<()>;
+
+    /// Lists the interface names inside `netns`.
+    ///
+    /// The read half of [`Netlink::delete_link`], and it exists for exactly one caller: the orphan
+    /// sweep's member-tap arm ([`sweep_orphans`](crate::orchestrator::sweep_orphans)), which has to
+    /// find a crashed member's leftover tap *inside* a segment namespace it is deliberately
+    /// keeping alive for the other members.
+    ///
+    /// The default answers "I cannot enumerate" — an empty list — which makes that arm a no-op for
+    /// an implementation that has no netlink behind it (the recording fakes). Empty is the safe
+    /// default here and only here, because this list is a list of **removal candidates**: a
+    /// `Netlink` that under-reports deletes less, never more. Contrast every other default in this
+    /// tree, where under-reporting is the fail-open direction.
+    ///
+    /// # Errors
+    /// Returns an error if the namespace cannot be entered or the `rtnetlink` dump fails.
+    fn list_links(&self, netns: &str) -> Result<Vec<String>> {
+        let _unused = netns;
+        Ok(Vec::new())
+    }
 }
 
 /// Interface for applying nftables rules.
@@ -406,11 +463,15 @@ impl Netlink for RtNetlink {
     }
 
     fn setup_tap_on_bridge(&self, netns: &str, tap_name: &str, bridge: &str) -> Result<()> {
-        // Nothing exists yet if this fails — an `EBUSY` means the interface of that name is
-        // someone else's, and its opener holds it — so it returns without any cleanup. (`EEXIST`
+        // Nothing exists yet if this fails — an `EBUSY` means an interface of that name is already
+        // there, whoever made it (`IFF_TUN_EXCL`; `net_sys::TAP_CREATE_FLAGS`) — so it returns
+        // without any cleanup, and the cleanup contract below is honest: every tap it deletes is
+        // one this call created. Before the exclusive flag, a persistent-but-unattached tap of that
+        // name was silently ADOPTED and the same cleanup deleted an interface this call did not
+        // make; our own stale member taps are now reclaimed by the orphan sweep instead
+        // (`orchestrator::sweep_orphans`), which is why the two landed together. (`EEXIST`
         // is NOT reachable from here: the kernel returns it only for a second `TUNSETIFF` on the
-        // *same* fd, which this path never issues. The converse does not hold either — see the
-        // create-or-attach note in `docs/implementation-notes.md`.)
+        // *same* fd, which this path never issues.)
         create_persistent_tap_in_ns(netns, tap_name)?;
 
         let name_for_cleanup = tap_name.to_string();
@@ -481,6 +542,31 @@ impl Netlink for RtNetlink {
                     .await
                     .map_err(|e| format!("link {link_name} del err: {e}"))?;
                 Ok(())
+            })
+        })?;
+
+        res.map_err(Error::Network)
+    }
+
+    fn list_links(&self, netns: &str) -> Result<Vec<String>> {
+        let res = in_netns(netns, move || {
+            run_with_rtnetlink(|handle| async move {
+                let mut links = handle.link().get().execute();
+                let mut names = Vec::new();
+                while let Some(msg) = links
+                    .try_next()
+                    .await
+                    .map_err(|e| format!("link dump err: {e}"))?
+                {
+                    // `IFLA_IFNAME` is the only attribute this needs, and every netdevice carries
+                    // exactly one — a message without it is a kernel that changed shape, not an
+                    // unnamed interface, so it is skipped rather than guessed at.
+                    names.extend(msg.attributes.into_iter().find_map(|attr| match attr {
+                        netlink_packet_route::link::LinkAttribute::IfName(n) => Some(n),
+                        _ => None,
+                    }));
+                }
+                Ok(names)
             })
         })?;
 

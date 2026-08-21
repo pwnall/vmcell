@@ -1363,8 +1363,20 @@ pub enum Egress {
     /// `host_services_port`/proxy forwards, and the privileged path reaches only
     /// what its TPROXY ruleset admits. Arbitrary outbound egress (dialing the
     /// frame's real destination / host masquerade) is **not implemented** for
-    /// `Open` in either mode; see implementation-notes.md (§16, H-NET-4). Use
-    /// [`Egress::Filtered`] for a mediated egress path.
+    /// `Open` in either mode (design §6.2, §17). Use [`Egress::Filtered`] for a
+    /// mediated egress path.
+    ///
+    /// **The datapath refuses what it does not forward (C7).** "Not implemented"
+    /// used to mean "answered wrongly": the unprivileged NAT's interface runs with
+    /// smoltcp's AnyIP on (`Filtered` needs it to intercept a destination the guest
+    /// chose), and a forward-port listener armed on a bare port matches *every*
+    /// destination address, so a guest dialing `93.184.216.34:<host_services_port>`
+    /// was accepted and spliced onto the host's own `127.0.0.1:<host_services_port>`
+    /// service — a silent destination substitution standing in for the arbitrary
+    /// outbound this mode does not provide. A permanent forward is now scoped to
+    /// this VM's own `/30` gateway (the §6.3 endpoint address the guest is given),
+    /// so an unadmitted destination gets a TCP reset: `Open` forwards exactly what
+    /// its mode admits and refuses the rest, rather than answering as something else.
     #[default]
     Open,
 }

@@ -3079,13 +3079,14 @@ restore suites. Retire this entry when the shared crate lands.
   (CH create + restore, QEMU create), so §9.4's "every daemon readiness wait" is true on the shipped
   path — the extraction alone left it false, because the unit gate exercises only the pure
   `socket_wait_budget` and is structurally blind to a call site that never reaches it; the call-site
-  property is therefore gated by its own source scan in each backend. The unpaced `start` survives as
-  a `#[deprecated]` shim, not because it is wanted but because removing a `pub fn` is an API break
-  that belongs to a ledgered version bump rather than a defect fix — and, measured rather than
-  assumed, `cargo semver-checks` would *not* have caught the removal (for a `0.x` crate it assumes
-  the minor bump that is allowed to break), so the ledger rule is the only thing holding it. Under
-  `-D warnings` the deprecation makes any new caller fail to build, which is what keeps the shim from
-  becoming the accidental twin. Delete it at the next `vmcell` version bump. *Deliberate narrowing:*
+  property is therefore gated by its own source scan in each backend. ~~The unpaced `start` survives as
+  a `#[deprecated]` shim… Delete it at the next `vmcell` version bump.~~ **DONE** on the 0.22 → 0.23
+  edge (2026-08-20 loose-end pass, Tier C): both shims are deleted under both `experiment-fuse` arms,
+  so reaching for the shorter name is a compile error rather than a deprecation warning. The recorded
+  measurement held on the real edge — `cargo semver-checks --baseline-rev origin/main -p vmcell`
+  reports "no semver update required", skipping all 254 checks because a `0.x` minor bump is the slot
+  allowed to break — so the ledger entry and one new gate are the only things carrying it. See the
+  wave-3 entry at the end of this file. *Deliberate narrowing:*
   the shared helper folds a
   failing `try_wait` into the deadline, so a poll error now surfaces as the readiness failure **with**
   the daemon's stderr rather than as its own message — nothing is swallowed, and the alternative was
@@ -6432,3 +6433,106 @@ The external-tool list is enumerated from the tree's actual spawns rather than f
 
 
 Design §17 sketches the validator's backend knob as "a knob on `ValidationOptions`". It ships as a parameter instead — `validate_with(&vmm, &artifacts, &opts)` — and `ValidationOptions` gains no field. The sketch is not implementable: `Vmm::create`/`restore` are `async fn`, so `dyn Vmm` is `error[E0038]` and no field can hold an erased backend or an erased factory over one; the enum-of-backends rustc suggests would make a contract crate depend on `vmcell-firecracker`/`-qemu`/`-crosvm`, inverting the layering, and would still exclude the out-of-tree backend the knob exists for; and a generic `ValidationOptions<V>` routes the same type parameter through the configuration type for no gain, at the cost of every signature that carries one. The parameter form is what `vmcell-bench`'s composition root and this crate's own `conformance::LiveProbe` already use, and it keeps `ValidationOptions` plain `Clone + Debug` data, which is what makes the change additive rather than breaking. §17's second question — one door or both — answers itself: `conformance::run_battery` never had the hardcode, so the `run_budget` asymmetry does not repeat; `only_the_default_door_names_a_concrete_backend` gates that rather than restating it. One deviation of its own: `validate_with` does not probe `/dev/kvm`, because the caller who chose the backend is the one who knows whether it needs one — `validate` probes for the Cloud Hypervisor it picks, `harness::has_kvm()` is public for a caller doing the same, and a test double needs nothing; refusing on the double's behalf would put the knob's own gate behind the facility the knob exists to be testable without. Artifact existence does move into `validate_with`, through the one `ensure_artifacts_exist` predicate both doors call, so a path typo is a typed refusal at either entry point. `validate`'s observable behavior, refusal order included, is unchanged. Note for whoever maintains the review record: `docs/90-claude-opus-code-review.md`'s C5 row names the now-public `validate_on` by its old private name.
+
+
+## Wave 3 — the remaining Tier A defects and Tier C items
+
+C9 — the parser-recognized-but-uncommitted pins. `KNOWN_PINS_NAMESPACES` recognized ten namespaces; `pins.json` committed seven. The gap was three, not the two design §10.2 names: `builder_base` (deliberate — a downstream override pair whose absence is `resolve_builder_base`'s `rootfs_*` fallback), `debian_snapshot_timestamp`, and `virtiofsd`.
+
+`debian_snapshot_timestamp` is now COMMITTED as `20260801T000000Z`, validated live against snapshot.debian.org (resolves to Debian 13.6 `trixie`, `Date: Sat, 11 Jul 2026` — and `trixie` is `vmcell-cli`'s `DEFAULT_RELEASE`). The gap was not merely a cold cache key: `vmcell-rootfs-builder`'s `MmdebstrapRootfsStage::run` hard-errors `Missing debian_snapshot_timestamp pin`, so the shipped verb `vmcell build --rootfs-source mmdebstrap` could not run off the committed baseline at all — only under a `$VMCELL_PINS` overlay — and that stage's `cache_key` folded `unwrap_or_default()`, an absence, so a re-pin could not invalidate a stale rootfs. The fold now hashes a value.
+
+`virtiofsd` stays UNCOMMITTED, deliberately, and the decision is now gated rather than tacit. Nothing in the tree reads the pin; `artifact/snapshot.rs:43-44` records why nothing may fold it (a snapshot-eligible VM attaches no vhost-user device, §8.1, so the snapshot never runs virtiofsd); and `ci.yml`'s `cargo install virtiofsd --locked` pins no version at all, so a committed value would be an unenforced substrate claim — one that has ALREADY drifted three ways in prose (host 1.14.0 / README "1.14.0 at the time of writing" / docs/benchmark-results.md 1.13.3). `every_recognized_pins_namespace_is_committed_or_declared_uncommitted` holds the exception table in both directions: committing the pin without wiring a reader now goes red naming the recorded reason. The fully-honest end state — deleting the namespace so an overlay naming it is rejected loud — is a breaking change to listed contract surface (§10.4) and is left to a pass that may touch `crates/vmcell/Cargo.toml`.
+
+Design §10.2's sentence "the CH/virtiofsd and snapshot-timestamp pins are recognized-when-present but not currently committed — so the snapshot stage's CH-build-identity fold arms only once that pin is added" was ALREADY stale before this pass (`cloud_hypervisor: "v53.0"` landed in the 2026-08-20 dependency pass, so the fold has been armed); it is now stale on the timestamp half too. Fold the correction in at the next design reissue rather than as errata.
+
+
+C4 — bench-vm's workspace-root ascent, design §17's last open "one law, one predicate" consolidation, is CLOSED. `vmcell::artifact::workspace_root()` is `pub` (it was `pub(crate)`, which is exactly why the third copy existed); `bench-vm`'s `workspace_root()` is now a one-line delegation, the shape `harness::ch_bin()` and the CLI's `ch_bin()` already use. The export stayed in `crates/vmcell/src/artifact/mod.rs`: the ascent's private core `find_vmcell_source_root` and its two other public answers (`artifacts_dir`, `vmcell_source_root`) are already there, so moving the law would have created the second home the item exists to prevent. `artifacts_dir()` had exposed this ascent's result joined with `target/vmcell-artifacts`; a caller wanting the bare anchor had nothing, which is the whole gap.
+
+The coupling §17 named — the `crates/vmcell-protocol/Cargo.toml` marker — is now spelled in one production line and gated by `scripts/ban-workspace-root-ascent-copies.sh`. The gate's needle is UNQUOTED, unlike its `$VMCELL_CH_BIN` sibling, because the marker also appears inside a user-facing string (`guest_tools.rs`'s "no vmcell checkout (no `…` above {})") and that mention is a real coupling: if the marker moved, the message would send an operator hunting for a file that no longer marks anything. It is rostered with its count and reason rather than excluded.
+
+THE SECOND HALF OF THE NOTES ENTRY IS NOT OPEN, and was left alone as instructed. `bench-vm`'s four-backend `VMM_BIN_RESOLVERS` table is held by a gate that CAN fail: `vmm_binary_matches_validator_contract_getters` pins all four DEFAULTS against `harness::{ch,fc,qemu,crosvm}_bin` (a bench-local `"qemu"` for QEMU reddens it), the var-name half is pinned by the injected-lookup test, the CH leg additionally equals `vmcell::artifact::ch_binary_path()`, and `ban-ch-binary-resolver-copies.sh` carries the file as a rostered entry at count 2. Collapsing further would need `fc_binary_path`/`qemu_binary_path`/`crosvm_binary_path` on the library, which §17 explicitly scopes out ("no `vmcell`-side law to route through, so banning their spellings would name no home to send the reader to; when one is added this gate grows an arm"). Not touched.
+
+Two observations for whoever writes the register next, neither acted on:
+* `crates/vmcelld/tests/integration.rs::workspace_root()` is a fourth spelling of "the root", but it walks two `parent()`s from its own `CARGO_MANIFEST_DIR`. Deliberately OUT of the new gate's scope, stated in its SCOPE section rather than left implicit: it cannot drift with the marker, it knows its own depth, and it breaks loudly if the crate moves. It answers a different question than the library's ascent ("where is the root from an ARBITRARY start dir, and what if there is none").
+* `bench-vm` carries several pre-existing bare `let _ = std::fs::remove_dir_all(&snap_dir)` (≈ lines 287/315/382/1510/1522/1530), an AGENTS "fail loud" violation inside my file budget but outside this item. Left for a pass that owns it rather than folded in.
+
+
+For `docs/implementation-notes.md` — I did not edit it (orchestrator-owned). The "virtiofsd readiness is paced by the caller's profile, with one narrowing" entry contains a now-discharged sentence; suggested replacement for the passage running from "The unpaced `start` survives as a `#[deprecated]` shim…" through "…Delete it at the next `vmcell` version bump.":
+
+  The unpaced `start` shims are **deleted**, on the `0.22 → 0.23` edge, under both `experiment-fuse`
+  arms — the ledgered bump that entry was waiting for. `start_paced` is now the only entry point, so
+  reaching for the shorter name is a compile error rather than a deprecation warning. The recorded
+  measurement held on the real edge: `cargo semver-checks --baseline-rev origin/main -p vmcell`
+  reports "no semver update required" (for a `0.x` crate it treats the minor bump as the
+  allowed-to-break slot and skips all 254 checks), so the ledger entry and one new gate are the only
+  things carrying the break. That gate is
+  `fs::one_start_entry_point_gate::virtiofsd_declares_exactly_one_start_entry_point`, which scans
+  `fs.rs` for the roster of `pub async fn` declarations and reddens on a second one. It exists
+  because the two backend scans gate CALL SITES and the shim was declared-and-never-called in-tree:
+  its mispacing was reachable only by a downstream consumer and structurally invisible to this repo
+  — the same blind spot that let the shim survive ten releases. Adding a `pub async fn` is neither a
+  compile error nor a signature semver-checks reads, so a scan is the only thing that can go red on
+  it.
+
+Also for the orchestrator: `docs/92-claude-opus-loose-end-inventory.md` line 72 ("The deprecated unpaced `VirtioFsDaemon::start` shims are past their recorded delete-at-next-bump date") is now discharged and should come off the Tier C list.
+
+
+**C7 — `Egress::Open` forwards what its mode admits, and refuses the rest (the smoltcp NAT half).** Design §17 recorded `Egress::Open` as providing no *arbitrary* outbound egress, closable "by real re-origination or a typed `Unsupported`". Neither was the right close, and the recorded framing understated the defect: on the unprivileged NAT, "not implemented" was implemented as *answering with something else*. `run_network` sets `set_any_ip(true)` — load-bearing for `Filtered`'s transparent L4 interception — under which smoltcp's `process_ipv4` accepts a frame for any destination (`has_ip_addr` returns `true` unconditionally when AnyIP is on), and a permanent forward armed on a bare port matched every destination address (`TcpSocket::accepts` reads `listen_endpoint.addr == None` as `addr_ok = true`). A guest dialing `93.184.216.34:<host_services_port>` was therefore accepted and spliced onto `127.0.0.1:<host_services_port>` — the host's own service. A silent destination substitution standing in for the egress the mode does not provide.
+
+Real re-origination was rejected: `Open` is the default, so it would hand every existing test VM whatever the host can reach, on the datapath §17 records an open bring-up flake against. A construction-time typed refusal was rejected as *unavailable*, not as too small: there is no input by which a caller asks for arbitrary outbound — `Open` is the default and the only spelling — so refusing it at `build()` breaks every shipped configuration, and a new always-`CapabilityUnavailable` variant would be a knob nobody boots plus an unwarranted public-API addition. The request is expressible only as a guest SYN, so that is where the refusal now lives.
+
+Landed: `net::smoltcp::backend::nat_forward_endpoint(host_gw, port)` is the one law for a permanent forward's destination scope — this VM's own `/30` gateway, the §6.3 endpoint address the guest is given. `rearm_or_release_closed` takes a whole `IpListenEndpoint` rather than a `u16`, so the NAT's only permanent `listen` site cannot spell the scope itself. An unadmitted destination now falls through to smoltcp's `rst_reply`: refused, not mis-originated. `admit_syn`'s dynamic mappings deliberately keep the unpinned form — that asymmetry is the difference between `Open` (refuse) and `Filtered` (intercept). One consequence is recorded at the composer: a `Filtered` VM's SYN to a foreign address on a *forwarded* port is now refused rather than intercepted; it was never intercepted before either (it was mis-originated), so the refusal removes a wrong answer without removing a right one.
+
+Gates: `open_admits_the_gateway_endpoint_and_refuses_an_arbitrary_destination` drives the real smoltcp stack with hand-built ARP/SYN frames and asserts on the frames that come back (negative first, then the positive control on the same socket) — red on the bare-port form with `syn=true rst=false`; and `every_permanent_forward_is_armed_on_the_composed_gateway_endpoint`, an in-source call-site scan, because the two spellings compile identically and no signature can see the drift — red on a dropped composer with "expected exactly 1 `nat_forward_endpoint(` call site; found 0". Its self-test carries the empty-text leg.
+
+Live: `test_egress_proxy_unprivileged`, `host_endpoint::cloud_hypervisor`, `nat_window_fill::cloud_hypervisor`, `nat_window_fill_upload::cloud_hypervisor` all pass, skip manifest empty — every one dials the gateway through `vmcell::net::ip_math`, which is exactly what the scoping admits.
+
+**Still open (deliberately out of this change's file scope):** the privileged arm. `Egress::Open` → `PrivilegedEgressRules::NoRules` installs no nft table at all, leaving the per-VM netns at the kernel's default `accept` — "whatever the datapath natively provides" is unpinned rather than enforced. Same honesty argument, but the predicate lives in `orchestrator.rs`. §17's Networking entry should be narrowed to that remaining half rather than retired.
+
+Also corrected: `Egress::Open`'s rustdoc pointed at `implementation-notes.md (§16, H-NET-4)`; `H-NET-4` survives only under `docs/historical/`, so the pointer was dangling and no gate could see it (`ban-dangling-design-ref.sh` resolves `§16` against the *design*, where it means "Performance"). Now cites design §6.2/§17.
+
+
+## As built: A6 (both orphan sweeps were liveness-blind) + A9 (`TUNSETIFF` adopted a stale tap)
+
+**Landed as ONE change, because A9 is unsafe without A6's other half.** The recorded open item said
+`IFF_TUN_EXCL` "belongs with the daemon start-up sweep that would have to reclaim it"; this is that
+pairing. Both recorded entries are hereby RETIRED — `clean_vmcell_netns` and the daemon's start-up
+sweep are no longer liveness-blind, and `TUNSETIFF` no longer adopts.
+
+**The liveness test is the id-claim lock, not a new notion.** `FsIdClaim::owner_is_live` was
+extracted out of `try_claim` and is now shared with both sweeps: one law, one predicate, and the
+gate on its drift is `scripts/ban-id-claim-law-copies.sh`. Three alternatives were weighed and are
+recorded at `orchestrator::IdClaim` so nobody re-derives them: a process in the netns (false for
+every healthy VM — the VMM runs in the host pid namespace), a tap carrier/attached owner (false for
+the whole window between our create and the VMM's open), and a `/proc/*/fd` scan (racy, and answers
+about the namespace rather than the id). `IdClaim` is three-valued and only `NoLiveOwner` permits a
+removal; an unreadable registry RETAINS.
+
+**Two shapes worth recording.** (1) `cleanup_orphan_netns` receives a `starts_with` filter, not an
+id space, so it asks both registries and keeps the strongest retention (`host_id_claim_any_space`).
+That is sound because it can only ever retain MORE than the id-space-precise check; the cost is a
+coincidence (a dead `-net-7` kept while segid 7 is live) and the alternative is deleting a running
+VM's network. The per-space check stays the rule wherever the space is known. (2) The sweep now
+removes something from INSIDE a resource it declined to remove: a segment netns outlives any single
+member, so a SIGKILLed member's persistent `<prefix>-tap-<vmid>` is residue that no netns deletion
+reaches once the namespace is (correctly) retained for its live members. Member taps are recognised
+through `naming::tap_name` equality, never a `-tap-` prefix — the bridge and `lo` are then out of
+reach by construction.
+
+**A stale-premise check that paid off.** The note's claim that `TUNSETIFF` silently adopts was
+verified, not assumed: with the flag removed, the live leg reports `setup_tap` returning `Ok(())`
+against a pre-existing `ip tuntap`-planted tap.
+
+**Deliberate scope limit, recorded rather than hidden.** A hermetic allocator registers nothing, so
+the sweeps cannot protect it and behave exactly as before. The protection is real for every
+`HostEnv::shared` caller. Also unchanged: `vmcell-broker`'s `BrokerReply::SweepDone` does not carry
+the two new `SweepReport` lists (`member_taps`, `retained`) — the sweep still performs the work over
+the broker, the reply just does not report it; adding them is a wire-DTO change for a later pass.
+
+**Gates.** `scripts/ban-id-claim-law-copies.sh` (+ self-test) for the law's two halves; seven KVM-free
+unit tests including the allocator↔sweep join and the two cross-space legs; and three live legs in
+`crates/vmcell/tests/tap_create.rs` (no VM, `CAP_NET_ADMIN` only): the exclusive-create refusal with
+its untouched-interface residue check and a positive control, the sweep keeping a live sibling's
+namespaces while reclaiming our own stale member tap AND the reclaimed name becoming creatable again
+(the join between the two halves), and the test-start sweeper honoring a held `VmidAllocator::shared`
+claim with the release-then-reclaim non-vacuity leg.

@@ -806,23 +806,20 @@ fn kernel_filename(label: Option<&str>) -> String {
 }
 
 /// The workspace root, so `--snap-dir` anchors independent of the process CWD
-/// (N-BIN-5). Mirrors the library's `workspace_root` ascent (the `vmcell-protocol`
-/// marker); the library's is `pub(crate)`, so collapsing this copy needs a `vmcell`-side
-/// export and cannot be done from this crate (`bench-workspace-root-third-copy`). Listed on
-/// the design §17 consolidation register beside `harness::ch_bin()` — the register, not this
-/// comment, is what keeps the duplicate from being forgotten; the marker string is the
-/// coupling to watch.
+/// (N-BIN-5) — `vmcell`'s **one** ascent
+/// ([`workspace_root`](vmcell::artifact::workspace_root)), called rather than mirrored.
+///
+/// This was a hand-rolled third copy of that ascent, the last entry on design §17's open
+/// "one law, one predicate" register: the library's was `pub(crate)`, so the collapse needed a
+/// `vmcell`-side export and could not be done from this crate. The coupling §17 named is the
+/// **marker string** the ascent looks for, which after this collapse is spelled in exactly one
+/// file — a copy that drifted on it would ascend to a *different* directory, and this harness would
+/// then measure warm-restore snapshots on one filesystem and boot artifacts from another,
+/// silently, with both numbers reported as one run. `scripts/ban-workspace-root-ascent-copies.sh`
+/// is the class's gate: a byte-identical copy is not a compile error, and the parity test below
+/// cannot see one.
 fn workspace_root() -> PathBuf {
-    let start = std::env::var_os("CARGO_MANIFEST_DIR")
-        .map(PathBuf::from)
-        .or_else(|| std::env::current_dir().ok())
-        .unwrap_or_else(|| PathBuf::from("."));
-    for dir in start.ancestors() {
-        if dir.join("crates/vmcell-protocol/Cargo.toml").is_file() {
-            return dir.to_path_buf();
-        }
-    }
-    start
+    vmcell::artifact::workspace_root()
 }
 
 /// Resolves `--snap-dir` to an absolute, CWD-independent path anchored on the
@@ -3137,6 +3134,44 @@ mod tests {
         assert_eq!(
             vmm_binary("cloud-hypervisor").expect("CH resolver"),
             vmcell::artifact::ch_binary_path()
+        );
+    }
+
+    // C4, design §17's LAST open "one law, one predicate" consolidation: this harness hand-rolled
+    // the library's workspace-root ascent because `vmcell::artifact::workspace_root` was
+    // `pub(crate)`. It is `pub` now and [`workspace_root`] delegates to it.
+    //
+    // The assertion is a POSITIVE identity, not `bench == library` — which after the delegation is
+    // an `a == a` tautology that cannot fail. `expected` is derived STRUCTURALLY (this crate's
+    // manifest dir is `<ws>/crates/vmcell-bench`, so the root is exactly two levels up) and is
+    // therefore independent of the marker file the ascent hunts for: a copy that drifted on the
+    // marker, or an ascent that found nothing and fell back to its start dir, resolves the CRATE
+    // dir and reddens here. RED on that inverse verified by restoring the hand-rolled loop with a
+    // typo'd marker: `resolve_snap_dir` then anchors on `crates/vmcell-bench`.
+    //
+    // What this test structurally CANNOT see is a BYTE-IDENTICAL second copy — it resolves the
+    // same root, so parity holds while the duplicate is free to drift later. That half is
+    // `scripts/ban-workspace-root-ascent-copies.sh`, which is why both gates ship.
+    //
+    // KVM-free, filesystem-free (no path is opened), env-free (no `set_var`).
+    #[test]
+    fn snap_dir_anchors_on_the_library_one_workspace_root() {
+        let expected = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("this crate is <workspace>/crates/vmcell-bench");
+        assert_eq!(
+            workspace_root(),
+            expected,
+            "bench-vm must anchor on the library's workspace root, not its own crate dir"
+        );
+        // The whole reason the ascent is called at all: a relative `--snap-dir` is CWD-independent.
+        assert_eq!(resolve_snap_dir("snaps"), expected.join("snaps"));
+        assert_eq!(resolve_snap_dir("a/b"), expected.join("a/b"));
+        // An absolute `--snap-dir` is honored verbatim (the other half of the resolver's contract).
+        assert_eq!(
+            resolve_snap_dir("/mnt/nvme/snaps"),
+            PathBuf::from("/mnt/nvme/snaps")
         );
     }
 

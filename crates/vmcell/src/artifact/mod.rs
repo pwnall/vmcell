@@ -1216,13 +1216,33 @@ fn flatten_pins_namespace(
         // The CH/virtiofsd build identity for the snapshot pool (§10.2, The stage model and the
         // five cache-key rules / M-ART-7): a snapshot is only valid for the exact CH build that
         // produced it, so the snapshot stage folds the `cloud_hypervisor` pin into its cache key.
+        //
+        // `virtiofsd` rides the same arm as a RECOGNIZED-BUT-UNCOMMITTED namespace, and
+        // `every_recognized_pins_namespace_is_committed_or_declared_uncommitted` is what keeps that
+        // state from going silent: no stage folds it, and `artifact/snapshot.rs` records why one
+        // must not — a snapshot-eligible VM attaches no vhost-user device (§8.1), so the snapshot
+        // never runs virtiofsd and its version cannot invalidate a snapshot. Committing a value
+        // here would be an unenforced claim about the host substrate (CI installs virtiofsd with a
+        // bare `cargo install virtiofsd --locked`, which pins no version), i.e. exactly the
+        // silently-stale figure the docs rule forbids. Wire a reader or drop the namespace; do not
+        // commit a value nothing reads.
         "cloud_hypervisor" | "virtiofsd" => {
             if let Some(v) = value.as_str() {
                 out.insert(name.to_string(), v.to_string());
             }
             Some(PinsNamespaceShape::Scalar)
         }
-        // The snapshot.debian.org timestamp the mmdebstrap source requires.
+        // The snapshot.debian.org timestamp the in-VM `mmdebstrap` rootfs source requires
+        // (`vmcell-rootfs-builder`): it interpolates the value straight into the `deb
+        // [check-valid-until=no] http://snapshot.debian.org/archive/debian/<ts>/ <release> main`
+        // mirror line and folds it into that stage's cache key. COMMITTED in `pins.json` since the
+        // C9 pass: `MmdebstrapRootfsStage::run` hard-errors `Missing debian_snapshot_timestamp pin`
+        // without it, so `vmcell build --rootfs-source mmdebstrap` could not run at all off the
+        // committed baseline, and the stage's key folded `unwrap_or_default()` — an ABSENCE, so a
+        // re-pin could not invalidate a stale rootfs. The committed value is a real
+        // snapshot.debian.org instant (it resolves to Debian 13.6 `trixie`, the CLI's
+        // `DEFAULT_RELEASE`); its shape is gated by
+        // `committed_pins_supply_the_debian_snapshot_timestamp_the_mmdebstrap_source_reads`.
         "debian_snapshot_timestamp" => {
             if let Some(ts) = value.as_str() {
                 out.insert("debian_snapshot_timestamp".to_string(), ts.to_string());
@@ -2476,7 +2496,19 @@ fn steward_src_hash(path: &Path) -> Result<String> {
 /// set to that member's dir (`crates/vmcell/`), and a relative `.` has no usable
 /// ancestors to ascend, so the artifacts under the workspace `target/` would not be
 /// found. The marker is `crates/vmcell-protocol/Cargo.toml`, a stable landmark.
-pub(crate) fn workspace_root() -> PathBuf {
+///
+/// **Why this is `pub`** (design §17, the last open "one law, one predicate" consolidation): it is
+/// `pub` for the same reason `ch_binary_path` is (not linked: that one is `pipeline`-gated and this
+/// one is not, so a link would dangle in a `--no-default-features` doc build) — so an out-of-crate
+/// harness anchors on the
+/// **same** root the library does instead of re-deriving it. `bench-vm` hand-rolled this ascent
+/// because there was no export to call, and the coupling that would have drifted silently is the
+/// marker string: a copy that ascends to a *different* directory measures a different filesystem
+/// for its snapshots than the artifacts it boots. [`artifacts_dir`] already exposed this ascent's
+/// result joined with `target/vmcell-artifacts`; a caller wanting the bare anchor had nothing.
+/// `scripts/ban-workspace-root-ascent-copies.sh` keeps the marker in this one file.
+#[must_use]
+pub fn workspace_root() -> PathBuf {
     let start = source_search_start();
     // No marker found (e.g. a bare binary run outside the workspace, or a downstream consumer's
     // own workspace) — fall back to the starting dir so callers still get a usable,
@@ -4701,6 +4733,206 @@ mod tests {
             );
         }
         assert!(pins_namespace_shape("kerne1").is_none());
+    }
+
+    // The namespaces the schema recognizes but `pins.json` deliberately does NOT commit, each with
+    // the reason. This is an EXCEPTION table checked in both directions against the committed
+    // document — not a second roster: the accept-list stays `flatten_pins_namespace`.
+    const UNCOMMITTED_PINS_NAMESPACES: [(&str, &str); 2] = [
+        (
+            "builder_base",
+            "a downstream OVERRIDE pair; absent, `resolve_builder_base` falls back to the `rootfs_*` \
+             pins, so committing it would freeze the fallback the fallback exists to be",
+        ),
+        (
+            "virtiofsd",
+            "no consumer: `artifact/snapshot.rs` records why the snapshot key must NOT fold it (a \
+             snapshot-eligible VM attaches no vhost-user device, §8.1), and CI installs virtiofsd \
+             with an UNVERSIONED `cargo install virtiofsd --locked` — so a committed value would be \
+             an unenforced claim about the host substrate that drifts silently",
+        ),
+    ];
+
+    // GATE (C9) — ACCEPT-THEN-IGNORE AT THE NAMESPACE LEVEL, the direction
+    // `known_pins_namespace_roster_matches_the_flatten_dispatch` cannot see: it checks
+    // committed ⊆ dispatch, and a namespace the parser recognizes while the baseline commits
+    // nothing resolves to an ABSENCE at every reader. That is how `debian_snapshot_timestamp`
+    // shipped: `MmdebstrapRootfsStage::run` hard-errors `Missing debian_snapshot_timestamp pin`
+    // and its `cache_key` folded `unwrap_or_default()`, so `vmcell build --rootfs-source
+    // mmdebstrap` could not run off the committed baseline at all.
+    //
+    // Every recognized namespace is therefore either COMMITTED or listed above with its reason,
+    // and both directions are checked so the exception table cannot go stale either way.
+    // Red-on-inverse: (a) delete `debian_snapshot_timestamp` from pins.json — it is in neither set
+    // and this names it; (b) add a dispatch arm + roster entry without committing or declaring it;
+    // (c) commit `virtiofsd` without wiring a reader and deleting its entry here.
+    #[test]
+    fn every_recognized_pins_namespace_is_committed_or_declared_uncommitted() {
+        let committed: serde_json::Value =
+            serde_json::from_str(COMMITTED_PINS).expect("committed pins.json is valid JSON");
+        let committed = committed.as_object().expect("pins.json is an object");
+        for name in KNOWN_PINS_NAMESPACES {
+            let declared = UNCOMMITTED_PINS_NAMESPACES.iter().any(|(n, _)| *n == name);
+            assert!(
+                committed.contains_key(name) || declared,
+                "`{name}` is a recognized pins namespace that pins.json does not commit and \
+                 UNCOMMITTED_PINS_NAMESPACES does not declare — every reader resolves it to an \
+                 absence, which is accept-then-ignore. Commit it, or declare it with its reason."
+            );
+        }
+        for (name, reason) in UNCOMMITTED_PINS_NAMESPACES {
+            assert!(
+                pins_namespace_shape(name).is_some(),
+                "`{name}` is declared uncommitted but the dispatch no longer knows it — drop the \
+                 stale exception entry"
+            );
+            assert!(
+                !committed.contains_key(name),
+                "`{name}` IS committed now, so its exception entry is a lie. Its recorded reason \
+                 was: {reason}. Wire the reader that makes the pin load-bearing, then delete the \
+                 entry."
+            );
+        }
+    }
+
+    // GATE (C9) — the committed baseline must SUPPLY the pin the in-VM `mmdebstrap` source reads,
+    // under the exact key that source spells, and in the exact shape it interpolates into a URL.
+    //
+    // The delegate on the other side of the crate boundary is `vmcell-rootfs-builder`'s
+    // `test_cache_key_tracks_snapshot_timestamp` (a re-pin must invalidate that stage's key) and
+    // `test_mirror_line_uses_pinned_timestamp` (the value lands in the snapshot.debian.org mirror
+    // line). Both drove hand-built `StageInputs`, so neither could see that the committed baseline
+    // handed the stage nothing at all — this test is that half, and it is why the fold now hashes a
+    // value instead of `unwrap_or_default()`'s absence.
+    //
+    // The shape assertion is not decoration: the value is interpolated straight into
+    // `http://snapshot.debian.org/archive/debian/<ts>/`, so a malformed pin fails as a 404 inside a
+    // builder VM, minutes into a build, rather than here.
+    // Red-on-inverse: remove the pin from pins.json, or remove the `debian_snapshot_timestamp` arm
+    // from `flatten_pins_namespace`.
+    #[test]
+    fn committed_pins_supply_the_debian_snapshot_timestamp_the_mmdebstrap_source_reads() {
+        let baseline = resolve_pins(None).expect("the committed baseline resolves");
+        let ts = baseline
+            .get("debian_snapshot_timestamp")
+            .expect(
+                "pins.json must commit `debian_snapshot_timestamp`: without it \
+                 `MmdebstrapRootfsStage::run` hard-errors `Missing debian_snapshot_timestamp pin` \
+                 and its cache key folds an absence",
+            )
+            .clone();
+        // `YYYYMMDDTHHMMSSZ` — snapshot.debian.org's archive path component.
+        let b = ts.as_bytes();
+        assert_eq!(b.len(), 16, "`{ts}` is not a snapshot.debian.org timestamp");
+        assert_eq!(b[8], b'T', "`{ts}` is missing the `T` separator");
+        assert_eq!(b[15], b'Z', "`{ts}` is missing the trailing `Z`");
+        assert!(
+            b[..8].iter().chain(&b[9..15]).all(u8::is_ascii_digit),
+            "`{ts}` has a non-digit where snapshot.debian.org wants a date-time"
+        );
+    }
+
+    // GATE (C9) — the overlay laws hold for the newly committed namespace, through the SHIPPED
+    // `resolve_pins` (never a second copy of the merge or the typo check): the overlay wins per
+    // key, the baseline's siblings survive, and a top-level typo is a hard error naming the key —
+    // the property that stops a misspelled override from silently resolving the committed pin and
+    // bootstrapping the WRONG Debian snapshot with a green log.
+    // Red-on-inverse: drop the `debian_snapshot_timestamp` arm from the dispatch and the override
+    // stops arriving; drop the accept-list check in `parse_pins_overlay` and the typo is accepted.
+    #[test]
+    fn pins_overlay_overrides_the_committed_snapshot_timestamp_and_rejects_its_typo() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let baseline = resolve_pins(None).expect("the committed baseline resolves");
+        let pinned = baseline
+            .get("debian_snapshot_timestamp")
+            .expect("committed")
+            .clone();
+
+        let overlay = write_overlay(
+            tmp.path(),
+            r#"{ "debian_snapshot_timestamp": "20200102T030405Z" }"#,
+        );
+        let merged = resolve_pins(Some(&overlay)).expect("a scalar override must be accepted");
+        assert_eq!(
+            merged.get("debian_snapshot_timestamp").map(String::as_str),
+            Some("20200102T030405Z"),
+            "the overlay must win over the committed timestamp"
+        );
+        assert_ne!(
+            merged.get("debian_snapshot_timestamp").map(String::as_str),
+            Some(pinned.as_str()),
+            "non-vacuous: the override must differ from the committed value"
+        );
+        assert_eq!(
+            merged.get("cloud_hypervisor"),
+            baseline.get("cloud_hypervisor"),
+            "a scalar override must not disturb its baseline siblings"
+        );
+
+        let typo = write_overlay(
+            tmp.path(),
+            r#"{ "debian_snapshot_timetsamp": "20200102T030405Z" }"#,
+        );
+        let res = resolve_pins(Some(&typo));
+        let Err(crate::error::Error::Artifact(msg)) = res else {
+            panic!("a misspelled top-level pins key must be a hard error, got {res:?}");
+        };
+        assert!(
+            msg.contains("debian_snapshot_timetsamp"),
+            "the rejection must name the offending key, got {msg}"
+        );
+    }
+
+    // GATE (C9) — the key the newly committed pin must NOT move. `artifact/snapshot.rs` records
+    // that a snapshot's validity is bounded by the CH build identity plus the CONTENT of its
+    // upstream kernel/rootfs artifacts; a re-pinned Debian snapshot reaches the snapshot pool
+    // through the rebuilt rootfs BYTES, so folding the timestamp here too would invalidate every
+    // snapshot on a pin edit that produced a byte-identical rootfs.
+    // Red-on-inverse: add a `debian_snapshot_timestamp` fold to `SnapshotStage::cache_key` and the
+    // insensitivity leg goes red; drop its `cloud_hypervisor` fold and the positive control does.
+    #[cfg(feature = "pipeline")]
+    #[test]
+    fn snapshot_key_ignores_the_snapshot_timestamp_pin_but_tracks_the_ch_pin() {
+        let stage = crate::artifact::snapshot::SnapshotStage {
+            cid_alloc: std::sync::Arc::new(crate::vmm::CidAllocator::new()),
+            vmid_alloc: crate::orchestrator::VmidAllocator::new(),
+        };
+        let mut base = StageInputs::default();
+        base.pins.insert("cloud_hypervisor".into(), "v53.0".into());
+
+        let mut with_ts = base.clone();
+        with_ts.pins.insert(
+            "debian_snapshot_timestamp".into(),
+            "20260801T000000Z".into(),
+        );
+        let mut other_ts = base.clone();
+        other_ts.pins.insert(
+            "debian_snapshot_timestamp".into(),
+            "20200102T030405Z".into(),
+        );
+        assert_eq!(
+            stage.cache_key(&with_ts),
+            stage.cache_key(&other_ts),
+            "the rootfs-source timestamp must not invalidate the snapshot pool: it reaches this \
+             key through the rootfs artifact's content, not through the pin"
+        );
+        assert_eq!(
+            stage.cache_key(&base),
+            stage.cache_key(&with_ts),
+            "committing the timestamp must not have moved the snapshot key at all"
+        );
+
+        // Positive control: the pin this key IS keyed on still moves it, so the assertions above
+        // are insensitivity and not a key that ignores its inputs (M-ART-7).
+        let mut newer_ch = base.clone();
+        newer_ch
+            .pins
+            .insert("cloud_hypervisor".into(), "v54.0".into());
+        assert_ne!(
+            stage.cache_key(&base),
+            stage.cache_key(&newer_ch),
+            "a CH version bump must still invalidate the snapshot cache key (M-ART-7)"
+        );
     }
 
     // GATE (delta 1 fix) — DISPATCH ⊆ ROSTER, the direction the roster test above cannot see. The

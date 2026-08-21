@@ -161,6 +161,21 @@ source scan because **no configuration cargo can build compiles that arm** (`roo
 ceiling, refusing with an explained 413 rather than truncating, placed at the one engine seam both
 the broker and single-process deployments traverse.
 
+**Wave 3 — the rest of Tier A and Tier C.** **A6+A9** landed as one change, because A9's own recorded
+note said the flag "belongs with the daemon start-up sweep that would have to reclaim it": both
+orphan sweeps are liveness-aware through the id-claim registry's own `owner_is_live` — the only host
+signal written by the same law that hands the id out — three-valued so "I cannot tell" retains rather
+than reaps, and `TUNSETIFF` now carries `IFF_TUN_EXCL`. The live leg confirmed the create-or-attach
+hazard empirically on this host rather than taking the note's word for it. **C4** closed design §17's
+LAST open one-law consolidation (`bench-vm`'s workspace-root ascent), with the marker-string coupling
+§17 named now gated rather than remembered. **C7** chose the honest refusal over re-origination and
+landed it in the datapath rather than as a doc note. **C9** committed `debian_snapshot_timestamp` —
+and found the gap was worse than a cold cache key: `vmcell build --rootfs-source mmdebstrap` could
+not run off the committed baseline at all. It left `virtiofsd` uncommitted *deliberately and now
+gated*, because nothing reads it and CI installs it unversioned, so a committed value would be an
+unenforced claim about the host substrate. **C10** deleted the `VirtioFsDaemon::start` shims on the
+0.22 → 0.23 edge, and re-confirmed on the real edge that `semver-checks` is silent on it.
+
 Also closed: **A10**, the design sentence outside §17 still asserting `validate()` had no overall
 wall-clock budget. §18's delta-register premise record still describes the pre-delta state, correctly
 and deliberately — that is what a recorded premise is, and editing it would falsify the register.
