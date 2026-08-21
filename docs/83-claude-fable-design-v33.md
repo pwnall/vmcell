@@ -2901,7 +2901,7 @@ vmm/usb.rs       # host-USB claim/release: vid:pid → usbfs node, record displa
 steward/         # StewardClient (host vsock client, handshake + desync); steward::session multiplexer (§3.2)
 fs.rs            # VirtioFsDaemon: one virtiofsd per share, perms, tags, sockets, socket-wait timeout
 net/             # NetConfig dispatch: tap (netns + /30 via rtnetlink, nft TPROXY) + userspace (smoltcp NAT)
-net_sys.rs       # the unsafe syscall edges net/ can't host (setns_net, TUNSETPERSIST); net/ is #![forbid(unsafe_code)]
+net_sys.rs       # the unsafe syscall edges net/ can't host (setns_net, TUNSETIFF, TUNSETPERSIST); net/ is #![forbid(unsafe_code)]
 proxy/           # EgressProxy (hudsucker MITM), TLS CA + leaf minting, test doubles + record/replay
 metrics.rs       # CgroupFs trait (real + recording fake), slice mgmt, peak/avg readers (direct sysfs writes)
 hostcaps.rs      # HostCapabilities: the ONE start-up probe of caps/KVM/netns/cgroup delegation (§7.2)
@@ -3168,7 +3168,7 @@ linked, permissive crate under `cargo-deny`'s license gate:
 
 | Capability | Naive OS tool | Crate (linked) |
 |---|---|---|
-| netns / tap / addrs / routes | `iproute2` (`ip`) | `rtnetlink` + `netns-rs` + `tun-tap` |
+| netns / tap / addrs / routes | `iproute2` (`ip`) | `rtnetlink` + `netns-rs` (tap creation is our own `TUNSETIFF`, §9.2) |
 | MITM CA + leaf minting | `openssl` | `rcgen` + `rustls` (via `hudsucker`) |
 | cgroup peak/avg reads | parse `/sys` by hand | `cgroups-rs` + `procfs` (reads only; slice create + limit writes go direct to sysfs) |
 | pull + unpack a Debian base | `skopeo` / `docker` | `oci-client` + `tar` + `flate2`/`zstd` |
@@ -3202,9 +3202,12 @@ Three caveats shaped the choices:
 package. Irreducibly external: `cloud-hypervisor` (pinned release binary), the kernel build toolchain,
 `nftables` (`nft`), `qemu-system-x86` (fallback only), and KVM. **License gate:** `cargo-deny` enforces an
 allow-list (`MIT`/`Apache-2.0`/`BSD-3`/`BSD-2`/`ISC`/`Zlib`/`0BSD`/`Unicode-3.0`/`CDLA-Permissive-2.0`)
-for all *linked* crates on every build, and ignores a set of dormant `unmaintained` advisories from the
-`tokio-0.1` tree that enters only via `tun-tap 0.1.4 → tokio-core → tokio 0.1.22` (the optional privileged
-tap path), each with a per-crate rationale.
+for all *linked* crates on every build. The advisory `ignore` list is **one entry**, with a per-crate
+rationale, and `unused-ignored-advisory = "deny"` makes a dead one red rather than a warning nobody
+reads. It was fifteen: fourteen were the dormant `tokio-0.1` tree, which entered only via
+`tun-tap 0.1.4 → tokio-core → tokio 0.1.22` — a crate carried for a single `TUNSETIFF`, now written
+in `net_sys` (§9.2) against `libc::ifreq`, and banned by name in `deny.toml` so it cannot return
+transitively.
 
 ### 9.7 Features and build shapes
 

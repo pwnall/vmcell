@@ -25,10 +25,12 @@ pub const DEFAULT_RESOURCE_PREFIX: &str = "vmcell";
 /// The longest **network-interface** name the Linux kernel accepts: `IFNAMSIZ - 1`, because
 /// `ifreq.ifr_name` is an `IFNAMSIZ`-byte array that must still hold the NUL terminator.
 ///
-/// An over-long name is not rejected, it is **silently truncated** — `tun-tap`'s shim does
-/// `strncpy(ifr.ifr_name, name, IFNAMSIZ - 1)` — so the tap comes up under a name nobody composed
-/// and the failure surfaces one step later, at the `rtnetlink` index lookup, far from the composer
-/// that overflowed. `libc::IFNAMSIZ` cannot be named here: `libc` is an optional dependency
+/// This is the bound the **composers** honor; `net_sys::create_tap_in_current_netns` is the
+/// boundary that enforces it, and it refuses an over-long name rather than truncating one. That
+/// division is the lesson of the shape it replaced: `tun-tap`'s C shim did
+/// `strncpy(ifr.ifr_name, name, IFNAMSIZ - 1)`, so an over-long name brought the tap up under a name
+/// nobody composed and the failure surfaced one step later, at the `rtnetlink` index lookup, far
+/// from the composer that overflowed. `libc::IFNAMSIZ` cannot be named here: `libc` is an optional dependency
 /// (`host-common`) while this module compiles in every feature configuration, so the value is
 /// restated and the `interface_names_fit_ifnamsiz` unit test pins the copy against the real ABI.
 const MAX_INTERFACE_NAME_LEN: usize = 15;

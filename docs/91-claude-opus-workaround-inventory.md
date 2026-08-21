@@ -16,7 +16,7 @@ already tracks under "re-verify the premise anchors before cutting".
 |---|---|---|
 | V1 | `vendor/vhost` + `vendor/vhost-user-backend` — the `SET_VRING_ENABLE` patch | **KEEP** — upstream still unpatched; blocker re-diagnosed |
 | V2 | `=` pins on `vhost`/`vhost-user-backend`/`vm-memory` | **KEEP** — mechanically required by V1 |
-| A1 | 14 RUSTSEC ignores from `tun-tap → tokio 0.1` | **KEEP, but the cause is now precisely located** |
+| A1 | 14 RUSTSEC ignores from `tun-tap → tokio 0.1` | **DISMISSED** — done in the follow-up pass; `tun-tap` is gone and banned |
 | A2 | `RUSTSEC-2024-0436` (`paste`) | **DISMISSED** — crate left the graph |
 | A3 | `RUSTSEC-2023-0089` (`atomic-polyfill`) | **KEEP** — still reachable via `postcard → heapless 0.7` |
 | B1 | `vmcell-bench`'s own `hudsucker`/`hyper` requirements | **DISMISSED** — deleted; the break it caused is now unrepresentable |
@@ -65,7 +65,7 @@ feature. The re-vendor was reverted and the pin-site rationale replaced with the
 **Unblocks when:** `fuse-backend-rs` publishes a release built on `vm-memory 0.18` / `virtio-queue
 0.18`. Re-check upstream's `set_vring_enable` first; the re-vendor procedure itself is now proven.
 
-## A1 — 14 of 15 advisory ignores are one crate, used for one call.
+## A1 — 14 of 15 advisory ignores were one crate, used for one call. Now dismissed.
 
 `deny.toml` carried 16 advisory ignores. Tracing every one to its root:
 
@@ -75,30 +75,51 @@ tun-tap 0.1.4 → tokio-core 0.1.18 → tokio 0.1.22 → {tokio-uds, tokio-io, t
     tokio-threadpool, tokio-current-thread} + mio 0.6 → mio-uds → net2
 ```
 
-That is **14 of the 16** carried before this pass (13 tokio-0.1 crates plus `net2`) — and, with
-`paste` removed below, **14 of the 15 that remain**. They are not dismissible by bumping:
+That was **14 of the 16** carried before the dependency pass (13 tokio-0.1 crates plus `net2`) — and,
+with `paste` removed below, 14 of the 15 that remained. They were not dismissible by bumping:
 `tun-tap 0.1.4` **is** the latest release, and the crate is unmaintained.
 
-What makes this worth recording: `tun-tap` is used at exactly **one** call site —
-`crates/vmcell/src/net/tap.rs:237`, `tun_tap::Iface::without_packet_info(name, Mode::Tap)` — i.e. a
-single `TUNSETIFF` ioctl. The trait seam above it was already scrubbed of `tun_tap` types (a recorded
-v24 deviation; `vmcell-broker` compiles without the dependency at all and is the living gate on that).
-So the whole tokio-0.1 subtree, and 14 permanent advisory exemptions, hang off one ioctl.
+What made it worth recording: `tun-tap` was used at exactly **one** call site — a single `TUNSETIFF`
+ioctl. The trait seam above it had already been scrubbed of `tun_tap` types (a recorded v24
+deviation). So the whole tokio-0.1 subtree, and 14 permanent advisory exemptions, hung off one ioctl.
 
-**Not done here, deliberately.** Replacing it is a source change to the privileged tap path, not a
-dependency bump, and it must be done the way AGENTS.md requires — a `#[repr(C)]` `ifreq` defined once
-with `size_of`/offset asserts against the ABI, never inline byte-math (the repo already has that shape
-in `vmcell-steward::netif`, and the 18-byte-`ifreq`-writing-22-bytes incident is why the rule exists).
-It needs live privileged validation, so it belongs in its own change with its own gate. Flagged as the
-single highest-leverage dependency cleanup available: **−14 advisory ignores, −~25 lockfile crates,
-+1 ioctl.**
+**Done in the follow-up pass**, as its own change with its own gates, which is why it was deferred
+rather than folded into the bump. `vmcell::net_sys::create_tap_in_current_netns` now opens
+`/dev/net/tun` and issues the ioctl against **`libc::ifreq`** — deliberately not a third hand-rolled
+`#[repr(C)] IfReq` beside the two recorded guest-side copies (D5): those exist because they need
+sub-offset access into the `ifr_ifru` union, while this needs only the `ifru_flags` arm, so the
+struct the kernel defines *is* the struct submitted and there is no layout that can drift.
+
+Measured, replacing the estimate this row used to carry:
+
+| | before | after |
+|---|---|---|
+| advisory ignores (`deny.toml`) | 15 | **1** (`RUSTSEC-2023-0089`, atomic-polyfill — A3) |
+| packages in `Cargo.lock` | 532 | **485** (47 leave, not the ~25 estimated here) |
+| `TUNSETIFF` call sites | 0 (in a C shim in a dependency) | 1 |
+
+The estimate was wrong in the direction that matters: the subtree also carried `futures 0.1`,
+`bytes 0.4`, four `crossbeam-*`, `parking_lot 0.9`, and a whole Windows/Fuchsia/Redox target fringe.
+Most of `cargo deny check bans`' `multiple-versions` warnings went with them.
+
+**What the change did NOT do, deliberately.** `TUNSETIFF` is create-**or-attach**: issued against a
+name that is already a persistent-but-unattached tap, it silently adopts that interface instead of
+failing. A stale tap left by a crashed run under the same name is therefore taken over rather than
+reported — and `setup_tap_on_bridge`'s cleanup contract then treats it as one this call created. The
+live-sibling case is safe (that one gives `EBUSY`); only the stale-unattached case is open. This is
+**pre-existing** — `tun-tap`'s shim passed the same flag word — and the port is merely what made it
+legible. `IFF_TUN_EXCL` is the one-flag fix, but it is a behavior change that also makes re-adopting
+our *own* stale tap fail, so it belongs with the daemon start-up sweep that would have to reclaim it.
+Recorded in `docs/implementation-notes.md` as an open item, not silently taken.
 
 ## A2 — `paste`: dismissed.
 
 `RUSTSEC-2024-0436` (`paste 1.0.15`, unmaintained) entered via the netlink stack. `rtnetlink`
 0.21 → 0.23 with `netlink-packet-route` 0.30 → 0.33 dropped it; `paste` is no longer in the graph at
 any target. The ignore was removed — a dead ignore is exactly the crate-less placeholder `deny.toml`'s
-own header forbids. `cargo deny check advisories` stays green at 15 ignores.
+own header forbids. After A1 the list is **1 entry**, and `unused-ignored-advisory = "deny"` now
+makes a dead ignore red instead of a `warning[advisory-not-detected]` that exits 0 — which is what
+had let every stale ignore this repo carried be caught by review or not at all.
 
 ## A3 — `atomic-polyfill`: still live.
 

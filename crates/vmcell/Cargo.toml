@@ -670,6 +670,17 @@ name = "vmcell"
 #     `experiment-fuse` exists. The rationale at the pin site records this; it replaced a recorded
 #     reason that was a hazard rather than a blocker.
 #
+#   * NOT BREAKING, but a consumer-visible dependency edge: `net-privileged` no longer pulls
+#     `tun-tap`, nor the `tokio 0.1` subtree behind it (47 packages leave the lock). The single
+#     `TUNSETIFF` it supplied is now `vmcell::net_sys::create_tap_in_current_netns`, written against
+#     `libc::ifreq`. No signature, feature NAME, or behavior on the contract surface moves — the
+#     `dep:` prefix means `tun-tap` never was a public feature — so `cargo semver-checks` is silent
+#     here by construction and this bullet is the only channel. It matters to exactly one kind of
+#     consumer: one that was resolving `tun-tap` out of vmcell's `Cargo.lock` rather than depending
+#     on it directly, which is the same anti-pattern `proxy::doubles`' module docs warn about, and
+#     which now stops resolving. Such a consumer names `tun-tap` in its own manifest, or does what
+#     vmcell did. The crate is `[bans]`-denied in `deny.toml`, transitively too, so it cannot return.
+#
 #   * UNCHANGED on the contract surface otherwise: the pins schema and its namespaces, the stage /
 #     pipeline / build entry points, `pack_rootfs_with_injection` and the labelled pack surface, the
 #     `VMCELL_*` env table, and the validator battery all keep their signatures and behavior. The
@@ -838,7 +849,6 @@ serde_json = { version = "1", optional = true }
 # Net
 rtnetlink = { version = "0.23", optional = true }
 netns-rs = { version = "0.2", optional = true }
-tun-tap = { version = "0.1", optional = true }
 
 
 # Proxy
@@ -1038,7 +1048,7 @@ qemu = ["host-common"]
 # invocation select them.
 crosvm = ["host-common"]
 
-net-privileged = ["host-common", "dep:rtnetlink", "dep:netns-rs", "dep:tun-tap", "dep:netlink-packet-route"]
+net-privileged = ["host-common", "dep:rtnetlink", "dep:netns-rs", "dep:netlink-packet-route"]
 experiment-nftables = ["net-privileged", "jip-nftables"]
 # Vestigial placeholder feature (never referenced by any `#[cfg(feature = ...)]`). Its optional
 # `jip-nftables` dep was removed as unused (cargo-machete verified; its lib `nftables_netlink` is

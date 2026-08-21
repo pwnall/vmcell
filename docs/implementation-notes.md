@@ -5987,8 +5987,9 @@ plus TSO. The netlink pair, whose whole API surface lives in `net/tap.rs`, compi
 
 The netlink bump also removed `paste` from the graph, retiring `RUSTSEC-2024-0436`; the ignore was
 deleted rather than left as a dead entry (`deny.toml`'s header forbids exactly that shape). 15 ignores
-remain, 14 of them the `tun-tap` subtree — see the inventory, row A1, for why that count is one crate
-and one ioctl rather than fourteen problems.
+remained at the close of *this* pass, 14 of them the `tun-tap` subtree — see the inventory, row A1,
+for why that count was one crate and one ioctl rather than fourteen problems. The follow-up pass below
+took the ioctl in-tree and the count is now 1.
 
 ### The hudsucker bump is a contract edge, and it broke an in-tree consumer
 
@@ -6156,3 +6157,69 @@ v4.3.0 → v6.1.0, `actions/upload-artifact` v4 → v7.0.1, `Swatinem/rust-cache
 head. All to full commit SHAs. Their breaking changes are Node-24 runtime bumps (hosted runners are
 past the runner floor) and `checkout`'s `allow-unsafe-pr-checkout`, which applies to
 `pull_request_target` — this workflow uses `pull_request`, so it does not apply.
+
+## Removing `tun-tap` — one ioctl in exchange for a dependency subtree (2026-08-20, follow-up)
+
+The A1 item the dependency pass deferred, taken as its own change because it is a source change to the
+privileged tap path rather than a bump, and needs live privileged validation.
+
+**What landed.** `vmcell::net_sys::create_tap_in_current_netns` opens `/dev/net/tun` and issues
+`TUNSETIFF` with `IFF_TAP | IFF_NO_PI`; `net/tap.rs`'s `create_persistent_tap_in_ns` calls it inside
+the same `in_netns` closure as before and still `TUNSETPERSIST`s and drops the fd. The dependency, the
+`tokio 0.1` subtree behind it (47 lock packages) and 14 of the 15 advisory ignores are gone;
+`deny.toml` bans the crate by name so it cannot return, transitively included.
+
+**Deliberate deviations, each with its reason:**
+
+- **`libc::ifreq`, not a third `#[repr(C)] IfReq`.** The tree carries two hand-rolled copies
+  (`vmcell-steward::netif`, `vmcell-guest-tools`) under recorded deviation D5, each with a
+  field-by-field divergence guard. They exist because they need *sub-offset* access into the
+  `ifr_ifru` union (`SOCKADDR_*`, `SIN_ADDR_OFFSET`); this site needs only the `ifru_flags` arm. Using
+  the kernel's own struct means there is no layout to drift and D5 does **not** grow a third member.
+  What can still drift — the request number, the flag word, the narrowing into the 16-bit union arm —
+  is pinned by `net_sys`'s `tunsetiff_abi_is_pinned_to_the_kernel`.
+- **The name is rejected, not truncated.** `tun-tap`'s shim did `strncpy(…, IFNAMSIZ - 1)`.
+  `naming.rs`'s `MAX_INTERFACE_NAME_LEN` rustdoc had named that silent truncation as an open hole for
+  as long as the dependency was carried; the boundary now enforces the bound the composers honor.
+  This is a behavior change on an error path no caller could previously reach.
+- **The open and the ioctl are one function on purpose.** A tap's namespace is captured at
+  `open("/dev/net/tun")`, not at the ioctl: `tun_chr_open` stores the opener's netns on the
+  `tun_file`'s socket and `__tun_chr_ioctl` reads it back from there, never from `current`. Splitting
+  them would let the open be hoisted out of `in_netns` — the natural tidy-up now that two statements
+  are visible where one opaque call used to be — and every tap would be created in the **host**
+  namespace, silently: the call returns `Ok` and the failure surfaces one step later at an
+  in-namespace `rtnetlink` lookup. `tests/tap_create.rs`'s
+  `tap_lands_in_the_target_netns_and_not_the_host` is the gate.
+- **`std::fs::OpenOptions`, never `libc::open`.** std sets `O_CLOEXEC` unconditionally and C's `open`
+  does not. `vmcelld` fork/execs VMMs and forks the broker concurrently with this call, and a leaked
+  `/dev/net/tun` fd is an *attached tap queue* — the VMM's own `TUNSETIFF` then fails `EBUSY`, which is
+  verbatim the failure the persist-then-drop dance exists to prevent. Byte-identical to what `tun-tap`
+  did; recorded because a "tidier" raw-`libc` port would regress it invisibly.
+- **No `IFF_MULTI_QUEUE`.** No backend requests a multi-queue tap today, and the kernel rejects a
+  queue-flag mismatch with `EINVAL` when the VMM re-attaches. Adding `queues=N` to QEMU's `-netdev` or
+  `num_queues` to `ChNet` means adding the flag here in the same change; the coupling was undocumented
+  anywhere before this and is now stated at the flag const.
+
+**Open item, found by this change and deliberately NOT taken: `TUNSETIFF` is create-or-attach.**
+Issued against a name that is already a persistent-but-unattached tap, it **succeeds**, silently
+adopting that interface. So a stale tap left by a crashed prior run under the same name is taken over
+rather than reported, `TUNSETPERSIST` is a no-op on it, and `setup_tap_on_bridge`'s cleanup contract
+then treats it as one this call created — its `name_for_cleanup` path would delete a device this call
+did not make. The live-sibling case is safe: that one gives `EBUSY`. This is **pre-existing** —
+`tun-tap`'s shim passed the same flags — and only became legible when the ioctl came in-tree.
+`IFF_TUN_EXCL` is the one-flag fix, but it also makes re-adopting our *own* stale tap fail, so it has
+to land with whatever reclaims it (the daemon's start-up sweep), and it is a behavior change on a
+privileged path that needs its own live validation. Left open rather than bundled.
+
+While confirming the above, the `setup_tap_on_bridge` comment claiming an `EEXIST` here meant "the
+interface is someone else's" was corrected: `EEXIST` is not reachable from this call site at all — the
+kernel returns it only for a second `TUNSETIFF` on the *same* fd.
+
+**Gates.** `net_sys`'s four unit tests (ABI pin, the name law, the read-back, the device path), each
+proven red by mutation; `tests/tap_create.rs`'s three live legs (flags + persistence off `ip -d`, the
+namespace law with its positive control, the refused-name leg with its truncated-name spelling and
+positive control) — no VM, `CAP_NET_ADMIN` only, so they run on the blessed runner and close the gap
+that `Netlink::setup_tap` had no live leg of its own; `deny.toml`'s by-name ban; and
+`unused-ignored-advisory = "deny"`, which turns a stale advisory ignore from a
+`warning[advisory-not-detected]` that exits 0 into a red gate — the reason every stale ignore this
+repo has carried was caught by review or not at all.

@@ -30,12 +30,18 @@ serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["use-std"] }
 libc = "0.2"
 
-# No dev-dependencies, and that ABSENCE is the gate for `setup-tap-returns-dead-option`. The
-# dispatch tests' recording `Netlink` fake needed `tun-tap` only because the trait's `setup_tap`
-# returned a `Result<Option<tun_tap::Iface>>` that was always `Ok(None)` and read by nobody — a
-# ledgered public seam forcing every out-of-tree implementor to depend on a crate `vmcell` does not
-# re-export (so the pin had to be guessed) for a value with no reader. It returns `Result<()>` now,
-# and this crate is the living proof: re-introducing any `tun_tap`-typed value in the trait breaks
-# `cargo check -p vmcell-broker --tests` with "use of undeclared crate or module `tun_tap`", because
-# the fake here implements `Netlink` with no such dependency available. (`cargo machete` does NOT
-# cover this: it does not analyze dev-dependencies.)
+# No dev-dependencies, and keeping it that way is the point. The dispatch tests' recording `Netlink`
+# fake needed `tun-tap` only because the trait's `setup_tap` returned a `Result<Option<tun_tap::Iface>>`
+# that was always `Ok(None)` and read by nobody — a ledgered public seam forcing every out-of-tree
+# implementor to depend on a crate `vmcell` does not re-export (so the pin had to be guessed) for a
+# value with no reader. It returns `Result<()>` now.
+#
+# What this crate's zero-dev-dependency posture proves has NARROWED, and saying so is the point of
+# this comment: while `vmcell` still carried `tun-tap`, re-introducing the type compiled fine there
+# and ONLY the fake here — implementing `Netlink` with no such dependency available — caught it. As
+# of the `tun-tap` removal the crate is out of the workspace graph entirely, so `cargo check -p vmcell`
+# fails first and `deny.toml`'s by-name ban keeps it from coming back, transitively included. The
+# posture is still worth holding (a dev-dependency added here would re-open the "the fake needs what
+# the trait leaks" path for the NEXT type), but it is no longer the discriminating gate, and a comment
+# that kept claiming it was would be claiming coverage it does not uniquely provide.
+# (`cargo machete` does NOT cover this: it does not analyze dev-dependencies.)

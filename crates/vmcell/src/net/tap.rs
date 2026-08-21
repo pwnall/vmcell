@@ -231,10 +231,15 @@ async fn link_up(handle: &rtnetlink::Handle, index: u32) -> std::result::Result<
 /// "Open tap device failed: Device or resource busy"), so the interface is persisted and the
 /// creating fd released. One helper for both the per-VM tap ([`Netlink::setup_tap`]) and the
 /// segment member tap ([`Netlink::setup_tap_on_bridge`]) — the two differ only in addressing.
-/// (The ioctl lives in `crate::net_sys` because this module is `#![forbid(unsafe_code)]`.)
+/// (Both ioctls live in `crate::net_sys` because this module is `#![forbid(unsafe_code)]`.)
+///
+/// The whole of the create — the `/dev/net/tun` open **and** the `TUNSETIFF` — happens inside the
+/// [`in_netns`] closure, because the tap's namespace is captured when the device is opened, not
+/// when the ioctl runs. [`crate::net_sys::create_tap_in_current_netns`] carries that law and the
+/// gate on it; do not split it so the open can be hoisted out of here.
 fn create_persistent_tap_in_ns(netns: &str, tap_name: &str) -> Result<()> {
     let tap = in_netns(netns, || {
-        tun_tap::Iface::without_packet_info(tap_name, tun_tap::Mode::Tap)
+        crate::net_sys::create_tap_in_current_netns(tap_name)
     })?
     .map_err(|e| Error::Network(format!("tap create fail: {e}")))?;
     {
@@ -401,8 +406,11 @@ impl Netlink for RtNetlink {
     }
 
     fn setup_tap_on_bridge(&self, netns: &str, tap_name: &str, bridge: &str) -> Result<()> {
-        // Nothing exists yet if this fails (in particular, an `EBUSY`/`EEXIST` means the
-        // interface of that name is someone else's) — so it returns without any cleanup.
+        // Nothing exists yet if this fails — an `EBUSY` means the interface of that name is
+        // someone else's, and its opener holds it — so it returns without any cleanup. (`EEXIST`
+        // is NOT reachable from here: the kernel returns it only for a second `TUNSETIFF` on the
+        // *same* fd, which this path never issues. The converse does not hold either — see the
+        // create-or-attach note in `docs/implementation-notes.md`.)
         create_persistent_tap_in_ns(netns, tap_name)?;
 
         let name_for_cleanup = tap_name.to_string();

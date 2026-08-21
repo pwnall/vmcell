@@ -29,10 +29,18 @@ deny = [
     { name = "seccomp", reason = "LGPL-2.1 crate + links libseccomp; use seccompiler (§20.6)" },
     { name = "syscallz", reason = "pulls seccomp-sys → the LGPL-2.1 libseccomp C library; use seccompiler (§20.6)" },
     { name = "birdcage", reason = "alternative sandbox crate (seccomp/landlock); banned by name so seccompiler stays the single sanctioned sandbox/seccomp dependency (§20.6, rubric B13)" },
+    { name = "tun-tap", reason = "unmaintained; supplied ONE TUNSETIFF ioctl (now vmcell::net_sys::create_tap_in_current_netns) and dragged in the whole tokio-0.1 subtree — 14 permanent RUSTSEC ignores and 47 lockfile packages. Banned by NAME because no other gate can see the re-entry: re-adding it does not redden, it merely makes those 14 advisories live again, to be 'fixed' with 14 fresh ignores. Applies transitively too (docs/91 A1)." },
 ]
 
 [advisories]
 yanked = "deny"
+# A dead ignore is not inert — it is a standing exemption for an exposure that no longer exists, and
+# the next crate to re-enter that advisory inherits a green gate. The prose below has forbidden them
+# since the 16-entry crate-less block was removed, but prose is not a gate: bare `cargo deny check`
+# reports an un-encountered ignore as a WARNING and exits 0, so every stale ignore this repo has
+# carried was caught by review or not at all. This makes it red. (Verified against the current tree:
+# every ignore below is live.)
+unused-ignored-advisory = "deny"
 # Every ignore below carries: affected crate · how it enters our graph / exposure · why acceptable.
 # Do NOT add a new ignore without that same three-part rationale, and NEVER add a crate-less,
 # boilerplate "no fixed upstream release" placeholder — a bulk ignore that names no crate cannot be
@@ -42,29 +50,10 @@ yanked = "deny"
 # for this reason; re-add individually, with a real rationale, only if the gate actually reports one.)
 ignore = [
     # --- Unmaintained-crate advisories: maintenance status only, no known exploitable defect ---
-    "RUSTSEC-2020-0016", # net2 0.2.39 (transitive, legacy I/O shim): unmaintained, superseded by socket2; build-graph only, no runtime use.
     "RUSTSEC-2023-0089", # atomic-polyfill 1.0.3 (transitive via embedded/no_std deps): unmaintained, superseded by portable-atomic; compile-target shim only.
     # (Removed RUSTSEC-2025-0134 / rustls-pemfile and RUSTSEC-2023-0071 / rsa: those crates left the
     #  graph when the unused `rustls-pemfile` and `pgp` deps were dropped — cargo-machete gate — so
     #  their ignores are no longer exercised. Re-add individually, with a real rationale, if they return.)
-    # --- Legacy tokio 0.1 ecosystem: ALL enter via tun-tap 0.1.4 → tokio-core 0.1.18 → tokio 0.1.22
-    #     (the optional `net-privileged` tap-network path). Superseded by the tokio 1.x host runtime;
-    #     this 0.1 subtree is dormant build-graph weight with no runtime use and no upgrade path for the
-    #     pinning dep tun-tap. RUSTSEC-2021-0124 is a data-race advisory (dormant copy, not the live 1.x
-    #     runtime); the rest are maintenance-status-only "unmaintained" advisories. ---
-    "RUSTSEC-2021-0124", # tokio 0.1.22 (legacy transitive only): oneshot data-race advisory; our async runtime is tokio 1.x, the 0.1 copy is dormant, no upgrade path for the pinning dep tun-tap.
-    "RUSTSEC-2026-0050", # tokio-uds 0.2.7: unmaintained tokio-0.1 unix-socket crate; dormant via tun-tap → tokio-core → tokio 0.1.22, no runtime use.
-    "RUSTSEC-2026-0051", # tokio-threadpool 0.1.18: unmaintained tokio-0.1 threadpool crate; dormant via tun-tap → tokio-core → tokio 0.1.22, no runtime use.
-    "RUSTSEC-2026-0052", # tokio-sync 0.1.8: unmaintained tokio-0.1 sync crate; dormant via tun-tap → tokio-core → tokio 0.1.22, no runtime use.
-    "RUSTSEC-2026-0054", # tokio-current-thread 0.1.7: unmaintained tokio-0.1 executor crate; dormant via tun-tap → tokio-core → tokio 0.1.22, no runtime use.
-    "RUSTSEC-2026-0056", # tokio-codec 0.1.2: unmaintained tokio-0.1 codec crate; dormant via tun-tap → tokio-core → tokio 0.1.22, no runtime use.
-    "RUSTSEC-2026-0057", # tokio-reactor 0.1.12: unmaintained tokio-0.1 reactor crate; dormant via tun-tap → tokio-core → tokio 0.1.22, no runtime use.
-    "RUSTSEC-2026-0058", # tokio-io 0.1.13: unmaintained tokio-0.1 io crate; dormant via tun-tap → tokio-core → tokio 0.1.22, no runtime use.
-    "RUSTSEC-2026-0059", # tokio-tcp 0.1.4: unmaintained tokio-0.1 tcp crate; dormant via tun-tap → tokio-core → tokio 0.1.22, no runtime use.
-    "RUSTSEC-2026-0060", # tokio-timer 0.2.13: unmaintained tokio-0.1 timer crate; dormant via tun-tap → tokio-core → tokio 0.1.22, no runtime use.
-    "RUSTSEC-2026-0061", # tokio-fs 0.1.7: unmaintained tokio-0.1 fs crate; dormant via tun-tap → tokio-core → tokio 0.1.22, no runtime use.
-    "RUSTSEC-2026-0063", # tokio-executor 0.1.10: unmaintained tokio-0.1 executor crate; dormant via tun-tap → tokio-core → tokio 0.1.22, no runtime use.
-    "RUSTSEC-2026-0064", # tokio-udp 0.1.6: unmaintained tokio-0.1 udp crate; dormant via tun-tap → tokio-core → tokio 0.1.22, no runtime use.
 ]
 
 [sources]
