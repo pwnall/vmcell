@@ -71,6 +71,89 @@ fn insert_injected_file(
     Ok(())
 }
 
+/// Which of vmcell's OWN injection-manifest entries claimed a dest — the two node kinds the
+/// injection tail of [`build_node_map`] can produce (design §4.2).
+#[cfg(feature = "am-fs-erofs")]
+#[derive(Clone, Copy, Debug)]
+enum InjectionKind {
+    /// An `injected_files` entry: a regular file (the steward, the CA, the multicall binary).
+    File,
+    /// An `injected_symlinks` entry: one applet link pointing at the multicall binary.
+    Symlink,
+}
+
+#[cfg(feature = "am-fs-erofs")]
+impl InjectionKind {
+    /// How this kind is named in the collision refusal.
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::File => "an injected file",
+            Self::Symlink => "an applet symlink",
+        }
+    }
+}
+
+/// Claims `dest_path` for one entry of vmcell's own injection manifest, refusing a dest an
+/// earlier entry of the SAME manifest already claimed (design §4.2, invariant F5).
+///
+/// # Why this refusal exists
+/// The manifest injects the guest-tools multicall binary as a FILE at
+/// `<tools_dir>/<multicall-bin>` and then one applet SYMLINK per roster entry into that same
+/// directory — and since v33 delta 6 (§10.5) that roster is registry DATA, not a const. Under the
+/// plain last-wins `insert` this tail used to do, a registered handler whose roster names the
+/// multicall binary's own file name replaced the binary with a dangling self-symlink: the image
+/// shipped with no multicall binary and every applet dangling, and the build reported success.
+/// That is the docs/90 H1 failure shape exactly — a silent wrong image, not a missing test helper.
+///
+/// # What is refused, and what is not
+/// **Every** duplicate dest inside vmcell's own tail is refused, not only a file-vs-symlink kind
+/// mismatch. Deliberate, for one reason: two manifest entries at one path mean the second's bytes
+/// are the image's and the first's are nowhere, whatever their kinds, so an identical-kind
+/// duplicate is exactly as silent. It is also the duplicate-dest law the F5 validator one level up
+/// already applies to downstream extras (`validate_extra_files`: "listed twice; the last writer
+/// would silently win"), applied to the same class of input rather than restated with a weaker
+/// rule. The refusal names both claimants and is keyed on the NORMALIZED path, because that is the
+/// key the merged tree is built on: `/vmcell-tools/ip`, `vmcell-tools/ip` and
+/// `vmcell-tools/x/../ip` are three raw strings and ONE node in the packed image, so a ledger
+/// keyed on the dest string would hand the second writer a free pass.
+///
+/// It deliberately does NOT cover the two collisions the packer resolves BY DESIGN, each with its
+/// own pinning test: a layer entry an injection overwrites (H-ART-3 — the injections are inserted
+/// last precisely so they win a `.wh.` whiteout or an upper layer), and a downstream
+/// [`ExtraFile`](crate::artifact::rootfs::ExtraFile) an injection overwrites (invariant F5's
+/// structural backstop; such an extra is rejected by `is_reserved_injection_path` one level up).
+/// Nor does it cover an injection whose dest is the PARENT of another injection's dest — that is
+/// `nodes_to_erofs`'s "child under non-directory node" refusal (L-ART-6), already loud, and a
+/// second copy here would be a second law.
+///
+/// # The gate binds the CALL SITES
+/// Both injection loops in [`build_node_map`] call this, and every test that guards the law drives
+/// `build_node_map` rather than this predicate — so dropping either call reddens them, which an
+/// extracted-predicate test would not see (AGENTS.md: "a gate binds the call sites, not just the
+/// extracted predicate").
+///
+/// # Errors
+/// [`crate::error::Error::Artifact`] naming the dest and both claiming entry kinds.
+#[cfg(feature = "am-fs-erofs")]
+fn claim_injection_dest(
+    claimed: &mut HashMap<PathBuf, InjectionKind>,
+    dest_path: &str,
+    kind: InjectionKind,
+) -> crate::error::Result<()> {
+    if let Some(prior) = claimed.insert(normalize_path(Path::new(dest_path)), kind) {
+        return Err(crate::error::Error::Artifact(format!(
+            "vmcell's rootfs injection manifest claims `{dest_path}` twice: {} and {} both name \
+             it. The last writer would silently win and the pack would report success while the \
+             image carries only one of them — an applet roster (§10.5) naming the multicall \
+             binary's own file name replaces that binary with a dangling self-symlink, leaving \
+             the image with no guest tools at all. Rename the colliding entry.",
+            prior.as_str(),
+            kind.as_str(),
+        )));
+    }
+    Ok(())
+}
+
 /// The PAX-record prefix every `SCHILY.xattr.<full name>` extended attribute arrives under.
 #[cfg(feature = "am-fs-erofs")]
 const PAX_SCHILY_XATTR: &str = "SCHILY.xattr.";
@@ -193,7 +276,8 @@ fn xattr_spec(full_name: &str, value: &[u8]) -> fs_erofs::mkfs::XattrSpec {
 /// GNU-sparse, an unfolded `x`/`L`/`K` extension header, or an unknown type byte) — such a member
 /// is rejected, never dropped, because a dropped member packs a rootfs that boots as if complete.
 /// The archive-wide pax global header (`g`) names no filesystem object and is the one skipped type.
-/// Under [`XattrPolicy::Preserve`], also if a member's PAX records cannot be decoded.
+/// Under [`XattrPolicy::Preserve`], also if a member's PAX records cannot be decoded. And, per
+/// [`claim_injection_dest`], if two entries of vmcell's OWN injection manifest claim one dest.
 #[cfg(feature = "am-fs-erofs")]
 fn build_node_map<'a, R: Read + 'a>(
     archives: impl IntoIterator<Item = tar::Archive<R>>,
@@ -442,10 +526,17 @@ fn build_node_map<'a, R: Read + 'a>(
     // makes the injected files
     // authoritative: an upper layer's content or a `.wh.` whiteout can no longer clobber the
     // baked steward or the CA under `usr/local/share/ca-certificates/`.
+    //
+    // Within that tail every dest is claimed EXACTLY ONCE (`claim_injection_dest`): the applet
+    // roster is registry data since v33 delta 6, so a roster entry naming the multicall binary's
+    // own file name used to overwrite the binary with a self-symlink here, silently.
+    let mut claimed: HashMap<PathBuf, InjectionKind> = HashMap::new();
     for injected in injected_files {
+        claim_injection_dest(&mut claimed, injected.0, InjectionKind::File)?;
         insert_injected_file(&mut entries, injected)?;
     }
     for (dest_path, target) in injected_symlinks {
+        claim_injection_dest(&mut claimed, dest_path, InjectionKind::Symlink)?;
         let node = Node::Symlink {
             mode: 0o777 | fs_erofs::inode::S_IFLNK,
             target: target.to_string(),
@@ -505,7 +596,9 @@ pub fn fuzz_node_paths<'a, R: Read + 'a>(
 /// vmcell's own injected and synthesized nodes carry none either way (invariant F5).
 ///
 /// # Errors
-/// Returns an error if reading the archive or generating the EROFS image fails.
+/// Returns an error if reading the archive or generating the EROFS image fails, or if two entries
+/// of vmcell's own injection manifest claim one dest (`claim_injection_dest`) — an applet roster
+/// naming the multicall binary's file name is refused rather than packed as a self-symlink.
 #[cfg(feature = "am-fs-erofs")]
 pub fn tar_to_erofs<'a, R: Read + 'a>(
     archives: impl IntoIterator<Item = tar::Archive<R>>,
@@ -2083,6 +2176,240 @@ mod tests {
             Some(Node::File { data, .. }) => assert_eq!(
                 data, b"INJECTED-STEWARD",
                 "vmcell's own injection is authoritative and is inserted last"
+            ),
+            other => panic!("expected the injected steward file node, got {other:?}"),
+        }
+    }
+
+    // The multicall binary's dest as `rootfs_injection_manifest` composes it
+    // (`{VMCELL_TOOLS_DIR}/{GUEST_TOOLS_MULTICALL_BIN}`). Those two consts are private to
+    // `artifact::rootfs`, so this is fixture data here, not a second spelling of a law: what
+    // these tests assert is the packer's collision PREDICATE, and the manifest side is pinned
+    // by `rootfs_injection_manifest_pins_truststore_and_tools`.
+    const TOOLS_BIN_DEST: &str = "vmcell-tools/vmcell-guest-tools";
+
+    /// One applet name taken from the shared roster const rather than invented, so the
+    /// non-colliding control is the shape the default handler actually ships.
+    fn first_applet() -> String {
+        format!(
+            "vmcell-tools/{}",
+            vmcell_protocol::GUEST_TOOLS_APPLETS
+                .first()
+                .expect("the applet roster is non-empty")
+        )
+    }
+
+    // THE DOCS/90 H1 SHAPE, refused (§4.2, invariant F5). `rootfs_injection_manifest` injects the
+    // multicall binary as a FILE at `<tools_dir>/<multicall-bin>` and one applet SYMLINK per
+    // roster entry into the SAME directory — and since v33 delta 6 that roster is registry DATA,
+    // so a registered handler can name the binary's own file name. Under the old last-wins
+    // `insert` the symlink replaced the binary with a dangling self-symlink: the image shipped no
+    // multicall binary and every applet dangling, and the pack reported success.
+    //
+    // RED ON THE INVERSE: delete the `claim_injection_dest` call in the symlink loop of
+    // `build_node_map` and this test packs `Ok` with a `Node::Symlink` at `TOOLS_BIN_DEST`.
+    #[test]
+    fn an_applet_symlink_over_the_injected_multicall_binary_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tools = dir.path().join("vmcell-guest-tools");
+        std::fs::write(&tools, b"MULTICALL-BINARY").unwrap();
+        let empty = || {
+            tar::Archive::new(std::io::Cursor::new({
+                let mut v = Vec::new();
+                tar::Builder::new(&mut v).finish().unwrap();
+                v
+            }))
+        };
+
+        // The colliding roster: an applet named after the multicall binary itself.
+        let err = build_node_map(
+            vec![empty()],
+            vec![],
+            vec![(TOOLS_BIN_DEST, tools.as_path(), None)],
+            vec![(TOOLS_BIN_DEST, "vmcell-guest-tools")],
+            XattrPolicy::Strip,
+        )
+        .expect_err("an applet symlink over the multicall binary must be refused, not packed");
+        match err {
+            crate::error::Error::Artifact(msg) => {
+                assert!(
+                    msg.contains(TOOLS_BIN_DEST)
+                        && msg.contains("an injected file")
+                        && msg.contains("an applet symlink"),
+                    "the refusal must name the dest and BOTH claimants, got: {msg}"
+                );
+            }
+            other => panic!("expected a typed Artifact refusal, got {other:?}"),
+        }
+
+        // POSITIVE CONTROL: the same manifest with a roster entry that does not name the binary
+        // packs, and both nodes are present with their own kinds.
+        let applet = first_applet();
+        let map = build_node_map(
+            vec![empty()],
+            vec![],
+            vec![(TOOLS_BIN_DEST, tools.as_path(), None)],
+            vec![(applet.as_str(), "vmcell-guest-tools")],
+            XattrPolicy::Strip,
+        )
+        .expect("a roster that collides with nothing must pack");
+        match map.get(&normalize_path(Path::new(TOOLS_BIN_DEST))) {
+            Some(Node::File { data, .. }) => assert_eq!(data, b"MULTICALL-BINARY"),
+            other => panic!("expected the multicall binary file node, got {other:?}"),
+        }
+        match map.get(&normalize_path(Path::new(&applet))) {
+            Some(Node::Symlink { target, .. }) => assert_eq!(target, "vmcell-guest-tools"),
+            other => panic!("expected the applet symlink node, got {other:?}"),
+        }
+    }
+
+    // The deliberate scope decision, stated in `claim_injection_dest`'s rustdoc and pinned here:
+    // an IDENTICAL-kind duplicate is refused too, both ways round. Two manifest entries at one
+    // dest mean the second's bytes are the image's and the first's are nowhere, whatever their
+    // kinds — the same hazard the F5 extra-file validator already refuses as "listed twice; the
+    // last writer would silently win". A duplicated applet name is the reachable instance: the
+    // roster is registry data and nothing dedups it.
+    //
+    // RED ON THE INVERSE: drop either `claim_injection_dest` call and the matching leg packs `Ok`.
+    #[test]
+    fn an_identical_kind_duplicate_injection_dest_is_refused_too() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let first = dir.path().join("first");
+        std::fs::write(&first, b"FIRST").unwrap();
+        let second = dir.path().join("second");
+        std::fs::write(&second, b"SECOND").unwrap();
+        let empty = || {
+            tar::Archive::new(std::io::Cursor::new({
+                let mut v = Vec::new();
+                tar::Builder::new(&mut v).finish().unwrap();
+                v
+            }))
+        };
+
+        // Two FILES at one dest.
+        let err = build_node_map(
+            vec![empty()],
+            vec![],
+            vec![
+                ("usr/sbin/vmcell-steward", first.as_path(), None),
+                ("usr/sbin/vmcell-steward", second.as_path(), None),
+            ],
+            vec![],
+            XattrPolicy::Strip,
+        )
+        .expect_err("two injected files at one dest must be refused");
+        match err {
+            crate::error::Error::Artifact(msg) => assert!(
+                msg.contains("usr/sbin/vmcell-steward") && msg.contains("an injected file"),
+                "the refusal must name the dest and the claimant kind, got: {msg}"
+            ),
+            other => panic!("expected a typed Artifact refusal, got {other:?}"),
+        }
+
+        // Two SYMLINKS at one dest — the duplicated applet roster entry.
+        let applet = first_applet();
+        let err = build_node_map(
+            vec![empty()],
+            vec![],
+            vec![],
+            vec![
+                (applet.as_str(), "vmcell-guest-tools"),
+                (applet.as_str(), "vmcell-guest-tools"),
+            ],
+            XattrPolicy::Strip,
+        )
+        .expect_err("a roster listing one applet twice must be refused");
+        match err {
+            crate::error::Error::Artifact(msg) => assert!(
+                msg.contains(&applet) && msg.contains("an applet symlink"),
+                "the refusal must name the dest and the claimant kind, got: {msg}"
+            ),
+            other => panic!("expected a typed Artifact refusal, got {other:?}"),
+        }
+    }
+
+    // The claim is keyed on the NORMALIZED path, because that is the key the merged tree is built
+    // on. `/vmcell-tools/x`, `vmcell-tools/x` and `vmcell-tools/y/../x` are ONE dest to
+    // `normalize_path` (it drops the root component and POPS a `..`) and therefore one node in the
+    // packed image — while as raw `PathBuf`s they are three distinct keys, so a ledger keyed on the
+    // dest string would hand the second writer a free pass and restore the silent clobber exactly.
+    // (An interior `.` needs no law here: `Path`'s own component equality already folds it.)
+    //
+    // RED ON THE INVERSE: key `claim_injection_dest`'s ledger on `PathBuf::from(dest_path)` instead
+    // of `normalize_path(dest_path)` and both legs pack `Ok` with the symlink winning.
+    #[test]
+    fn the_injection_claim_is_keyed_on_the_normalized_dest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tools = dir.path().join("vmcell-guest-tools");
+        std::fs::write(&tools, b"MULTICALL-BINARY").unwrap();
+        let empty = || {
+            tar::Archive::new(std::io::Cursor::new({
+                let mut v = Vec::new();
+                tar::Builder::new(&mut v).finish().unwrap();
+                v
+            }))
+        };
+        for spelling in [
+            "/vmcell-tools/vmcell-guest-tools",
+            "vmcell-tools/vmcell-tools/../vmcell-guest-tools",
+        ] {
+            // Same normalized dest as `TOOLS_BIN_DEST`, different raw string.
+            assert_eq!(
+                normalize_path(Path::new(spelling)),
+                normalize_path(Path::new(TOOLS_BIN_DEST)),
+                "the fixture must be a second SPELLING of the one dest"
+            );
+            let err = build_node_map(
+                vec![empty()],
+                vec![],
+                vec![(TOOLS_BIN_DEST, tools.as_path(), None)],
+                vec![(spelling, "vmcell-guest-tools")],
+                XattrPolicy::Strip,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, crate::error::Error::Artifact(_)),
+                "expected a typed Artifact refusal for `{spelling}`, got {err:?}"
+            );
+        }
+    }
+
+    // THE REFUSAL'S SCOPE, guarded from over-reach: it covers vmcell's OWN manifest only. A LAYER
+    // entry at an injection dest — including one of a different node KIND, a symlink where the
+    // injected steward goes — is still resolved last-wins by design (H-ART-3: the injections are
+    // the tail precisely so they win a stale layer). Refusing that would make a base image that
+    // happens to ship a `usr/sbin/vmcell-steward` symlink unpackable.
+    //
+    // RED ON THE INVERSE: claim the layer-merge keys in the same ledger and this errors instead of
+    // packing the injected steward.
+    #[test]
+    fn a_layer_entry_under_an_injection_dest_is_still_last_wins() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let steward = dir.path().join("steward");
+        std::fs::write(&steward, b"INJECTED-STEWARD").unwrap();
+        let mut layer = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut layer);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(0);
+            header.set_mode(0o777);
+            header.set_entry_type(tar::EntryType::Symlink);
+            b.append_link(&mut header, "usr/sbin/vmcell-steward", "/bin/true")
+                .unwrap();
+            b.finish().unwrap();
+        }
+        let map = build_node_map(
+            vec![tar::Archive::new(std::io::Cursor::new(layer))],
+            vec![],
+            vec![("usr/sbin/vmcell-steward", steward.as_path(), None)],
+            vec![],
+            XattrPolicy::Strip,
+        )
+        .expect("a layer symlink at an injection dest is overwritten, not refused");
+        match map.get(&normalize_path(Path::new("usr/sbin/vmcell-steward"))) {
+            Some(Node::File { data, .. }) => assert_eq!(
+                data, b"INJECTED-STEWARD",
+                "vmcell's injection wins the layer's symlink of the same path"
             ),
             other => panic!("expected the injected steward file node, got {other:?}"),
         }

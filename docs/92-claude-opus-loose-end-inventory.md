@@ -130,3 +130,20 @@ session delegates `cpu memory pids` and not `io`.
 Recorded per item in `docs/implementation-notes.md`. Tiers A, B, C and D are the pass's scope;
 E and F are recorded here and left on the register, each with its blocker, which is what
 distinguishes a scheduled cut from a forgotten one.
+
+**Wave 1 — Tier A defects, all six with their gates:** A2 (the crosvm baked CID, whose §17 entry is
+rewritten as closed and whose live leg was proven red under a real crosvm at baked 4 / fresh 3), A3
+(the restore-side USB law, two arms because copying `create()`'s precheck is a no-op on the one
+backend that splices the argv), A4 (the tar2erofs kind-clobber refusal), A5
+(`clear_feature_declaration`, at the one inject+pack tail rather than in the mmdebstrap arm, so it
+covers every source), A7 (the session closed-flag — the registry `Option` that already existed, not
+a second flag), A8 (mini-init pacing, through the predicate that already owned the rapid-failure cap).
+
+**Wave 1 — Tier B gate holes:** A1/B-class (the e2fsprogs cache key, now interpolated and held by
+arm 8), B4 (`just example-downstream`), B5 (semver-checks on push — it had never once run against a
+change to vmcell's own public API), B6 (`test-unit-undelegated`'s vacuity guard), B2
+(`ban-orphan-recipe.sh` + self-test), B3 (`test-with-delegated-scope.sh`, which surfaced an
+unguarded `mkdir` that aborted where its four siblings degrade), B7 (`just install-hooks`).
+
+Still open from Tier B: **B8**, the release-half runner CI builds and `setcap`s unconditionally for
+a consumer only the hand-run bench workflow has. It is a cost, not a defect, and is left deliberate.

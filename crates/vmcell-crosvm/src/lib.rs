@@ -879,6 +879,15 @@ impl Vmm for Crosvm {
         }
         vmcell::vmm::reject_unsupported_console("crosvm", &self.capabilities(), cfg.console_mode)?;
 
+        // The USB half of the same M4 law: crosvm always runs `--no-usb`, so a
+        // `usb_host_devices` list handed to `restore()` was accepted and silently dropped
+        // (`create()` refuses it). The ONE shared restore predicate returns the identical
+        // `usb_host_passthrough` refusal here (§8.1, The warm-snapshot path and the eligibility law), before any spawn.
+        vmcell::vmm::reject_usb_host_devices_on_restore(
+            "crosvm",
+            &self.capabilities(),
+            &cfg.usb_host_devices,
+        )?;
         // M4: `restore()` must refuse exactly what `create()` refuses — the restore run args come
         // from the same `build_crosvm_run_args`, which has nowhere to put an `io_limit`, so an
         // unguarded restore would silently attach the throttled disk unthrottled. One predicate,
@@ -1129,6 +1138,12 @@ impl VmInstance for CrosvmInstance {
     }
 
     fn guest_cid(&self) -> u32 {
+        // On a restore this is the snapshot's BAKED CID, not `res.guest_cid` — and the orchestrator
+        // reads exactly this to decide which CID to hold out of the allocatable pool for the VM's
+        // lifetime (`CidGuard::adopt_baked_cid`, design §17, Open gaps and future capabilities,
+        // crosvm item 7). crosvm's vsock is in-kernel AF_VSOCK, so the CID is a host-global
+        // identity: reporting the fresh allocation here would silently hand the baked one back to
+        // the pool for a later VM to collide on.
         self.cid
     }
 
@@ -1774,6 +1789,76 @@ mod tests {
             )
             .await
             .expect_err("the control path still fails on the missing snapshot artifact");
+        assert!(
+            matches!(&err, Error::Vmm(msg) if msg.contains("snapshot artifact")),
+            "expected the un-throttled control to reach the missing-artifact error, got {err:?}"
+        );
+    }
+
+    // docs/90 A3 (the open half of docs/78 M4), crosvm leg — the sibling of
+    // `restore_rejects_disk_io_throttle_like_create`: vmcell always launches crosvm with
+    // `--no-usb`, so `create()` refuses a host-USB config through the shared predicate, while
+    // `restore()` accepted the same list and dropped it silently. KVM-free: the refusal precedes
+    // the snapshot-artifact check and any spawn, which is what the positive control proves.
+    //
+    // Red on the inverse: delete the `reject_usb_host_devices_on_restore` call from `restore()`
+    // and the restore leg reaches the missing-artifact `Vmm` error instead of the typed refusal.
+    #[tokio::test]
+    async fn restore_refuses_a_host_usb_config_exactly_as_create_does() {
+        let crosvm = Crosvm::new("/usr/bin/crosvm");
+        let usb_cfg = VmConfig::builder(
+            "/boot/vmlinux",
+            RootfsSource::Erofs {
+                image: PathBuf::from("/img/rootfs.erofs"),
+            },
+        )
+        .with_usb_host_device(vmcell::config::UsbHostDevice::new(0xdead, 0xbeef))
+        // Keeps crosvm's net guard (which runs before the USB one on create) from deciding the
+        // outcome, so both legs are about USB and nothing else.
+        .network_disabled()
+        .build()
+        .expect("a host-USB device on a non-snapshotting config must build");
+
+        let created = crosvm
+            .create(&usb_cfg, &test_res(), &FakeCgroupFs::new())
+            .await
+            .expect_err("crosvm advertises usb_host_passthrough: false");
+        let restored = crosvm
+            .restore(
+                Path::new("/nonexistent-crosvm-usb-snapshot"),
+                &usb_cfg,
+                &test_res(),
+                &FakeCgroupFs::new(),
+            )
+            .await
+            .expect_err("restore must refuse exactly what create refuses");
+        for err in [&created, &restored] {
+            assert!(
+                matches!(err, Error::Unsupported { vmm, feature }
+                    if vmm == "crosvm" && feature == Feature::UsbHostPassthrough.name()),
+                "expected a usb_host_passthrough Unsupported naming the VmmCapabilities field \
+                 (N-VMM-1), got {err:?}"
+            );
+        }
+        assert_eq!(
+            created.to_string(),
+            restored.to_string(),
+            "an incapable backend owes the restore path the IDENTICAL refusal its create path \
+             gives — the descriptor arm of the shared predicate, not a second spelling"
+        );
+
+        // Positive control: the SAME restore without the device gets past this guard and fails on
+        // the missing snapshot artifact — so the refusal above is about the device, not about
+        // restore refusing everything.
+        let err = crosvm
+            .restore(
+                Path::new("/nonexistent-crosvm-usb-snapshot"),
+                &erofs_cfg(),
+                &test_res(),
+                &FakeCgroupFs::new(),
+            )
+            .await
+            .expect_err("the control still fails on the missing snapshot artifact");
         assert!(
             matches!(&err, Error::Vmm(msg) if msg.contains("snapshot artifact")),
             "expected the un-throttled control to reach the missing-artifact error, got {err:?}"

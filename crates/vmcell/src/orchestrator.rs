@@ -92,10 +92,73 @@ pub struct CidGuard {
     /// The unique guest CID.
     pub cid: u32,
     allocator: std::sync::Arc<crate::vmm::CidAllocator>,
+    /// The **baked** guest CID a restored VM actually answers on, when that is not [`Self::cid`]
+    /// (design §17, Open gaps and future capabilities, crosvm item 7) — `Some` only when
+    /// [`Self::adopt_baked_cid`] claimed it, so it is released here exactly once and never on
+    /// behalf of another holder.
+    ///
+    /// One guard for both CIDs rather than a second guard beside it, for the reason
+    /// [`VmidGuard::lineage`] gives on the vmid axis: this is the same ownership with the same
+    /// lifetime. A restored VM whose backend re-programs the snapshot's baked `--vsock cid=`
+    /// *is* that CID for as long as it runs, so both must stay out of the pool until it is gone.
+    baked: Option<u32>,
+}
+
+impl CidGuard {
+    /// Takes the **baked** guest CID a restored VM answers on out of the allocatable pool for this
+    /// guard's lifetime (design §17, Open gaps and future capabilities, crosvm item 7).
+    ///
+    /// crosvm bakes the vsock CID into its snapshot and refuses a rotated `--vsock cid=` on
+    /// restore, so its `restore()` re-programs the baked one while the orchestrator's fresh
+    /// allocation — the CID this guard was built on — goes unused by the VM. crosvm's vsock is
+    /// **in-kernel** AF_VSOCK, so the CID is a HOST-GLOBAL identity rather than a per-scratch-dir
+    /// path: once the ancestor was torn down, nothing kept `baked` out of the pool and a later VM
+    /// drawing it collided with this live one. Keyed on
+    /// [`VmInstance::guest_cid`](crate::vmm::VmInstance::guest_cid) — what the backend says it
+    /// actually answers on — so a rotating backend (CH/QEMU/FC), which reports its fresh CID, hits
+    /// the `baked == self.cid` no-op and needs no branch at the call site.
+    ///
+    /// The property wanted is **"no other VM may draw `baked` while we answer on it"**, not
+    /// exclusive ownership of the claim, so — exactly as [`VmidGuard::adopt_lineage`] decides it on
+    /// the vmid axis — a CID that is *already* reserved satisfies it and is accepted with a warning:
+    /// the live restore suite deliberately manipulates the CID pool across a restore, and refusing a
+    /// restore for being in the state the reservation exists to create would be backwards.
+    /// `self.baked` is set only when the claim is **ours**, so `Drop` never releases a CID this
+    /// guard did not take.
+    ///
+    /// # Errors
+    /// Propagates everything from [`CidAllocator::reserve`](crate::vmm::CidAllocator::reserve) that
+    /// is *not* a conflict: [`crate::error::Error::Vmm`] for a CID outside the guest range
+    /// `3..=254` (a snapshot whose baked sidecar names no legal CID is broken, and a VM answering on
+    /// it is unreachable — fail loud rather than resume it).
+    fn adopt_baked_cid(&mut self, baked: u32) -> Result<()> {
+        if baked == self.cid {
+            return Ok(());
+        }
+        match self.allocator.reserve(baked) {
+            Ok(_) => {
+                self.baked = Some(baked);
+                Ok(())
+            }
+            Err(crate::error::Error::Exhaustion(_)) => {
+                tracing::warn!(
+                    "this snapshot bakes guest CID {baked}, which the restored VM answers on, and \
+                     that CID is already reserved elsewhere. No new VM can draw it while that \
+                     reservation stands, so the restore continues — but the reservation is not ours \
+                     to hold, so it must outlive this VM.",
+                );
+                Ok(())
+            }
+            Err(other) => Err(other),
+        }
+    }
 }
 
 impl Drop for CidGuard {
     fn drop(&mut self) {
+        if let Some(baked) = self.baked {
+            self.allocator.release(baked);
+        }
         self.allocator.release(self.cid);
     }
 }
@@ -1514,6 +1577,9 @@ impl<V: Vmm> MicroVm<V> {
         let cid_guard = CidGuard {
             cid: guest_cid,
             allocator: cids,
+            // Set below on the restore path only, once the backend has told us which CID it
+            // actually answers on (design §17, crosvm item 7).
+            baked: None,
         };
 
         let res = PerVmResources {
@@ -1866,6 +1932,19 @@ impl<V: Vmm> MicroVm<V> {
             instance.vsock_path(),
         ) {
             vmid.adopt_lineage(ancestor)?;
+        }
+        // §17 (Open gaps and future capabilities), crosvm item 7: the SAME hazard on the CID axis,
+        // which the vmid reservation above cannot reach by construction — it keys on the host
+        // *path* a backend adopted, and crosvm spawns into its own scratch dir. crosvm bakes the
+        // vsock CID into its snapshot and refuses a rotated `--vsock cid=` on restore (§2.5, crosvm
+        // — the fourth backend (v29, boot-first)), so the restored VM answers on the BAKED CID while
+        // the `CidGuard` above holds the fresh allocation. Its vsock is in-kernel AF_VSOCK, so that
+        // CID is a host-global identity: once the ancestor was torn down, a later VM drew it and
+        // collided with this live one. Keyed on what the backend reports it answers on
+        // (`guest_cid()`), so a rotating backend is the no-op arm and needs no branch here — and
+        // done BEFORE the resume, beside the vmid one: a squatting VM must not be brought back up.
+        if let Some(cid_guard) = staged.cid_guard.as_mut() {
+            cid_guard.adopt_baked_cid(instance.guest_cid())?;
         }
         info!("Resuming instance...");
         instance.resume().await?;
@@ -3559,6 +3638,7 @@ mod tests {
             cid: Some(CidGuard {
                 cid,
                 allocator: cids,
+                baked: None,
             }),
             tmp_dir: Some(tmp_dir),
             timeouts: crate::config::Timeouts::default(),
@@ -3658,6 +3738,7 @@ mod tests {
                 cid_guard: Some(CidGuard {
                     cid: 3,
                     allocator: std::sync::Arc::new(crate::vmm::CidAllocator::new()),
+                    baked: None,
                 }),
                 res: PerVmResources {
                     cgroup_name: "vmcell-vm-8".to_string(),
@@ -4326,6 +4407,294 @@ mod tests {
         assert_eq!(
             *created, *deleted,
             "every created slice must be deleted when resume fails after restore"
+        );
+    }
+
+    /// A fake backend modelling the **non-rotating AF_VSOCK** restore shape: its `restore` hands
+    /// back an instance that answers on the snapshot's BAKED guest CID rather than on the fresh
+    /// `res.guest_cid` the orchestrator allocated (§17, Open gaps and future capabilities, crosvm
+    /// item 7 — crosvm refuses a rotated `--vsock cid=`, so its `restore()` re-programs the CID it
+    /// reads out of the snapshot sidecar).
+    ///
+    /// Its own fake rather than a `FakeVmm` knob: `FakeVmInstance::guest_cid` is a constant, and
+    /// giving it a per-instance CID would mean a new field on a struct several suites build by
+    /// exhaustive literal. Everything except the CID delegates to `FakeVmInstance`, so the call
+    /// record (`calls`) is the same one the rest of this module reads.
+    #[derive(Debug)]
+    struct BakedCidVmm {
+        /// The CID the RESTORED instance reports, standing in for crosvm's baked sidecar value.
+        baked: u32,
+        /// Shared with every instance this fake mints, so the test can see which lifecycle calls
+        /// ran — in particular whether `resume` ran.
+        calls: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl BakedCidVmm {
+        fn new(baked: u32) -> Self {
+            Self {
+                baked,
+                calls: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            }
+        }
+
+        /// A `FakeVmInstance` recording into this fake's shared call log. Written out rather
+        /// than `..Default::default()`: `FakeVmInstance` implements `Drop`, so functional-update
+        /// syntax cannot move out of it.
+        fn fake_instance(&self) -> crate::vmm::FakeVmInstance {
+            crate::vmm::FakeVmInstance {
+                vsock_path: std::path::PathBuf::from("/tmp/fake-baked-cid-vsock"),
+                serial: std::path::PathBuf::from("/tmp/fake-baked-cid-serial"),
+                calls: self.calls.clone(),
+                faults: crate::vmm::FaultMenu::default(),
+                control_plane_probes: std::sync::Arc::default(),
+            }
+        }
+
+        fn recorded(&self) -> Vec<String> {
+            self.calls.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        }
+    }
+
+    /// [`BakedCidVmm`]'s instance: a `FakeVmInstance` whose reported guest CID is overridden.
+    #[derive(Debug)]
+    struct BakedCidInstance {
+        inner: crate::vmm::FakeVmInstance,
+        cid: u32,
+    }
+
+    impl crate::vmm::VmInstance for BakedCidInstance {
+        async fn boot(&mut self) -> Result<()> {
+            self.inner.boot().await
+        }
+        async fn request_shutdown(&mut self) -> Result<()> {
+            self.inner.request_shutdown().await
+        }
+        async fn kill(&mut self) -> Result<()> {
+            self.inner.kill().await
+        }
+        async fn has_exited(&mut self) -> bool {
+            self.inner.has_exited().await
+        }
+        async fn pause(&mut self) -> Result<()> {
+            self.inner.pause().await
+        }
+        async fn resume(&mut self) -> Result<()> {
+            self.inner.resume().await
+        }
+        async fn snapshot(&mut self, dir: &std::path::Path) -> Result<()> {
+            self.inner.snapshot(dir).await
+        }
+        fn vsock_path(&self) -> &std::path::Path {
+            self.inner.vsock_path()
+        }
+        fn guest_cid(&self) -> u32 {
+            self.cid
+        }
+        fn serial_log(&self) -> &std::path::Path {
+            self.inner.serial_log()
+        }
+    }
+
+    impl Vmm for BakedCidVmm {
+        type Instance = BakedCidInstance;
+
+        async fn create(
+            &self,
+            _cfg: &VmConfig,
+            res: &PerVmResources,
+            _cgroups: &dyn crate::metrics::CgroupFs,
+        ) -> Result<Self::Instance> {
+            // A cold boot adopts nothing: it answers on the CID it was handed.
+            Ok(BakedCidInstance {
+                inner: self.fake_instance(),
+                cid: res.guest_cid,
+            })
+        }
+
+        async fn restore(
+            &self,
+            _snapshot_dir: &std::path::Path,
+            _cfg: &VmConfig,
+            _res: &PerVmResources,
+            _cgroups: &dyn crate::metrics::CgroupFs,
+        ) -> Result<Self::Instance> {
+            if let Ok(mut lock) = self.calls.lock() {
+                lock.push("restore".to_string());
+            }
+            Ok(BakedCidInstance {
+                inner: self.fake_instance(),
+                cid: self.baked,
+            })
+        }
+
+        fn capabilities(&self) -> crate::vmm::VmmCapabilities {
+            crate::vmm::VmmCapabilities {
+                snapshot_restore: true,
+                lazy_restore: false,
+                virtio_fs_shares: true,
+                unprivileged_vhost_user_net: true,
+                nested_virt: true,
+                virtio_console: true,
+                // The crosvm/FC tier: a restore does NOT rotate the host-side identity.
+                restore_rotates_host_paths: false,
+                disk_io_throttle: true,
+                usb_host_passthrough: false,
+            }
+        }
+
+        fn id(&self) -> &str {
+            "bakedcid"
+        }
+    }
+
+    // §17 (Open gaps and future capabilities), crosvm item 7 — the CALL-SITE half, KVM-free, the
+    // twin of `vmm::tests::a_restore_holds_the_ancestor_vmid_its_adopted_paths_are_keyed_on` on the
+    // OTHER axis. crosvm's restore re-programs the snapshot's baked `--vsock cid=` while the
+    // orchestrator's `CidGuard` holds a freshly allocated CID, and crosvm's vsock is in-kernel
+    // AF_VSOCK — a host-global identity. Nothing held the baked CID, so a later VM drew it and
+    // collided with the live restored one. The fakes are KVM- and network-blind, so this asserts on
+    // the ALLOCATOR, which is exactly where the identity lives; the live half is
+    // `snapshot_restore.rs`'s reservation leg under `just test-crosvm`.
+    //
+    // Red on the inverse: drop the `adopt_baked_cid` call from `restore_inner` (or hand it
+    // `res.guest_cid`) and the "must not be reallocatable" assert fails; drop the `baked` release
+    // from `CidGuard::drop` and the post-drop assert fails.
+    #[tokio::test]
+    async fn a_restore_holds_the_baked_guest_cid_the_backend_answers_on() {
+        const BAKED: u32 = 42;
+        let vmm = BakedCidVmm::new(BAKED);
+        let env = HostEnv::for_unit_tests();
+
+        // Precondition: the baked CID is free, so the refusal below is about this restore.
+        assert_eq!(
+            env.cids
+                .reserve(BAKED)
+                .expect("precondition: BAKED is free"),
+            BAKED
+        );
+        env.cids.release(BAKED);
+
+        let vm = MicroVm::restore(
+            &vmm,
+            std::path::Path::new("/tmp/fake-snap"),
+            erofs_cfg(),
+            &env,
+        )
+        .await
+        .expect("the fake restore must succeed");
+
+        // Non-vacuity: the CID the VM ANSWERS on is not the one the orchestrator allocated for it,
+        // which is the whole shape being guarded.
+        let fresh = vm
+            .cid
+            .as_ref()
+            .expect("a restored VM holds a CID guard")
+            .cid;
+        assert_ne!(fresh, BAKED);
+        assert_eq!(
+            vm.instance().guest_cid(),
+            BAKED,
+            "the fake models crosvm: the restored VM answers on the snapshot's baked CID"
+        );
+
+        assert!(
+            env.cids.reserve(BAKED).is_err(),
+            "the baked CID {BAKED} the restored VM answers on must not be reallocatable while it \
+             lives — a later VM drawing it collides on the host's in-kernel AF_VSOCK CID space"
+        );
+        assert!(
+            env.cids.reserve(fresh).is_err(),
+            "the restored VM's own allocated CID {fresh} is held too"
+        );
+
+        // …and the reservation is a lease, not a leak: teardown returns BOTH CIDs.
+        drop(vm);
+        assert_eq!(env.cids.reserve(BAKED).expect("baked CID released"), BAKED);
+        assert_eq!(env.cids.reserve(fresh).expect("own CID released"), fresh);
+    }
+
+    // The fail-loud arm, and the ORDERING clause with it: a snapshot whose baked CID is outside the
+    // guest range `3..=254` names no legal vsock identity, so the restore is refused — BEFORE the
+    // resume ("a squatting VM must not be brought back up"), which the untouched call record proves
+    // directly. Residue is zero on that path, like every other mid-restore failure.
+    //
+    // Red on the inverse: move the `adopt_baked_cid` call after `instance.resume()` and the
+    // "resume must not have run" assert fails; drop the call entirely (or swallow the error with a
+    // bare `let _ =`) and the `is_err` assert fails.
+    #[tokio::test]
+    async fn a_restore_baking_an_out_of_range_cid_is_refused_before_the_resume() {
+        // 2 is VMADDR_CID_HOST — a real CID, and never a guest's.
+        let vmm = BakedCidVmm::new(2);
+        let recorder = RecordingCgroupFs::default();
+        let env = HostEnv {
+            cgroups: std::sync::Arc::new(recorder.clone()),
+            ..HostEnv::for_unit_tests()
+        };
+
+        let res = MicroVm::restore(
+            &vmm,
+            std::path::Path::new("/tmp/fake-snap"),
+            erofs_cfg(),
+            &env,
+        )
+        .await;
+        assert!(
+            matches!(res, Err(crate::error::Error::Vmm(_))),
+            "a baked CID outside 3..=254 must fail loud, got {res:?}"
+        );
+
+        let calls = vmm.recorded();
+        assert!(
+            calls.contains(&"restore".to_string()),
+            "non-vacuity: the backend's restore did run, so the refusal is the reservation's; \
+             calls: {calls:?}"
+        );
+        assert!(
+            !calls.contains(&"resume".to_string()),
+            "the CID reservation must be taken BEFORE the resume: a VM squatting on a CID it \
+             cannot legally hold must not be brought back up; calls: {calls:?}"
+        );
+
+        let created = recorder.created.lock().unwrap_or_else(|e| e.into_inner());
+        let deleted = recorder.deleted.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(!created.is_empty(), "setup_env should have created a slice");
+        assert_eq!(
+            *created, *deleted,
+            "every created slice must be deleted when the CID reservation refuses the restore"
+        );
+    }
+
+    // The boundary case, and the arm the LIVE suite leans on: the baked CID is already reserved by
+    // somebody else (in `snapshot_restore.rs` the test itself manipulates the pool across a
+    // restore). The property wanted — "no other VM may draw it while we answer on it" — already
+    // holds, so the restore proceeds; but the claim is not ours, so teardown must NOT hand it back.
+    //
+    // Red on the inverse, both ways: make the conflict arm a refusal and the restore fails; set
+    // `self.baked = Some(baked)` on it and the post-drop assert fails, because teardown returns a
+    // CID somebody else is still holding — a worse defect than the one being fixed.
+    #[tokio::test]
+    async fn a_restore_does_not_release_a_baked_cid_claim_it_never_took() {
+        const BAKED: u32 = 77;
+        let vmm = BakedCidVmm::new(BAKED);
+        let env = HostEnv::for_unit_tests();
+        env.cids
+            .reserve(BAKED)
+            .expect("the caller holds the baked CID across the restore");
+
+        let vm = MicroVm::restore(
+            &vmm,
+            std::path::Path::new("/tmp/fake-snap"),
+            erofs_cfg(),
+            &env,
+        )
+        .await
+        .expect("a restore whose baked CID is already held must not be refused");
+
+        assert_eq!(vm.instance().guest_cid(), BAKED);
+        drop(vm);
+        assert!(
+            env.cids.reserve(BAKED).is_err(),
+            "teardown must not release a CID reservation this VM never took"
         );
     }
 
@@ -5527,6 +5896,7 @@ mod tests {
             cid: Some(CidGuard {
                 cid,
                 allocator: cid_alloc.clone(),
+                baked: None,
             }),
             tmp_dir: None,
             timeouts: crate::config::Timeouts::default(),

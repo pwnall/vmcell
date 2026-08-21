@@ -3120,12 +3120,11 @@ restore suites. Retire this entry when the shared crate lands.
 Named here so the next pass does not rediscover them, and so nothing above reads as complete when
 it is not:
 
-- On the backends, host USB is the remaining half of the eligibility law: crosvm's restore now runs
-  `reject_disk_io_throttle` like its create (gated by `restore_rejects_disk_io_throttle_like_create`),
-  but no backend's `restore()` runs the USB precheck its `create()` runs — QEMU splices `usb-host`
-  devices that were never capability-checked nor proven openable, and CH/FC/crosvm drop an accepted
-  `usb_host_devices` list silently. The orchestrator boundary covers every in-tree production path;
-  `Vmm` is a public trait, so a downstream consumer calling `vmm.restore()` directly bypasses it.
+- ~~On the backends, host USB is the remaining half of the eligibility law.~~ **CLOSED** by the
+  2026-08-20 loose-end pass (Tier A): `vmcell::vmm::reject_usb_host_devices_on_restore` is the one
+  predicate all four `restore()` bodies now call, in two arms — the descriptor-keyed delegation, and
+  the capability-independent refusal that closes QEMU, where the descriptor says `true` and the argv
+  splice was real. See that pass's entry at the end of this file.
 - `vmcell-bench`'s `workspace_root()` is a third copy of the workspace ascent, and its backend-binary
   table parallels the validator's `harness::*_bin` getters (held to the contract by a parity gate,
   not by sharing code) — `vmcell`'s own resolvers are `pub(crate)`, so both collapse only via a
@@ -4179,9 +4178,11 @@ leave a `Service` steward powering the machine off whenever handler registration
 which is not a rare path but the path a constrained guest takes.
 
 **Not covered, recorded:** the `Service` post-restore question stays unmeasured — `resync_reachable()`
-is still `Pid1`-only (§17), and nothing here changes that. `mini-init`'s restart loop has no pacing
+is still `Pid1`-only (§17), and nothing here changes that. ~~`mini-init`'s restart loop has no pacing
 on the *exit* path (only on the spawn-failure path), so a program that exits instantly burns the cap
-in microseconds; bounded and fail-loud, but not rate-limited.
+in microseconds; bounded and fail-loud, but not rate-limited.~~ **CLOSED** by the 2026-08-20
+loose-end pass (Tier A) — both call sites now sleep what `mini_init_restart_after` returns; see that
+pass's entry at the end of this file.
 
 **Live-validated** on the CH backend: the 6-leg `service_steward` battery green, each of the three
 load-bearing gates confirmed red under a planted regression (subreaper removed, `teardown_all`
@@ -6299,3 +6300,102 @@ survived, in `review-preflight-priv.sh` itself (twice, one of them directly abov
 are now fixed; the accurate rule is **a sudo happens whenever `bless_one` falls through its
 idempotence skip**, and the mtime proxy is the one arm that does not. `README.md`'s first-bless and
 `implementation-notes`' caps-mismatch mentions are correct as written and were left alone.
+
+
+---
+
+# The 2026-08-20 loose-end pass — Tier A (defects) and Tier B (gate holes)
+
+Directed by `docs/92-claude-opus-loose-end-inventory.md`, which swept every register for
+specified-but-unbuilt work and put each candidate through an adversarial verifier whose default was
+to assume it had already shipped. What follows reconciles what that pass actually changed. Items the
+inventory records as Tier E (features) or Tier F (roadmap) are **not** here: they stay on the
+register with their blockers, which is the difference between a scheduled cut and a forgotten one.
+
+**The session closed-flag (design §17, Sessions).** `Session::write_stdin`/`close_stdin`/`resize`/`close` observed only the writer channel, which dies one transport failure *after* the reader task closes the registry, so each returned `Ok(())` for a no-op write across that window while its own `# Errors` rustdoc promised `Error::Steward`. The fix adds no new flag: the registry's `Option` — already the closure `SessionMux::open` reads — *is* the shared closed-flag, and a `Session` now holds a clone of that `Arc` and reads it in `Session::send`, the one helper all four mutators route through. Check-closed and enqueue occupy one critical section against the same lock the reader's terminal step closes the registry through, so the window closes rather than narrows: either the flag is `None` and the call fails loud, or the frame enqueues while the connection is genuinely open. The gate is six KVM-free in-crate legs: one refusal leg per method, each on its own connection with the writer asserted alive (a shared connection would make legs 2–4 vacuous through the older send-failure branch), a live-connection positive control that the four frames still reach the peer, and a call-site scan pinning `self.write_tx` to exactly one site inside `send` — red, respectively, on deleting the flag check, on a flag hardwired closed, and on inlining an enqueue into a mutator.
+
+
+The §7.4 declaration sidecar is found by filesystem existence beside the image path, never through the artifact map, so a rootfs producer with no `RootfsFeaturesStage` beside it inherited whatever the last producer left there: `vmcell build --rootfs-source mmdebstrap` over an artifacts dir that held an OCI build republished `rootfs.erofs` under the OCI entry's `rootfs.features`, and every cell read that declaration — with the other artifact's provenance on every removal it caused — as this image's. `vmcell::feature::clear_feature_declaration` is the counterpart the register recorded as missing, sitting beside `feature_manifest_path` and composing the name through it, so a labelled image (`rootfs-acme.ext4` → `rootfs-acme.features`) is correct for free and the default image's live declaration beside it is untouched; a removal that fails is `Error::Artifact` naming the path, never a swallow. It is called from `pack_rootfs_with_injection`, the one inject+pack tail every rootfs source meets, rather than mirrored into the mmdebstrap arm, which covers the in-VM builder, `oci2-erofs` and any downstream producer on the listed surface in one site. That does not race the declaration stage's unconditional emission: the CLI pushes `RootfsFeaturesStage` after the image stage and `Pipeline::build` treats a vanished payload as a MISS, so the declaring pipeline re-emits the same bytes on the same build (the "a deleted sidecar comes back" leg of `the_sidecar_is_emitted_and_readable_including_for_an_empty_declaration` already pins that from the other side), and the worst case for any other ordering is the baseline rather than a foreign claim. The gate is the KVM-free `republishing_an_image_clears_another_producers_feature_declaration`: non-vacuity through `FeatureDeclaration::load_beside` before the pack, the positive `baseline` identity plus on-disk absence after it, and the default-image positive control that reddens on a hand-formatted name. The recorded-gap entry naming this mmdebstrap case is retired.
+
+
+The `tar2erofs` file-vs-symlink clobber recorded as "still open" is closed, and it was worse than the note said: `rootfs_injection_manifest` injects the guest-tools multicall binary as a FILE at `{VMCELL_TOOLS_DIR}/{GUEST_TOOLS_MULTICALL_BIN}` and one applet SYMLINK per roster entry into that same directory, and since v33 delta 6 the roster is registry DATA — a handler entry naming `vmcell-guest-tools` as an applet replaced the binary with a dangling self-symlink under the tail's plain last-wins `insert`, so the image shipped with no multicall binary and every applet dangling while the pack reported success (the docs/90 H1 shape). `build_node_map`'s injection tail now claims each dest exactly once through the one `claim_injection_dest` predicate, keyed on the normalized path because that is the merged tree's own key, and refuses a second claim with a typed `Error::Artifact` naming the dest and both claimants. The scope is deliberate and stated in its rustdoc: EVERY duplicate inside vmcell's own manifest is refused, identical kinds included — matching the F5 duplicate-dest law `validate_extra_files` already applies to downstream extras rather than restating it more weakly — while the two collisions the packer resolves by design keep their existing behavior and their existing tests (a layer entry an injection overwrites, H-ART-3; an `ExtraFile` an injection overwrites, F5's structural backstop), and an injection whose dest is another injection's parent stays `nodes_to_erofs`'s L-ART-6 refusal rather than a second copy of it. `fuzz_node_paths` is unchanged and still reaches the production predicate through `build_node_map`. The gate is four in-file unit tests that drive `build_node_map`, each proven red by deleting the claim call in the loop it guards, by keying the ledger on the raw dest string, and — for the anti-over-reach control — by extending the ledger over the layer-merge keys.
+
+
+**`mini-init`'s restart loop is paced, by the predicate that already owned the cap.** The v33 delta-5 record's own "not covered" entry — pacing on the spawn-failure arm only, so a program that exits instantly burns the cap in microseconds — is closed, and the entry is retired. The defect was one law spelled two ways: a `Duration::from_millis(200)` literal at the spawn-failure call site and no pause at all on the exit path, which is the path `/bin/false` (and any service that dies at start-up) actually takes; bounded and fail-loud, but with the retries so close together that no transient a retry exists for could clear between them, and with every console line written into the persisted serial artifact as fast as the guest CPU could emit it. `mini_init_next_failure_count` is now `mini_init_restart_after`, returning the pause *together with* the strike count — one predicate for "how many" and "how fast", because they answer the same question — and both call sites sleep what it returns. The shape is clamped exponential backoff charged to the strike (250 ms doubling to a 4 s ceiling, ~3.75 s across a whole burst: real time for a transient, still far inside the 30 s failure window so fail-loud stays prompt), while a program that *stayed up* is charged neither a strike nor a pause, which keeps the service SIGTERM leg as quick as it was. The arithmetic is the binary's one `retry_backoff`, which `accept_error_pacing` now also rides with its own two named constants — its curve is unchanged, and its pre-existing test proves it. Two gates, because the unit test alone cannot see the regression return: `every_rapid_restart_is_paced_and_the_whole_burst_stays_inside_the_window` (KVM-free, sleep-free — the predicate takes the measured run duration rather than reading a clock) holds the curve, red on an unpaced strike and red again on a window-sized one; `scripts/ban-unpaced-guest-retry.sh` holds the call sites, banning any `thread::sleep` in guest-tools production text that builds its duration on the spot, with its delegate named and its zero-file, sleep-free-tree, and missing-delegate scans all reported as `gate misconfigured`.
+
+
+**The USB half of the restore-side eligibility law is closed.** No backend's `restore()` ran the USB precheck its `create()` ran: CH/FC/crosvm accepted a `usb_host_devices` list and dropped it silently, and QEMU — whose `usb_host_passthrough` is `true`, so `reject_usb_host_devices` passes it — spliced `-device usb-host,…` into the restored VM's argv through the shared `spawn_qemu` while handing the instance a `UsbHostClaim::default()`: devices never resolved to a usbfs node, never proven openable, never put back at teardown. The orchestrator boundary covered every in-tree path, but `Vmm` is public, so a consumer calling `vmm.restore()` directly bypassed it. `vmcell::vmm::reject_usb_host_devices_on_restore` is the one predicate all four backends now call before any spawn, in two arms: it delegates to `reject_usb_host_devices` (keyed off the descriptor handed in, so an incapable backend owes restore the identical refusal its create gives), and then — capability-independently, because no descriptor field can answer "re-attach a host device across a migration stream" — refuses with `USB_PASSTHROUGH_BLOCKS_RESTORE`, a `const` initialized from `orchestrator::INELIGIBLE_USB_PASSTHROUGH` rather than a second literal, so the backend and orchestrator boundaries cannot drift into two near-miss prose strings. Copying create's precheck alone would have been a no-op on the one backend that actually splices USB into its argv, which is why the second arm exists. Five KVM-free gates hold it: the predicate's own two-arm test in `vmm::tests` (red on either arm deleted) and one per-backend test driving the real `restore()` (red on the call site deleted, each landing on the next error down — the missing `config.json`/sidecar/snapshot artifact, or QEMU's in-kernel-vsock refusal). The QEMU leg additionally asserts that the cold path is untouched: `create()` still travels past the descriptor precheck into `claim_usb_host_devices`.
+
+
+**§17 crosvm item 7 — the baked guest CID is now held by the restored VM's `CidGuard`.** crosvm's `restore()` re-programs the snapshot's baked `--vsock cid=` (it refuses a rotated one) while `restore_inner` allocated a fresh CID whose guard held only that one, so the baked CID — a host-global in-kernel AF_VSOCK identity, not a per-scratch-dir path — was free for same-process reallocation the moment the ancestor was torn down, and a later VM drawing it collided with the live restored VM; the M9 vmid fix could not reach it, because that one keys on the host *path* a backend adopted and crosvm spawns into its own scratch dir. `CidGuard` now carries a private `baked: Option<u32>` and the one predicate `CidGuard::adopt_baked_cid`, shaped after `VmidGuard::adopt_lineage` on the vmid axis: `restore_inner` calls it with `instance.guest_cid()` — what the backend says it actually answers on, so a rotating backend takes the no-op arm and no call site branches per backend — immediately after the vmid adoption and **before** the resume, an already-reserved CID is a warning rather than a refusal and is never adopted into the guard, and an out-of-range baked CID fails loud as `Error::Vmm`. A second copy of the law is not writable: `CidGuard`'s fields are private, so no backend crate can construct a guard, and inside `vmcell` there is one restore path — the drift is a compile error, so this law earns no grep-ban. The gate is the `snapshot_restore` matrix leg, which now holds the lowest CID across block 1 and releases it just before the restore (instead of holding the source's, which made the reservation unobservable — one allocator, one set entry, no refcount) and asserts that the CID the restored VM answers on cannot be reallocated while it lives, with the crosvm branch proving two distinct CIDs are held so the assertion is not the VM's own guard; it is red on the inverse live under crosvm ("the guest CID 4 the restored VM answers on must not be reallocatable while that VM is live"), and three KVM-free orchestrator tests over a purpose-built `BakedCidVmm` pin the adoption, the fail-loud out-of-range arm together with the before-the-resume ordering, and the never-took-it-never-releases-it arm, because CI has no crosvm binary and a live-only gate is a gate CI cannot run.
+
+
+**The e2fsprogs cache key could not fall behind its pin any more, because it no longer restates it.**
+`ci.yml`'s `actions/cache` key spelled `e2fsprogs-1.47.2-7a959221c1b1cc6e-…` against a `1.47.4` /
+`da274408…` pin — so the very re-pin the digest-in-the-key existed to protect would have been served
+the tree built from the bytes it replaced, and the key's own comment asserted that this could not
+happen. A comment cannot hold two numbers equal. The pin moved to **job scope** in both jobs and the
+key now interpolates `${{ env.E2FSPROGS_VERSION }}` / `${{ env.E2FSPROGS_SHA256 }}`, which makes the
+restatement unrepresentable rather than merely repaired. The durable half is arm 8 of
+`ci_obtains_the_ext4_facility_rather_than_living_with_the_skip`, which asserts the *coupling* rather
+than the equality: the key must interpolate both halves, must not spell the pinned version
+literally, and the step must not carry a second pin beside the job-scoped one. Proven red three
+ways — the exact key that shipped, a half-interpolated key, and a re-added step-scoped pin. Arms 1–4
+were rewired for the move (the build step is now located by its own `obtain_e2fsprogs` marker rather
+than by `PIN`, which since the hoist matches in the job preamble; the step chunks are collected from
+`steps:` onward so the job-scoped pin is not counted as a third chunk).
+
+**`just example-downstream` exists, so the CI job can invoke a recipe instead of restating one.**
+The `example-downstream` job hand-copied `cargo build --locked` and `./ci-check.sh` — AGENTS.md rule
+3's drift class — and the reason the class had no home is that there was no recipe to call. There is
+now, and the job is one `run: just example-downstream` behind the same pinned `taiki-e/install-action`
+every other `just`-invoking job uses. `ban-recipe-body-handcopy.sh` covers it from that moment on.
+
+**`cargo semver-checks` now runs on every event, not only on pull requests.** It was
+`if: github.event_name == 'pull_request'`, and the only PRs this repo has ever had are dependabot's,
+so the contract-surface gate had **never once run against a change to vmcell's own public API**:
+every such change lands as a direct push to `main`, precisely the event the condition excluded. The
+gate was structurally unable to fire on the path changes actually take. One baseline expression now
+covers both events (`pull_request.base.sha` or `event.before`) — a second step with the opposite
+`if:` would have been the hand-copy class one file over — and an all-zero baseline is fail-loud
+rather than a silent comparison against nothing, which is the shape that hid this for so long.
+
+**`test-unit-undelegated` proves its own premise before trusting a green run.** The recipe exists to
+mirror the hosted runner's undelegated-cgroup condition, and its whole premise — that
+`/sys/fs/cgroup` is *unwritable* inside the sandbox — was asserted nowhere. On a host where the
+operator can write the bind source, the bind still succeeds, `create_dir_all` still succeeds, and a
+green run reads as "the undelegated condition passes" when it never held. It now probes with an
+actual `mkdir` through `bwrap` (a permission-bit reading would miss an ACL or a group) and reports
+`gate misconfigured` rather than running — this repo's zero-file-scan doctrine one level out. Proven
+both ways on this host: green against root-owned `/srv`, red against a writable bind source.
+
+**`scripts/ban-orphan-recipe.sh` closes the orphan class one level above the scripts.**
+`ban-ci-script-handcopy.sh` ARM 4 already holds the `gates` roster equal to the gate-shaped scripts
+on disk in *both* directions; the identical argument about `just` recipes had no gate, and a recipe
+nothing invokes rots exactly the way the three ci.yml hand-copies rotted — silently, because a thing
+nobody runs cannot go red. It is a two-way roster rather than a bare "every recipe has a caller",
+because some recipes legitimately have none: the opt-in live suites keep a *named* absent facility
+(no crosvm binary, a full-Debian pull, a designated USB device) and the operator verbs are typed by
+a human by design; demanding a caller would force a fake one. So an un-called recipe must be
+rostered with its reason, and a rostered recipe that has since acquired a caller is a stale
+exemption. Bodies are read back through `just --show`, which is also how the self-test caught a real
+bug in the gate on its first run: `just --show` normalizes `{{just_executable()}}` to
+`{{ just_executable() }}`, so the original needle found no recursive caller at all.
+
+**`scripts/with-delegated-scope.sh` finally has a red-on-inverse self-test — and one arm out of
+family.** It is the sole entry of `ban-ci-script-handcopy.sh`'s exemption allowlist and every live
+suite runs through it, with four warn-and-continue arms on which `set -euo pipefail` is inert (each
+being `if !`-guarded), so a regression there degrades every cgroup leg in the tree to "ran without
+delegation" without reddening anything. The self-test fabricates a cgroup tree under `bwrap` —
+`/proc/self/cgroup` is untouched, so the wrapper computes exactly the `cg_base` it would in
+production and meets whatever the fixture put there — and drives all four arms, the
+`exec "$@"` contract, and three mutated copies. Writing it surfaced the inconsistency: `mkdir -p
+"$cg_base/supervisor"` was **unguarded**, so it was the one arm that aborted under `set -e` instead
+of degrading, and it aborts the whole suite it was invoked to wrap. It is guarded like its four
+siblings now.
+
+**`just install-hooks` performs the deploy step `scripts/git-pre-commit` had only described.** The
+hook's own header said "symlink into `.git/hooks/pre-commit`" and nothing performed it, so it was
+installed in no checkout including this one — a deploy step written as prose is a deploy step that
+does not happen. A symlink, never a copy: a copy is the hand-copy class one directory over, and it
+silently keeps running the version it was copied from.

@@ -953,6 +953,72 @@ pub fn reject_usb_host_devices(
     Ok(())
 }
 
+/// **The one refusal every backend's `restore()` returns for a host-USB config** — the *same*
+/// [`Removal`](crate::feature::Removal) value the orchestrator's clone-eligibility arm returns
+/// (`INELIGIBLE_USB_PASSTHROUGH`), aliased here because that arm is `pub(crate)` and three of the
+/// four backends live in their own crates (§8.1, The warm-snapshot path and the eligibility law).
+///
+/// A `const` initialized *from* the orchestrator's arm rather than a second literal: the two
+/// boundaries cannot drift into two near-miss prose strings the way the four vhost-user refusals
+/// did before [`crate::feature::VHOST_USER_BLOCKS_SNAPSHOT`] collapsed them, and a backend test can
+/// assert arm IDENTITY instead of matching a fragment.
+pub const USB_PASSTHROUGH_BLOCKS_RESTORE: crate::feature::Removal =
+    crate::orchestrator::INELIGIBLE_USB_PASSTHROUGH;
+
+/// Rejects [`VmConfig::usb_host_devices`](crate::config::VmConfig::usb_host_devices) on the
+/// **restore** path, on every backend — the half of the honor-or-reject law `create()` already
+/// held (§8.1, The warm-snapshot path and the eligibility law).
+///
+/// A passed-through host USB device is host state living **outside** guest RAM: the migration
+/// stream carries the guest's view of the xhci controller, never the device behind it. So no
+/// backend can honor such a config on restore, and until this predicate existed none refused it
+/// either — CH / Firecracker / crosvm dropped the accepted list silently, and QEMU (whose
+/// `usb_host_passthrough` is `true`, so [`reject_usb_host_devices`] passes it) spliced
+/// `-device usb-host,…` into the restored VM's argv **without** the
+/// [`usb::claim_usb_host_devices`] precheck `create()` runs — an unresolved, unproven,
+/// never-put-back claim on a host device (§2.4, QEMU q35 — the fallback and most-proven nester).
+///
+/// **One law, one predicate, two arms:**
+///
+/// 1. the create-side arm, delegated to [`reject_usb_host_devices`] and therefore keyed off the
+///    [`VmmCapabilities`] handed in — never a hardcoded `false` here — so a backend that cannot
+///    attach a host USB device at all refuses a restore with the *identical* typed error its
+///    `create()` returns (`usb_host_passthrough`): a restore must not accept what create rejects,
+///    and a re-gate of the flag moves both paths at one site;
+/// 2. the restore-only arm, reached only when arm 1 passed — i.e. on a backend whose descriptor
+///    says it *can* attach one — which refuses with [`USB_PASSTHROUGH_BLOCKS_RESTORE`]
+///    (`snapshot_restore`, config provenance). This arm is deliberately capability-INDEPENDENT:
+///    the migration stream carries no host device on any backend, present or future, so there is
+///    no descriptor field for it to read. Copying arm 1 alone into `restore()` would have been a
+///    no-op on QEMU — the one backend that actually splices `usb-host` into its argv.
+///
+/// The orchestrator covers every in-tree production path, but [`Vmm`] is public: a downstream
+/// consumer calling `vmm.restore()` directly bypassed it entirely, which is why the refusal
+/// belongs here too.
+///
+/// # Errors
+/// Returns [`Error::Unsupported`](crate::error::Error::Unsupported) when `devices` is non-empty:
+/// `{ vmm, feature: "usb_host_passthrough" }` when `caps.usb_host_passthrough` is `false`,
+/// otherwise the [`USB_PASSTHROUGH_BLOCKS_RESTORE`] refusal (`feature: "snapshot_restore"`).
+/// `Ok(())` for an empty list.
+pub fn reject_usb_host_devices_on_restore(
+    vmm: &str,
+    caps: &VmmCapabilities,
+    devices: &[crate::config::UsbHostDevice],
+) -> Result<()> {
+    // Arm 1: whatever `create()` would say, `restore()` says too — keyed off the descriptor, never
+    // a hardcoded `false` here.
+    reject_usb_host_devices(vmm, caps, devices)?;
+    // Arm 2: the backend CAN attach one cold, and still cannot re-attach one to a restored VM.
+    if !devices.is_empty() {
+        return Err(crate::error::Error::from_removal(
+            vmm,
+            &USB_PASSTHROUGH_BLOCKS_RESTORE,
+        ));
+    }
+    Ok(())
+}
+
 /// Returns `true` when a VM carrying any of these is **not** snapshot-eligible,
 /// because it has a vhost-user device attached (a virtio-fs data share served by
 /// virtiofsd, the unprivileged `vhost-user-net` NAT, or an external `vhost-user-net`
@@ -2690,6 +2756,78 @@ mod tests {
         reject_usb_host_devices("cloud-hypervisor", &caps(false), &[])
             .expect("no USB device requested must never be refused");
         reject_usb_host_devices("qemu", &caps(true), &[])
+            .expect("no USB device requested must never be refused");
+    }
+
+    // docs/90 A3: the restore half of the same law, whose two arms answer two different
+    // questions and must not collapse into one. (a) An incapable backend owes `restore()` the
+    // IDENTICAL refusal its `create()` gives — same `vmm`, same `usb_host_passthrough` feature
+    // string — because a restore that accepts what create rejects is the M4 defect; (b) a
+    // CAPABLE backend (QEMU alone) still cannot re-attach a host device to a restored VM, so it
+    // gets the `snapshot_restore` removal instead, with the config provenance naming the input
+    // to drop; (c) the empty list is accepted on both sides, so wiring this into four
+    // `restore()` paths cannot reject the 99% config.
+    //
+    // Red on the inverse: an arm-2-only predicate (dropping the delegation to
+    // `reject_usb_host_devices`) reddens the incapable legs' identity assert; an arm-1-only
+    // predicate — the trap of "just copy create's precheck", which is a NO-OP on the one backend
+    // that actually splices USB into its argv — reddens the QEMU leg, which would return `Ok`.
+    #[test]
+    fn reject_usb_host_devices_on_restore_answers_incapable_and_capable_backends_differently() {
+        use crate::config::UsbHostDevice;
+
+        let caps = |usb_host_passthrough: bool| VmmCapabilities {
+            snapshot_restore: true,
+            lazy_restore: false,
+            virtio_fs_shares: true,
+            unprivileged_vhost_user_net: true,
+            nested_virt: true,
+            virtio_console: true,
+            restore_rotates_host_paths: true,
+            disk_io_throttle: true,
+            usb_host_passthrough,
+        };
+        let devices = [UsbHostDevice::new(0x1d6b, 0x0002)];
+
+        // (a) Incapable backend: byte-identical to what `create()` refuses with.
+        for vmm in ["cloud-hypervisor", "firecracker", "crosvm"] {
+            let on_create = reject_usb_host_devices(vmm, &caps(false), &devices)
+                .expect_err("create refuses a host USB device on an incapable backend");
+            let on_restore = reject_usb_host_devices_on_restore(vmm, &caps(false), &devices)
+                .expect_err("restore must refuse exactly what create refuses");
+            assert!(
+                matches!(&on_restore, crate::error::Error::Unsupported { vmm: got, feature }
+                    if got == vmm
+                        && feature == crate::feature::Feature::UsbHostPassthrough.name()),
+                "expected the create-side usb_host_passthrough Unsupported from {vmm}, got \
+                 {on_restore:?}"
+            );
+            assert_eq!(on_create.to_string(), on_restore.to_string());
+        }
+
+        // (b) Capable backend: create accepts (asserted, so the leg is not vacuous), restore
+        //     refuses with the restore-only arm — the SAME `Removal` the orchestrator's
+        //     clone-eligibility boundary returns for this config, asserted by identity.
+        reject_usb_host_devices("qemu", &caps(true), &devices)
+            .expect("a capable backend accepts a host USB device on the COLD path");
+        let err = reject_usb_host_devices_on_restore("qemu", &caps(true), &devices)
+            .expect_err("no backend can re-attach a host USB device to a restored VM");
+        assert!(
+            matches!(&err, crate::error::Error::Unsupported { feature, .. }
+                if feature == crate::feature::Feature::SnapshotRestore.name()),
+            "the feature string must be Feature::name() by construction (F6), got {err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            crate::error::Error::from_removal("qemu", &USB_PASSTHROUGH_BLOCKS_RESTORE).to_string(),
+            "the capable-backend arm must be THIS removal — the one the orchestrator boundary \
+             already returns for the same config: {err:?}"
+        );
+
+        // (c) The empty list is accepted on both sides — the over-rejection inverse.
+        reject_usb_host_devices_on_restore("cloud-hypervisor", &caps(false), &[])
+            .expect("no USB device requested must never be refused");
+        reject_usb_host_devices_on_restore("qemu", &caps(true), &[])
             .expect("no USB device requested must never be refused");
     }
 

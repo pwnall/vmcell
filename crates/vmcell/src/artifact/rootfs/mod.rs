@@ -1585,6 +1585,27 @@ pub async fn pack_rootfs_with_injection(
                 pack_merged_tar_as_ext4(producer, &merged_tar, &out_buf)?;
             }
         }
+        // A new image at this path invalidates whatever feature declaration is sitting beside it
+        // (§7.4). One site for both emitters, after the write and before the artifact is
+        // registered, because it is a property of *publishing an image*, not of a format.
+        //
+        // The declaration sidecar is found by filesystem existence beside the image path
+        // (`FeatureDeclaration::load_beside`), never through the artifact map, so a producer with
+        // no `RootfsFeaturesStage` beside it inherits the last producer's declaration verbatim —
+        // `vmcell build --rootfs-source mmdebstrap` over an artifacts dir that held an OCI build is
+        // the shipped instance. This tail is where every rootfs source meets (§4.3 obligation 3),
+        // so clearing here covers the in-VM builder, `oci2-erofs`, and any downstream producer that
+        // packs through the listed surface, without any of them having to remember.
+        //
+        // It is NOT a second "the declaration went away" law racing the stage's unconditional
+        // emission: a pipeline that runs `RootfsFeaturesStage` runs it AFTER the image stage, and
+        // `Pipeline::build` treats a vanished payload as a MISS — so the declaring pipeline
+        // re-emits the same bytes on the same build, which the
+        // `the_sidecar_is_emitted_and_readable_including_for_an_empty_declaration` gate already
+        // pins from the other side (its "a deleted sidecar comes back" leg). The
+        // worst case for a mis-ordered pipeline is the BASELINE, which is the honest reading of an
+        // artifact that declares nothing — never another artifact's claim wearing this one's name.
+        crate::feature::clear_feature_declaration(&out_buf)?;
         let mut outputs = StageOutputs::default();
         // Through the ONE artifact-key law, never the bare literal: `rootfs_artifact_key(None)` IS
         // `"rootfs"`, so the default label's key is byte-identical, while a labelled pack stops
@@ -2945,5 +2966,124 @@ mod tests {
         // And the default stage declares the default, so a caller that never mentions the policy
         // packs exactly what it always packed.
         assert_eq!(RootfsStage::new().pack_options().xattrs, XattrPolicy::Strip);
+    }
+
+    // §7.4 GATE: republishing an image over a path where a DIFFERENT producer left a feature
+    // declaration must not hand that declaration to the new image. KVM-free, through the real
+    // `pack_rootfs_with_injection` — the one tail every rootfs source meets — so it covers the
+    // shipped instance (`vmcell build --rootfs-source mmdebstrap` into an artifacts dir that held
+    // an OCI build) without booting the builder VM that instance needs.
+    //
+    // Three claims, and the third is what makes the first two more than "the file is gone":
+    //
+    //  1. NON-VACUITY, measured on the reader the product uses: before the pack,
+    //     `FeatureDeclaration::load_beside` really does report the foreign stance for this image.
+    //     A test that only asserted the absence afterwards would stay green against a sidecar
+    //     nothing ever read.
+    //  2. The POSITIVE IDENTITY after the pack is `FeatureDeclaration::baseline(source)` — the
+    //     stated answer for an artifact that declares nothing — not merely "different from
+    //     before", and the file itself is gone at `feature_manifest_path`'s composed name.
+    //  3. The POSITIVE CONTROL: the *default* image's declaration, sitting in the same directory,
+    //     SURVIVES a labelled pack. A clear that hand-formatted `rootfs.features` would pass claim
+    //     2 for the default image and silently destroy a labelled one's declaration (or, packing
+    //     the label, leave the labelled sidecar stale and delete the default's) — the registry
+    //     shape §10.5 landed is exactly a labelled image published beside a default one.
+    //
+    // RED on the inverse (delete the `clear_feature_declaration` call from the tail): claim 2's
+    // `load_beside` still reports `Some(&false)` for the republished image and the `exists` assert
+    // fires — the stale declaration is read as this image's, with the OTHER artifact's provenance
+    // attached to every removal it causes.
+    #[cfg(feature = "am-fs-erofs")]
+    #[tokio::test]
+    async fn republishing_an_image_clears_another_producers_feature_declaration() {
+        use crate::feature::{Feature, FeatureDeclaration, Source, feature_manifest_path};
+
+        stabilize_ca();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path();
+        // A static-musl steward stand-in: it makes `require_libc6` false, so an empty layer set
+        // packs — this gate is about the sidecar beside the image, not the image's contents.
+        let musl = write_tmp(dir, "steward-musl", b"#!static-steward");
+
+        // The state an OCI build leaves: an image, and beside it the declaration
+        // `RootfsFeaturesStage` emitted from that build's registry entry. Both labels, so the
+        // labelled pack below has a same-directory neighbour to leave alone.
+        let pack_at = async |label: Option<&str>| {
+            let out = dir.join(rootfs_filename(label, RootfsFormat::default()));
+            pack_rootfs_with_injection(
+                vec![],
+                &StageInputs::default(),
+                &out,
+                &PackOptions::new()
+                    .with_steward_musl(Some(musl.clone()))
+                    .with_label(label),
+            )
+            .await
+            .map(|_| out)
+        };
+        // Rendered by the real producer, never a hand-written manifest body: what a stale sidecar
+        // contains is whatever the previous build wrote, and that is this.
+        let declared = {
+            let mut stances = std::collections::BTreeMap::new();
+            stances.insert(Feature::SnapshotRestore, false);
+            FeatureDeclaration {
+                source: None,
+                stances,
+            }
+            .render_manifest()
+        };
+
+        for label in [None, Some("acme")] {
+            let image = dir.join(rootfs_filename(label, RootfsFormat::default()));
+            std::fs::write(feature_manifest_path(&image), &declared)
+                .expect("the previous build's declaration");
+        }
+        let source_for =
+            |label: Option<&str>| Source::Rootfs(rootfs_filename(label, RootfsFormat::default()));
+        // 1. Non-vacuity, through the reader every cell uses.
+        let stale = FeatureDeclaration::load_beside(
+            &dir.join(rootfs_filename(Some("acme"), RootfsFormat::default())),
+            source_for(Some("acme")),
+        )
+        .expect("the previous build's sidecar parses");
+        assert_eq!(
+            stale.stances.get(&Feature::SnapshotRestore),
+            Some(&false),
+            "the leg is vacuous unless the stale sidecar is actually read for this image"
+        );
+
+        // The republish: the labelled image only, by a producer with no declaration stage.
+        let image = pack_at(Some("acme")).await.expect("the pack must succeed");
+
+        // 2. The positive identity: the baseline, stated.
+        let after = FeatureDeclaration::load_beside(&image, source_for(Some("acme")))
+            .expect("an artifact with no declaration reads as the baseline");
+        assert_eq!(
+            after,
+            FeatureDeclaration::baseline(source_for(Some("acme"))),
+            "an image republished by a producer that declares nothing must read as the BASELINE, \
+             not as the previous producer's declaration (§7.4)"
+        );
+        assert!(
+            !feature_manifest_path(&image).exists(),
+            "the stale declaration must be gone from disk, not merely out-voted: {}",
+            feature_manifest_path(&image).display()
+        );
+
+        // 3. The positive control: the neighbour this pack did not publish keeps its declaration.
+        let untouched = dir.join(rootfs_filename(None, RootfsFormat::default()));
+        assert!(
+            feature_manifest_path(&untouched).exists(),
+            "packing `acme` must not delete the DEFAULT image's declaration: {}",
+            feature_manifest_path(&untouched).display()
+        );
+        assert_eq!(
+            FeatureDeclaration::load_beside(&untouched, source_for(None))
+                .expect("the untouched sidecar parses")
+                .stances
+                .get(&Feature::SnapshotRestore),
+            Some(&false),
+            "…and it still says what its own build declared"
+        );
     }
 }

@@ -257,6 +257,33 @@ fn run_kvm_ok() -> i32 {
 }
 
 // ---------------------------------------------------------------------------
+// Retry pacing — the one backoff law every retry loop in this binary obeys.
+// ---------------------------------------------------------------------------
+
+/// The pause before retry number `consecutive` (1-based): `base`, doubled once per preceding
+/// consecutive failure, clamped at `ceiling`.
+///
+/// The **one** backoff computation in this binary. Every loop here that retries something which
+/// can keep failing — an `accept` on a listener fd that has gone permanently bad, `mini-init`
+/// restarting a supervised program that exits instantly — has the same two failure modes if it
+/// retries unpaced: it burns the guest's CPU, and, because guest stdout **is** the serial console
+/// vmcell persists as a per-VM log artifact, it writes the same line into a host file as fast as
+/// that CPU allows. Each caller owns its `base` and `ceiling` as named consts, because the
+/// policies genuinely differ (a listener that recovers wants to be picked up quickly; a
+/// crash-looping init wants to fail loud quickly). What does not differ, and is therefore not
+/// written twice, is the shape.
+///
+/// Total at every input: the exponent is clamped before it is applied and the multiply saturates,
+/// so no `consecutive` overflows, wraps, or exceeds `ceiling`.
+fn retry_backoff(base: Duration, ceiling: Duration, consecutive: u32) -> Duration {
+    // `u32::BITS - 1` is the largest defined shift; past it the answer is `ceiling` anyway, so
+    // clamping the exponent costs nothing and removes the overflow.
+    let doublings = consecutive.saturating_sub(1).min(u32::BITS - 1);
+    let factor = 1u32.checked_shl(doublings).unwrap_or(u32::MAX);
+    base.saturating_mul(factor).min(ceiling)
+}
+
+// ---------------------------------------------------------------------------
 // `mini-init` — the smallest generic init that runs the steward as a service
 // (v33 §3.5, §18 delta 5).
 // ---------------------------------------------------------------------------
@@ -274,6 +301,15 @@ const MINI_INIT_MAX_RAPID_FAILURES: u32 = 5;
 /// than this resets the counter — a long-lived steward that eventually exits is a restart, not a
 /// crash-loop.
 const MINI_INIT_FAILURE_WINDOW: Duration = Duration::from_secs(30);
+
+/// The pause before the **first** paced restart, doubling per strike — see
+/// [`mini_init_restart_after`], which owns the reasoning, and [`retry_backoff`], which owns the
+/// arithmetic.
+const MINI_INIT_RESTART_BACKOFF_BASE: Duration = Duration::from_millis(250);
+
+/// The ceiling on a single restart pause. With [`MINI_INIT_MAX_RAPID_FAILURES`] at 5 the doubling
+/// never reaches it; it is what keeps the policy bounded if the cap ever grows.
+const MINI_INIT_RESTART_BACKOFF_CEILING: Duration = Duration::from_secs(4);
 
 /// Where the rootfs injection manifest always places the steward binary — what `mini-init`
 /// supervises when its argv names nothing else.
@@ -325,19 +361,75 @@ fn parse_mini_init_args(args: &[String]) -> Result<Vec<String>, String> {
     Ok(args.to_vec())
 }
 
-/// Decides whether a steward exit is part of a crash-loop.
+/// What `mini-init` does once the supervised program has gone away (v33 §3.5).
+#[derive(Debug, PartialEq, Eq)]
+enum MiniInitRestart {
+    /// Wait, then start the program again.
+    After {
+        /// How long to wait first — see [`mini_init_restart_after`] for why, and why it is zero
+        /// for a program that had stayed up.
+        delay: Duration,
+        /// The consecutive-rapid-failure count to carry into the next round.
+        consecutive: u32,
+    },
+    /// The rapid-failure cap has tripped: power off, fail-loud.
+    CapTripped,
+}
+
+/// Decides what happens after the supervised program has gone away: how many rapid failures are
+/// on the record, and how long to wait before trying again (v33 §3.5).
 ///
-/// Pure so the cap is unit-testable without spawning anything: `run` for how long the steward
-/// stayed up, `consecutive` for how many rapid failures preceded it. Returns the new count, and
-/// `None` once the cap is reached — which the caller turns into a fail-loud power-off.
-fn mini_init_next_failure_count(run: Duration, consecutive: u32) -> Option<u32> {
+/// Pure, so the whole restart policy is unit-testable with no guest and no sleeping. `run` is how
+/// long the program stayed up — the *caller* measures it and nothing here reads a clock, which is
+/// what makes the answers deterministic — and `consecutive` is how many rapid failures preceded
+/// this one.
+///
+/// **Two decisions, one predicate, because they answer the same question.** The cap bounds *how
+/// many* rapid restarts happen; the pacing bounds *how fast*. The cap alone used to be the whole
+/// policy, and a program that exits instantly (`/bin/false`) burned all
+/// [`MINI_INIT_MAX_RAPID_FAILURES`] strikes inside a few microseconds: fail-loud, but with the
+/// retries so close together that no transient a retry exists for — a device node that appears a
+/// beat later, a transport still being wired up — could possibly have cleared between them, and
+/// with every console line written into the persisted serial artifact as fast as the guest CPU
+/// could emit it. (The spawn-failure arm did pause, for 200 ms, at the call site; the exit arm did
+/// not pause at all. That is one law spelled two ways plus a literal, which is why the pause now
+/// comes back from here.)
+///
+/// The shape is **clamped exponential backoff charged to the strike**, through the binary's one
+/// [`retry_backoff`]: [`MINI_INIT_RESTART_BACKOFF_BASE`] doubling per strike to
+/// [`MINI_INIT_RESTART_BACKOFF_CEILING`] — 250 ms, 500 ms, 1 s, 2 s today, the ceiling binding
+/// only if the cap grows. Two properties are deliberate:
+///
+/// * The paced retries span a few seconds — real time for a transient to clear — and stay far
+///   inside [`MINI_INIT_FAILURE_WINDOW`], so pacing cannot turn a crash-looping cell into one
+///   that takes minutes to admit it is dead. Fail-loud stays prompt.
+/// * A program that **stayed up** comes back with **no** delay: its exit is a restart, not a
+///   failure, so it is charged neither a strike nor a pause. That is what keeps the service
+///   SIGTERM leg — steward exits, `mini-init` brings it straight back — as quick as it was.
+///
+/// The delay is slept *between* this decision and the next `Instant::now()`, so a pause is never
+/// charged to the next round's uptime; a paced restart cannot masquerade as a healthy run.
+fn mini_init_restart_after(run: Duration, consecutive: u32) -> MiniInitRestart {
     if run >= MINI_INIT_FAILURE_WINDOW {
         // It stayed up. This is a restart, not a crash-loop — the counter resets, so a cell that
-        // runs for hours and is then stopped does not inherit an old strike.
-        return Some(0);
+        // runs for hours and is then stopped does not inherit an old strike, and it does not wait.
+        return MiniInitRestart::After {
+            delay: Duration::ZERO,
+            consecutive: 0,
+        };
     }
     let next = consecutive.saturating_add(1);
-    (next < MINI_INIT_MAX_RAPID_FAILURES).then_some(next)
+    if next >= MINI_INIT_MAX_RAPID_FAILURES {
+        return MiniInitRestart::CapTripped;
+    }
+    MiniInitRestart::After {
+        delay: retry_backoff(
+            MINI_INIT_RESTART_BACKOFF_BASE,
+            MINI_INIT_RESTART_BACKOFF_CEILING,
+            next,
+        ),
+        consecutive: next,
+    }
 }
 
 /// The `mini-init` applet: rejects any argv it cannot honor, then runs as PID 1.
@@ -379,13 +471,15 @@ fn mini_init_forever(supervised: &[String]) -> i32 {
             Ok(child) => child,
             Err(e) => {
                 eprintln!("mini-init: could not start {program}: {e}");
-                match mini_init_next_failure_count(started.elapsed(), consecutive_failures) {
-                    Some(next) => {
-                        consecutive_failures = next;
-                        std::thread::sleep(Duration::from_millis(200));
+                match mini_init_restart_after(started.elapsed(), consecutive_failures) {
+                    MiniInitRestart::After { delay, consecutive } => {
+                        consecutive_failures = consecutive;
+                        std::thread::sleep(delay);
                         continue;
                     }
-                    None => return mini_init_power_off(MINI_INIT_CAP_TRIPPED),
+                    MiniInitRestart::CapTripped => {
+                        return mini_init_power_off(MINI_INIT_CAP_TRIPPED);
+                    }
                 }
             }
         };
@@ -406,11 +500,23 @@ fn mini_init_forever(supervised: &[String]) -> i32 {
                 None => break -1,
             }
         };
-        println!("mini-init: {program} exited (status {status}); restarting it");
-
-        match mini_init_next_failure_count(started.elapsed(), consecutive_failures) {
-            Some(next) => consecutive_failures = next,
-            None => return mini_init_power_off(MINI_INIT_CAP_TRIPPED),
+        match mini_init_restart_after(started.elapsed(), consecutive_failures) {
+            MiniInitRestart::After { delay, consecutive } => {
+                // One line per exit, and the pause is part of it: an operator reading the
+                // persisted serial log sees the rate, not just the fact.
+                println!(
+                    "mini-init: {program} exited (status {status}); restarting it in {delay:?}"
+                );
+                consecutive_failures = consecutive;
+                // The pacing. Without it a program that exits instantly is re-spawned instantly,
+                // which spends the whole cap in microseconds and writes its console lines as fast
+                // as the guest CPU allows.
+                std::thread::sleep(delay);
+            }
+            MiniInitRestart::CapTripped => {
+                println!("mini-init: {program} exited (status {status})");
+                return mini_init_power_off(MINI_INIT_CAP_TRIPPED);
+            }
         }
     }
 }
@@ -613,6 +719,12 @@ fn vsock_listener(port: u32) -> Result<std::os::fd::OwnedFd, String> {
     Ok(listener)
 }
 
+/// The first accept-error pause — see [`accept_error_pacing`], which owns the reasoning.
+const ACCEPT_ERROR_BACKOFF_BASE: Duration = Duration::from_millis(50);
+
+/// The ceiling on an accept-error pause — see [`accept_error_pacing`].
+const ACCEPT_ERROR_BACKOFF_CEILING: Duration = Duration::from_millis(1600);
+
 /// How an accept loop paces itself after `consecutive` **consecutive** failed
 /// `accept`s: how long to pause, and whether to log this one.
 ///
@@ -629,9 +741,15 @@ fn vsock_listener(port: u32) -> Result<std::os::fd::OwnedFd, String> {
 /// recovers is picked up within 1.6 s), and only the first three failures plus every
 /// fiftieth after them are logged, which bounds the artifact at a few lines per
 /// minute while still recording that the listener is broken.
+///
+/// The pause itself is the binary's one [`retry_backoff`]: this loop owns the two constants,
+/// not the arithmetic, which `mini-init`'s restart pacing answers with its own pair.
 fn accept_error_pacing(consecutive: u32) -> (Duration, bool) {
-    let doublings = consecutive.saturating_sub(1).min(5);
-    let pause = Duration::from_millis(50u64 << doublings);
+    let pause = retry_backoff(
+        ACCEPT_ERROR_BACKOFF_BASE,
+        ACCEPT_ERROR_BACKOFF_CEILING,
+        consecutive,
+    );
     let log = consecutive <= 3 || consecutive.is_multiple_of(50);
     (pause, log)
 }
@@ -2404,36 +2522,126 @@ mod tests {
     // cannot start spins forever — a guest that spins silently looks exactly like a guest that
     // works, to a host waiting out a connect budget.
     //
-    // RED on a cap that never trips (always `Some`), and on one that counts a long-lived steward's
-    // ordinary exit as a strike (which would power off a healthy cell after five restarts).
+    // RED on a cap that never trips (always `After`), and on one that counts a long-lived
+    // steward's ordinary exit as a strike (which would power off a healthy cell after five
+    // restarts).
     #[test]
     fn the_rapid_failure_cap_trips_only_on_a_crash_loop() {
         // Successive fast failures accumulate, then trip.
         let mut count = 0;
         for expected in 1..MINI_INIT_MAX_RAPID_FAILURES {
-            count = mini_init_next_failure_count(Duration::from_millis(10), count)
-                .expect("below the cap, a fast failure must be counted and tolerated");
-            assert_eq!(count, expected);
+            let MiniInitRestart::After { consecutive, .. } =
+                mini_init_restart_after(Duration::from_millis(10), count)
+            else {
+                panic!("below the cap, a fast failure must be counted and tolerated");
+            };
+            assert_eq!(consecutive, expected);
+            count = consecutive;
         }
         assert_eq!(
-            mini_init_next_failure_count(Duration::from_millis(10), count),
-            None,
+            mini_init_restart_after(Duration::from_millis(10), count),
+            MiniInitRestart::CapTripped,
             "the {MINI_INIT_MAX_RAPID_FAILURES}th rapid failure must trip the cap, not be tolerated"
         );
 
         // A steward that STAYED UP resets the counter — its exit is a restart, not a crash-loop,
-        // and it must not inherit an old strike.
+        // and it must not inherit an old strike. It also comes back with no pause at all: charging
+        // a healthy service's restart a backoff would slow every `systemctl restart` in the cell.
+        let restart = MiniInitRestart::After {
+            delay: Duration::ZERO,
+            consecutive: 0,
+        };
         assert_eq!(
-            mini_init_next_failure_count(
-                MINI_INIT_FAILURE_WINDOW,
-                MINI_INIT_MAX_RAPID_FAILURES - 1
-            ),
-            Some(0),
-            "an exit after a full window is a restart; the counter resets"
+            mini_init_restart_after(MINI_INIT_FAILURE_WINDOW, MINI_INIT_MAX_RAPID_FAILURES - 1),
+            restart,
+            "an exit after a full window is a restart; the counter resets and it does not wait"
         );
         assert_eq!(
-            mini_init_next_failure_count(MINI_INIT_FAILURE_WINDOW * 100, 0),
-            Some(0)
+            mini_init_restart_after(MINI_INIT_FAILURE_WINDOW * 100, 0),
+            restart
+        );
+    }
+
+    // The pacing half of the same predicate: the cap bounds how MANY rapid restarts happen, this
+    // bounds how FAST. A supervised program that exits instantly used to be re-spawned instantly —
+    // the whole cap spent in microseconds, no transient given any time to clear, and one console
+    // line per iteration into a serial log the host persists as an artifact.
+    //
+    // RED on the pre-fix shape (no pause on the exit path, i.e. `delay: Duration::ZERO` for a
+    // strike): the floor assertion fires on the very first rapid failure. RED the other way too —
+    // an unclamped or window-sized backoff trips the last assertion, which is what keeps pacing
+    // from defeating the fail-loud the cap exists for.
+    #[test]
+    fn every_rapid_restart_is_paced_and_the_whole_burst_stays_inside_the_window() {
+        let mut count = 0;
+        let mut budget = Duration::ZERO;
+        let mut previous = Duration::ZERO;
+        // `while let` rather than `loop { match }`: the cap arm IS the loop's end condition.
+        while let MiniInitRestart::After { delay, consecutive } =
+            mini_init_restart_after(Duration::from_micros(1), count)
+        {
+            assert!(
+                delay >= MINI_INIT_RESTART_BACKOFF_BASE,
+                "rapid failure #{consecutive} must pause at least the floor before the \
+                         restart, got {delay:?} — an unpaced restart is the hot spin"
+            );
+            assert!(
+                delay <= MINI_INIT_RESTART_BACKOFF_CEILING,
+                "rapid failure #{consecutive} asked for {delay:?}, past the ceiling"
+            );
+            assert!(
+                delay >= previous,
+                "the pause must not shrink as the strikes pile up: #{consecutive} asked \
+                         for {delay:?} after {previous:?}"
+            );
+            previous = delay;
+            budget += delay;
+            count = consecutive;
+        }
+        assert_eq!(
+            count,
+            MINI_INIT_MAX_RAPID_FAILURES - 1,
+            "the burst must end at the cap, not before it"
+        );
+
+        // The curve itself, pinned: it really doubles rather than being a flat floor.
+        assert_eq!(
+            mini_init_restart_after(Duration::ZERO, 0),
+            MiniInitRestart::After {
+                delay: MINI_INIT_RESTART_BACKOFF_BASE,
+                consecutive: 1
+            }
+        );
+        assert_eq!(
+            mini_init_restart_after(Duration::ZERO, 1),
+            MiniInitRestart::After {
+                delay: MINI_INIT_RESTART_BACKOFF_BASE * 2,
+                consecutive: 2
+            }
+        );
+
+        // Enough real time for a transient — a device node that appears a beat later — to clear…
+        assert!(
+            budget >= Duration::from_secs(1),
+            "a burst that spans {budget:?} gives a transient no time at all to clear"
+        );
+        // …and far enough inside the window that pacing never turns a crash-loop into a cell that
+        // takes minutes to admit it is dead. Fail-loud stays prompt.
+        assert!(
+            budget * 2 < MINI_INIT_FAILURE_WINDOW,
+            "the paced burst spans {budget:?}, too close to the {MINI_INIT_FAILURE_WINDOW:?} \
+             window: pacing must not defeat the cap's fail-loud"
+        );
+
+        // The shared law is total. A count no loop will ever reach still answers the ceiling
+        // rather than wrapping, panicking, or overflowing the multiply.
+        assert_eq!(
+            retry_backoff(
+                MINI_INIT_RESTART_BACKOFF_BASE,
+                MINI_INIT_RESTART_BACKOFF_CEILING,
+                u32::MAX
+            ),
+            MINI_INIT_RESTART_BACKOFF_CEILING
         );
     }
 

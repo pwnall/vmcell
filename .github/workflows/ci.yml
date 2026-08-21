@@ -166,12 +166,30 @@ jobs:
       - name: typos   # docs are a first-class artifact
         run: typos
 
-      - name: public-API semver (PRs only)
-        if: github.event_name == 'pull_request'
+      - name: public-API semver (every event, not just PRs)
         # Runs on the pinned toolchain — 1.98.0 satisfies cargo-semver-checks' rustc floor.
-        # BOTH contract crates (design v30 §10.4): `vmcell-artifact-validator` is downstream contract
+        # BOTH contract crates (design §10.4): `vmcell-artifact-validator` is downstream contract
         # surface, so a breaking change there is ledgered like one to `vmcell` — mirrors `just ci`.
-        run: cargo semver-checks --baseline-rev "${{ github.event.pull_request.base.sha }}" -p vmcell -p vmcell-artifact-validator
+        #
+        # It used to be `if: github.event_name == 'pull_request'`, and the only PRs this repo has
+        # ever had are dependabot's — so the contract-surface gate had never once run against a
+        # change to vmcell's OWN public API. Every such change lands as a direct push to `main`,
+        # which is precisely the event the condition excluded: the gate was structurally unable to
+        # fire on the path changes actually take. One baseline expression covers both events —
+        # a second step with the opposite `if:` would be the hand-copy class one file over.
+        env:
+          BASELINE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          set -euo pipefail
+          # A push that CREATES a branch reports the all-zero SHA as `before`. `on: push` is scoped
+          # to `main`, which exists, so this is unreachable in practice — and it fails loud rather
+          # than silently comparing against nothing, which is the shape that hid this gate for so
+          # long in the first place.
+          if [ "$BASELINE" = "0000000000000000000000000000000000000000" ] || [ -z "$BASELINE" ]; then
+            echo "no baseline revision for this event: there is nothing to compare the public API against" >&2
+            exit 1
+          fi
+          cargo semver-checks --baseline-rev "$BASELINE" -p vmcell -p vmcell-artifact-validator
 
       # ---- Feature-powerset: LAST and BLOCKING (former C-GATE-1 debt, closed by the §10.5 collapse). ----
       - name: clippy feature-powerset (blocking; must be GREEN after the §10.5 collapse)
@@ -193,17 +211,17 @@ jobs:
         run: rustup toolchain install    # examples/ is a descendant dir, so the root pin governs it too
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
 
-      # `cargo build --locked` in the example's OWN workspace: a stale example Cargo.lock fails here
-      # rather than being silently regenerated, exactly as in the main workspace.
-      - name: build the consumer workspace
-        run: cargo build --locked
-        working-directory: examples/downstream-kernel
+      - uses: taiki-e/install-action@a2a5f6e99e1a31540baa0468acfa302cff0f359f  # v2.86.4
+        # `just` so the step below can invoke the recipe instead of hand-copying it; `fallback: none`
+        # for the reason given at the lint job's install step.
+        with: { tool: "just", fallback: none }
 
-      # Overlay resolution, the harness-getter contract both ways, the documented CLI invocations,
-      # and the vendored-vhost assertion trio (this workspace is delta 2's positive control).
+      # THE RECIPE, invoked — never copied. Both commands (the `--locked` build of the example's
+      # OWN workspace, and its `ci-check.sh`) live in `just example-downstream`; this job used to
+      # restate them, which is the drift class AGENTS.md rule 3 and
+      # `scripts/ban-recipe-body-handcopy.sh` exist for.
       - name: downstream contract check (KVM-free legs)
-        run: ./ci-check.sh
-        working-directory: examples/downstream-kernel
+        run: just example-downstream
 
   # ---- Fast tests: unit, codec, property. No KVM. DEFAULT (non-ignored) set only. ----
   test-unit:
@@ -215,6 +233,15 @@ jobs:
       # shape already fixed in `test-integration` — so the manifest is pointed, reset, and printed
       # here too. `just skip-manifest-*` and `record_capability_skip` both read this variable.
       VMCELL_SKIP_MANIFEST: ${{ github.workspace }}/target/vmcell-skip-manifest.txt
+      # The §4.7 ext4 facility's pin, at JOB scope so the cache key below can INTERPOLATE it
+      # rather than restate it. The restatement is what drifted: the key spelled `1.47.2` and the
+      # first 16 hex of the retired digest against a `1.47.4` pin, so a re-pin would have been
+      # served the tree built from the bytes it replaced — precisely the hazard the key's own
+      # comment claimed to prevent. A comment cannot hold two numbers equal; an interpolation can,
+      # and arm 8 of `ci_obtains_the_ext4_facility_rather_than_living_with_the_skip` makes a
+      # restated key red.
+      E2FSPROGS_VERSION: "1.47.4"
+      E2FSPROGS_SHA256: "da274408bebbfd13a5a2fc3cfc66e3ffff17c48534673aa67f88d49b99123b96"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with: { persist-credentials: false }   # do not leave the token in .git/config (zizmor: artipacked)
@@ -254,14 +281,12 @@ jobs:
         continue-on-error: true   # a cache failure must cost a rebuild, never the job
         with:
           path: ~/.local/e2fsprogs
-          # The DIGEST is in the key, not only the version, so a re-pin can never be served the tree
-          # built from the bytes it replaced.
-          key: e2fsprogs-1.47.2-7a959221c1b1cc6e-${{ runner.os }}-${{ runner.arch }}
+          # The DIGEST is in the key, not only the version, so a re-pin can never be served the
+          # tree built from the bytes it replaced — and both halves are INTERPOLATED from the
+          # job-scoped pin, so the key cannot fall behind the pin the way it had.
+          key: e2fsprogs-${{ env.E2FSPROGS_VERSION }}-${{ env.E2FSPROGS_SHA256 }}-${{ runner.os }}-${{ runner.arch }}
       - name: e2fsprogs for the ext4 battery (pinned, checksum-verified, non-gating)
         continue-on-error: true
-        env:
-          E2FSPROGS_VERSION: "1.47.4"
-          E2FSPROGS_SHA256: "da274408bebbfd13a5a2fc3cfc66e3ffff17c48534673aa67f88d49b99123b96"
         run: |
           set -uo pipefail
           prefix="$HOME/.local/e2fsprogs"
@@ -361,6 +386,15 @@ jobs:
       # defaulted to a per-PID temp file nobody surfaced, leaving the "skip manifest reviewed"
       # rubric row unenforced — a skip that nobody can read is an invisible pass.
       VMCELL_SKIP_MANIFEST: ${{ github.workspace }}/target/vmcell-skip-manifest.txt
+      # The §4.7 ext4 facility's pin, at JOB scope so the cache key below can INTERPOLATE it
+      # rather than restate it. The restatement is what drifted: the key spelled `1.47.2` and the
+      # first 16 hex of the retired digest against a `1.47.4` pin, so a re-pin would have been
+      # served the tree built from the bytes it replaced — precisely the hazard the key's own
+      # comment claimed to prevent. A comment cannot hold two numbers equal; an interpolation can,
+      # and arm 8 of `ci_obtains_the_ext4_facility_rather_than_living_with_the_skip` makes a
+      # restated key red.
+      E2FSPROGS_VERSION: "1.47.4"
+      E2FSPROGS_SHA256: "da274408bebbfd13a5a2fc3cfc66e3ffff17c48534673aa67f88d49b99123b96"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with: { persist-credentials: false }   # do not leave the token in .git/config (zizmor: artipacked)
@@ -463,14 +497,12 @@ jobs:
         continue-on-error: true   # a cache failure must cost a rebuild, never the job
         with:
           path: ~/.local/e2fsprogs
-          # The DIGEST is in the key, not only the version, so a re-pin can never be served the tree
-          # built from the bytes it replaced.
-          key: e2fsprogs-1.47.2-7a959221c1b1cc6e-${{ runner.os }}-${{ runner.arch }}
+          # The DIGEST is in the key, not only the version, so a re-pin can never be served the
+          # tree built from the bytes it replaced — and both halves are INTERPOLATED from the
+          # job-scoped pin, so the key cannot fall behind the pin the way it had.
+          key: e2fsprogs-${{ env.E2FSPROGS_VERSION }}-${{ env.E2FSPROGS_SHA256 }}-${{ runner.os }}-${{ runner.arch }}
       - name: e2fsprogs for the ext4 battery (pinned, checksum-verified, non-gating)
         continue-on-error: true
-        env:
-          E2FSPROGS_VERSION: "1.47.4"
-          E2FSPROGS_SHA256: "da274408bebbfd13a5a2fc3cfc66e3ffff17c48534673aa67f88d49b99123b96"
         run: |
           set -uo pipefail
           prefix="$HOME/.local/e2fsprogs"

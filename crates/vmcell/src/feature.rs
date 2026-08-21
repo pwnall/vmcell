@@ -396,6 +396,55 @@ pub fn feature_manifest_path(artifact: &std::path::Path) -> std::path::PathBuf {
     artifact.with_extension("features")
 }
 
+/// Removes a **stale** feature-declaration sidecar left beside `artifact` by an earlier producer
+/// (§7.4, The feature intersection).
+///
+/// The counterpart of [`RootfsFeaturesStage`](crate::artifact::rootfs::RootfsFeaturesStage), for
+/// the producers that emit no declaration at all — and it exists for the same reason
+/// [`crate::artifact::kernel::clear_resolved_config`] does, one artifact over. The declaration
+/// stage's unconditional emission removes the "this label *stopped* declaring things" hazard, but
+/// only for a pipeline that runs that stage; the sidecar is found by **filesystem existence**
+/// beside the image path ([`FeatureDeclaration::load_beside`]), not through the artifact map, so a
+/// producer with no declaration stage inherits whatever the last one left at that path. That is a
+/// real, shipped shape: `vmcell build --rootfs-source mmdebstrap` republishes `rootfs.erofs` into
+/// an artifacts dir where an OCI build published `rootfs.features`, and every cell then reads the
+/// OCI entry's declaration as this image's — a claim the mmdebstrap image never made, wearing the
+/// provenance of one that did. Absent is the honest answer for an artifact that declares nothing
+/// ([`FeatureDeclaration::baseline`]), so the removal restores it rather than leaving a
+/// declaration nobody wrote about this image.
+///
+/// The name is composed by [`feature_manifest_path`] and never spelled here, which is what makes
+/// this correct for a **labelled** image for free: `rootfs.erofs` → `rootfs.features`,
+/// `rootfs-acme.ext4` → `rootfs-acme.features`. A hand-formatted `rootfs.features` would leave a
+/// labelled image's stale declaration in place *and* destroy the default image's live one — the
+/// registry shape §10.5 landed is exactly a labelled image published beside a default one.
+///
+/// An already-absent sidecar is success (the common case: nothing declared here before).
+///
+/// # Errors
+///
+/// [`Error::Artifact`] when an existing sidecar cannot be removed — never a swallowed failure that
+/// leaves the stale declaration behind, because the swallow is indistinguishable from the defect it
+/// would be hiding.
+pub fn clear_feature_declaration(artifact: &std::path::Path) -> Result<()> {
+    let sidecar = feature_manifest_path(artifact);
+    match std::fs::remove_file(&sidecar) {
+        Ok(()) => {
+            tracing::info!(
+                manifest = %sidecar.display(),
+                "removed a stale feature-declaration sidecar (this producer declares nothing)"
+            );
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(Error::Artifact(format!(
+            "failed to remove the stale feature manifest at {}: {e} — leaving it would have every \
+             cell read a DIFFERENT artifact's declaration as this image's (§7.4)",
+            sidecar.display()
+        ))),
+    }
+}
+
 /// **The one locator** every [`FeatureDeclaration::parse_manifest`] refusal carries: the 1-based
 /// line number *and* the offending line's own code text.
 ///

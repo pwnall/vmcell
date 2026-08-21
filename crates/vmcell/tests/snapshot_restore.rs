@@ -184,6 +184,20 @@ async fn test_snapshot_restore_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
     // into `HostEnv`; `steward()` no longer takes a clock argument).
     let mut env = vmcell::HostEnv::hermetic();
 
+    // Design §17 (Open gaps and future capabilities), crosvm item 7: hold the LOWEST
+    // guest CID across block 1, so the source VM draws a higher one. `CidAllocator::allocate` hands
+    // the lowest free CID, so releasing this one just before the restore makes the RESTORE's fresh
+    // allocation take it — which leaves the source's baked CID both FREE and NOT re-drawn at
+    // restore time. That combination is what the reservation leg below needs: free, so the
+    // orchestrator's `CidGuard` can actually claim it (a claim the test held instead would be
+    // indistinguishable from the guard's own — one allocator, one set entry, no refcount); and not
+    // re-drawn, so `baked != fresh` and neither the crosvm `assert_eq` nor the QEMU `assert_ne`
+    // below is vacuous.
+    let low_cid = env
+        .cids
+        .allocate()
+        .expect("the lowest guest CID is free on a hermetic env");
+
     // 1. Create a VM and take a snapshot
     {
         // TESTS-LIFECYCLE-6: gate on the effective CAP_NET_ADMIN (the §13 (Cross-cutting invariants)
@@ -357,20 +371,25 @@ async fn test_snapshot_restore_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
             .reserve(original_vmid)
             .expect("original vmid is free after block 1 shutdown; reserving forces a new vmid");
 
-        // Symmetric to the vmid reservation: hold the source's (now-freed) guest CID so
-        // the restore path's fresh `cids.allocate()` is forced to hand a DIFFERENT one.
-        // This makes the QEMU CID-rotation assertion below non-vacuous — without it the
-        // freed CID could be re-handed and `new_cid` could coincidentally equal
-        // `original_cid`, so a `restore()` that reused the baked CID would slip the
-        // assert. Harmless for CH/FC, whose identity assert is path-based.
+        // Same intent as the vmid reservation — force the restore's fresh `cids.allocate()` to
+        // hand a CID DIFFERENT from the source's, so the QEMU rotation assert and the crosvm
+        // baked-reuse assert below are both non-vacuous — but taken from the other side, by
+        // RELEASING `low_cid` (held since before block 1) instead of by holding the source's.
+        // §17 (crosvm item 7): holding `original_cid` across the restore would hide the property
+        // this leg now also asserts, namely that the ORCHESTRATOR reserves the baked CID a
+        // non-rotating AF_VSOCK backend re-programs. Harmless for CH/FC, whose identity assert is
+        // path-based.
         let original_cid: u32 = std::fs::read_to_string(snapshot_dir.join("original_cid.txt"))
             .unwrap()
             .trim()
             .parse()
             .unwrap();
-        env.cids
-            .reserve(original_cid)
-            .expect("original CID is free after block 1 shutdown; reserving forces a new CID");
+        assert!(
+            low_cid < original_cid,
+            "the source VM must have drawn a CID above the held low one ({low_cid}), or the \
+             restore's fresh allocation could coincide with the baked cid={original_cid}"
+        );
+        env.cids.release(low_cid);
 
         // Drive the one-shot post-restore clock resync from an INJECTED FakeClock (≈ pre_time +
         // 1000s), captured on `env.clock` BEFORE restore. The orchestrator fires the resync on the
@@ -470,6 +489,20 @@ async fn test_snapshot_restore_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
             "restored VM must have a valid guest CID, got {new_cid}"
         );
 
+        // Design §17 (Open gaps and future capabilities), crosvm item 7: the CID a restored VM
+        // ANSWERS ON is out of the allocatable pool for its whole lifetime — whichever CID that is.
+        // On a rotating backend that is the fresh allocation its own `CidGuard` holds; on a
+        // non-rotating AF_VSOCK backend
+        // (crosvm bakes the CID into the snapshot and refuses a rotated `--vsock cid=`) it is the
+        // BAKED one, which no allocator held before this fix. crosvm's vsock is in-kernel, so the
+        // CID is a HOST-GLOBAL identity, not a per-scratch-dir path: a later VM drawing it collides
+        // with this live one. The crosvm branch below proves this is not vacuously the VM's own.
+        assert!(
+            env.cids.reserve(new_cid).is_err(),
+            "the guest CID {new_cid} the restored VM answers on must not be reallocatable while \
+             that VM is live"
+        );
+
         let original_vsock =
             std::fs::read_to_string(snapshot_dir.join("original_vsock.txt")).unwrap();
         let new_vsock = vm.instance().vsock_path().to_str().unwrap();
@@ -506,9 +539,10 @@ async fn test_snapshot_restore_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
                 }
                 // QEMU in-kernel vhost-vsock: identity is the guest CID (its
                 // `vsock_path` is a vestigial per-scratch-dir file). Restore programs a
-                // FRESH `res.guest_cid`; block 2 reserved the source's CID, so the fresh
-                // one MUST differ — a restore that reused the baked CID (the inverse of
-                // the rotation change, §2.4) reddens the `assert_ne`.
+                // FRESH `res.guest_cid`, which is `low_cid` — released just before the
+                // restore and the lowest free CID — while the source baked a HIGHER one,
+                // so the two differ by construction and a restore that reused the baked
+                // CID (the inverse of the rotation change, §2.4) reddens the `assert_ne`.
                 vmcell::vmm::VsockEndpoint::Vsock { cid, .. } => {
                     assert_ne!(
                         cid, original_cid,
@@ -536,14 +570,31 @@ async fn test_snapshot_restore_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
                 // crosvm in-kernel vhost-vsock: identity is the guest CID, but unlike QEMU crosvm
                 // BAKES the CID into the snapshot and rejects a rotated `--vsock cid=` on restore
                 // ("Virtio vsock incorrect cid for restore"), so `restore()` reuses the baked CID
-                // verbatim (`restore_rotates_host_paths: false`). Block 2 reserved the source's CID, so
-                // a backend that (wrongly) rotated it would hand a DIFFERENT one — this `assert_eq`
-                // reddens on that inverse. The reconnect above already proved the rebound CID live.
+                // verbatim (`restore_rotates_host_paths: false`). The restore's own fresh
+                // allocation is `low_cid`, so a backend that (wrongly) rotated would hand a
+                // DIFFERENT one — this `assert_eq` reddens on that inverse. The reconnect above
+                // already proved the rebound CID live.
                 vmcell::vmm::VsockEndpoint::Vsock { cid, .. } => {
                     assert_eq!(
                         cid, original_cid,
                         "a non-rotating AF_VSOCK backend (crosvm) must reuse the snapshot's baked \
                          cid={original_cid} verbatim, got {cid}"
+                    );
+                    // §17 (crosvm item 7), the non-vacuity control for the reservation assert
+                    // above: the CID this VM answers on is NOT the one the orchestrator allocated
+                    // for it. The fresh allocation is `low_cid`, and it is held too — so TWO distinct
+                    // CIDs are out of the pool, which only the orchestrator's baked-CID adoption
+                    // (`CidGuard::adopt_baked_cid`) explains. Red on the inverse: drop that
+                    // adoption and the baked CID is reallocatable while this VM is live.
+                    assert_ne!(
+                        cid, low_cid,
+                        "the baked CID must differ from the restore's own fresh allocation, or \
+                         the reservation assert above is the VM's own guard"
+                    );
+                    assert!(
+                        env.cids.reserve(low_cid).is_err(),
+                        "the restored VM's own freshly allocated CID {low_cid} is held too, so \
+                         the held baked cid={original_cid} is the ADOPTED one"
                     );
                 }
             }
@@ -670,5 +721,15 @@ async fn test_snapshot_restore_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
         );
 
         vm.shutdown().await.expect("Failed to shutdown restored VM");
+
+        // §17 (crosvm item 7): the reservation is a lease, not a leak — teardown returns the CID
+        // the VM answered on. Red on the inverse: a `CidGuard::drop` that releases only its own
+        // `cid` leaves the adopted baked CID permanently out of the pool.
+        assert_eq!(
+            env.cids
+                .reserve(new_cid)
+                .expect("the CID the restored VM answered on is released on teardown"),
+            new_cid
+        );
     }
 }

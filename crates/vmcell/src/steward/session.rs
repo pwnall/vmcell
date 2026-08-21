@@ -44,6 +44,13 @@ type FrameSink = SplitSink<FramedStream, ::bytes::Bytes>;
 /// a pending `recv()` wakes with `None` instead of hanging) and makes the closure
 /// observable to [`SessionMux::open`], which then returns the documented typed
 /// error rather than registering into a map nothing will ever read from.
+///
+/// This `Option` is the connection's **one shared closed-flag** (§17, Open gaps and future capabilities):
+/// the reader's terminal step is its only writer, and every host→guest path reads
+/// it under this same lock before enqueueing a frame — [`SessionMux::open`] (which
+/// needs the map anyway) and [`Session::send`], the one helper behind
+/// `write_stdin`/`close_stdin`/`resize`/`close`. There is no second flag to drift:
+/// a `Session` holds a clone of this `Arc`, not a copy of the state.
 type Registry = Arc<Mutex<Option<HashMap<SessionId, mpsc::UnboundedSender<SessionEvent>>>>>;
 
 /// An output or terminal event delivered to a [`Session`] (§3, The control plane: vsock, the host clients, and the steward).
@@ -248,6 +255,9 @@ impl SessionMux {
             id,
             event_rx,
             write_tx: self.write_tx.clone(),
+            // The SHARED closed-flag, not a copy of it: `Session::send` reads the
+            // very `Option` the reader's terminal step takes to `None`.
+            registry: Arc::clone(&self.registry),
             exited: false,
         })
     }
@@ -316,6 +326,9 @@ pub struct Session {
     id: SessionId,
     event_rx: mpsc::UnboundedReceiver<SessionEvent>,
     write_tx: mpsc::UnboundedSender<::bytes::Bytes>,
+    /// The mux's shared closed-flag (the [`Registry`] `Option`), read by
+    /// [`Session::send`] before every enqueue.
+    registry: Registry,
     exited: bool,
 }
 
@@ -372,8 +385,26 @@ impl Session {
         self.send(Message::CloseSession { session: self.id })
     }
 
+    /// The one host→guest enqueue behind all four mutators above — so the
+    /// closed-check exists once, not four times (§13, Cross-cutting invariants).
+    ///
+    /// Check-closed and enqueue happen in ONE critical section, against the same
+    /// lock the reader task's terminal step closes the [`Registry`] through (and
+    /// the same one [`SessionMux::open`] checks). That is what makes the window
+    /// *close* rather than narrow: either the flag is already `None` and this
+    /// fails loud per every caller's `# Errors` contract, or the frame is
+    /// enqueued while the connection is still open. Observing only `write_tx` —
+    /// which dies one transport failure LATER — returned `Ok(())` for a no-op
+    /// write across that whole window (§17, Open gaps and future capabilities).
     fn send(&self, msg: Message) -> Result<()> {
+        // Encode + `MAX_FRAME_BYTES`-check BEFORE the lock: an over-cap frame is
+        // a caller error, not a connection state, and it must not hold the lock
+        // the reader delivers guest output through.
         let frame = encode_frame(&msg)?;
+        let closed_flag = self.registry.lock().unwrap_or_else(|e| e.into_inner());
+        if closed_flag.is_none() {
+            return Err(Error::Steward("session connection is closed".into()));
+        }
         self.write_tx
             .send(frame)
             .map_err(|_| Error::Steward("session connection is closed".into()))
@@ -888,5 +919,204 @@ mod tests {
             0,
             "a failed send must remove the just-inserted entry (no orphan)"
         );
+    }
+
+    /// §17 (Open gaps and future capabilities) shared setup for the closed-flag legs: a mux whose
+    /// reader task has ended (peer close) while its WRITER TASK IS STILL ALIVE, plus
+    /// one `Session` opened before that close.
+    ///
+    /// The live writer is the whole reason each leg is non-vacuous. Pre-fix, the
+    /// four mutators observed only `write_tx`, which dies one transport failure
+    /// LATER: the frame enqueued into a channel nothing would ever drain and the
+    /// method returned `Ok(())`. The `OpenSession` frame is drained by the peer
+    /// BEFORE the close so the writer is parked on its channel rather than
+    /// failing on an in-flight frame — otherwise the legs would pass through the
+    /// pre-existing send-failure branch and prove nothing.
+    async fn session_on_closed_connection() -> (SessionMux, Session) {
+        let (client_io, server_io) = UnixStream::pair().expect("unix pair");
+        let mut mux = SessionMux::from_framed(Framed::new(ControlStream::Unix(client_io), codec()));
+        let mut guest = Framed::new(server_io, codec());
+        let session = mux
+            .open(SessionSpec::new(ExecRequest::new(vec!["a".into()])))
+            .await
+            .expect("open while live");
+        let _ = guest.next().await.expect("open frame").expect("io");
+        drop(guest);
+        mux.await_reader_for_test().await;
+        assert!(
+            !mux.write_tx.is_closed(),
+            "the writer must still be alive — a closed writer channel would make every leg vacuous"
+        );
+        (mux, session)
+    }
+
+    // §17 (Open gaps and future capabilities), closed-flag leg 1 of 4 — `write_stdin`. Each mutator
+    // gets its OWN leg with its OWN fresh connection: sharing one would let the
+    // first call kill the writer and leave legs 2..4 passing through the
+    // send-failure branch — a flag set before the method has bound anything.
+    // RED on the inverse (drop the `closed_flag.is_none()` check in `Session::send`):
+    // the enqueue succeeds and `expect_err` fires. KVM-free (UnixStream::pair).
+    #[tokio::test]
+    async fn write_stdin_after_registry_close_fails_loud() {
+        let (mux, s) = session_on_closed_connection().await;
+        let err = s
+            .write_stdin(b"ping")
+            .await
+            .expect_err("write_stdin on a closed connection must fail loud, not return Ok(())");
+        assert!(
+            matches!(err, Error::Steward(_)),
+            "the `# Errors` contract promises Error::Steward; got {err:?}"
+        );
+        assert!(
+            !mux.write_tx.is_closed(),
+            "the refusal came from the flag, not a dead writer"
+        );
+    }
+
+    // §17 (Open gaps and future capabilities), closed-flag leg 2 of 4 — `close_stdin`. Same inverse.
+    #[tokio::test]
+    async fn close_stdin_after_registry_close_fails_loud() {
+        let (mux, s) = session_on_closed_connection().await;
+        let err = s
+            .close_stdin()
+            .await
+            .expect_err("close_stdin on a closed connection must fail loud, not return Ok(())");
+        assert!(
+            matches!(err, Error::Steward(_)),
+            "the `# Errors` contract promises Error::Steward; got {err:?}"
+        );
+        assert!(
+            !mux.write_tx.is_closed(),
+            "the refusal came from the flag, not a dead writer"
+        );
+    }
+
+    // §17 (Open gaps and future capabilities), closed-flag leg 3 of 4 — `resize`. Same inverse.
+    #[tokio::test]
+    async fn resize_after_registry_close_fails_loud() {
+        let (mux, s) = session_on_closed_connection().await;
+        let err = s
+            .resize(24, 80)
+            .await
+            .expect_err("resize on a closed connection must fail loud, not return Ok(())");
+        assert!(
+            matches!(err, Error::Steward(_)),
+            "the `# Errors` contract promises Error::Steward; got {err:?}"
+        );
+        assert!(
+            !mux.write_tx.is_closed(),
+            "the refusal came from the flag, not a dead writer"
+        );
+    }
+
+    // §17 (Open gaps and future capabilities), closed-flag leg 4 of 4 — `close`. Same inverse.
+    #[tokio::test]
+    async fn close_after_registry_close_fails_loud() {
+        let (mux, s) = session_on_closed_connection().await;
+        let err = s
+            .close()
+            .await
+            .expect_err("close on a closed connection must fail loud, not return Ok(())");
+        assert!(
+            matches!(err, Error::Steward(_)),
+            "the `# Errors` contract promises Error::Steward; got {err:?}"
+        );
+        assert!(
+            !mux.write_tx.is_closed(),
+            "the refusal came from the flag, not a dead writer"
+        );
+    }
+
+    // §13 (Cross-cutting invariants), the CALL-SITE half of the closed-flag law: the four legs above
+    // pin the predicate, and this pins that every mutator still goes THROUGH it. A
+    // fifth mutator (or a "fast path" in an existing one) that touched `write_tx`
+    // directly would enqueue without reading the flag and re-open exactly the
+    // window §17 (Open gaps and future capabilities) recorded — with all four legs still green, because
+    // they only ever drive the four methods that exist today. KVM-free: it reads
+    // this file's own source.
+    //
+    // RED on the inverse: move `self.write_tx.send(frame)` up into `write_stdin`
+    // (two occurrences), or add a mutator that sends directly (one occurrence
+    // before `fn send`).
+    #[test]
+    fn every_session_mutator_enqueues_through_the_one_closed_checking_helper() {
+        let src = include_str!("session.rs");
+        let start = src
+            .find("impl Session {")
+            .expect("the `impl Session` block must exist");
+        let block_len = src[start..]
+            .find("\n}\n")
+            .expect("the `impl Session` block must be terminated");
+        let block = &src[start..start + block_len];
+        let send_at = block
+            .find("fn send(&self, msg: Message)")
+            .expect("`Session::send` is the one enqueue helper");
+        let sites: Vec<usize> = block
+            .match_indices("self.write_tx")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            sites.len(),
+            1,
+            "`impl Session` must touch `self.write_tx` exactly once — inside `send`, after the \
+             closed-flag check; found {} site(s)",
+            sites.len()
+        );
+        assert!(
+            sites[0] > send_at,
+            "the one `self.write_tx` site must be inside `Session::send`, not in a mutator that \
+             would bypass the closed-flag check"
+        );
+    }
+
+    // The POSITIVE CONTROL for the four legs above: on a LIVE connection the same
+    // four mutators return Ok and their frames actually reach the guest peer, in
+    // order. Without it, a closed-flag stuck at `closed` (or a `send` that refuses
+    // unconditionally) would keep all four legs green while breaking every session.
+    // RED on a flag that is set anywhere but the reader's terminal step.
+    #[tokio::test]
+    async fn session_writes_reach_the_peer_while_the_connection_is_live() {
+        let (client_io, server_io) = UnixStream::pair().expect("unix pair");
+        let mux = SessionMux::from_framed(Framed::new(ControlStream::Unix(client_io), codec()));
+        let mut guest = Framed::new(server_io, codec());
+        let s = mux
+            .open(SessionSpec::new(ExecRequest::new(vec!["a".into()])))
+            .await
+            .expect("open while live");
+        let _ = guest.next().await.expect("open frame").expect("io");
+
+        s.write_stdin(b"ping")
+            .await
+            .expect("write_stdin on a live connection");
+        s.close_stdin()
+            .await
+            .expect("close_stdin on a live connection");
+        s.resize(24, 80).await.expect("resize on a live connection");
+        s.close().await.expect("close on a live connection");
+
+        let id = s.id();
+        for expected in [
+            Message::Stdin {
+                session: id,
+                data: b"ping".to_vec(),
+            },
+            Message::StdinEof { session: id },
+            Message::Winsize {
+                session: id,
+                rows: 24,
+                cols: 80,
+            },
+            Message::CloseSession { session: id },
+        ] {
+            let frame = tokio::time::timeout(Duration::from_secs(5), guest.next())
+                .await
+                .expect("a live-connection write must reach the peer")
+                .expect("a frame")
+                .expect("io");
+            assert_eq!(
+                postcard::from_bytes::<Message>(&frame).expect("decode"),
+                expected
+            );
+        }
     }
 }

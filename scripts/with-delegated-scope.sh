@@ -18,7 +18,13 @@ cg_rel=$(awk -F: '/^0::/{print $3}' /proc/self/cgroup)
 cg_base="/sys/fs/cgroup${cg_rel}"
 
 if [ -d "$cg_base" ]; then
-  mkdir -p "$cg_base/supervisor"
+  # Guarded like its four siblings below. Unguarded, `set -e` made this the ONE arm that aborted
+  # instead of degrading — and it aborts the whole suite it was invoked to wrap, which is the
+  # opposite of this wrapper's stated contract ("running without delegation" is the documented
+  # fallback). `scripts/test-with-delegated-scope.sh` drives every arm including this one.
+  if ! mkdir -p "$cg_base/supervisor" 2>/dev/null; then
+    echo "with-delegated-scope: WARN could not create supervisor leaf ($cg_base/supervisor)" >&2
+  fi
   # Move ourselves (and thus the test processes we spawn) into the leaf first;
   # writing subtree_control while the scope still holds a process fails EBUSY.
   if ! echo $$ >"$cg_base/supervisor/cgroup.procs" 2>/dev/null; then

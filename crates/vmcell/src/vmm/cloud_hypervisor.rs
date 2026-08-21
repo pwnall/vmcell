@@ -781,6 +781,17 @@ impl Vmm for CloudHypervisor {
             &self.capabilities(),
             cfg.console_mode,
         )?;
+        // The USB half of the same honor-or-reject law, on the path that used to drop it:
+        // CH has no USB controller, so a `usb_host_devices` list handed to `restore()` was
+        // accepted and silently ignored. Refused through the ONE shared restore predicate,
+        // which yields the identical `usb_host_passthrough` refusal `create()` returns here
+        // (§8.1, The warm-snapshot path and the eligibility law). Placed before the eligibility guards so the refusal is reachable for every
+        // config shape, not just the snapshot-eligible ones.
+        crate::vmm::reject_usb_host_devices_on_restore(
+            "cloud-hypervisor",
+            &self.capabilities(),
+            &cfg.usb_host_devices,
+        )?;
         // The same descriptor self-check as `create()`. `restore()` is the path that actually
         // consumes `cfg.restore_mode` (it becomes `--restore source_url=…,prefault=on|off`), so
         // a restore that accepted exactly what create rejects is the crosvm M4 defect one path
@@ -1987,6 +1998,88 @@ mod tests {
             matches!(&err, Error::Unsupported { vmm, feature }
                 if vmm == "cloud-hypervisor" && feature == "lazy_restore"),
             "expected a lazy_restore Unsupported, got {err:?}"
+        );
+    }
+
+    // docs/90 A3 (the open half of docs/78 M4): `restore()` must refuse a host-USB config
+    // exactly as `create()` does. CH has no USB controller at all, so `create()` has always
+    // refused; `restore()` accepted the same list and dropped it silently — an accepted input
+    // neither honored nor rejected. Both legs are KVM-free: the refusal precedes the snapshot
+    // `config.json` read and any spawn, which the positive control below is what proves.
+    //
+    // Red on the inverse: delete the `reject_usb_host_devices_on_restore` call from `restore()`
+    // and the restore leg fails on the missing `config.json` (an `Error::Io`) instead of the
+    // typed refusal — the exact silent-drop this guards.
+    #[tokio::test]
+    async fn restore_refuses_a_host_usb_config_exactly_as_create_does() {
+        let usb_cfg = VmConfig::builder(
+            "/k",
+            crate::config::RootfsSource::Erofs {
+                image: PathBuf::from("/i"),
+            },
+        )
+        .with_usb_host_device(crate::config::UsbHostDevice::new(0xdead, 0xbeef))
+        // Keeps the eligibility guard (which runs after this one on the restore path) from
+        // deciding the outcome, so the assertion is about USB and nothing else.
+        .network_disabled()
+        .build()
+        .expect("a host-USB device on a non-snapshotting config must build");
+        let ch = CloudHypervisor::new("/usr/bin/cloud-hypervisor");
+        let cgroups = crate::metrics::FakeCgroupFs::new();
+
+        let created = ch
+            .create(&usb_cfg, &plan_test_res(), &cgroups)
+            .await
+            .expect_err("CH advertises usb_host_passthrough: false");
+        let restored = ch
+            .restore(
+                Path::new("/nonexistent-ch-usb-snapshot"),
+                &usb_cfg,
+                &plan_test_res(),
+                &cgroups,
+            )
+            .await
+            .expect_err("restore must refuse exactly what create refuses");
+        for err in [&created, &restored] {
+            assert!(
+                matches!(err, Error::Unsupported { vmm, feature }
+                    if vmm == "cloud-hypervisor"
+                        && feature == crate::feature::Feature::UsbHostPassthrough.name()),
+                "expected a usb_host_passthrough Unsupported naming the VmmCapabilities field \
+                 (N-VMM-1), got {err:?}"
+            );
+        }
+        assert_eq!(
+            created.to_string(),
+            restored.to_string(),
+            "an incapable backend owes the restore path the IDENTICAL refusal its create path \
+             gives — the descriptor arm of the shared predicate, not a second spelling"
+        );
+
+        // Positive control: the SAME restore without the USB device travels past this guard and
+        // dies reading the snapshot's `config.json`, so the refusal above is about the device,
+        // not about restore refusing everything (and it pins the KVM-free, pre-spawn ordering).
+        let clean_cfg = VmConfig::builder(
+            "/k",
+            crate::config::RootfsSource::Erofs {
+                image: PathBuf::from("/i"),
+            },
+        )
+        .network_disabled()
+        .build()
+        .expect("build the control config");
+        let err = ch
+            .restore(
+                Path::new("/nonexistent-ch-usb-snapshot"),
+                &clean_cfg,
+                &plan_test_res(),
+                &cgroups,
+            )
+            .await
+            .expect_err("the control still fails on the absent snapshot config.json");
+        assert!(
+            matches!(&err, Error::Io(io) if io.kind() == std::io::ErrorKind::NotFound),
+            "expected the control to reach the missing snapshot config.json, got {err:?}"
         );
     }
 

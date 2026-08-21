@@ -1134,6 +1134,15 @@ impl Vmm for Firecracker {
         // Same self-check `create()` makes, on the path that actually consumes
         // `cfg.restore_mode`: a restore must not accept what create rejects.
         reject_unadvertised_capabilities(&self.capabilities(), cfg)?;
+        // The USB half of the same law: FC has no USB controller, so a `usb_host_devices`
+        // list handed to `restore()` was accepted and silently dropped (`create()` refused it).
+        // The ONE shared restore predicate returns the identical `usb_host_passthrough`
+        // refusal here (§8.1, The warm-snapshot path and the eligibility law), before any spawn.
+        vmcell::vmm::reject_usb_host_devices_on_restore(
+            "firecracker",
+            &self.capabilities(),
+            &cfg.usb_host_devices,
+        )?;
         // VMM-5: self-check the capability descriptor rather than assuming the
         // backend supports restore.
         if !self.capabilities().snapshot_restore {
@@ -2202,6 +2211,81 @@ mod tests {
                 "expected a lazy_restore Unsupported, got {err:?}"
             );
         }
+    }
+
+    // docs/90 A3 (the open half of docs/78 M4): `restore()` must refuse a host-USB config
+    // exactly as `create()` does. FC has no USB controller, so `create()` has always refused
+    // through the shared predicate; `restore()` accepted the same list and dropped it silently
+    // — an accepted input neither honored nor rejected. Both legs are KVM-free: the refusal
+    // precedes the host-paths sidecar read and any spawn, which the positive control proves.
+    //
+    // Red on the inverse: delete the `reject_usb_host_devices_on_restore` call from `restore()`
+    // and the restore leg fails on the missing sidecar (an `Error::Io`) instead of the typed
+    // refusal — the exact silent drop this guards.
+    #[tokio::test]
+    async fn restore_refuses_a_host_usb_config_exactly_as_create_does() {
+        let fc = Firecracker::new("/usr/bin/firecracker");
+        let usb_cfg = erofs_builder()
+            .with_usb_host_device(vmcell::config::UsbHostDevice::new(0xdead, 0xbeef))
+            // Keeps FC's net guard (which runs before the USB one on create) from deciding the
+            // outcome, so both legs are about USB and nothing else.
+            .network_disabled()
+            .build()
+            .expect("a host-USB device on a non-snapshotting config must build");
+
+        let created = fc
+            .create(
+                &usb_cfg,
+                &reject_test_resources("usb-create"),
+                &FakeCgroupFs::new(),
+            )
+            .await
+            .expect_err("FC advertises usb_host_passthrough: false");
+        let restored = fc
+            .restore(
+                Path::new("/nonexistent-fc-usb-snapshot"),
+                &usb_cfg,
+                &reject_test_resources("usb-restore"),
+                &FakeCgroupFs::new(),
+            )
+            .await
+            .expect_err("restore must refuse exactly what create refuses");
+        for err in [&created, &restored] {
+            assert!(
+                matches!(err, Error::Unsupported { vmm, feature }
+                    if vmm == "firecracker"
+                        && feature == vmcell::feature::Feature::UsbHostPassthrough.name()),
+                "expected a usb_host_passthrough Unsupported naming the VmmCapabilities field \
+                 (N-VMM-1), got {err:?}"
+            );
+        }
+        assert_eq!(
+            created.to_string(),
+            restored.to_string(),
+            "an incapable backend owes the restore path the IDENTICAL refusal its create path \
+             gives — the descriptor arm of the shared predicate, not a second spelling"
+        );
+
+        // Positive control: the SAME restore without the device travels past this guard and dies
+        // reading the absent host-paths sidecar, so the refusal above is about the device, not
+        // about restore refusing everything (and it pins the pre-spawn ordering).
+        let clean_cfg = erofs_builder()
+            .network_disabled()
+            .build()
+            .expect("build the control config");
+        let err = fc
+            .restore(
+                Path::new("/nonexistent-fc-usb-snapshot"),
+                &clean_cfg,
+                &reject_test_resources("usb-control"),
+                &FakeCgroupFs::new(),
+            )
+            .await
+            .expect_err("the control still fails on the absent snapshot sidecar");
+        assert!(
+            matches!(&err, Error::Io(io) if io.kind() == std::io::ErrorKind::NotFound),
+            "expected the control to reach the missing host-paths sidecar, got {err:?}"
+        );
     }
 
     // The positive control for both refusals above (AGENTS.md: a negative security/capability

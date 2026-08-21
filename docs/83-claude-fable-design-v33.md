@@ -5059,21 +5059,30 @@ vhost-vsock is validated in the **privileged** mode; whether `/dev/vhost-vsock` 
 crosvm's `--block` has no bandwidth/iops key, so `disk_io_throttle` is a hard `false` (§2.6); a future
 `blkdebug`-style shim is the only path. (6) **control transport** — the shipped choice re-invokes the crosvm
 binary as a client; linking `libcrosvm_control` (lower latency, a build/link step) is the recorded
-alternative. (7) **the baked guest CID is held by no allocator across a restore** — the CID-axis sibling
-of the vmid hazard the docs/90 pass closed on Firecracker's vsock path, and it is **open**.
-`restore()` reads the snapshot's baked CID from its sidecar and programs `--vsock cid=<baked>`, because
-crosvm refuses a rotated one; the orchestrator meanwhile allocated a *fresh* CID and its `CidGuard`
-holds that one. Nothing reserves the baked CID, so once the ancestor was torn down it is free for
-same-process reallocation, and crosvm's vsock is **in-kernel** AF_VSOCK — the CID is a host-global
-identity, not a per-scratch-dir path. A later VM drawing it therefore collides with the live restored
-VM on the host's vhost-vsock CID space. The FC fix does not cover this by construction: it keys on the
-host *path* a backend adopted (`adopted_scratch_vmid`), and crosvm spawns into its own scratch dir —
-its non-rotating resource is the CID. *Owner:* `vmcell-crosvm::restore` + `orchestrator::restore_inner`
-(the reservation belongs beside the vmid one, before the resume — a squatting VM must not be brought
-back up). *Fix:* have the backend report the baked CID it adopted and reserve it on the restored VM's
-`CidGuard` for that VM's lifetime, the shape `VmidAllocator::reserve` already gives the vmid axis.
-*Gate:* a `just test-crosvm` snapshot/restore leg asserting `CidAllocator::reserve(baked)` **fails**
-while the restored VM is live, red on the inverse by dropping the reservation.
+alternative. (7) **the baked guest CID across a restore: CLOSED** (2026-08-20 loose-end pass) — the
+CID-axis sibling of the vmid hazard the docs/90 pass closed on Firecracker's vsock path. `restore()`
+reads the snapshot's baked CID from its sidecar and programs `--vsock cid=<baked>`, because crosvm
+refuses a rotated one, while the orchestrator allocated a *fresh* CID whose `CidGuard` held only that
+one; nothing kept the baked CID out of the pool, and crosvm's vsock is **in-kernel** AF_VSOCK — the
+CID is a host-global identity, not a per-scratch-dir path — so once the ancestor was torn down a
+later VM drew it and collided with the live restored VM. The FC fix could not cover this by
+construction: it keys on the host *path* a backend adopted (`adopted_scratch_vmid`), and crosvm
+spawns into its own scratch dir, so its non-rotating resource is the CID. `CidGuard` now carries a
+private `baked: Option<u32>` — the CID twin of `VmidGuard::lineage` — and `CidGuard::adopt_baked_cid`
+is the one predicate: `baked == self.cid` is the no-op arm every rotating backend takes, an exhausted
+claim warns and does **not** take ownership of somebody else's reservation, and an out-of-range baked
+CID is fail-loud `Error::Vmm`. `restore_inner` calls it beside the vmid `adopt_lineage` and **before**
+`instance.resume()`, keyed on `instance.guest_cid()` — what the backend says it answers on — so no
+backend needs a branch, and `Drop` releases the claim only when it was ours. The guard's fields are
+private, so a second reservation path is a compile error and the law earns no grep-ban. *Gates:* the
+`just test-crosvm` / `just test-privileged` `snapshot_restore` leg asserts `CidAllocator::reserve` on
+the CID the restored VM answers on **fails** while that VM is live (the leg now releases the source
+VM's CID before restoring, so the claim under test is the guard's own and not the harness's, and
+holds a distinct low CID so the crosvm branch is non-vacuous with two CIDs out of the pool) — proven
+red by deleting the call, with a real crosvm, at baked 4 / fresh 3. Three KVM-free twins in
+`orchestrator.rs` carry it where CI has no crosvm binary: the reservation and its release, the
+out-of-range refusal *before* the resume (red when the call is moved after it), and the conflict arm
+that must not release a claim it never took.
 **Resolved during v29 validation**: (a) crosvm's own multiprocess sandbox is incompatible with
 the single-process supervision model (`/var/empty` jail failure), so it runs `--disable-sandbox` + the
 Layer-2 jailer deny-list (on for `Enforcing`) — validated to boot, exec, and do tap/netns networking under

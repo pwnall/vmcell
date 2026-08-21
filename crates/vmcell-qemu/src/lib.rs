@@ -1332,6 +1332,23 @@ impl Vmm for Qemu {
         // descriptor says cannot do it. One predicate with `snapshot()`'s self-guard.
         require_snapshot_restore_capable(self.capabilities().snapshot_restore)?;
         vmcell::vmm::reject_unsupported_console("qemu", &self.capabilities(), cfg.console_mode)?;
+        // The half `reject_usb_host_devices` structurally CANNOT cover here: QEMU's
+        // `usb_host_passthrough` is `true`, so create's precheck passes a USB config — and
+        // `spawn_qemu` splices `-device usb-host,…` on the restore path too. A restored VM
+        // therefore carried the devices in its argv with no `claim_usb_host_devices` behind
+        // them: never resolved to a usbfs node, never proven openable, never put back at
+        // teardown. A host USB device is host state living OUTSIDE guest RAM — the migration
+        // stream carries the guest's view of the xhci controller, not the device — so the
+        // honest outcome is the typed refusal the ONE shared restore predicate returns
+        // (§8.1, The warm-snapshot path and the eligibility law), the same `Removal` the orchestrator boundary already returned for this
+        // config. It runs before the eligibility guards below because a non-snapshotting USB
+        // config (the only shape `build()` admits) would otherwise die on the in-kernel-vsock
+        // arm and never name the input to drop.
+        vmcell::vmm::reject_usb_host_devices_on_restore(
+            "qemu",
+            &self.capabilities(),
+            &cfg.usb_host_devices,
+        )?;
         // Same self-check `create()` makes, on the path that actually consumes
         // `cfg.restore_mode`: a restore must not accept what create rejects.
         reject_unadvertised_capabilities(&self.capabilities(), cfg)?;
@@ -1383,8 +1400,10 @@ impl Vmm for Qemu {
             self.spawn_qemu(cfg, res, cgroups, &params).await?,
             self.capabilities().snapshot_restore,
             // No USB claim on the restore path: a non-empty `usb_host_devices` is refused
-            // at the one orchestrator boundary before any backend is reached (docs/78 M4),
-            // so a restored VM never displaces a host driver and has nothing to put back.
+            // by `reject_usb_host_devices_on_restore` above — in this backend as well as at
+            // the orchestrator boundary (docs/78 M4) — so the list reaching here is empty by
+            // construction, a restored VM never displaces a host driver, and there is
+            // nothing to put back.
             vmcell::vmm::usb::UsbHostClaim::default(),
             cfg.mem_mib,
         );
@@ -2214,6 +2233,106 @@ mod tests {
         // separate this leg from the vhost-user one, so the leg is pinned to the shared const's
         // identity. The non-vacuity pair is the sibling test below: the SAME restore with
         // `snapshotting(true)` gets past this guard and reaches the state-file check.
+        assert_is_removal(&err, &IN_KERNEL_VSOCK_REQUIRED_FOR_SNAPSHOT);
+    }
+
+    // docs/90 A3 (the open half of docs/78 M4), QEMU leg — the discriminating one. QEMU is the
+    // ONE backend whose `usb_host_passthrough` is `true`, so `reject_usb_host_devices` passes a
+    // USB config here and copying create's precheck into `restore()` would have been a NO-OP.
+    // What `restore()` actually did with such a config, measured: `spawn_qemu` is shared, so it
+    // spliced `-device qemu-xhci … -device usb-host,…` into the restored VM's argv while
+    // `restore()` handed the instance a `UsbHostClaim::default()` — devices never resolved to a
+    // usbfs node, never proven openable, never put back at teardown. A host USB device is host
+    // state OUTSIDE guest RAM (the migration stream carries the guest's view of the xhci
+    // controller, not the device), so the honest outcome is a typed refusal naming that reason:
+    // the same `Removal` the orchestrator's clone-eligibility arm already returned.
+    //
+    // Four legs, all KVM-free and binary-free (the refusal precedes every spawn):
+    //   1. the refusal itself, asserted by arm IDENTITY, not by a prose fragment;
+    //   2. the discriminator — the capability arm of the shared predicate ACCEPTS this list on
+    //      QEMU, so leg 1 can only have come from the restore-only arm;
+    //   3. the cold path is untouched: `create()` travels past the descriptor precheck into the
+    //      real host-side claim, which is where a USB config lives or dies on this backend;
+    //   4. the non-vacuity control — the same restore MINUS the device reaches the next guard.
+    //
+    // Red on the inverse: delete the `reject_usb_host_devices_on_restore` call from `restore()`
+    // and leg 1 gets the in-kernel-vsock refusal (the guard below it) instead of this one.
+    #[tokio::test]
+    async fn restore_refuses_a_host_usb_config_qemu_alone_can_create() {
+        use vmcell::config::{RootfsSource, UsbHostDevice, VmConfig};
+
+        let qemu = Qemu::new("/usr/bin/qemu-system-x86_64");
+        let device = UsbHostDevice::new(0xdead, 0xbeef);
+        // `build()` refuses `usb_host_devices` + `snapshotting`, so a host-USB config is
+        // non-snapshotting BY CONSTRUCTION — which is exactly why the restore-side USB guard has
+        // to run before the eligibility guards, and why leg 4 below is the control it needs.
+        let usb_cfg = VmConfig::builder(
+            "/k",
+            RootfsSource::Erofs {
+                image: PathBuf::from("/i"),
+            },
+        )
+        .with_usb_host_device(device)
+        .build()
+        .expect("a host-USB device on a non-snapshotting config must build");
+        let cgroups = FakeCgroupFs::new();
+
+        // 1. The refusal, by arm identity.
+        let err = qemu
+            .restore(
+                Path::new("/nonexistent-qemu-usb-snapshot"),
+                &usb_cfg,
+                &restore_test_res(),
+                &cgroups,
+            )
+            .await
+            .expect_err("a restored VM cannot re-attach a host USB device");
+        assert_is_removal(&err, &vmcell::vmm::USB_PASSTHROUGH_BLOCKS_RESTORE);
+
+        // 2. The discriminator: QEMU's descriptor says it CAN attach one, so the shared
+        //    capability arm accepts this very list. Leg 1 is therefore the restore-only arm
+        //    talking — not `reject_usb_host_devices` firing, which on this backend it cannot.
+        let caps = <Qemu as Vmm>::capabilities(&qemu);
+        assert!(
+            caps.usb_host_passthrough,
+            "QEMU is the backend that CAN pass a host USB device (§2.4, QEMU q35 — the fallback and most-proven nester): {caps:?}"
+        );
+        vmcell::vmm::reject_usb_host_devices("qemu", &caps, &usb_cfg.usb_host_devices)
+            .expect("the capability arm must accept a USB list on QEMU");
+
+        // 3. The cold path is unchanged: `create()` gets past the descriptor precheck and dies in
+        //    the real host-side claim (`claim_usb_host_devices`), which is what a USB config is
+        //    supposed to face on QEMU. `0xdead:0xbeef` matches no host device, so the claim is a
+        //    read-only sysfs scan that detaches nothing.
+        let err = qemu
+            .create(&usb_cfg, &restore_test_res(), &cgroups)
+            .await
+            .expect_err("no host device matches dead:beef, so the claim fails loud");
+        assert!(
+            matches!(&err, Error::Vmm(msg) if msg.contains("host USB passthrough")),
+            "create must still reach the host-side USB claim, not a typed refusal: {err:?}"
+        );
+
+        // 4. Non-vacuity: the SAME restore without the device travels past the new guard and dies
+        //    on the eligibility guard below it — so leg 1 is about the device, not about restore
+        //    refusing every non-snapshotting config.
+        let clean_cfg = VmConfig::builder(
+            "/k",
+            RootfsSource::Erofs {
+                image: PathBuf::from("/i"),
+            },
+        )
+        .build()
+        .expect("build the control config");
+        let err = qemu
+            .restore(
+                Path::new("/nonexistent-qemu-usb-snapshot"),
+                &clean_cfg,
+                &restore_test_res(),
+                &cgroups,
+            )
+            .await
+            .expect_err("the control still fails on the external-vsock eligibility guard");
         assert_is_removal(&err, &IN_KERNEL_VSOCK_REQUIRED_FOR_SNAPSHOT);
     }
 

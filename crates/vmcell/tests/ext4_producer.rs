@@ -1561,14 +1561,29 @@ fn every_ext4_battery_asks_the_one_law() {
 /// The set of jobs is *derived* from the workflow (any job invoking a recipe that selects these
 /// legs), never listed here: a third job that runs the suite must carry the step by construction.
 ///
+/// Arm 8 is the one this battery learned the hard way: the `actions/cache` key spelled a version
+/// and a digest of its own beside the pin, and a re-pin moved the pin and left the key — so the
+/// job would have restored the tree built from the bytes the pin replaced, which is exactly what
+/// the key's own comment promised could not happen. A comment cannot hold two numbers equal. The
+/// pin is now job-scoped and the key INTERPOLATES it, so the arm asserts the coupling rather than
+/// the equality: a key that restates any literal from the pin is red, because a literal is what
+/// falls behind.
+///
 /// RED ON THE INVERSE, per arm: delete the step from either job (arm 1), move it after the suite
 /// step (arm 2), pin a version below `MIN_E2FSPROGS_VERSION` (arm 3), drop the `sha256sum -c`
-/// (arm 4), drop `continue-on-error` (arm 5), drop the `-V` report (arm 6), or edit one job's copy
-/// and not the other's (arm 7).
+/// (arm 4), drop `continue-on-error` (arm 5), drop the `-V` report (arm 6), edit one job's copy
+/// and not the other's (arm 7), or restate the pin in the cache key instead of interpolating it
+/// (arm 8).
 #[test]
 fn ci_obtains_the_ext4_facility_rather_than_living_with_the_skip() {
-    /// The marker identifying the facility step, and the env var that carries its pin.
+    /// The env var carrying the pin. It lives at JOB scope, not on the build step, so that the
+    /// cache key can interpolate it — see arm 8.
     const PIN: &str = "E2FSPROGS_VERSION";
+    /// The digest half of the pin, keyed the same way and for the same reason.
+    const PIN_DIGEST: &str = "E2FSPROGS_SHA256";
+    /// A marker unique to the BUILD step, used for the ordering arm now that `PIN` itself sits in
+    /// the job preamble and would match before any step at all.
+    const BUILD_STEP: &str = "obtain_e2fsprogs";
     /// The recipes that select this battery's legs: `test-unit` runs every non-`#[ignore]`d test
     /// here, `test-privileged` adds the `#[ignore]`d live half in `ext4_cell`.
     const SUITES: [&str; 2] = ["just test-unit", "just test-privileged"];
@@ -1619,8 +1634,10 @@ fn ci_obtains_the_ext4_facility_rather_than_living_with_the_skip() {
         let (name, body) = runners[0];
         let code = code_only(body);
         // 1 + 2. The step exists in THIS job and runs BEFORE the suite it serves. A facility
-        //        installed afterwards is a facility the suite ran without.
-        let step_at = code.find(PIN).unwrap_or_else(|| {
+        //        installed afterwards is a facility the suite ran without. The marker is the build
+        //        step's own shell function, NOT `PIN`: since arm 8 moved the pin to job scope,
+        //        `PIN` matches in the preamble and would report an ordering that no step has.
+        let step_at = code.find(BUILD_STEP).unwrap_or_else(|| {
             panic!(
                 "job `{name}` runs `{suite}`, which selects the §4.7 ext4 legs, but carries no \
                  e2fsprogs step: those legs would record a capability skip on every CI run and the \
@@ -1634,9 +1651,15 @@ fn ci_obtains_the_ext4_facility_rather_than_living_with_the_skip() {
              later steps, so a step placed after it obtains the facility for nobody"
         );
         // The step's own text: every `- `-introduced chunk of this job that mentions e2fsprogs,
-        // comment lines dropped so the comparison across jobs is over what RUNS.
+        // comment lines dropped so the comparison across jobs is over what RUNS. Scanned from
+        // `steps:` onward: the job-scoped pin arm 8 introduced also matches "e2fsprogs", and
+        // counting the preamble as a step would break the pair this arm asserts on.
+        let steps_body = body
+            .split_once("\n    steps:")
+            .unwrap_or_else(|| panic!("job `{name}` has no `steps:` key"))
+            .1;
         let mut chunks: Vec<String> = Vec::new();
-        for raw in body.split("\n      - ") {
+        for raw in steps_body.split("\n      - ") {
             let chunk = code_only(raw);
             if chunk.to_ascii_lowercase().contains("e2fsprogs") {
                 chunks.push(chunk);
@@ -1652,11 +1675,12 @@ fn ci_obtains_the_ext4_facility_rather_than_living_with_the_skip() {
         let step = chunks.join("\n");
 
         // 3. The pin satisfies the producer's own gate. One law: the constant, not a copied number.
-        let pinned = step
+        //    Read from the JOB body — arm 8 moved it there so the cache key could interpolate it.
+        let pinned = code
             .split_once(&format!("{PIN}: \""))
             .and_then(|(_, rest)| rest.split_once('"'))
             .map(|(v, _)| v.to_string())
-            .unwrap_or_else(|| panic!("job `{name}`'s step must pin `{PIN}: \"<x.y.z>\"`: {step}"));
+            .unwrap_or_else(|| panic!("job `{name}` must pin `{PIN}: \"<x.y.z>\"`: {code}"));
         let parts: Vec<u32> = pinned
             .split('.')
             .map(|p| {
@@ -1683,8 +1707,8 @@ fn ci_obtains_the_ext4_facility_rather_than_living_with_the_skip() {
             "job `{name}`'s e2fsprogs tarball must be checksum-verified: {step}"
         );
         assert!(
-            step.contains("E2FSPROGS_SHA256"),
-            "…against a pinned digest beside the version: {step}"
+            code.contains(PIN_DIGEST),
+            "…against a pinned digest beside the version: {code}"
         );
         // 5. Non-gating: a facility this repo cannot obtain must degrade to the recorded skip, which
         //    is the honest outcome — never to a red job, which is the outcome nobody reads.
@@ -1700,6 +1724,42 @@ fn ci_obtains_the_ext4_facility_rather_than_living_with_the_skip() {
             "job `{name}`'s step must print the resolved `mkfs.ext4 -V`, or the log cannot say \
              whether the battery ran or skipped: {step}"
         );
+        // 8. The cache key is DERIVED from the pin, never a restatement of it. A restated key is
+        //    what shipped: `e2fsprogs-1.47.2-7a959221c1b1cc6e-…` against a `1.47.4` /
+        //    `da274408…` pin, so the very re-pin the digest-in-the-key was there to protect would
+        //    have been served the retired tree. Interpolation is the only shape that cannot fall
+        //    behind, so this asserts the interpolation and forbids the literal.
+        let key_line = step
+            .lines()
+            .find(|l| l.trim_start().starts_with("key: e2fsprogs-"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "job `{name}`'s e2fsprogs cache step must carry a `key: e2fsprogs-…`: {step}"
+                )
+            })
+            .trim();
+        for var in [PIN, PIN_DIGEST] {
+            assert!(
+                key_line.contains(&format!("env.{var}")),
+                "job `{name}`'s cache key must INTERPOLATE `env.{var}`, not restate its value — a \
+                 key that spells the pin is a second copy of it, and the copy is what fell behind \
+                 (`{key_line}`)"
+            );
+        }
+        assert!(
+            !key_line.contains(&pinned),
+            "job `{name}`'s cache key spells the pinned version `{pinned}` literally beside the \
+             interpolation (`{key_line}`) — the literal is the half that goes stale"
+        );
+        // …and the pin it interpolates must not ALSO sit on the build step, which is how the two
+        // spellings came to exist in the first place.
+        assert!(
+            !step.contains(&format!("{PIN}: \"")),
+            "job `{name}` restates `{PIN}` on the e2fsprogs step as well as at job scope; the \
+             cache key can only interpolate the job-scoped one, so the step-scoped copy is a \
+             second pin that nothing holds equal: {step}"
+        );
+
         facility_steps.push((name.clone(), step));
     }
 

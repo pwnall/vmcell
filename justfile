@@ -180,6 +180,27 @@ test-unit-undelegated:
     #!/usr/bin/env bash
     set -euo pipefail
     command -v bwrap >/dev/null || { echo "bwrap (bubblewrap) is required for this recipe" >&2; exit 1; }
+    # THE VACUITY GUARD. This recipe's entire premise is that /sys/fs/cgroup is UNWRITABLE inside
+    # the sandbox — that IS the runner condition it mirrors. Nothing asserted it, so on a host
+    # where the operator owns the bind source the bind still succeeds, `create_dir_all` still
+    # succeeds, and a green run reads as "the undelegated condition passes" when it never held.
+    # That is this repo's own zero-file-scan doctrine one level out: a gate pointed at nothing
+    # must say `gate misconfigured`, never a reassuring green. The probe is an actual `mkdir`
+    # rather than a permission-bit reading, because the question is empirical — the bind source
+    # could be root-owned and still writable through an ACL or a group the operator is in.
+    probe=vmcell-undelegated-vacuity-probe
+    if bwrap --dev-bind / / --bind /srv /sys/fs/cgroup -- mkdir "/sys/fs/cgroup/${probe}" 2>/dev/null
+    then
+        # The bind is over the REAL /srv, so a probe that succeeded left residue there. A gate's
+        # own fixtures are residue too, on the failure path as much as the success path.
+        rmdir "/srv/${probe}" 2>/dev/null || echo "warning: leftover /srv/${probe}" >&2
+        echo "gate misconfigured: /sys/fs/cgroup is WRITABLE inside the sandbox." >&2
+        echo "  This recipe would then exercise the DELEGATED path under an undelegated name —" >&2
+        echo "  the 21 KVM-free cgroup tests would pass for the wrong reason and the runner" >&2
+        echo "  condition would stay unmirrored. The bind source (/srv) must be a directory this" >&2
+        echo "  user cannot write; on this host it is not." >&2
+        exit 1
+    fi
     bwrap --dev-bind / / --bind /srv /sys/fs/cgroup --chdir {{justfile_directory()}} -- \
         cargo nextest run --locked --all-features \
             -E 'not test(=apply_jail_sets_no_new_privs_and_the_core_rlimit)'
@@ -404,6 +425,43 @@ test-systemd:
         cargo nextest run --locked --profile integration -p vmcell --run-ignored all \
         --no-tests=fail -E 'kind(test) & test(systemd_cell)'
 
+# The out-of-tree consumer workspace (design §10.4) — the gate that holds the downstream
+# contract's *guidance* by compiling against it. Breaking this is the intended failure mode of
+# contract drift; "fixing" the example to stay green instead of versioning the contract inverts
+# the gate.
+#
+# It exists as a recipe for AGENTS.md rule 3: `ci.yml`'s `example-downstream` job used to restate
+# these two commands, and a CI step that hand-copies a recipe drifts from it. There was no recipe
+# to call, which is why the class had no home. KVM-free, so it runs anywhere.
+#
+# `cargo build --locked` in the example's OWN workspace: a stale example Cargo.lock fails here
+# rather than being silently regenerated, exactly as in the main workspace. `ci-check.sh` then
+# covers overlay resolution, the harness-getter contract both ways, the documented CLI
+# invocations, and the vendored-vhost assertion trio.
+example-downstream:
+    cd {{justfile_directory()}}/examples/downstream-kernel && cargo build --locked
+    cd {{justfile_directory()}}/examples/downstream-kernel && ./ci-check.sh
+
+# Install the repo-tracked git hooks. `scripts/git-pre-commit` shipped with a "symlink this into
+# .git/hooks/pre-commit" note in its own header and nothing that performs it — a deploy step
+# written as prose is a deploy step that does not happen, which is why the hook was installed in
+# no checkout including this one. A SYMLINK, never a copy: a copy is the hand-copy class the two
+# meta-gates exist for, one directory over, and it silently keeps running the version it was
+# copied from.
+#
+# Not on any CI path by design (a hook is a local convenience; CI runs the real gates), so it is
+# a rostered human entry point in `scripts/ban-orphan-recipe.sh`.
+install-hooks:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    hooks="$(git -C {{justfile_directory()}} rev-parse --git-path hooks)"
+    mkdir -p "$hooks"
+    # `-f` so re-running is idempotent; the relative target keeps the link valid if the checkout moves.
+    ln -sfn ../../scripts/git-pre-commit "$hooks/pre-commit"
+    test -x {{justfile_directory()}}/scripts/git-pre-commit \
+        || { echo "scripts/git-pre-commit is not executable; a symlink to it would be inert" >&2; exit 1; }
+    echo "installed: $hooks/pre-commit -> $(readlink "$hooks/pre-commit")"
+
 # Reset the run-scoped capability-skip manifest. Run BEFORE a suite sequence (the CI kvm job does)
 # so the surfaced skips belong to this run and not to an accumulated history.
 skip-manifest-reset:
@@ -622,6 +680,36 @@ gates:
     # one peculiar to a complement gate: a tree that is ONLY the delegated crate).
     ./scripts/ban-inline-netns-path.sh
     ./scripts/test-ban-inline-netns-path.sh
+    # AGENTS rule 3, one level ABOVE the orphan-SCRIPT class `ban-ci-script-handcopy.sh` ARM 4
+    # already covers: a `just` RECIPE that nothing invokes is maintained, shellchecked, documented
+    # work that runs nowhere and therefore cannot go red. Both directions, like its sibling — an
+    # un-called recipe must be rostered WITH the reason a human is its only caller (the opt-in live
+    # suites' named absent facility; the operator verbs), and a roster entry whose recipe has since
+    # ACQUIRED a caller is a stale exemption, i.e. a widened blind spot. Bodies are read back
+    # through `just --show`, so an interpolated `{{{{just_executable()}}}}` call reads as it runs.
+    ./scripts/ban-orphan-recipe.sh
+    ./scripts/test-ban-orphan-recipe.sh
+    # design §3.5 / AGENTS.md "a gate binds the CALL SITES, not just the extracted predicate":
+    # `mini-init` is PID 1 in the service proof cell, and its restart loop spelled its pacing twice
+    # and unevenly — a literal `Duration::from_millis(200)` on the spawn-failure arm, and NOTHING on
+    # the exit arm, so a program that exits instantly burned the whole rapid-failure cap in
+    # microseconds and wrote a console line per iteration into the persisted serial-log artifact.
+    # The pause now comes back from `mini_init_restart_after` (with the strike count) over the one
+    # `retry_backoff`. The unit tests hold the CURVE and stay green while a call site ignores the
+    # answer and sleeps its own literal again; this scan holds the call sites. Scoped to the
+    # guest-tools tree on purpose (the steward's non-retry polls are legitimately literal), it names
+    # its delegate, and it treats a zero-file scan, a sleep-free production text, and a missing
+    # delegate all as `gate misconfigured` rather than a green verdict.
+    ./scripts/ban-unpaced-guest-retry.sh
+    ./scripts/test-ban-unpaced-guest-retry.sh
+    # The one script `ban-ci-script-handcopy.sh` EXEMPTS from its no-scripts-in-ci.yml arm, and the
+    # one every live suite runs through — and it had no can-it-fail proof of any kind. Its four
+    # warn-and-continue arms are each `if !`-guarded, so `set -euo pipefail` is inert on all four
+    # and a regression degrades every cgroup leg in the tree to "ran without delegation" silently.
+    # The self-test fabricates a cgroup tree under `bwrap` (the wrapper computes the same `cg_base`
+    # it would in production, because /proc/self/cgroup is untouched) and drives every arm plus the
+    # `exec "$@"` contract, red-on-inverse against mutated copies.
+    ./scripts/test-with-delegated-scope.sh
     # docs/81 §8/§9 ("one law, one predicate"): the kernel ARTIFACT-KEY (`kernel-<label>`) and
     # PIN-KEY (`kernel_<label>_<sub>`) laws were triplicated and unexported — a private method in
     # `artifact::kernel`, a byte-duplicate in `vmcell-kernel-builder`, and the pin key composed
