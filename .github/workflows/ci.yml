@@ -116,7 +116,18 @@ jobs:
       # recorded-skip fallback to degrade to, so a runner that cannot install it must fail loudly
       # here rather than silently retire the gate.
       - name: bubblewrap (the delegated-scope self-test fabricates its cgroup tree under it)
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq bubblewrap
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq bubblewrap
+          # INSTALLING IT IS NOT ENOUGH, measured: ubuntu-24.04 ships
+          # `kernel.apparmor_restrict_unprivileged_userns=1`, which denies the user namespace bwrap
+          # needs, and every leg then dies with `setting up uid map: Permission denied`. The runner
+          # has sudo and this is a plain sysctl, so obtain the facility properly rather than letting
+          # the gate describe the sandbox instead of the wrapper. `|| true`: on a kernel without the
+          # knob the sysctl is absent and its absence is not a failure — the self-test's own probe
+          # is what decides, and it names this line if it still cannot run.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          bwrap --dev-bind / / -- /bin/true && echo "bwrap: usable"
 
       # Note the workflow-level `CARGO_TERM_COLOR: always` above still applies to everything the
       # recipe runs — that is deliberate. It is the condition that silently killed three cargo-tree

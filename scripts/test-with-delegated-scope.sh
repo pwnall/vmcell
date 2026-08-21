@@ -40,6 +40,21 @@ command -v bwrap >/dev/null || {
   echo "nothing — which is the vacuous-pass shape this repo treats as red, not as a skip."
   exit 1
 }
+# PRESENT is not the same as USABLE, and the difference cost a red CI: the lint runner installed
+# bubblewrap fine and then every `bwrap` invocation died with `setting up uid map: Permission
+# denied`, so eleven legs failed with eleven confusing messages instead of one true one. Ubuntu
+# 24.04 sets `kernel.apparmor_restrict_unprivileged_userns=1`, which denies the user namespace
+# bwrap needs unless its AppArmor profile is loaded. Probe it ONCE, up front, and name the cause.
+if ! bwrap --dev-bind / / -- /bin/true 2>/dev/null; then
+  echo "gate misconfigured: bwrap is installed but cannot create a user namespace here:"
+  bwrap --dev-bind / / -- /bin/true 2>&1 | sed 's/^/    /' || true
+  echo "  Ubuntu 24.04+ denies unprivileged user namespaces unless bubblewrap's AppArmor profile"
+  echo "  is loaded. On a runner or container, either load it or set"
+  echo "      sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0"
+  echo "  before this gate. Reported here rather than as eleven failing legs, because the legs"
+  echo "  would each be describing the sandbox and not the wrapper they exist to test."
+  exit 1
+fi
 
 fails=0
 pass() { printf '  ok  %s\n' "$1"; }

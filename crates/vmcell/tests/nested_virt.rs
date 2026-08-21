@@ -421,12 +421,77 @@ const L2_MEM_MIB: u32 = 128;
 /// (captured console + exit 124) rather than as a killed test binary.
 const L2_BUDGET_SECS: u32 = 180;
 
+/// Whether THIS HOST can host a guest that itself runs a guest — the precondition this leg needs and
+/// that no backend capability answers.
+///
+/// `capabilities().nested_virt` is a claim about the BACKEND (it emits `kvm-{intel,amd}.nested=1`
+/// on the L1's cmdline); whether the L1 can actually run an L2 comes from the L0. Two host facts
+/// decide it, and both are read rather than assumed:
+///
+/// * **the host is itself a guest** — then our L1 is an L2 and its guest would be an L3, which
+///   mainstream KVM does not support. This is the CI case: a hosted runner is a VM, so the leg
+///   timed out there while passing on bare metal, and the timeout named the vsock round trip
+///   rather than the reason. `systemd-detect-virt` answers it (`none` = bare metal).
+/// * **the host's KVM module has nesting off** — no L1 gets VMX at all.
+///
+/// Returns `false` to mean "genuinely absent, record a skip". A probe that cannot RUN is a broken
+/// host, not an absent facility, and panics — the same split `probe_ext4_or_record_skip` draws.
+fn host_can_nest_two_levels() -> bool {
+    let out = std::process::Command::new("systemd-detect-virt")
+        .output()
+        .unwrap_or_else(|e| panic!("systemd-detect-virt must be runnable to decide this leg: {e}"));
+    // Exit 1 with `none` on stdout is its documented "not a VM" answer, so the status is not the
+    // signal — the word is.
+    let virt = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if virt.is_empty() {
+        panic!("systemd-detect-virt printed nothing; this probe cannot decide and must not guess");
+    }
+    if virt != "none" {
+        eprintln!(
+            "nested_virt_l2_boot: this host is itself a guest ({virt}), so the L2 this leg boots \
+             would be an L3 — a facility mainstream KVM does not provide. Recording the skip."
+        );
+        return false;
+    }
+    // Read whichever vendor module is loaded; absent means no KVM nesting to have.
+    for param in [
+        "/sys/module/kvm_intel/parameters/nested",
+        "/sys/module/kvm_amd/parameters/nested",
+    ] {
+        if let Ok(v) = std::fs::read_to_string(param) {
+            let v = v.trim();
+            if v == "Y" || v == "1" {
+                return true;
+            }
+            eprintln!(
+                "nested_virt_l2_boot: {param} reads {v:?} — nesting is off. Recording the skip."
+            );
+            return false;
+        }
+    }
+    eprintln!(
+        "nested_virt_l2_boot: neither kvm_intel nor kvm_amd exposes a `nested` parameter. \
+               Recording the skip."
+    );
+    false
+}
+
 vmm_matrix_test!(nested_virt_l2_boot, |vmm| {
     require_cap!(vmcell::vmm::Vmm::capabilities(&vmm), nested_virt, vmm);
     // The payload has to reach the guest somehow; on the two backends that advertise `nested_virt`
     // (CH, QEMU) virtio-fs is the road. A backend advertising one and not the other skips honestly
     // here instead of failing on a missing mount.
     require_cap!(vmcell::vmm::Vmm::capabilities(&vmm), virtio_fs_shares, vmm);
+    // The HOST half, which no capability flag covers. `require_cap!` cannot express it — it reads a
+    // `VmmCapabilities` field and panics for the primary backend — so this is the recorded-skip
+    // shape the ext4 battery uses for a genuinely absent host facility.
+    if !host_can_nest_two_levels() {
+        common::record_capability_skip(
+            vmcell::vmm::Vmm::id(&vmm),
+            "nested_l2_host_cannot_nest_two_levels",
+        );
+        return;
+    }
     test_nested_virt_l2_boot_impl(&vmm).await;
 });
 
