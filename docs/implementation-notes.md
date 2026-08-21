@@ -6897,3 +6897,57 @@ Suggested addition to docs/implementation-notes.md, appended to the "Tier E3+E4 
 The test is now `pause_and_resume_over_rest_stop_and_restart_the_guest_s_execution` (renamed: a name promising a clock claim while asserting something else is its own small lie) and measures EXECUTION, two independent ways over three windows — running control, paused, resumed. Guest side: a detached spin loop appends one byte per iteration to the overlay's tmpfs upper, so the file's SIZE counts iterations the guest actually completed; bytes cannot be written while no vCPU runs and, unlike a clock, cannot be caught up afterwards. Host side: `utime + stime` of the `vcpuN` threads of this VM's own VMM process, which leans on no guest semantics whatsoever. Three details are load-bearing and are commented at their sites. (1) The workload OUTLIVES the `exec` that starts it, and that is not incidental: the steward kills a one-shot child's process group on the way out only when that child is still running (`serve.rs::kill_unexited`), and the launching shell has exited by then — a long-running exec could not have been used instead, because `Registry::exec` holds the per-VM handle lock for its whole duration and would have blocked the very pause under test. The `>/dev/null 2>&1` on the background job is equally load-bearing: a background job still holding the exec's stdout pipe keeps `handle_exec`'s pump from ever seeing EOF, so the call never returns. (2) The third (resumed) window is what keeps the paused window's two zeros honest — a workload that had simply DIED would score zero across the pause as well — and it is the "restart" half of the claim. (3) `vcpu_ticks` panics unless it finds exactly `vcpus` threads named `vcpu*`: a scan that matched nothing would report a motionless zero and make every assertion vacuously true (the zero-file-scan law, docs/90 G4, one level out from the shell gates).
 
 RED ON THE INVERSE, both halves, driven against `MicroVmHandle::pause`/`::resume` in `launcher.rs` reduced to `Ok(())` — the exact defect the old test could not see, a route that moves the state machine and refuses execs without ever telling the VMM: guest side "850521 spin-loop iterations across the pause against 850182 over the running control", host side "201 ticks across the pause against 200". Whoever revisits the pause routes should note what the recorded E3 residual (a backend that pauses and then fails its reply leaves the daemon reporting `Ready`) is now backed by: the daemon's label is not evidence about the vCPUs, and this test is the only place in the tree that measures them.
+
+
+## The CI red this pass shipped, and why local green did not see it
+
+Nine commits landed with `just ci` green every time, and CI was red for eight of them. Three
+independent causes, each a different way for a local run to be a weaker claim than it sounds.
+
+**1. The consumer workspace's `Cargo.lock` went stale — for the second time.** The contract bumps
+this pass moved `vmcell` 0.22.0 → 0.23.3 and `vmcell-artifact-validator` 0.6.0 → 0.6.1, and
+`examples/downstream-kernel/Cargo.lock` still pinned the old pair, so its `--locked` build failed on
+the runner. Exactly two path-dep lines needed regenerating and **no example source changed**, which
+is the evidence that the contract additions really were additive — this was a version move that had
+not been propagated, not the contract drift the example job exists to catch.
+
+The durable half is the interesting one: `just ci` did not run the example workspace at all, so a
+green `just ci` was asserting something it had never checked. `ci` now invokes
+`just example-downstream` last. Leaving it out was not a coverage gap so much as a gap in the
+*claim* — the recipe's own header says it is the CI definition, and ci.yml runs that job.
+
+**2. A gate this pass added needed a facility the lint runner lacks.**
+`scripts/test-with-delegated-scope.sh` fabricates its cgroup tree under `bwrap` and — deliberately —
+treats an absent `bwrap` as `gate misconfigured` rather than skipping, which is the same law every
+source-scanning ban here follows. On the hosted lint runner there is no `bwrap`, so `just gates`
+failed from the first commit onward. The fix is to OBTAIN the facility (the precedent
+`ci_obtains_the_ext4_facility_rather_than_living_with_the_skip` sets one job over), not to soften the
+gate into a skip. It is deliberately not `continue-on-error`: unlike the ext4 case there is no
+recorded-skip fallback to degrade to, so a runner that cannot install it must fail loudly rather than
+silently retire the gate.
+
+**3. A new test depended on cgroup delegation without saying so.**
+`validate_with_runs_on_the_caller_supplied_backend` asserted that the caller's `FakeVmm` was asked to
+`create`. But `MicroVm::start` creates the per-VM cgroup slice **before** it asks the backend for
+anything, so on an undelegated host the run stops first and the call log is empty — the assertion
+then says nothing about dispatch. This is the same blind spot `just test-unit-undelegated` exists to
+mirror (21 KVM-free tests once failed on the hosted runner for weeks while `just test-unit` stayed
+green), and the new test had joined them; reproducing it locally under that recipe took one command.
+
+The fix splits the claim by what each half actually needs.
+`validate_with_dispatches_every_level_onto_the_caller_supplied_backend` is an in-source scan across
+**both hops** — `validate_with` → `run_level` → the three runners — and needs no host facility at
+all, so the dispatch claim now holds on every host; asserting only hop 1 would still have passed a
+`run_level` that substituted a backend of its own, which is the same defect one call deeper. The
+behavioural leg keeps its stronger assertions and branches on **evidence** — did the log record a
+`create` — rather than on a re-derived predicate: `cgroup_memory_delegated()` was tried first and is
+the wrong question, reading false on hosts where the start succeeds anyway, so it asserted the wrong
+thing in both directions. On the weaker arm the test still demands the roster come back whole, which
+is the property `fill_unrecorded` exists for. Both scan hops were driven red; a full
+`just test-unit-undelegated` run (1549/1549) confirms nothing else in the tree carries the same
+dependence.
+
+**The process lesson, which is the one worth keeping.** All three were visible on the first push and
+none was looked at. `just ci` green is a claim about the local host; it is not a claim about CI, and
+this repo's own `test-unit-undelegated` recipe and `ci_obtains_the_facility` step both exist because
+that difference has cost it before. Check the run after pushing, not nine commits later.

@@ -982,6 +982,16 @@ ci:
     # …and the half nextest structurally cannot run: doctests. See the `test-doc` recipe's header —
     # ci.yml's test-unit job invokes this same recipe.
     {{just_executable()}} test-doc
+    # THE OUT-OF-TREE CONSUMER, because `just ci` claims to be the CI definition and ci.yml runs
+    # `example-downstream` as its own job. Leaving it out is not a gap in coverage so much as a gap
+    # in the CLAIM: a green `just ci` said "CI will pass" while the one job that compiles against the
+    # published contract was never run locally. That is exactly how it broke — a version bump moved
+    # `vmcell` 0.22.0 -> 0.23.3 and the example's `Cargo.lock` stayed behind, so its `--locked` build
+    # failed on the runner for four consecutive pushes while `just ci` was green every time. It is
+    # the SECOND time this repo has shipped a stale consumer lockfile; the first is recorded in
+    # implementation-notes. It is last because it is the slowest and its own workspace is excluded
+    # from every cargo command above.
+    {{just_executable()}} example-downstream
     # public-API semver intent (CI runs this PRs-only against the PR base; locally diff vs the main
     # merge-base). Runs on the pinned toolchain — 1.98.0 satisfies cargo-semver-checks' rustc floor.
     # v30 delta 2: `vmcell-artifact-validator` is downstream CONTRACT surface (§10.4), so it is

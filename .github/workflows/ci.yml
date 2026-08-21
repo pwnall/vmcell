@@ -106,6 +106,18 @@ jobs:
       # (first entry in the recipe) now fails if this file ever names a `scripts/*.sh` directly
       # again, and asserts the recipe's roster is exactly the gate-shaped scripts on disk.
       #
+      # bubblewrap, because ONE gate on the roster genuinely needs it and refuses to pretend
+      # otherwise: `scripts/test-with-delegated-scope.sh` fabricates a cgroup tree under `bwrap` to
+      # drive every arm of the one wrapper `ban-ci-script-handcopy.sh` exempts and every live suite
+      # runs through. It treats an absent `bwrap` as `gate misconfigured` and exits non-zero rather
+      # than skipping, which is the same law every source-scanning ban here follows — so the honest
+      # fix is to OBTAIN the facility, exactly as `test-integration` builds e2fsprogs rather than
+      # living with that battery's skip. Not `continue-on-error`: unlike the ext4 case there is no
+      # recorded-skip fallback to degrade to, so a runner that cannot install it must fail loudly
+      # here rather than silently retire the gate.
+      - name: bubblewrap (the delegated-scope self-test fabricates its cgroup tree under it)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq bubblewrap
+
       # Note the workflow-level `CARGO_TERM_COLOR: always` above still applies to everything the
       # recipe runs — that is deliberate. It is the condition that silently killed three cargo-tree
       # bans, `just ci` does not set it, and `ban-uncolored-cargo-parse.sh` (inside the recipe) is

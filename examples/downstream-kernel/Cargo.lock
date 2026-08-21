@@ -3109,7 +3109,7 @@ dependencies = [
 
 [[package]]
 name = "vmcell"
-version = "0.22.0"
+version = "0.23.3"
 dependencies = [
  "am-fs-erofs",
  "async-trait",
@@ -3162,7 +3162,7 @@ dependencies = [
 
 [[package]]
 name = "vmcell-artifact-validator"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "futures",
  "tempfile",

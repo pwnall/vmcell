@@ -1112,15 +1112,95 @@ mod tests {
         }
     }
 
+    // THE KNOB, structurally — the half that holds on EVERY host, including one whose cgroup
+    // controllers are not delegated. `validate_with` must hand its own `vmm` argument to the level
+    // runners and must never reach for `default_backend()`, which is `validate`'s job alone.
+    //
+    // This scan exists because the behavioural leg below cannot run everywhere, and finding that
+    // out cost a red CI: `MicroVm::start` creates the per-VM cgroup slice BEFORE it asks the
+    // backend to create anything, so on an undelegated host the fake's call log is empty and an
+    // assertion about it says nothing about dispatch. That is the same undelegated-runner blind
+    // spot `just test-unit-undelegated` exists to mirror — 21 KVM-free tests once failed there for
+    // weeks while `just test-unit` stayed green — and this test had joined them.
+    //
+    // RED on the inverse (verified): replace `run_core(vmm, …)` with `run_core(&default_backend(),
+    // …)` in `validate_with`'s body and the `default_backend` assertion fires; drop a runner's
+    // `vmm` argument and the per-runner assertion names it.
+    #[test]
+    fn validate_with_dispatches_every_level_onto_the_caller_supplied_backend() {
+        // The function's own body, sliced out of this file's text.
+        const SRC: &str = include_str!("lib.rs");
+        let body = SRC
+            .split_once("pub async fn validate_with")
+            .expect("validate_with is defined in this file")
+            .1;
+        // Terminate at the function's OWN closing brace — the first column-0 `}`. Slicing to the
+        // next `pub` instead ran past the end and swept in `validate`'s body, which legitimately
+        // names `default_backend`; the over-long slice is why this assertion fired on a correct
+        // tree the first time it was written.
+        let body = body
+            .split_once("\n}")
+            .expect("validate_with's body ends at a column-0 brace")
+            .0;
+        assert!(
+            (200..4_000).contains(&body.len()),
+            "gate misconfigured: the slice of `validate_with` is {} bytes, so every assertion \
+             below would be reading the wrong text",
+            body.len()
+        );
+        // Hop 1: `validate_with` hands its OWN `vmm` to the per-level dispatcher.
+        assert!(
+            body.contains("run_level(level, vmm,"),
+            "`validate_with` must pass its own `vmm` to `run_level`; found no such call in its \
+             body:\n{body}"
+        );
+        assert!(
+            !body.contains("default_backend"),
+            "`validate_with` must never reach for `default_backend()` — that is `validate`'s job, \
+             and the whole point of this door is that the caller chooses:\n{body}"
+        );
+
+        // Hop 2: the dispatcher hands that same `vmm` to every level runner. Asserted here rather
+        // than assumed, because hop 1 alone would still pass if `run_level` quietly substituted a
+        // backend of its own — which is the same defect one call deeper.
+        let dispatch = SRC
+            .split_once("async fn run_level<V: Vmm>")
+            .expect("run_level is defined in this file")
+            .1
+            .split_once("\n}")
+            .expect("run_level's body ends at a column-0 brace")
+            .0;
+        for runner in ["run_core", "run_extended", "run_full"] {
+            let call = format!("{runner}(vmm,");
+            assert!(
+                dispatch.contains(&call),
+                "`run_level` must pass the caller's `vmm` to `{runner}`; found no `{call}`:\n\
+                 {dispatch}"
+            );
+        }
+        assert!(
+            !dispatch.contains("default_backend"),
+            "`run_level` must never reach for `default_backend()` either:\n{dispatch}"
+        );
+    }
+
     // THE KNOB, behaviorally: `validate_with` boots on the backend the CALLER handed it, not on
     // the one `validate` picks. `FakeVmm` records every `create` it is asked for, so "the caller's
     // backend was the one driven" is an assertion and not an inference — and the fake needs no
     // `/dev/kvm`, which is exactly why that probe stayed on `validate` and did not move into this
     // door.
     //
+    // IT DOES, HOWEVER, NEED A DELEGATED CGROUP, and that is not a detail: `MicroVm::start` creates
+    // the per-VM slice before it asks the backend for anything, so on an undelegated host the run
+    // stops with a `Cgroup` error and the fake is never touched. Rather than assert nothing there,
+    // this leg says which host it is on and asserts the honest alternative — the roster still comes
+    // back whole, with the boot failure recorded rather than an id silently missing. The dispatch
+    // claim itself is carried unconditionally by the source scan above, which is why gating here
+    // costs no coverage.
+    //
     // RED on the inverse (verified): ignore the `vmm` argument in `validate_with` and run on
-    // `default_backend()` instead — the fake's call log stays empty and this fails, on a host with
-    // KVM and on one without.
+    // `default_backend()` instead — the fake's call log stays empty and this fails, on any host
+    // whose cgroups are delegated.
     //
     // WHAT THIS FAKE CANNOT SEE, and the live leg that does (AGENTS.md): it boots nothing and
     // touches no filesystem, so it proves the dispatch and not that a real backend still comes up
@@ -1137,13 +1217,44 @@ mod tests {
             .expect("a run inside its budget reports");
 
         let calls = vmm.calls.lock().expect("the fake's call log").clone();
+
+        // WHICH ARM, decided by EVIDENCE rather than by a re-derived predicate. The condition that
+        // matters is "did `MicroVm::start` get as far as asking the backend", and no probe in this
+        // crate answers it: `cgroup_memory_delegated()` is about a controller in `subtree_control`
+        // and reads false on hosts where the start succeeds anyway, so branching on it asserted the
+        // wrong thing in both directions (measured). Reading the call log cannot drift from what
+        // `start` actually did.
+        if !calls.iter().any(|c| c == "create") {
+            // The host stopped the start before the backend was reached — a cgroup base this
+            // process may not create under, which is the undelegated-runner condition
+            // `just test-unit-undelegated` mirrors. Not a silent pass: the roster must still come
+            // back WHOLE with its reason recorded, which is the property `fill_unrecorded` exists
+            // for, and an id silently missing is the defect it was written against. The dispatch
+            // claim itself is carried on this arm by
+            // `validate_with_dispatches_every_level_onto_the_caller_supplied_backend`, which needs
+            // no host facility at all — so nothing is lost here except the ability to distinguish
+            // two backends that both failed at the same host step.
+            assert!(
+                report.outcomes.iter().any(|o| o.id == "boot.config"),
+                "the roster comes back whole even when the host stops the start: {:?}",
+                report.outcomes
+            );
+            assert!(
+                report.outcomes.len() >= checks::CORE_CHECK_IDS.len(),
+                "every Core id is accounted for, not just the ones reached: {:?}",
+                report.outcomes
+            );
+            return;
+        }
+
         assert!(
             calls.iter().any(|c| c == "create"),
             "the caller's backend must be the one driven, but it was never asked to create a VM: \
              {calls:?}"
         );
         // …and the report is that backend's story, not another's: the scripted failure the caller
-        // handed in is what the boot check reports back.
+        // handed in is what the boot check reports back. (Delegated arm only — the undelegated one
+        // returned above, where the boot failure's text is the host's cgroup error.)
         assert!(
             report.outcomes.iter().any(|o| matches!(
                 &o.status,
