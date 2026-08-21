@@ -38,6 +38,44 @@ pub enum Error {
     /// A timeout error.
     #[error("Timeout error: {0}")]
     Timeout(String),
+    /// The **guest kernel** reported a recognizable fault on its serial console, and that — not
+    /// the host operation's expired budget — is why the operation failed (§5.4, The guest-kernel
+    /// contract and the bootstrap seed).
+    ///
+    /// Returned in place of [`Error::Timeout`] by a host operation that was waiting on the guest
+    /// when its console proved the guest had died: a KASAN report in an erofs decompressor and a
+    /// wedged `vhost-device-vsock` daemon used to produce byte-identical
+    /// `"Steward connection timed out"` errors, so the reader's first question was always the one
+    /// the evidence already answered.
+    ///
+    /// **This is not a capability refusal.** §7.2 (The fail-loud capability contract and
+    /// `HostCapabilities`) reserves
+    /// [`Error::Unsupported`] / [`Error::CapabilityUnavailable`] for a facility that is *absent*
+    /// — a question about the host's configuration, answerable before the VM boots and identically
+    /// on every boot. A guest kernel fault is the other half of that contract: a facility that is
+    /// *broken*, discovered at runtime, on this boot only. It therefore gets its own typed variant
+    /// carrying the evidence, exactly as §7.2 asks a broken facility to report errno.
+    ///
+    /// Produced only through
+    /// [`SerialFault::into_error`](crate::vmm::fault::SerialFault::into_error), so the
+    /// classification law has one home.
+    #[cfg(feature = "host-common")]
+    #[error("guest kernel fault during {op} ({fault}): {evidence}")]
+    GuestKernelFault {
+        /// Which fault class the console proves. Match on this rather than on the message
+        /// (`fault == GuestFault::Kasan`), never a substring of the rendered string — the
+        /// substring-matcher class is retired (invariant F6).
+        fault: crate::vmm::fault::GuestFault,
+        /// The host operation that was waiting when the fault was observed, in the host's own
+        /// words ("steward vsock handshake"). Same role as
+        /// [`Error::CapabilityUnavailable::op`](Error::CapabilityUnavailable).
+        op: String,
+        /// The console line that proved it, already rendered through
+        /// [`capped_debug`](vmcell_protocol::capped_debug): the console is guest-controlled, so the
+        /// error carries the one matched line and never the whole flood. The full tail stays in the
+        /// serial log file.
+        evidence: String,
+    },
     /// A custom serialization/deserialization error string.
     #[error("Serialization error: {0}")]
     Serialize(String),

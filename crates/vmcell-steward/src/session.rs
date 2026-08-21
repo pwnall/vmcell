@@ -56,7 +56,9 @@ impl StdinSink {
 pub(crate) enum StdinItem {
     /// Bytes from a `Stdin` frame.
     Data(Vec<u8>),
-    /// The host's `StdinEof`.
+    /// The host's `StdinEof`, for a **pipe** session only. A PTY session never
+    /// enqueues one: [`route_stdin_eof`] refuses it at the routing boundary
+    /// ([`SessionHandle::accepts_stdin_eof`]).
     Eof,
 }
 
@@ -118,6 +120,30 @@ impl SessionHandle {
         }
     }
 
+    /// Whether this session's stdin can be **half-closed** — the guest-side half of
+    /// the one stdin-half-close law (§17, Open gaps and future capabilities).
+    ///
+    /// True for a pipe session: dropping the child's stdin write end is a real
+    /// half-close, and the child reads EOF. False for a PTY session: a
+    /// pseudo-terminal has no write-side half-close at all. The only thing that
+    /// even resembles one is the line discipline's `VEOF` character, and it is not
+    /// a half-close — it means end-of-input only to a reader that happens to be in
+    /// canonical mode *at that instant*, and is delivered as a literal byte to any
+    /// other (a raw-mode reader would receive `0x04` as data). The mode can change
+    /// between the check and the write, so even a mode-discriminating variant
+    /// could not be made correct. The facility is absent, so it is refused rather
+    /// than approximated (§7.2, The fail-loud capability contract and HostCapabilities).
+    ///
+    /// This is the ONE place pty-ness answers that question in the guest;
+    /// [`session_stdin_route`] is its one call site, so `route_stdin_eof` cannot
+    /// re-derive it. The host end refuses the same operation *before the wire*
+    /// (`vmcell::steward::session::Session::supports_stdin_close`), so a
+    /// conforming client never sends a PTY `StdinEof` at all — what reaches here
+    /// is a non-conforming client, and it is refused loud rather than discarded.
+    pub(crate) fn accepts_stdin_eof(&self) -> bool {
+        self.pty_master.is_none()
+    }
+
     /// Stops this session's stdin writer thread and joins it (M6) — the one place
     /// that sequence lives. Flag it closing (a writer parked on a full pipe or
     /// terminal gives up within one [`STDIN_POLL_SLICE`]), drop the queue's last
@@ -169,14 +195,26 @@ pub(crate) fn spawn_stdin_writer(
                     }
                 }
                 // Pipe: drop the write end → the child reads EOF, but only now
-                // that every byte queued ahead of this item has been written. PTY:
-                // a no-op (closing the master would tear down output — a PTY
-                // caller ends input in-band).
-                StdinItem::Eof => {
-                    if matches!(sink, Some(StdinSink::Pipe(_))) {
-                        sink = None;
+                // that every byte queued ahead of this item has been written.
+                //
+                // The PTY arm is belt-and-braces, not a second copy of the law:
+                // `route_stdin_eof` refuses a PTY session's `StdinEof` at the
+                // routing boundary (`SessionHandle::accepts_stdin_eof`), so one
+                // cannot reach this queue. If a future edit let one through,
+                // dropping the master here would silently swallow every LATER
+                // `Stdin` byte for that session (the `sink.as_ref()` arm above
+                // treats a taken sink as already closed) — so keep the terminal
+                // and say so loud instead.
+                StdinItem::Eof => match sink.take() {
+                    None | Some(StdinSink::Pipe(_)) => {}
+                    Some(pty @ StdinSink::Pty(_)) => {
+                        tracing::warn!(
+                            "vmcell-steward: StdinEof reached PTY session {:?}'s writer thread; a pseudo-terminal has no stdin half-close, keeping the terminal open",
+                            session
+                        );
+                        sink = Some(pty);
                     }
-                }
+                },
             }
         }
         // Dropping `sink` closes a pipe session's write end (the child reads EOF)
@@ -664,16 +702,27 @@ pub(crate) fn write_stdin_sink(
     Ok(())
 }
 
-/// Looks up a session's stdin queue, releasing the table lock before returning it
+/// Everything a host→guest stdin frame needs from a live session's handle (M6),
+/// read out under ONE table lock so a `Stdin` and a `StdinEof` for the same
+/// session can never disagree about what that session is.
+pub(crate) struct StdinRoute {
+    /// The queue feeding that session's stdin writer thread.
+    pub(crate) tx: std::sync::mpsc::Sender<StdinItem>,
+    /// [`SessionHandle::accepts_stdin_eof`] for this session, evaluated at the one
+    /// site that evaluates it: `true` for a pipe session, `false` for a PTY.
+    pub(crate) accepts_eof: bool,
+}
+
+/// Looks up a session's stdin route, releasing the table lock before returning it
 /// (M6). A frame for an unknown/closed session is dropped at debug — the session
 /// simply already ended.
-pub(crate) fn session_stdin_queue(
-    sessions: &Sessions,
-    session: SessionId,
-) -> Option<std::sync::mpsc::Sender<StdinItem>> {
+pub(crate) fn session_stdin_route(sessions: &Sessions, session: SessionId) -> Option<StdinRoute> {
     let table = sessions.lock().unwrap_or_else(|e| e.into_inner());
     match table.get(&session) {
-        Some(h) => Some(h.stdin_tx.clone()),
+        Some(h) => Some(StdinRoute {
+            tx: h.stdin_tx.clone(),
+            accepts_eof: h.accepts_stdin_eof(),
+        }),
         None => {
             tracing::debug!(
                 "vmcell-steward: stdin frame for unknown/closed session {:?}; dropping",
@@ -690,13 +739,13 @@ pub(crate) fn session_stdin_queue(
 /// stdin can no longer stall the dispatch loop — and with it `CloseSession` and
 /// the connection-owns-its-sessions teardown (§13).
 pub(crate) fn route_stdin(sessions: &Sessions, session: SessionId, data: Vec<u8>) {
-    let Some(tx) = session_stdin_queue(sessions, session) else {
+    let Some(route) = session_stdin_route(sessions, session) else {
         return;
     };
     // Never a silent drop: the only failure is a writer thread that has already
     // ended (its sink died), which is the same condition the pre-M6 inline write
     // reported at debug.
-    if tx.send(StdinItem::Data(data)).is_err() {
+    if route.tx.send(StdinItem::Data(data)).is_err() {
         tracing::debug!(
             "vmcell-steward: stdin queue for session {:?} is closed; dropping",
             session
@@ -705,16 +754,35 @@ pub(crate) fn route_stdin(sessions: &Sessions, session: SessionId, data: Vec<u8>
 }
 
 /// Routes a `StdinEof` frame (§3, The control plane: vsock, the host clients, and the steward): closes a **pipe** session's stdin
-/// (dropping the write end → the child reads EOF); a no-op for a PTY session
-/// (closing the master would tear down output — a PTY caller ends input in-band).
-/// Sequenced through the SAME queue as the bytes (M6), so the pipe closes only
-/// after everything already queued has been written — an out-of-band close would
-/// truncate the child's input.
+/// (dropping the write end → the child reads EOF), sequenced through the SAME
+/// queue as the bytes (M6), so the pipe closes only after everything already
+/// queued has been written — an out-of-band close would truncate the child's
+/// input.
+///
+/// **A PTY session's `StdinEof` is REFUSED here, loud** (§17, Open gaps and future capabilities):
+/// a pseudo-terminal has no stdin half-close, so there is nothing to honor —
+/// see [`SessionHandle::accepts_stdin_eof`] for why an approximation (the
+/// termios `VEOF` byte) would be worse than the refusal. The refusal is a `warn`
+/// because the guest has no per-frame error reply: the wire protocol's only
+/// guest→host session frames are `SessionStdout`/`SessionStderr`/`SessionExit`,
+/// and reporting in-band would inject steward prose into the caller's terminal
+/// stream. It costs nothing in practice — the host end refuses this operation
+/// *before* the wire, so only a non-conforming client can produce the frame this
+/// arm logs. What it must never be is what it was: enqueued, then silently
+/// discarded by the writer thread (an accepted input that was neither honored
+/// nor rejected).
 pub(crate) fn route_stdin_eof(sessions: &Sessions, session: SessionId) {
-    let Some(tx) = session_stdin_queue(sessions, session) else {
+    let Some(route) = session_stdin_route(sessions, session) else {
         return;
     };
-    if tx.send(StdinItem::Eof).is_err() {
+    if !route.accepts_eof {
+        tracing::warn!(
+            "vmcell-steward: refusing StdinEof for PTY session {:?}: a pseudo-terminal has no stdin half-close (end input in-band or CloseSession)",
+            session
+        );
+        return;
+    }
+    if route.tx.send(StdinItem::Eof).is_err() {
         tracing::debug!(
             "vmcell-steward: stdin queue for session {:?} is closed; EOF is already implied",
             session
@@ -762,4 +830,198 @@ pub(crate) fn close_session(sessions: &Sessions, session: SessionId) {
         }
     };
     kill_group(pid);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::time::Instant;
+
+    /// A fresh one-entry session table over `sink`, with `pty_master` set exactly
+    /// as the production PTY path sets it — the field
+    /// [`SessionHandle::accepts_stdin_eof`] reads. `pid` is 0: these tests never
+    /// take the kill/teardown path, so no signal is ever sent.
+    fn table_with(sink: StdinSink, pty_master: Option<Arc<OwnedFd>>) -> (Sessions, SessionId) {
+        let id = SessionId(0);
+        let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));
+        sessions
+            .lock()
+            .expect("a fresh table's lock is never poisoned")
+            .insert(id, SessionHandle::new(id, Some(sink), pty_master, 0));
+        (sessions, id)
+    }
+
+    /// Reads whatever the pty slave has, waiting until `deadline` for the writer
+    /// thread to deliver it. The slave is `O_NONBLOCK`, so `EAGAIN` is "nothing
+    /// yet" — the bound is on the WHOLE wait, not on the gaps between polls.
+    fn read_slave_until(slave: BorrowedFd<'_>, deadline: Instant) -> Vec<u8> {
+        let mut buf = [0u8; 256];
+        loop {
+            match rustix::io::read(slave, &mut buf) {
+                Ok(0) => panic!("the pty slave saw EOF: nothing may close this terminal"),
+                Ok(n) => return buf.get(..n).unwrap_or_default().to_vec(),
+                Err(rustix::io::Errno::AGAIN | rustix::io::Errno::INTR) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "the pty slave never received the routed stdin bytes"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => panic!("pty slave read failed: {e}"),
+            }
+        }
+    }
+
+    // §17 (Open gaps and future capabilities), the PTY half-close law, guest end: a
+    // `StdinEof` for a PTY session is REFUSED — nothing is written to the terminal
+    // and the terminal stays open. Data-plane on a REAL pty (rubric A10): the
+    // assertion is on the bytes the slave (the "child") actually reads, not on a
+    // queue or a log line.
+    //
+    // RED on both inverses:
+    //  * option (a), "send the termios VEOF": the slave's canonical line discipline
+    //    turns that byte into an end-of-input, so the read returns Ok(0) and
+    //    `read_slave_until`'s EOF panic fires — and the post-EOF leg below could
+    //    never run.
+    //  * the shipped-before-this-change behavior (enqueue, then discard in the
+    //    writer thread) is what the third leg pins: with the `sink.take()` arm made
+    //    unconditional, the master sink is dropped, every LATER byte is discarded as
+    //    "stdin already closed", and the final `read_slave_until` times out.
+    #[test]
+    fn pty_stdin_eof_is_refused_and_the_terminal_stays_open() {
+        use rustix::fs::{Mode, OFlags};
+
+        let (master, slave_path) = open_pty().expect("a pty pair (needs /dev/ptmx)");
+        let slave = rustix::fs::open(
+            slave_path.as_c_str(),
+            OFlags::RDWR | OFlags::NOCTTY | OFlags::NONBLOCK,
+            Mode::empty(),
+        )
+        .expect("open the pty slave");
+        let master = Arc::new(master);
+        let (sessions, id) = table_with(
+            StdinSink::Pty(Arc::clone(&master)),
+            Some(Arc::clone(&master)),
+        );
+
+        // (1) Terminal input works: the routed line reaches the slave.
+        route_stdin(&sessions, id, b"before\n".to_vec());
+        assert_eq!(
+            read_slave_until(slave.as_fd(), Instant::now() + Duration::from_secs(5)),
+            b"before\n".to_vec(),
+            "a PTY session's routed stdin must reach the terminal"
+        );
+
+        // (2) The refusal: no byte at all is delivered for the `StdinEof` — in
+        // particular not a `VEOF` (0x04), which this terminal's canonical line
+        // discipline would turn into an end-of-input for the reader.
+        route_stdin_eof(&sessions, id);
+        std::thread::sleep(Duration::from_millis(300));
+        let mut buf = [0u8; 256];
+        match rustix::io::read(slave.as_fd(), &mut buf) {
+            Err(rustix::io::Errno::AGAIN) => {}
+            Ok(0) => panic!("StdinEof must not end the terminal's input: the slave read EOF"),
+            Ok(n) => panic!(
+                "StdinEof must deliver NO bytes to a PTY; got {:?}",
+                buf.get(..n).unwrap_or_default()
+            ),
+            Err(e) => panic!("pty slave read failed: {e}"),
+        }
+
+        // (3) The positive control for the refusal: the session is untouched, so a
+        // LATER byte still reaches the terminal. This is the leg the pre-change
+        // "enqueue it and let the writer thread discard it" shape could break.
+        route_stdin(&sessions, id, b"after\n".to_vec());
+        assert_eq!(
+            read_slave_until(slave.as_fd(), Instant::now() + Duration::from_secs(5)),
+            b"after\n".to_vec(),
+            "a refused StdinEof must leave the session's stdin fully usable"
+        );
+    }
+
+    // The POSITIVE CONTROL for the leg above, and the pipe half of the same law: a
+    // pipe session's `StdinEof` IS honored — the child's stdin write end closes and
+    // the reader sees EOF, after every queued byte. RED if the refusal were widened
+    // to every session (the read would block past the deadline and never EOF).
+    #[test]
+    fn pipe_stdin_eof_is_honored_and_the_child_reads_eof() {
+        let (mut reader, writer) = std::io::pipe().expect("pipe");
+        let (sessions, id) = table_with(StdinSink::Pipe(writer.into()), None);
+
+        route_stdin(&sessions, id, b"payload".to_vec());
+        route_stdin_eof(&sessions, id);
+        // Drop the table so the handle's last queue sender goes with it; the writer
+        // thread ends once drained, exactly as it does when a session's waiter
+        // removes its own entry.
+        drop(sessions);
+
+        let mut got = Vec::new();
+        reader.read_to_end(&mut got).expect("read to EOF");
+        assert_eq!(
+            got,
+            b"payload".to_vec(),
+            "a pipe session's StdinEof must close the write end AFTER every queued byte"
+        );
+    }
+
+    // The CALL-SITE half of the guest-end law (§13, Cross-cutting invariants): the
+    // legs above pin the behavior, and this pins that the behavior cannot be
+    // re-derived somewhere else. `accepts_stdin_eof` is the one predicate and
+    // `session_stdin_route` its one call site, so a future `route_stdin_eof` cannot
+    // grow its own pty test that drifts from it; and `StdinItem::Eof` may enter the
+    // queue only AFTER that guard. Source-scanning, KVM-free: it reads this file,
+    // stopping at the test module so these tests' own text cannot satisfy it.
+    //
+    // RED on the inverse: move the `accepts_eof` check below the `route.tx.send`
+    // (the ordering assert), or add a second `.accepts_stdin_eof()` call site / a
+    // second `StdinItem::Eof` enqueue (the count asserts).
+    #[test]
+    fn stdin_eof_is_enqueued_only_through_the_one_pty_refusing_predicate() {
+        let src = include_str!("session.rs");
+        let cut = src
+            .find("\n#[cfg(test)]\n")
+            .expect("the test module marks the end of the production source");
+        let prod = src.get(..cut).unwrap_or_default();
+
+        let calls = prod.matches(".accepts_stdin_eof()").count();
+        assert_eq!(
+            calls, 1,
+            "`accepts_stdin_eof` is the ONE guest-side answer to \"does this session have a stdin \
+             half-close?\"; found {calls} call sites"
+        );
+        let route_at = prod
+            .find("pub(crate) fn session_stdin_route(")
+            .expect("`session_stdin_route` is the one lookup");
+        assert!(
+            prod.get(route_at..)
+                .unwrap_or_default()
+                .contains(".accepts_stdin_eof()"),
+            "the one call site must be inside `session_stdin_route`, read under the table lock"
+        );
+
+        let eof_at = route_at
+            + prod
+                .get(route_at..)
+                .unwrap_or_default()
+                .find("fn route_stdin_eof(")
+                .expect("`route_stdin_eof` must follow the lookup it uses");
+        let body = prod.get(eof_at..).unwrap_or_default();
+        let guard = body
+            .find("if !route.accepts_eof")
+            .expect("`route_stdin_eof` must guard on the predicate's answer");
+        let enqueue = body
+            .find("send(StdinItem::Eof)")
+            .expect("`route_stdin_eof` is the one place an Eof is enqueued");
+        assert!(
+            guard < enqueue,
+            "the PTY refusal must come BEFORE the enqueue, or a PTY's Eof reaches the queue again"
+        );
+        assert_eq!(
+            prod.matches("send(StdinItem::Eof)").count(),
+            1,
+            "exactly one site may enqueue a StdinEof — the one that refuses a PTY first"
+        );
+    }
 }

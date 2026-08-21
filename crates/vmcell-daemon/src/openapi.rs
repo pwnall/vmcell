@@ -93,6 +93,20 @@ pub const API_ROUTES: &[RouteDef] = &[
     },
     RouteDef {
         method: "POST",
+        path: "/v1/vms/{id}/pause",
+        op_id: "pauseVm",
+        authenticated: true,
+        summary: "Pause a Ready VM's vCPUs (409 if it is not Ready)",
+    },
+    RouteDef {
+        method: "POST",
+        path: "/v1/vms/{id}/resume",
+        op_id: "resumeVm",
+        authenticated: true,
+        summary: "Resume a Paused VM's vCPUs (409 if it is not Paused)",
+    },
+    RouteDef {
+        method: "POST",
         path: "/v1/vms/{id}/snapshot",
         op_id: "snapshotVm",
         authenticated: true,
@@ -464,6 +478,34 @@ mod tests {
             table_open, open,
             "open route set must be exactly {OPEN_ROUTES:?}"
         );
+    }
+
+    // The vCPU verbs are on the table BY NAME (design §11.5, The HTTP REST API and its OpenAPI
+    // document; §17, Open gaps and future capabilities — "Pause/resume routes"). The parity tests
+    // above are relational — they hold just as well for a table that lost both rows — so this is the
+    // roster assertion that a shipped route cannot silently leave. RED on the inverse: delete either
+    // `RouteDef`.
+    #[test]
+    fn the_vcpu_verbs_are_documented_authenticated_operations() {
+        let doc = openapi_document();
+        for (op_id, path) in [
+            ("pauseVm", "/v1/vms/{id}/pause"),
+            ("resumeVm", "/v1/vms/{id}/resume"),
+        ] {
+            let row = API_ROUTES
+                .iter()
+                .find(|r| r.op_id == op_id)
+                .unwrap_or_else(|| panic!("{op_id} must be in API_ROUTES"));
+            assert_eq!(row.path, path, "{op_id} path");
+            assert_eq!(row.method, "POST", "{op_id} is a POST (it changes state)");
+            assert!(row.authenticated, "{op_id} must be behind the bearer layer");
+            let op = &doc["paths"][path]["post"];
+            assert_eq!(op["operationId"], op_id, "{op_id} must be in the document");
+            assert!(
+                !op["security"].is_null(),
+                "{op_id} must carry the bearer requirement in the served document"
+            );
+        }
     }
 
     #[test]

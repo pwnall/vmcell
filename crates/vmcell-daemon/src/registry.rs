@@ -85,14 +85,19 @@ impl VmSlot {
         self.status().state = state;
     }
 
-    /// Leaves `Snapshotting` when the write finishes — but never overwrites `Destroying`, which is a
-    /// **one-way** door: a destroy marks it in place and then waits for the handle lock this write
-    /// holds (see [`Registry::teardown_slot`]), so restoring `Ready` here would re-advertise a VM
-    /// whose teardown is already parked behind the write and let a new op in behind it.
-    fn leave_snapshotting(&self) {
+    /// The ONE lifecycle-state transition every completed op uses: move `from` -> `to`, and leave the
+    /// state alone if it is no longer `from`.
+    ///
+    /// The conditional is what honors the **one-way `Destroying` door**. A destroy marks `Destroying`
+    /// in place and then waits for the handle lock the op holds (see [`Registry::teardown_slot`]), so
+    /// an op that finishes afterwards and assigned its own result unconditionally would re-advertise a
+    /// VM whose teardown is already parked behind it and let a new op in behind that. It applies to
+    /// every op that moves the state, not just the snapshot it was first written for: a `pause` that
+    /// lands after a destroy would otherwise publish `Paused` over `Destroying`.
+    fn transition_from(&self, from: VmState, to: VmState) {
         let mut status = self.status();
-        if status.state == VmState::Snapshotting {
-            status.state = VmState::Ready;
+        if status.state == from {
+            status.state = to;
         }
     }
 
@@ -378,6 +383,55 @@ impl Registry {
         handle_mut(&mut inner, id)?.usage().await
     }
 
+    /// Pauses a `Ready` VM's vCPUs, returning the VM's updated info (design §11.5, The HTTP REST API
+    /// and its OpenAPI document; the [`VmHandle::pause`] half has
+    /// shipped since the seam was written).
+    ///
+    /// # Errors
+    /// [`DaemonError::NotFound`] (gone) / [`DaemonError::Conflict`] (not `Ready` — already paused,
+    /// snapshotting, or being destroyed) / the mapped backend error.
+    pub async fn pause(&self, id: &VmId) -> DaemonResult<VmInfo> {
+        self.drive_vcpus(id, VcpuVerb::Pause).await
+    }
+
+    /// Resumes a `Paused` VM's vCPUs, returning the VM's updated info.
+    ///
+    /// # Errors
+    /// [`DaemonError::NotFound`] (gone) / [`DaemonError::Conflict`] (not `Paused`) / the mapped
+    /// backend error.
+    pub async fn resume(&self, id: &VmId) -> DaemonResult<VmInfo> {
+        self.drive_vcpus(id, VcpuVerb::Resume).await
+    }
+
+    /// The one state machine both vCPU verbs run (one law, one predicate — a second copy would be
+    /// two chances to get the `Destroying` door or the re-check wrong).
+    ///
+    /// It is deliberately the **same** shape `exec` and `snapshot` use, because the hazards are the
+    /// same ones:
+    ///
+    /// * the required state is checked BEFORE queueing on the handle lock, so a verb aimed at a
+    ///   snapshotting or dying VM gets its 409 promptly instead of after a multi-second guest-RAM
+    ///   write (finding `snapshotting-state-unobservable-and-list-blocks`);
+    /// * it is re-checked UNDER the lock, because the state can move while the call queues — the
+    ///   same predicate, never a second copy;
+    /// * the new state is published only on success and only through [`VmSlot::transition_from`], so
+    ///   a failed pause leaves a still-`Ready` VM (a state derived from the handle, not a hopeful
+    ///   label) and a pause that lands behind a parked teardown does not reopen the VM.
+    ///
+    /// The residual, stated rather than hidden: a backend that pauses the guest and *then* fails its
+    /// reply leaves the daemon reporting `Ready` for a stopped guest. The alternative — recording the
+    /// state a failed call asked for — makes the label a wish on every path, so the honest one is
+    /// kept and the client's remedy is the ordinary one: retry, or destroy.
+    async fn drive_vcpus(&self, id: &VmId, verb: VcpuVerb) -> DaemonResult<VmInfo> {
+        let slot = self.slot(id).await?;
+        slot.require_state(verb.from(), id)?;
+        let mut inner = slot.inner.lock().await;
+        slot.require_state(verb.from(), id)?;
+        verb.drive(handle_mut(&mut inner, id)?).await?;
+        slot.transition_from(verb.from(), verb.to());
+        Ok(slot.info())
+    }
+
     /// Writes a warm snapshot of a `Ready` VM into the artifact store under `artifact_prefix/`,
     /// returning the (sorted) file names written. The prefix is **create-only**, like every other
     /// name in the store: an existing one is refused, not written into. For the duration of the
@@ -432,7 +486,9 @@ impl Registry {
             Ok(handle) => {
                 slot.set_state(VmState::Snapshotting);
                 let r = handle.snapshot(&out_dir).await;
-                slot.leave_snapshotting(); // still live whether or not the snapshot succeeded
+                // Still live whether or not the snapshot succeeded — through the one transition
+                // helper, so the `Destroying` door stays one-way.
+                slot.transition_from(VmState::Snapshotting, VmState::Ready);
                 r
             }
             Err(e) => Err(e),
@@ -594,6 +650,43 @@ impl Registry {
     }
 }
 
+/// Which vCPU-lifecycle verb [`Registry::drive_vcpus`] is running. The pair share one state machine
+/// and differ in exactly three facts — the state they require, the state they publish, and the handle
+/// call — so those three live here and the machine lives once.
+#[derive(Debug, Clone, Copy)]
+enum VcpuVerb {
+    /// `Ready` -> `Paused`.
+    Pause,
+    /// `Paused` -> `Ready`.
+    Resume,
+}
+
+impl VcpuVerb {
+    /// The state the VM must be in for this verb to be admitted.
+    const fn from(self) -> VmState {
+        match self {
+            Self::Pause => VmState::Ready,
+            Self::Resume => VmState::Paused,
+        }
+    }
+
+    /// The state a successful call publishes.
+    const fn to(self) -> VmState {
+        match self {
+            Self::Pause => VmState::Paused,
+            Self::Resume => VmState::Ready,
+        }
+    }
+
+    /// Drives the verb through the VM handle.
+    async fn drive(self, handle: &mut Box<dyn VmHandle>) -> DaemonResult<()> {
+        match self {
+            Self::Pause => handle.pause().await,
+            Self::Resume => handle.resume().await,
+        }
+    }
+}
+
 fn handle_mut<'a>(inner: &'a mut VmInner, id: &VmId) -> DaemonResult<&'a mut Box<dyn VmHandle>> {
     inner
         .handle
@@ -680,17 +773,33 @@ mod tests {
         Normal,
         /// Signal `entered`, then block until `release` is notified — the in-flight window a
         /// concurrent delete / `get` / `list` / `exec` races against.
-        Blocked(Arc<SnapshotGate>),
+        Blocked(Arc<HandleGate>),
         /// Remove the snapshot directory before returning `Ok` — exactly what a racing
         /// `delete_artifact_if_unused` did to an unpinned prefix, so the read-back must fail loud
         /// instead of reporting `files: []`.
         RemovesDir,
     }
 
-    /// The rendezvous a `Blocked` snapshot uses: `entered` fires when the backend write starts,
+    /// What a fake `pause` does — the vCPU verbs' own fault menu (AGENTS.md: every fault-menu arm is
+    /// driven by a test). `resume` needs no arms of its own: the state machine both verbs run is one
+    /// function, so an arm proven on `pause` is proven for `resume`.
+    #[derive(Clone, Default)]
+    enum PauseBehavior {
+        /// Succeed.
+        #[default]
+        Normal,
+        /// Fail the backend call, so the "state moves only on success" law can be driven.
+        Fails,
+        /// Signal `entered`, then block until `release` — the in-flight window a concurrent destroy
+        /// races against (the one-way `Destroying` door).
+        Blocked(Arc<HandleGate>),
+    }
+
+    /// The rendezvous a `Blocked` handle op uses: `entered` fires when the backend call starts,
     /// `release` lets it finish. `Notify` stores one permit, so neither side can miss the other.
+    /// Shared by the snapshot and pause fault arms — one rendezvous to reason about, not two.
     #[derive(Default)]
-    struct SnapshotGate {
+    struct HandleGate {
         entered: tokio::sync::Notify,
         release: tokio::sync::Notify,
     }
@@ -704,6 +813,11 @@ mod tests {
         /// inline command must not leak its VM through. A non-zero *exit* is a different thing (an
         /// `Ok` outcome), so this arm is the only way to drive the error path.
         fail_exec: bool,
+        pause_behavior: PauseBehavior,
+        /// Counts the `pause`/`resume` calls that actually reached the handle — the fake's own data
+        /// plane. Without it a registry that moved the state and never called the backend would pass
+        /// every state assertion below.
+        vcpu_calls: Arc<AtomicUsize>,
     }
 
     #[async_trait]
@@ -755,9 +869,21 @@ mod tests {
             Ok(())
         }
         async fn pause(&mut self) -> DaemonResult<()> {
-            Ok(())
+            self.vcpu_calls.fetch_add(1, Ordering::SeqCst);
+            match &self.pause_behavior {
+                PauseBehavior::Normal => Ok(()),
+                PauseBehavior::Fails => Err(DaemonError::Internal(
+                    "fake pause: the VMM control socket refused the pause".to_string(),
+                )),
+                PauseBehavior::Blocked(gate) => {
+                    gate.entered.notify_one();
+                    gate.release.notified().await;
+                    Ok(())
+                }
+            }
         }
         async fn resume(&mut self) -> DaemonResult<()> {
+            self.vcpu_calls.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
         async fn shutdown(self: Box<Self>) -> DaemonResult<()> {
@@ -779,6 +905,8 @@ mod tests {
         shutdowns: Arc<AtomicUsize>,
         snapshot_behavior: SnapshotBehavior,
         fail_exec: bool,
+        pause_behavior: PauseBehavior,
+        vcpu_calls: Arc<AtomicUsize>,
         launches: LaunchLog,
     }
 
@@ -791,6 +919,8 @@ mod tests {
                 shutdowns: self.shutdowns.clone(),
                 snapshot_behavior: self.snapshot_behavior.clone(),
                 fail_exec: self.fail_exec,
+                pause_behavior: self.pause_behavior.clone(),
+                vcpu_calls: self.vcpu_calls.clone(),
             }))
         }
     }
@@ -812,14 +942,27 @@ mod tests {
     fn registry_capturing(
         snapshot_behavior: SnapshotBehavior,
     ) -> (Registry, Arc<AtomicUsize>, LaunchLog, tempfile::TempDir) {
-        registry_faulty(snapshot_behavior, false)
+        registry_faulty(Faults {
+            snapshot: snapshot_behavior,
+            ..Faults::default()
+        })
     }
 
-    /// The one registry builder, with the fake's whole fault menu: the snapshot behavior plus
-    /// whether every `exec` fails.
-    fn registry_faulty(
-        snapshot_behavior: SnapshotBehavior,
+    /// The fake handle's whole fault menu, in one value with a `Default` — so a test names only the
+    /// arm it drives and a new arm does not touch every call site.
+    #[derive(Clone, Default)]
+    struct Faults {
+        snapshot: SnapshotBehavior,
         fail_exec: bool,
+        pause: PauseBehavior,
+        /// The counter the fake handle bumps on every vCPU verb. The caller keeps a clone, which is
+        /// how a test asserts the backend was actually driven rather than only the state relabelled.
+        vcpu_calls: Arc<AtomicUsize>,
+    }
+
+    /// The one registry builder, over the fake's whole fault menu.
+    fn registry_faulty(
+        faults: Faults,
     ) -> (Registry, Arc<AtomicUsize>, LaunchLog, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
         let artifacts =
@@ -831,8 +974,10 @@ mod tests {
         let launcher = FakeLauncher {
             next_vmid: AtomicU64::new(1),
             shutdowns: shutdowns.clone(),
-            snapshot_behavior,
-            fail_exec,
+            snapshot_behavior: faults.snapshot,
+            fail_exec: faults.fail_exec,
+            pause_behavior: faults.pause,
+            vcpu_calls: faults.vcpu_calls,
             launches: launches.clone(),
         };
         let reg = Registry::new(Box::new(launcher), artifacts, 0xdead_beef);
@@ -1017,7 +1162,10 @@ mod tests {
     // `shutdowns` stays 0.
     #[tokio::test]
     async fn a_create_whose_inline_exec_fails_leaves_no_vm_behind() {
-        let (reg, shutdowns, _log, _d) = registry_faulty(SnapshotBehavior::Normal, true);
+        let (reg, shutdowns, _log, _d) = registry_faulty(Faults {
+            fail_exec: true,
+            ..Faults::default()
+        });
         let mut req = create_req();
         req.command = Some(vec!["echo".into(), "hi".into()]);
         req.ephemeral = false; // the caller asked to KEEP the VM
@@ -1038,7 +1186,7 @@ mod tests {
 
         // Positive control: the same non-ephemeral create with a WORKING exec keeps its VM, so the
         // teardown above is about the failure and not about `command` itself.
-        let (reg, shutdowns, _log, _d) = registry_faulty(SnapshotBehavior::Normal, false);
+        let (reg, shutdowns, _log, _d) = registry_faulty(Faults::default());
         let mut req = create_req();
         req.command = Some(vec!["echo".into(), "kept".into()]);
         let created = reg.create(req).await.expect("create + inline exec");
@@ -1218,7 +1366,7 @@ mod tests {
     // prefix out from under the running snapshot.
     #[tokio::test]
     async fn delete_refuses_a_prefix_a_snapshot_is_writing_then_allows_it_after() {
-        let gate = Arc::new(SnapshotGate::default());
+        let gate = Arc::new(HandleGate::default());
         let (reg, _s, _d) = registry_with(SnapshotBehavior::Blocked(gate.clone()));
         let reg = Arc::new(reg);
         let created = reg.create(create_req()).await.expect("create");
@@ -1262,7 +1410,7 @@ mod tests {
     // writing into — the `InUse` assertion fails, and so does the snapshot's read-back.
     #[tokio::test]
     async fn a_destroy_parked_on_the_handle_lock_keeps_the_snapshot_prefix_pinned() {
-        let gate = Arc::new(SnapshotGate::default());
+        let gate = Arc::new(HandleGate::default());
         let (reg, shutdowns, _d) = registry_with(SnapshotBehavior::Blocked(gate.clone()));
         let reg = Arc::new(reg);
         let created = reg.create(create_req()).await.expect("create");
@@ -1369,7 +1517,7 @@ mod tests {
     // snapshot — the timeouts fire — and the state read back is a stale `Ready`.
     #[tokio::test]
     async fn snapshotting_state_is_observable_and_blocks_neither_reads_nor_other_vms() {
-        let gate = Arc::new(SnapshotGate::default());
+        let gate = Arc::new(HandleGate::default());
         let (reg, _s, _d) = registry_with(SnapshotBehavior::Blocked(gate.clone()));
         let reg = Arc::new(reg);
         let busy = reg.create(create_req()).await.expect("vm a");
@@ -1559,6 +1707,309 @@ mod tests {
             1,
             "the positive control did reach the launcher"
         );
+    }
+
+    // ---- the vCPU verbs: `POST /v1/vms/{id}/pause` and `/resume` (design §11.5, The HTTP REST API
+    // and its OpenAPI document; §17, Open gaps and future capabilities — "Pause/resume routes") ----
+
+    /// A registry whose fake handle runs `pause` under `pause_behavior` and counts every vCPU-verb
+    /// call that reached the backend. The counter is what keeps the state assertions honest: a
+    /// registry that relabelled the slot and never called the handle would satisfy every one of them.
+    fn registry_vcpu(pause: PauseBehavior) -> (Registry, Arc<AtomicUsize>, tempfile::TempDir) {
+        let faults = Faults {
+            pause,
+            ..Faults::default()
+        };
+        let calls = faults.vcpu_calls.clone();
+        let (reg, _shutdowns, _log, dir) = registry_faulty(faults);
+        (reg, calls, dir)
+    }
+
+    // The happy path, both directions, asserted through the OBSERVABLE state (`get`, i.e. what
+    // `GET /v1/vms/{id}` serves) and through the fake's call counter, not just the returned value.
+    // RED on the inverse (a `pause` that returns `slot.info()` without moving the state, or one that
+    // never reaches the handle): the `get` assertion or the counter goes red.
+    #[tokio::test]
+    async fn pause_moves_ready_to_paused_and_resume_moves_back() {
+        let (reg, calls, _d) = registry_vcpu(PauseBehavior::Normal);
+        let created = reg.create(create_req()).await.expect("create");
+        let id = &created.info.id;
+        assert_eq!(reg.get(id).await.expect("get").state, VmState::Ready);
+
+        let paused = reg.pause(id).await.expect("pause a Ready vm");
+        assert_eq!(
+            paused.state,
+            VmState::Paused,
+            "the reply carries the new state"
+        );
+        assert_eq!(
+            reg.get(id).await.expect("get").state,
+            VmState::Paused,
+            "and `GET /v1/vms/{{id}}` observes it"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "the backend pause ran");
+
+        let resumed = reg.resume(id).await.expect("resume a Paused vm");
+        assert_eq!(resumed.state, VmState::Ready);
+        assert_eq!(reg.get(id).await.expect("get").state, VmState::Ready);
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "the backend resume ran");
+    }
+
+    // The refusals a paused VM owes, each with its POSITIVE CONTROL after the resume (AGENTS.md: a
+    // negative result needs a positive control, or "refuses everything" would pass).
+    //
+    // `snapshot` is on the list deliberately: `MicroVm::snapshot` pauses internally and RESUMES when
+    // it is done, so snapshotting a paused VM would silently restart the guest behind the daemon's
+    // own state. Refusing keeps the one-state-machine story true.
+    //
+    // RED on the inverse (drop the `require_state` in `drive_vcpus`, or give `snapshot`/`exec` a
+    // `want` of anything but `Ready`): the paused VM answers instead of conflicting.
+    #[tokio::test]
+    async fn a_paused_vm_refuses_exec_pause_and_snapshot_and_resumes_back_into_all_three() {
+        let (reg, _calls, _d) = registry_vcpu(PauseBehavior::Normal);
+        let created = reg.create(create_req()).await.expect("create");
+        let id = &created.info.id;
+        reg.pause(id).await.expect("pause");
+
+        for (verb, err) in [
+            (
+                "exec",
+                reg.exec(id, ExecRequestDto::new(vec!["echo".into(), "hi".into()]))
+                    .await
+                    .expect_err("exec on a paused vm"),
+            ),
+            ("pause", reg.pause(id).await.expect_err("second pause")),
+            (
+                "snapshot",
+                reg.snapshot(id, "snap-paused")
+                    .await
+                    .expect_err("snapshot of a paused vm"),
+            ),
+        ] {
+            assert!(
+                matches!(err, DaemonError::Conflict(_)),
+                "{verb} on a paused VM must be a Conflict, got {err:?}"
+            );
+            assert_eq!(err.kind().status_code(), 409, "{verb} is a 409");
+            assert!(
+                err.message().contains("Paused"),
+                "{verb}'s message names the state that refused it: {}",
+                err.message()
+            );
+        }
+        assert!(
+            !reg.artifacts().dir().join("snap-paused").exists(),
+            "the refused snapshot must leave no prefix dir behind"
+        );
+
+        // Positive controls: all three work again after the resume.
+        reg.resume(id).await.expect("resume");
+        assert_eq!(
+            reg.exec(id, ExecRequestDto::new(vec!["echo".into(), "hi".into()]))
+                .await
+                .expect("exec after resume")
+                .stdout()
+                .expect("decode"),
+            b"echo hi"
+        );
+        reg.snapshot(id, "snap-paused")
+            .await
+            .expect("snapshot after resume");
+        reg.pause(id).await.expect("pause after resume");
+    }
+
+    // The mirror refusal: resume is admitted only from `Paused`. RED on the inverse (a `resume` that
+    // takes `VmState::Ready` as its `from`): a running VM is "resumed" and the backend is driven for
+    // nothing.
+    #[tokio::test]
+    async fn resume_of_a_running_vm_is_conflict() {
+        let (reg, calls, _d) = registry_vcpu(PauseBehavior::Normal);
+        let created = reg.create(create_req()).await.expect("create");
+        let err = reg
+            .resume(&created.info.id)
+            .await
+            .expect_err("resume of a Ready vm");
+        assert!(matches!(err, DaemonError::Conflict(_)), "got {err:?}");
+        assert_eq!(err.kind().status_code(), 409);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "a refused verb must not reach the backend at all"
+        );
+        // Positive control: the verb is not simply broken.
+        reg.pause(&created.info.id).await.expect("pause");
+        reg.resume(&created.info.id).await.expect("resume");
+    }
+
+    // "Derived from the handle, not a hopeful label" (design §11.4, The VM registry and the start-up
+    // sweep): a pause the BACKEND refused leaves the VM `Ready`, and the positive control proves that
+    // `Ready` is real rather than a stale label — the VM still execs.
+    //
+    // RED on the inverse (publishing `verb.to()` before driving the handle, or ignoring its error):
+    // the VM reads `Paused` while its guest is still running, and every later `exec` 409s against a
+    // cell that would have answered.
+    #[tokio::test]
+    async fn a_backend_pause_failure_leaves_the_vm_ready_and_usable() {
+        let (reg, calls, _d) = registry_vcpu(PauseBehavior::Fails);
+        let created = reg.create(create_req()).await.expect("create");
+        let id = &created.info.id;
+
+        let err = reg.pause(id).await.expect_err("the backend refuses");
+        assert!(matches!(err, DaemonError::Internal(_)), "got {err:?}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "the backend was driven");
+        assert_eq!(
+            reg.get(id).await.expect("get").state,
+            VmState::Ready,
+            "a failed pause must not publish a state the guest is not in"
+        );
+        assert_eq!(
+            reg.exec(id, ExecRequestDto::new(vec!["echo".into(), "ok".into()]))
+                .await
+                .expect("the still-Ready vm execs")
+                .stdout()
+                .expect("decode"),
+            b"echo ok"
+        );
+    }
+
+    // The one-way `Destroying` door, on the vCPU path (the law `transition_from` states once, first
+    // learned on the snapshot path): a destroy marks `Destroying` in place and parks on the handle
+    // lock the in-flight pause holds. When that pause completes it must NOT publish `Paused` over
+    // `Destroying` — that would re-advertise a VM whose teardown is already parked behind it and let
+    // a new op in behind that.
+    //
+    // RED on the inverse (`slot.set_state(verb.to())` unconditionally in `drive_vcpus`): the pause
+    // returns `Paused` for a VM being torn down, and the doomed VM is admitted for further ops.
+    #[tokio::test]
+    async fn a_pause_landing_behind_a_parked_teardown_does_not_reopen_the_vm() {
+        let gate = Arc::new(HandleGate::default());
+        let (reg, _calls, _d) = registry_vcpu(PauseBehavior::Blocked(gate.clone()));
+        let reg = Arc::new(reg);
+        let created = reg.create(create_req()).await.expect("create");
+        let id = created.info.id.clone();
+        let budget = std::time::Duration::from_millis(500);
+
+        let pause_reg = reg.clone();
+        let pause_id = id.clone();
+        let pause = tokio::spawn(async move { pause_reg.pause(&pause_id).await });
+        gate.entered.notified().await; // the backend pause is now in flight, holding `inner`
+
+        let destroy_reg = reg.clone();
+        let destroy_id = id.clone();
+        let destroy = tokio::spawn(async move { destroy_reg.destroy(&destroy_id).await });
+
+        // Wait until the teardown has marked the slot in place and parked on the handle lock.
+        let deadline = tokio::time::Instant::now() + budget;
+        loop {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the teardown never reached `Destroying` within {budget:?}"
+            );
+            if reg
+                .get(&id)
+                .await
+                .is_ok_and(|i| i.state == VmState::Destroying)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        gate.release.notify_one();
+        let info = pause
+            .await
+            .expect("join")
+            .expect("the pause itself succeeded");
+        assert_eq!(
+            info.state,
+            VmState::Destroying,
+            "a pause completing behind a parked teardown reports the doomed state, never `Paused`"
+        );
+        tokio::time::timeout(budget, destroy)
+            .await
+            .expect("the teardown completes once the pause releases the handle")
+            .expect("join")
+            .expect("destroy");
+        assert!(reg.is_empty().await, "the VM is gone");
+    }
+
+    // The call-site scan for the one-way `Destroying` door (AGENTS.md: a gate binds the CALL SITES,
+    // not just the extracted predicate). `transition_from` is the law; `set_state` is the
+    // unconditional assignment it is built on, and only two callers may use it — the snapshot's
+    // `Snapshotting` claim (which holds the handle lock and is what a teardown then parks behind) and
+    // `teardown_slot`'s `Destroying` mark (the door itself). Every other op publishes its result
+    // through `transition_from`.
+    //
+    // RED on the inverse: add a third `set_state` call — e.g. `drive_vcpus` publishing `Paused`
+    // unconditionally, the exact shape `a_pause_landing_behind_a_parked_teardown_does_not_reopen_the_vm`
+    // catches at runtime. Two gates for one law is deliberate: the runtime one proves the behavior,
+    // this one proves no NEW op quietly reintroduces the shape somewhere the runtime gate is not
+    // looking.
+    #[test]
+    fn only_the_snapshot_claim_and_the_teardown_mark_assign_a_state_unconditionally() {
+        let src = include_str!("registry.rs");
+        let prod = src
+            .split("\n#[cfg(test)]\n")
+            .next()
+            .expect("the production half of this file");
+        let sites: Vec<&str> = prod
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .filter(|code| code.contains("set_state(") && !code.contains("fn set_state"))
+            .map(str::trim)
+            .collect();
+        assert_eq!(
+            sites.len(),
+            2,
+            "exactly two unconditional state assignments may exist — the `Snapshotting` claim and \
+             the `Destroying` mark. Everything else publishes through `transition_from`, which is \
+             what keeps `Destroying` a ONE-WAY door. Found: {sites:#?}"
+        );
+        assert!(
+            sites.iter().any(|s| s.contains("VmState::Snapshotting")),
+            "the snapshot claim must be one of them: {sites:#?}"
+        );
+        assert!(
+            sites.iter().any(|s| s.contains("VmState::Destroying")),
+            "the teardown mark must be the other: {sites:#?}"
+        );
+    }
+
+    // A paused VM is still an OWNED VM: it holds its VMM process, netns/tap, cgroup and scratch dir,
+    // so it still PINS its artifacts and must still be destroyable — otherwise pausing a cell would
+    // be a way to leak one. `stats` reads the cgroup and needs no particular state, so it keeps
+    // working too. RED on the inverse (a `pins` that skips paused slots, or a `destroy` that
+    // requires `Ready`): the delete succeeds under a live VM, or the paused VM cannot be reclaimed.
+    #[tokio::test]
+    async fn a_paused_vm_still_pins_its_artifacts_stats_and_can_be_destroyed() {
+        let (reg, _calls, _d) = registry_vcpu(PauseBehavior::Normal);
+        reg.artifacts()
+            .create("paused-disk", b"bytes")
+            .expect("seed disk");
+        let created = reg
+            .create(create_req().with_extra_disk("paused-disk"))
+            .await
+            .expect("create");
+        let id = &created.info.id;
+        reg.pause(id).await.expect("pause");
+
+        assert!(
+            matches!(
+                reg.delete_artifact_if_unused("paused-disk").await,
+                Err(DaemonError::InUse(_))
+            ),
+            "a paused VM still pins its disks"
+        );
+        assert!(reg.artifacts().exists("paused-disk"), "the file survives");
+        reg.stats(id).await.expect("stats work on a paused vm");
+
+        reg.destroy(id).await.expect("a paused vm is destroyable");
+        assert!(reg.is_empty().await, "the paused VM is gone after destroy");
+        // Positive control: the pin released with the VM.
+        reg.delete_artifact_if_unused("paused-disk")
+            .await
+            .expect("delete after teardown");
+        assert!(!reg.artifacts().exists("paused-disk"));
     }
 }
 

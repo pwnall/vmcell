@@ -6681,3 +6681,107 @@ actionlint, zizmor, typos, semver-checks, 1356 unit tests, doctests, and the who
 `vmcell-privilege/src/lib.rs` (both crate roots took the preamble line), so the blessed runner is
 stale and needs `just bless` before `test-privileged`/`test-daemon`/`test-validator` can certify the
 tree under review.
+
+
+## Wave 6 — Tier E, the first four designed features
+
+For docs/implementation-notes.md (I may not edit docs/**):
+
+**PTY `StdinEof` is a typed refusal, not the design's "no-op" (E2, design §17 Sessions; §3.3 deviation).** Design §3.3 specifies `StdinEof` as "a no-op for a PTY session … a half-closed-input refinement is §17". As built, that no-op was worse than documented: `route_stdin_eof` enqueued `StdinItem::Eof` and the stdin writer thread discarded it for a PTY sink — an accepted input neither honored nor rejected, with the host's `Session::close_stdin` returning `Ok(())`. §17's refinement is now landed as a **refusal**, and §3.3's "no-op" wording is superseded: `Session::close_stdin` returns `Error::CapabilityUnavailable` for a PTY session (decided host-side from the `SessionSpec`, before `encode_frame`, so no frame reaches the wire), and `route_stdin_eof` refuses one loud in-guest for a non-conforming client. Option (a) — deliver the termios `VEOF` — was implemented, measured, and rejected: VEOF means end-of-input only to a reader in canonical mode at that instant and is a literal `0x04` data byte to any other, and the mode can change between the check and the write, so no mode-discriminating variant is sound. §7.2 governs: an absent facility is refused, not approximated. Two predicates hold the one law, one per side of the wire (they cannot be single-sourced without touching `vmcell-protocol`): `Session::supports_stdin_close` (host) and `SessionHandle::accepts_stdin_eof` (guest, one call site — `session_stdin_route`), each with an in-file call-site scan. **Recorded honest boundary:** the guest's refusal is a `tracing::warn!`, because the protocol's only guest→host session frames are `SessionStdout`/`SessionStderr`/`SessionExit` — an in-band report would inject steward prose into the caller's terminal stream, and a per-frame error reply would be a wire-protocol addition. It is unreachable through vmcell's own host API by construction.
+
+
+For `docs/implementation-notes.md` (I could not edit docs/ — please land this, it is a justified deviation from a design statement):
+
+### E5: the netns-scoped net-usage read is netlink, not sysfs (§7.1 / §17 premise corrected)
+
+§7.1 ("Per-VM egress bytes belong in a future *network*-scoped usage type that reads
+`/sys/class/net/<if>/statistics` inside the VM netns") and §17's Networking register state the
+mechanism as fact. The mechanism does not work. sysfs's net subsystem is namespace-tagged **per
+superblock**, captured at mount time — `kernfs_super_info->ns` — so `setns(CLONE_NEWNET)` moves the
+calling thread and leaves the inherited `/sys` describing the namespace it was mounted in. That is
+why iproute2's `netns_exec` unshares the mount namespace and re-mounts `/sys` at all ("Mount a
+version of /sys that describes the network namespace").
+
+Observed on this host, no privileges needed:
+
+    $ bwrap --unshare-net --unshare-user --dev-bind / / -- \
+        sh -c 'ls /sys/class/net; ip -o link show'
+    enx9cbf0d000d07 enxa0cec8fb6e0c lo wlp170s0     # sysfs: the ROOT netns
+    lo                                              # netlink: the new netns
+
+A sysfs read after a bare `setns` therefore answers about the **root** namespace: `ENOENT` for a tap
+that exists only inside the VM's namespace (which `tests/lifecycle.rs` already notes never appears
+under the root `/sys/class/net`), and — the dangerous arm — the **host's** counters for any name
+that collides. Making the sketch literal needs `unshare(CLONE_NEWNS)` plus a fresh sysfs mount per
+read, i.e. new `unsafe` in `net_sys.rs` and a mount namespace on an observation path.
+
+AS BUILT: `net::usage::NetUsageTarget::read` issues one `RTM_GETLINK` for the named interface and
+decodes `IFLA_STATS64`, on a netlink socket created **after** the namespace move — a socket's netns
+is fixed at `socket()` time, which is `net_sys::setns_net`'s own documented rationale. `IFLA_STATS64`
+carries the same `rtnl_link_stats64` struct sysfs renders as text, so nothing is lost. The move goes
+through the existing `net::tap::in_netns`; there is no second `setns`.
+
+Do not "fix" this back to sysfs. `net::usage::counter_reader_gate` reddens on a production
+`"/sys/class/net` read and on a second `LinkAttribute::Stats64` decode, in both directions.
+
+Also worth folding into the design when it is next reissued: §7.1's and §17's sentences should say
+"a netlink `IFLA_STATS64` read inside the VM netns" rather than the sysfs path.
+
+SECOND ENTRY — a scoping deviation, smaller:
+
+### E5: no `MicroVm::net_usage()` convenience method (yet)
+
+The per-VM entry point is `NetUsageTarget::for_vm(vm.netns(), vm.segment_membership())?.read()`.
+`orchestrator.rs` was outside this change's file allowlist, so the one-line delegation
+`MicroVm::net_usage()` is not there. It is a two-line addition against a law that already exists and
+is already gated; adding it is safe and needs no new test beyond routing the live leg through it.
+
+
+For `docs/implementation-notes.md` (I could not edit docs/**):
+
+**Tier E3+E4 landed (daemon pause/resume routes; streaming artifact upload).** §17's "Pause/resume
+routes" and "Streaming upload (v1 reads the file into memory)" are closed; §17 and docs/92's Tier E
+list should be rewritten as closed.
+
+E3. `POST /v1/vms/{id}/pause` and `/resume`, added to the ONE `API_ROUTES` table so the router fold
+and the served OpenAPI document pick them up by construction (P5). The state machine is
+`Registry::drive_vcpus`, one core shared by both verbs through a `VcpuVerb` carrying the three facts
+that differ (required state, published state, handle call). It reuses the shapes `exec`/`snapshot`
+already had, for the reasons they had them: state checked before queueing on the handle lock (prompt
+409), re-checked under it, and the result published only on success and only through
+`VmSlot::transition_from`. That helper GENERALIZES the old `leave_snapshotting` — the one-way
+`Destroying` door is now one law rather than a snapshot-specific special case, which is what stops a
+pause landing behind a parked teardown from re-advertising a doomed VM. Both a runtime gate and a
+call-site scan hold it. `snapshot` of a paused VM is refused deliberately: the backend's own snapshot
+pauses and RESUMES internally, so allowing it would restart the guest behind the daemon's state.
+RECORDED RESIDUAL, at the call site: a backend that pauses the guest and then fails its reply leaves
+the daemon reporting `Ready` for a stopped guest. The alternative — recording the state a failed call
+asked for — makes the label a wish on every path; the client's remedy is retry or destroy.
+
+E4. The upload streams on both ends. `ArtifactStore::create_streaming` returns an `ArtifactWriter`
+fed chunk by chunk; `ArtifactStore::create` is now literally that path with one chunk, so create-only,
+atomicity, the digest sidecar, the rollback and the cap are stated once and cannot drift between the
+buffered and streamed doors. The handler takes the raw `axum::body::Body` — note that
+`DefaultBodyLimit` is an EXTRACTOR-side limit and so does not apply to it; the ceiling is the store's
+own `max_bytes` (from `vmcelld --max-artifact-bytes`, default 4 GiB), checked BEFORE each chunk is
+written, which bounds the disk as well as the memory. Abandoning a writer publishes nothing because
+the name is claimed only by the `persist_noclobber` inside `finish` and the `NamedTempFile` removes
+itself on `Drop`; the handler therefore has no cleanup path that could itself be wrong. Client side,
+`UploadBody::Path` is `tokio::fs::File` -> `reqwest::Body` (reqwest's `stream` feature), which sends
+chunked with no `Content-Length` — that framing difference is the only externally observable
+discriminator between reading a file and streaming it, and it is what the client's gate asserts.
+
+
+For docs/implementation-notes.md (docs are outside my scope; supplied as text):
+
+E1 — structured serial fault capture (panic/oops/KASAN/lockdep → typed Error). Landed. Three judgements are recorded because each is a road not taken:
+
+(a) THE TWO CLASSIFIERS STAY TWO. `vmcell::vmm::fault` (host-side, "did the guest kernel die, and should this lifecycle op say so instead of reporting its own budget") and `vmcell-artifact-validator::classify` (conformance, "which §5.4 artifact contract clause did this boot break") are not merged. Their needle sets are disjoint and the boundary was already drawn in the validator's own source (classify.rs:647 records that it does not claim `Kernel panic` because the host owns it). What WAS folded is the duplicate that existed: `RealSerialLog::contains_panic`'s three inline panic literals now come from `GuestFault::Panic.signatures()`. Any future unification must go validator → vmcell, never back, because that is the only direction the dependency edge allows; the module rustdoc says so, so the next reader does not re-derive it.
+
+(b) ONLY A **STOPPED** KERNEL ABORTS A WAIT; every class RE-LABELS an expiry. `classify_serial_fault` returns a `kind` (the cause, by one precedence list) and a `halted` flag (a panic signature is present) computed INDEPENDENTLY. The connect loop aborts on `halted`, which is byte-for-byte today's fast-fail condition, and relabels on expiry for any class. An oops or a KASAN report therefore does NOT cut a boot short: the kernel keeps running after both, and §5.5 ships KASAN/LOCKDEP kernels deliberately, so aborting on them would fail boots that would have succeeded. Being wrong that way costs a fabricated failure; being conservative costs only latency on a boot that was already going to fail. Do not "tighten" this without measuring.
+
+(c) A HOST PROBLEM MUST NOT BECOME A GUEST-FAULT REPORT, and the mechanism is `RealSerialLog::read()` returning `None` (not `Some("")`) for an absent or unreadable console. Absent evidence and empty evidence mean opposite things — the validator learned the same lesson from the other direction with `BootKind::Restored` — so a wedged `vhost-device-vsock`, a missing socket, or a busy host still reports itself as `Error::Timeout`. The negative controls (`a_real_healthy_boot_is_not_a_guest_fault`, `a_healthy_console_still_reports_the_hosts_own_timeout`, `an_absent_console_is_not_a_guest_fault`) are the load-bearing tests, and the healthy fixture is a REAL captured vmcell boot whose cmdline echo contains `panic=1` — which is what disqualifies the obvious needle by evidence rather than by argument.
+
+GATE DEFECT WORTH REMEMBERING (a new instance of the vacuity class, found by the gate's own self-test): a source-scanning ban that extracts its needles from a Rust const array must JOIN the file before matching. rustfmt decides per-const whether the array fits on one line; the line-at-a-time extractor silently dropped every literal of a collapsed const and then ran past the array picking up unrelated strings, so the gate printed `ok: 11 signatures` while guarding the wrong 11 and letting a real inline `contains("Kernel panic")` through. Both rustfmt shapes plus a decoy literal outside every array are now pinned in the self-test.
+
+STALE COMMENT LEFT BEHIND (validator crate was off-limits to this lane): `crates/vmcell-artifact-validator/src/checks.rs:1177` still says the erofs root-mount panic "surfaces only as \"Panic detected in serial log\"". That string no longer exists; the failure now arrives as `Error::GuestKernelFault` carrying the kernel's own panic line, which the validator still overlays its §5.4 clause on. Comment-only; nothing depends on it.

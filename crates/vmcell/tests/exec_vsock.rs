@@ -324,9 +324,18 @@ async fn connect_panic_in_serial_log_fails_fast() {
     .await;
     let elapsed = start.elapsed();
 
+    // E1: the fast-fail is unchanged; what it RETURNS is now typed. `FakeSerialLog` knows only the
+    // boolean, so the honest classification is an evidence-free `Panic` (`SerialFault::opaque_panic`)
+    // — `tests/serial_fault.rs` is where a console with real text proves the cause is named.
     assert!(
-        matches!(&res, Err(vmcell::Error::Steward(_))),
-        "connect must fail with Error::Steward on a panicked serial log, got {res:?}"
+        matches!(
+            &res,
+            Err(vmcell::Error::GuestKernelFault {
+                fault: vmcell::vmm::fault::GuestFault::Panic,
+                ..
+            })
+        ),
+        "connect must fail with a typed guest-kernel fault on a panicked serial log, got {res:?}"
     );
     assert!(
         elapsed < std::time::Duration::from_secs(1),

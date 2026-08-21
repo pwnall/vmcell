@@ -51,6 +51,12 @@ impl VmEngine for OverCapEngine {
     async fn get(&self, _id: &VmId) -> DaemonResult<VmInfo> {
         Ok(vminfo())
     }
+    async fn pause(&self, _id: &VmId) -> DaemonResult<VmInfo> {
+        Ok(vminfo())
+    }
+    async fn resume(&self, _id: &VmId) -> DaemonResult<VmInfo> {
+        Ok(vminfo())
+    }
     async fn exec(&self, _id: &VmId, _req: ExecRequestDto) -> DaemonResult<ExecOutcomeDto> {
         Ok(ExecOutcomeDto {
             code: 0,

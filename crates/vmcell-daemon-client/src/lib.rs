@@ -139,13 +139,29 @@ impl From<PathBuf> for UploadBody {
 }
 
 impl UploadBody {
-    fn into_bytes(self) -> Result<Vec<u8>, ClientError> {
+    /// Turns this body into the `reqwest` body that will be written to the wire.
+    ///
+    /// The [`UploadBody::Path`] arm **streams**: the file is opened and handed to `reqwest` as a byte
+    /// stream, so a multi-gigabyte kernel or rootfs is written chunk by chunk and never sits in the
+    /// client's memory (design §11.7, The client library and CLI; §17, Open gaps and future
+    /// capabilities — "Streaming upload (v1 reads the file into memory)"). v1 called `std::fs::read`
+    /// here, which made the largest artifact a client could upload a function of its own RAM, and
+    /// made a streaming server pointless: the buffering had already happened.
+    ///
+    /// The file is opened here rather than at [`UploadBody::from`] so the I/O error arrives at the
+    /// call that can report it, and so a body built and never sent holds no file descriptor.
+    ///
+    /// # Errors
+    /// [`ClientError::Io`] if the file cannot be opened.
+    async fn into_reqwest_body(self) -> Result<reqwest::Body, ClientError> {
         match self {
-            Self::Bytes(b) => Ok(b),
-            // v1 reads the file into memory; streaming a large image is a small follow-up
-            // (`reqwest::Body::wrap_stream`), recorded in design §17 (Open gaps and future capabilities).
-            Self::Path(p) => std::fs::read(&p)
-                .map_err(|e| ClientError::Io(format!("cannot read {}: {e}", p.display()))),
+            Self::Bytes(b) => Ok(reqwest::Body::from(b)),
+            Self::Path(p) => {
+                let file = tokio::fs::File::open(&p)
+                    .await
+                    .map_err(|e| ClientError::Io(format!("cannot open {}: {e}", p.display())))?;
+                Ok(reqwest::Body::from(file))
+            }
         }
     }
 }
@@ -274,10 +290,11 @@ impl DaemonClient {
         artifact_name: &str,
         body: impl Into<UploadBody>,
     ) -> Result<ArtifactInfo, ClientError> {
-        // Validated client-side for a clear early error (the same predicate the daemon enforces).
+        // Validated client-side for a clear early error (the same predicate the daemon enforces) —
+        // and before the file is opened, so a bad name costs no I/O.
         let url = self.artifact_url(artifact_name)?;
-        let bytes = body.into().into_bytes()?;
-        self.send_json(self.http.put(url).body(bytes)).await
+        let body = body.into().into_reqwest_body().await?;
+        self.send_json(self.http.put(url).body(body)).await
     }
 
     /// Lists artifacts.
@@ -385,6 +402,27 @@ impl DaemonClient {
     pub async fn stats(&self, id: &VmId) -> Result<ResourceUsageDto, ClientError> {
         let url = self.vm_url(id, "v1/vms/{}/stats")?;
         self.send_json(self.http.get(url)).await
+    }
+
+    /// `pause`: stops a `Ready` VM's vCPUs, returning its updated info (design §11.5, The HTTP REST
+    /// API and its OpenAPI document). Every host resource stays held, so the VM still pins its
+    /// artifacts; `exec`/`snapshot` are refused with [`ErrorKind::Conflict`] until it is resumed.
+    ///
+    /// # Errors
+    /// [`ClientError`] — [`ErrorKind::Conflict`] if the VM is not `Ready`, [`ErrorKind::NotFound`] if
+    /// it is gone.
+    pub async fn pause(&self, id: &VmId) -> Result<VmInfo, ClientError> {
+        let url = self.vm_url(id, "v1/vms/{}/pause")?;
+        self.send_json(self.http.post(url)).await
+    }
+
+    /// `resume`: restarts a `Paused` VM's vCPUs, returning its updated info.
+    ///
+    /// # Errors
+    /// [`ClientError`] — [`ErrorKind::Conflict`] if the VM is not `Paused`.
+    pub async fn resume(&self, id: &VmId) -> Result<VmInfo, ClientError> {
+        let url = self.vm_url(id, "v1/vms/{}/resume")?;
+        self.send_json(self.http.post(url)).await
     }
 
     /// `snapshot`: writes a warm snapshot into the artifact store under `artifact_prefix/`.
@@ -599,13 +637,15 @@ mod tests {
                 .expect_err("exec"),
         ));
         refused.push(("stats", c.stats(&escape_id).await.expect_err("stats")));
+        refused.push(("pause", c.pause(&escape_id).await.expect_err("pause")));
+        refused.push(("resume", c.resume(&escape_id).await.expect_err("resume")));
         refused.push((
             "snapshot",
             c.snapshot(&escape_id, "snap1").await.expect_err("snapshot"),
         ));
         refused.push(("destroy", c.destroy(&escape_id).await.expect_err("destroy")));
 
-        assert_eq!(refused.len(), 8, "every resource-naming verb is covered");
+        assert_eq!(refused.len(), 10, "every resource-naming verb is covered");
         for (verb, err) in &refused {
             assert_eq!(
                 err.kind(),
@@ -693,7 +733,7 @@ mod tests {
             );
         }
         assert!(
-            checked_joins >= 9,
+            checked_joins >= 11,
             "the scan found only {checked_joins} checked joins — it is not reading the verbs"
         );
         assert_eq!(
@@ -702,11 +742,176 @@ mod tests {
         );
     }
 
-    #[test]
-    fn upload_body_from_bytes_roundtrips() {
-        let b = UploadBody::from(vec![1u8, 2, 3])
-            .into_bytes()
-            .expect("bytes");
-        assert_eq!(b, vec![1, 2, 3]);
+    // ---- the streaming upload (design §11.7, The client library and CLI; §17, Open gaps and future
+    // capabilities — "Streaming upload (v1 reads the file into memory)") ----
+
+    /// What a one-shot loopback server saw: the request head (headers verbatim) and the decoded body.
+    struct SeenRequest {
+        head: String,
+        body: Vec<u8>,
+    }
+
+    /// Serves exactly ONE HTTP/1.1 request on `listener`, decoding either framing (chunked or
+    /// content-length), answering with a JSON [`ArtifactInfo`], and returning what it received.
+    ///
+    /// Hand-rolled because the point of the gate is the bytes and headers the client actually put on
+    /// the wire — an HTTP library on this side would hide exactly the framing under test.
+    async fn serve_one_upload(listener: tokio::net::TcpListener) -> SeenRequest {
+        use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _};
+
+        let (sock, _) = listener.accept().await.expect("accept");
+        let (rd, mut wr) = sock.into_split();
+        let mut rd = tokio::io::BufReader::new(rd);
+
+        let mut head = String::new();
+        loop {
+            let mut line = String::new();
+            let n = rd.read_line(&mut line).await.expect("read head line");
+            assert!(n > 0, "the client closed before finishing the request head");
+            if line == "\r\n" {
+                break;
+            }
+            head.push_str(&line);
+        }
+
+        let lower = head.to_ascii_lowercase();
+        let mut body = Vec::new();
+        if lower.contains("transfer-encoding: chunked") {
+            loop {
+                let mut size_line = String::new();
+                rd.read_line(&mut size_line).await.expect("chunk size");
+                let size = usize::from_str_radix(size_line.trim(), 16).expect("hex chunk size");
+                if size == 0 {
+                    break;
+                }
+                let mut chunk = vec![0u8; size];
+                rd.read_exact(&mut chunk).await.expect("chunk body");
+                body.extend_from_slice(&chunk);
+                let mut crlf = [0u8; 2];
+                rd.read_exact(&mut crlf).await.expect("chunk CRLF");
+            }
+        } else if let Some(len) = lower
+            .lines()
+            .find_map(|l| l.strip_prefix("content-length:"))
+            .and_then(|v| v.trim().parse::<usize>().ok())
+        {
+            body = vec![0u8; len];
+            rd.read_exact(&mut body).await.expect("sized body");
+        }
+
+        let reply = serde_json::to_vec(&ArtifactInfo {
+            name: "rootfs.erofs".to_string(),
+            size_bytes: body.len() as u64,
+            sha256: "0".repeat(64),
+        })
+        .expect("encode reply");
+        wr.write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                reply.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("write head");
+        wr.write_all(&reply).await.expect("write body");
+        wr.flush().await.expect("flush");
+
+        SeenRequest { head, body }
+    }
+
+    /// A fixture file of `len` pseudo-random-ish bytes, in a temp dir that cleans itself up on the
+    /// panic path as well as the success path (AGENTS.md: a test's own fixtures are residue too).
+    fn fixture_file(len: usize) -> (tempfile::TempDir, PathBuf, Vec<u8>) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("rootfs.erofs");
+        let bytes: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&path, &bytes).expect("write fixture");
+        (dir, path, bytes)
+    }
+
+    async fn upload_against_a_local_server(
+        body: impl Into<UploadBody>,
+    ) -> (ArtifactInfo, SeenRequest) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(serve_one_upload(listener));
+        let client = DaemonClient::new(
+            Url::parse(&format!("http://{addr}")).expect("url"),
+            "test-key",
+        )
+        .expect("client");
+        let info = client
+            .upload_artifact("rootfs.erofs", body)
+            .await
+            .expect("upload");
+        (info, server.await.expect("server join"))
+    }
+
+    // The file arm STREAMS, proven on the wire: the request carries `Transfer-Encoding: chunked` and
+    // no `Content-Length`, which is precisely what a body of unknown length looks like — and the
+    // bytes that arrive are the file's, byte for byte, over a body far larger than one chunk.
+    //
+    // RED on the inverse (`UploadBody::Path => std::fs::read(&p)`, the v1 implementation): the whole
+    // file is in memory before the request starts, so reqwest knows its length and sends a sized
+    // body — the `chunked` assertion fails and the `Content-Length` one does too. That is the only
+    // externally visible difference between reading a file and streaming it, which is why the gate
+    // is written on the framing rather than on the payload alone.
+    #[tokio::test]
+    async fn a_file_upload_is_streamed_to_the_wire_and_arrives_byte_exact() {
+        let (_dir, path, bytes) = fixture_file(512 * 1024);
+        let (info, seen) = upload_against_a_local_server(path.as_path()).await;
+
+        let lower = seen.head.to_ascii_lowercase();
+        assert!(
+            lower.contains("transfer-encoding: chunked"),
+            "a streamed file body is chunked; head was:\n{}",
+            seen.head
+        );
+        assert!(
+            !lower.contains("content-length:"),
+            "a streamed body cannot know its length up front; head was:\n{}",
+            seen.head
+        );
+        assert_eq!(seen.body, bytes, "the file's bytes arrive unchanged");
+        assert_eq!(info.size_bytes, bytes.len() as u64);
+    }
+
+    // The positive control for the framing assertion above: the in-memory arm IS sized, so the gate
+    // is reading a real property of the body rather than something true of every request this client
+    // makes. Same verb, same server, one variable changed.
+    #[tokio::test]
+    async fn a_byte_upload_is_sent_as_a_sized_body() {
+        let bytes: Vec<u8> = (0..64 * 1024).map(|i| (i % 251) as u8).collect();
+        let (_info, seen) = upload_against_a_local_server(bytes.clone()).await;
+        let lower = seen.head.to_ascii_lowercase();
+        assert!(
+            lower.contains(&format!("content-length: {}", bytes.len())),
+            "an in-memory body knows its length; head was:\n{}",
+            seen.head
+        );
+        assert!(!lower.contains("transfer-encoding: chunked"));
+        assert_eq!(seen.body, bytes);
+    }
+
+    // The file arm reports its I/O failure as the client's own typed error, at the call that can act
+    // on it — and before anything reaches the wire.
+    #[tokio::test]
+    async fn a_missing_upload_file_is_a_typed_io_error() {
+        let c = offline_client();
+        let err = c
+            .upload_artifact(
+                "rootfs.erofs",
+                Path::new("/nonexistent/vmcell-upload-fixture"),
+            )
+            .await
+            .expect_err("a missing file must fail");
+        assert!(
+            matches!(err, ClientError::Io(_)),
+            "expected an Io error, got {err:?}"
+        );
+        assert!(err.to_string().contains("vmcell-upload-fixture"));
     }
 }

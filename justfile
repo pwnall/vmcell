@@ -704,6 +704,18 @@ gates:
     # through `just --show`, so an interpolated `{{{{just_executable()}}}}` call reads as it runs.
     ./scripts/ban-orphan-recipe.sh
     ./scripts/test-ban-orphan-recipe.sh
+    # E1: "what does a guest-kernel fault look like on the console" is ONE law
+    # (`vmcell::vmm::fault`), because the host already had two readers of the same bytes — the
+    # boolean panic detector's three inline literals and the validator's §5.4 clause literals — and
+    # their agreement (the validator deliberately does not claim `Kernel panic`) was enforced by
+    # nothing. This scanner reads its needles OUT of the `*_SIGNATURES` consts, so a needle added to
+    # the law is banned elsewhere from that moment on and the gate can never disagree with the code.
+    # The self-test proves every arm red, including the one that already bit: a line-at-a-time
+    # extractor loses every literal of a rustfmt-COLLAPSED const and then scoops unrelated strings —
+    # the first cut guarded 11 of the wrong needles and let a real inline `contains("Kernel panic")`
+    # through while printing "ok".
+    ./scripts/ban-inline-kernel-fault-signature.sh
+    ./scripts/test-ban-inline-kernel-fault-signature.sh
     # A6/A9 ("one law, one predicate"): the cross-process id-claim law — WHERE the registry is
     # (`SHARED_{VMID,SEGID}_CLAIM_DIR`) and HOW owner liveness is decided (`FsIdClaim::owner_is_live`'s
     # `/proc/{pid}` probe). Both halves drift SILENTLY and fail OPEN: a second spelling compiles, passes

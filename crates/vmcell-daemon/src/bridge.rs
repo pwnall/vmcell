@@ -168,6 +168,10 @@ pub trait VmEngine: Send + Sync {
     async fn exec(&self, id: &VmId, req: ExecRequestDto) -> DaemonResult<ExecOutcomeDto>;
     /// Samples a VM's resource usage.
     async fn stats(&self, id: &VmId) -> DaemonResult<ResourceUsageDto>;
+    /// Pauses a `Ready` VM's vCPUs, returning its updated info.
+    async fn pause(&self, id: &VmId) -> DaemonResult<VmInfo>;
+    /// Resumes a `Paused` VM's vCPUs, returning its updated info.
+    async fn resume(&self, id: &VmId) -> DaemonResult<VmInfo>;
     /// Writes a warm snapshot into the store under `prefix/`.
     async fn snapshot(&self, id: &VmId, prefix: &str) -> DaemonResult<SnapshotInfo>;
     /// Destroys a VM (graceful ordered teardown).
@@ -211,6 +215,12 @@ impl VmEngine for Registry {
     }
     async fn stats(&self, id: &VmId) -> DaemonResult<ResourceUsageDto> {
         Registry::stats(self, id).await
+    }
+    async fn pause(&self, id: &VmId) -> DaemonResult<VmInfo> {
+        Registry::pause(self, id).await
+    }
+    async fn resume(&self, id: &VmId) -> DaemonResult<VmInfo> {
+        Registry::resume(self, id).await
     }
     async fn snapshot(&self, id: &VmId, prefix: &str) -> DaemonResult<SnapshotInfo> {
         Registry::snapshot(self, id, prefix).await
@@ -280,6 +290,8 @@ enum EngineRequest {
     Get(VmId),
     Exec(VmId, ExecRequestDto),
     Stats(VmId),
+    Pause(VmId),
+    Resume(VmId),
     Snapshot(VmId, String),
     Destroy(VmId),
     IsArtifactInUse(String),
@@ -409,6 +421,16 @@ async fn dispatch(engine: &dyn VmEngine, req: EngineRequest) -> EngineReply {
         },
         EngineRequest::Stats(id) => match engine.stats(&id).await {
             Ok(v) => EngineReply::Stats(v),
+            Err(e) => err(&e),
+        },
+        // Both vCPU verbs answer with `Info` — the VM's state after the move — so a client reads the
+        // state it reached rather than assuming it.
+        EngineRequest::Pause(id) => match engine.pause(&id).await {
+            Ok(v) => EngineReply::Info(v),
+            Err(e) => err(&e),
+        },
+        EngineRequest::Resume(id) => match engine.resume(&id).await {
+            Ok(v) => EngineReply::Info(v),
             Err(e) => err(&e),
         },
         EngineRequest::Snapshot(id, prefix) => match engine.snapshot(&id, &prefix).await {
@@ -617,7 +639,12 @@ fn call_budget(req: &EngineRequest) -> Duration {
                 .max(BROKER_VM_CALL_BUDGET),
             None => BROKER_VM_CALL_BUDGET,
         },
+        // Pause/resume are VM-lifecycle, not control: each drives the VMM's own control socket AND
+        // queues on the per-VM handle lock, which an in-flight snapshot holds for a whole guest-RAM
+        // write. A control-sized budget would 500 a pause that is merely waiting its turn.
         EngineRequest::Create(_)
+        | EngineRequest::Pause(_)
+        | EngineRequest::Resume(_)
         | EngineRequest::Snapshot(..)
         | EngineRequest::Destroy(_)
         | EngineRequest::ShutdownAll => BROKER_VM_CALL_BUDGET,
@@ -857,6 +884,20 @@ impl VmEngine for BrokerClientEngine {
     async fn stats(&self, id: &VmId) -> DaemonResult<ResourceUsageDto> {
         match self.call(EngineRequest::Stats(id.clone())).await? {
             EngineReply::Stats(v) => Ok(v),
+            EngineReply::Err(w) => Err(daemon_error_from_wire(w)),
+            other => Err(unexpected(&other)),
+        }
+    }
+    async fn pause(&self, id: &VmId) -> DaemonResult<VmInfo> {
+        match self.call(EngineRequest::Pause(id.clone())).await? {
+            EngineReply::Info(v) => Ok(v),
+            EngineReply::Err(w) => Err(daemon_error_from_wire(w)),
+            other => Err(unexpected(&other)),
+        }
+    }
+    async fn resume(&self, id: &VmId) -> DaemonResult<VmInfo> {
+        match self.call(EngineRequest::Resume(id.clone())).await? {
+            EngineReply::Info(v) => Ok(v),
             EngineReply::Err(w) => Err(daemon_error_from_wire(w)),
             other => Err(unexpected(&other)),
         }

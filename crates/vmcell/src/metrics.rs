@@ -40,7 +40,12 @@ pub struct ResourceUsage {
     /// netns/interface handle, so an always-zero `net_*` field would be a lie
     /// (§7.1, What is read and enforced / rubric B8). See the "Net counters omitted
     /// from `ResourceUsage`"
-    /// deviation in `docs/implementation-notes.md`.
+    /// deviation in `docs/implementation-notes.md`. They are not *unavailable*, they are
+    /// **elsewhere**: [`net::NetUsage`](crate::net::NetUsage) is the netns-scoped usage type §7.1
+    /// names, read off the VM's host-side tap inside its namespace. The two scopes stay two types
+    /// on purpose — this one answers about a process tree, that one about an interface in a
+    /// namespace, and a VM can have the first without the second (the unprivileged smoltcp NAT has
+    /// no tap at all, and says so with a typed refusal).
     pub mem_limit_enforced: bool,
     /// Whether the memory counters (`mem_current_mib`, `mem_peak_mib`) were read
     /// and parsed successfully (§7.1, What is read and enforced, rule 3: an unread

@@ -998,12 +998,15 @@ pub const IO_LIMIT_REFILL_TIME_MS: u64 = 1000;
 /// Kernel `printk` to the legacy 8250 `ttyS0` UART is a **per-byte PIO trap → VM
 /// exit** (§5.3, The kernel command line), so verbose boot logging is a real cold-boot cost — the single
 /// largest lever in the §16 (Performance) latency pass. This knob lets debugging and specific
-/// tests opt into a verbose log without making every VM pay the exit tax. Panic
-/// capture works at every level:
-/// [`contains_panic`](crate::vmm::SerialLog::contains_panic) matches the literal panic
-/// markers (`Kernel panic`, `panicked at`, `panic - not syncing`), not log-level
-/// prefixes (§5.3, The kernel command line — the "KERN_EMERG lines" phrasing earlier
-/// revisions carried was drift).
+/// tests opt into a verbose log without making every VM pay the exit tax. Fault
+/// capture works at every level: [`classify_fault`](crate::vmm::SerialLog::classify_fault) and
+/// its boolean sibling [`contains_panic`](crate::vmm::SerialLog::contains_panic) match the
+/// kernel's own fault markers — the roster is
+/// [`GuestFault::signatures`](crate::vmm::fault::GuestFault::signatures), never a copy quoted
+/// here — not log-level prefixes (§5.3, The kernel command line — the "KERN_EMERG lines"
+/// phrasing earlier revisions carried was drift). What the LEVEL costs is the advisory classes:
+/// a panic is `KERN_EMERG` and prints at every setting, while a lockdep splat is
+/// `KERN_WARNING` and is gone below `loglevel=5`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum KernelVerbosity {

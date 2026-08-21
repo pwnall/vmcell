@@ -15,13 +15,14 @@ use crate::dto::{
 };
 use crate::error::{DaemonError, DaemonResult};
 use crate::openapi::{API_ROUTES, RouteDef, openapi_document};
-use axum::body::Bytes;
+use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Path as AxPath, Request, State};
 use axum::http::{StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::{MethodRouter, any, delete, get, post, put};
 use axum::{Json, Router};
+use futures::StreamExt as _;
 use std::sync::Arc;
 
 /// The shared handler state (cheaply `Clone` — everything is behind an `Arc` or is `Copy`).
@@ -66,6 +67,8 @@ fn method_router_for(route: &RouteDef) -> Option<MethodRouter<AppState>> {
         ("POST", "/v1/vms/{id}/exec") => post(exec_vm),
         ("GET", "/v1/vms/{id}/stats") => get(stats_vm),
         ("POST", "/v1/vms/{id}/snapshot") => post(snapshot_vm),
+        ("POST", "/v1/vms/{id}/pause") => post(pause_vm),
+        ("POST", "/v1/vms/{id}/resume") => post(resume_vm),
         ("GET", "/healthz") => get(health),
         ("GET", "/openapi.json") => get(openapi_handler),
         _ => return None,
@@ -150,12 +153,65 @@ async fn auth_layer(
 
 // ---- artifact handlers ----
 
+/// `PUT /v1/artifacts/{name}` — the **streaming** upload (design §11.7, The client library and CLI;
+/// §17, Open gaps and future capabilities).
+///
+/// Takes the raw [`Body`] rather than `Bytes` on purpose: the `Bytes` extractor buffers the whole
+/// request before the handler runs, so a 4 GiB rootfs upload was a 4 GiB allocation in the
+/// network-facing parent — and the store then had to be handed a slice it could only get by
+/// materializing it. With the body raw, [`stream_body_into_store`] moves the upload one chunk at a
+/// time and the store hashes/caps/writes as it flows.
+///
+/// The [`DefaultBodyLimit`] layer this subtree carries is an extractor-side limit and therefore does
+/// **not** apply here (nothing on this path buffers for it to bound); the per-upload ceiling is
+/// enforced chunk by chunk by [`crate::artifact_store::ArtifactWriter::write_chunk`], from the same
+/// `max_bytes` the store was opened with — a lower ceiling than the layer's, checked earlier, and one
+/// that bounds the DISK as well as the memory.
 async fn create_artifact(
     State(state): State<AppState>,
     AxPath(name): AxPath<String>,
-    body: Bytes,
+    body: Body,
 ) -> DaemonResult<Json<ArtifactInfo>> {
-    Ok(Json(state.artifacts.create(&name, &body)?))
+    Ok(Json(
+        stream_body_into_store(&state.artifacts, &name, body).await?,
+    ))
+}
+
+/// The one ingest loop: drain `body` chunk by chunk into a create-only, atomic, digest-sidecar'd
+/// store write.
+///
+/// Ordered so that **nothing is read before the name is cleared**: `create_streaming` refuses a
+/// reserved `.sha256` suffix, an invalid name, or an already-taken one before the first chunk is
+/// pulled, so a client cannot make the daemon drain gigabytes for a request that was always going to
+/// be refused.
+///
+/// **A torn upload publishes nothing.** Every failure path — a client that disconnects mid-body, a
+/// chunk that crosses the cap, an I/O error — returns through `?`, which drops the
+/// [`crate::artifact_store::ArtifactWriter`]; its temp file goes with it and the artifact's name was
+/// never claimed (the claim is the rename inside `finish`). So there is no cleanup path here that
+/// could itself be wrong.
+///
+/// # Errors
+/// The store's typed errors (`InvalidName`/`BadRequest`/`AlreadyExists`/`PayloadTooLarge`/`Internal`),
+/// plus [`DaemonError::BadRequest`] when the client's body fails mid-stream — the request was
+/// incomplete, which is the client's condition to report, not a server fault.
+async fn stream_body_into_store(
+    store: &ArtifactStore,
+    name: &str,
+    body: Body,
+) -> DaemonResult<ArtifactInfo> {
+    let mut writer = store.create_streaming(name)?;
+    let mut chunks = body.into_data_stream();
+    while let Some(chunk) = chunks.next().await {
+        let chunk = chunk.map_err(|e| {
+            DaemonError::BadRequest(format!(
+                "the upload body for artifact {name:?} failed mid-stream after {} bytes: {e}",
+                writer.written()
+            ))
+        })?;
+        writer.write_chunk(&chunk)?;
+    }
+    writer.finish()
 }
 
 async fn list_artifacts(State(state): State<AppState>) -> DaemonResult<Json<Vec<ArtifactInfo>>> {
@@ -230,6 +286,23 @@ async fn snapshot_vm(
     ))
 }
 
+/// `POST /v1/vms/{id}/pause` — stop the guest's vCPUs, leaving every host resource held. The reply
+/// is the VM's info, so the client reads the state it moved to rather than inferring it.
+async fn pause_vm(
+    State(state): State<AppState>,
+    AxPath(id): AxPath<String>,
+) -> DaemonResult<Json<VmInfo>> {
+    Ok(Json(state.engine.pause(&VmId(id)).await?))
+}
+
+/// `POST /v1/vms/{id}/resume` — restart a paused guest's vCPUs.
+async fn resume_vm(
+    State(state): State<AppState>,
+    AxPath(id): AxPath<String>,
+) -> DaemonResult<Json<VmInfo>> {
+    Ok(Json(state.engine.resume(&VmId(id)).await?))
+}
+
 async fn destroy_vm(
     State(state): State<AppState>,
     AxPath(id): AxPath<String>,
@@ -286,6 +359,12 @@ mod tests {
     }
 
     fn app_with(auth: AuthPolicy) -> Router {
+        app_with_artifacts_dir(auth).0
+    }
+
+    /// The router **and** the artifacts directory behind it, so an upload gate can assert on the
+    /// store the handler actually wrote into (and on the temp residue beside it).
+    fn app_with_artifacts_dir(auth: AuthPolicy) -> (Router, std::path::PathBuf) {
         let dir = Box::leak(Box::new(tempfile::tempdir().expect("tempdir")));
         let art_dir = dir.path().join("artifacts");
         // The engine (registry) and the parent's artifact store are separate seams over the same
@@ -301,7 +380,7 @@ mod tests {
             auth,
             max_artifact_bytes: 1 << 20,
         };
-        build_router(state)
+        (build_router(state), art_dir)
     }
 
     async fn status_of(uri: &str, auth: Option<&str>) -> StatusCode {
@@ -427,6 +506,233 @@ mod tests {
             warns.load(Ordering::SeqCst),
             0,
             "no bypass warn when a key authenticated"
+        );
+    }
+
+    // The vCPU routes are wired to the ENGINE, not to the loud `unwired` placeholder: an
+    // authenticated `pause`/`resume` of an id no registry holds comes back as the engine's typed
+    // 404, with its structured body — a row with no handler would answer the 500 `unwired` renders,
+    // and a row mounted on the wrong verb would answer 204/200. RED on the inverse: drop either arm
+    // from `method_router_for`.
+    #[tokio::test]
+    async fn the_vcpu_routes_reach_the_engine_and_render_its_typed_error() {
+        let app = app();
+        for path in ["/v1/vms/probe/pause", "/v1/vms/probe/resume"] {
+            let req = Request::builder()
+                .method("POST")
+                .uri(path)
+                .header(header::AUTHORIZATION, "Bearer secret")
+                .body(Body::empty())
+                .expect("request");
+            let resp = app.clone().oneshot(req).await.expect("response");
+            assert_eq!(
+                resp.status(),
+                StatusCode::NOT_FOUND,
+                "{path} must reach the engine, which owns no such VM"
+            );
+            let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+                .await
+                .expect("body");
+            let parsed: serde_json::Value = serde_json::from_slice(&body).expect("error body");
+            assert_eq!(parsed["error"], "not_found", "{path} body: {parsed}");
+            assert!(
+                parsed["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("no vm probe")),
+                "{path} must name the VM it could not find: {parsed}"
+            );
+        }
+    }
+
+    // ---- the streaming artifact upload (design §11.7, The client library and CLI; §17, Open gaps
+    // and future capabilities — "Streaming upload (v1 reads the file into memory)") ----
+
+    /// The temp files an in-flight upload leaves in the artifacts dir.
+    fn temp_files(dir: &std::path::Path) -> usize {
+        std::fs::read_dir(dir)
+            .expect("readdir")
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".tmp"))
+            .count()
+    }
+
+    fn upload_request(uri: &str, body: Body) -> Request<Body> {
+        Request::builder()
+            .method("PUT")
+            .uri(uri)
+            .header(header::AUTHORIZATION, "Bearer secret")
+            .body(body)
+            .expect("request")
+    }
+
+    // A body arriving in many chunks — more than any single buffer the handler holds — is stored
+    // byte-exact and answered with the digest of what was stored. The chunk count is the point: the
+    // handler never sees the whole body at once, and the digest is still right.
+    //
+    // RED on the inverse (`body: Bytes` + `store.create(&name, &body)`, the pre-streaming handler):
+    // this still passes — buffering is not observable from outside — which is exactly why the
+    // NON-buffering claim is gated separately, by the mid-flight residue leg below and by the
+    // client's own `Path`-arm gate. What this leg proves is that the streaming path did not LOSE
+    // anything: no dropped chunk, no reordered write, no digest computed over a prefix.
+    #[tokio::test]
+    async fn a_multi_chunk_upload_is_stored_byte_exact_and_digested() {
+        let (app, dir) = app_with_artifacts_dir(AuthPolicy::Key(ApiKey::from_secret(b"secret")));
+        let chunk: Vec<u8> = (0..64 * 1024).map(|i| (i % 251) as u8).collect();
+        let chunks = 12; // 768 KiB, inside the 1 MiB per-upload cap this test app carries
+        let expected: Vec<u8> = chunk
+            .iter()
+            .cycle()
+            .take(chunk.len() * chunks)
+            .copied()
+            .collect();
+
+        let stream = futures::stream::iter(
+            std::iter::repeat_n(chunk.clone(), chunks)
+                .map(Ok::<Vec<u8>, std::io::Error>)
+                .collect::<Vec<_>>(),
+        );
+        let resp = app
+            .clone()
+            .oneshot(upload_request(
+                "/v1/artifacts/rootfs",
+                Body::from_stream(stream),
+            ))
+            .await
+            .expect("response");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .expect("body");
+        let info: ArtifactInfo = serde_json::from_slice(&body).expect("ArtifactInfo");
+        assert_eq!(info.size_bytes, expected.len() as u64);
+        assert_eq!(
+            info.sha256,
+            crate::artifact_store::hex_sha256(&expected),
+            "the reply's digest is the digest of what was sent"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("rootfs")).expect("read back"),
+            expected,
+            "and the stored bytes are the ones that were sent"
+        );
+        assert_eq!(
+            temp_files(&dir),
+            0,
+            "no temp residue after a published upload"
+        );
+    }
+
+    // The per-upload cap binds a STREAM: the request is refused at the chunk that crosses it, with
+    // the typed 413 the buffered path already returned, and nothing is published. The client cannot
+    // make the daemon fill its artifacts filesystem by simply never stopping.
+    //
+    // RED on the inverse (a cap checked only in `finish`, or only by the `DefaultBodyLimit` layer —
+    // which does not apply to a raw-`Body` handler at all): the upload is accepted, or the temp file
+    // grows past the ceiling before anything notices.
+    #[tokio::test]
+    async fn an_over_cap_streamed_upload_is_a_typed_413_with_nothing_published() {
+        let (app, dir) = app_with_artifacts_dir(AuthPolicy::Key(ApiKey::from_secret(b"secret")));
+        // 32 x 64 KiB = 2 MiB against this app's 1 MiB per-upload cap.
+        let stream = futures::stream::iter(
+            std::iter::repeat_n(vec![0u8; 64 * 1024], 32)
+                .map(Ok::<Vec<u8>, std::io::Error>)
+                .collect::<Vec<_>>(),
+        );
+        let resp = app
+            .oneshot(upload_request(
+                "/v1/artifacts/toobig",
+                Body::from_stream(stream),
+            ))
+            .await
+            .expect("response");
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .expect("body");
+        let parsed: serde_json::Value = serde_json::from_slice(&body).expect("error body");
+        assert_eq!(parsed["error"], "payload_too_large", "body: {parsed}");
+        assert!(!dir.join("toobig").exists(), "nothing was published");
+        assert_eq!(temp_files(&dir), 0, "and no residue was left behind");
+    }
+
+    // The torn upload, end to end: the client disconnects mid-body. The residue check runs in the
+    // order AGENTS.md prescribes — the temp file is observed to EXIST while the body is still
+    // arriving (from inside the stream itself), and afterwards it is gone — and the artifact was
+    // never published under its real name.
+    //
+    // RED on the inverse (a handler that publishes what it received, or one that only removes its
+    // temp file on the success path): `rootfs` exists after the tear, or a `.tmp…` file survives in
+    // a store whose `list` deliberately hides it.
+    #[tokio::test]
+    async fn a_torn_upload_publishes_nothing_and_leaves_no_temp_behind() {
+        let (app, dir) = app_with_artifacts_dir(AuthPolicy::Key(ApiKey::from_secret(b"secret")));
+        let seen_mid_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let probe_dir = dir.clone();
+        let probe = seen_mid_flight.clone();
+        let stream = futures::stream::unfold(0usize, move |i| {
+            let probe_dir = probe_dir.clone();
+            let probe = probe.clone();
+            async move {
+                match i {
+                    // Mid-flight: the upload's bytes are on disk under a temp name, and the
+                    // artifact's own name holds nothing.
+                    2 => {
+                        probe.store(temp_files(&probe_dir), Ordering::SeqCst);
+                        assert!(
+                            !probe_dir.join("rootfs").exists(),
+                            "an in-flight upload must not be readable under its real name"
+                        );
+                        Some((Ok(vec![0xABu8; 64 * 1024]), i + 1))
+                    }
+                    // …and the client goes away.
+                    4 => Some((
+                        Err(std::io::Error::other("the client went away mid-upload")),
+                        i + 1,
+                    )),
+                    _ if i > 4 => None,
+                    _ => Some((Ok(vec![0xABu8; 64 * 1024]), i + 1)),
+                }
+            }
+        });
+
+        let resp = app
+            .clone()
+            .oneshot(upload_request(
+                "/v1/artifacts/rootfs",
+                Body::from_stream(stream),
+            ))
+            .await
+            .expect("response");
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "an incomplete body is the client's condition to report"
+        );
+        assert_eq!(
+            seen_mid_flight.load(Ordering::SeqCst),
+            1,
+            "the upload really was in flight, with its bytes in a temp file"
+        );
+        assert!(!dir.join("rootfs").exists(), "nothing was published");
+        assert_eq!(
+            temp_files(&dir),
+            0,
+            "and the temp file went with the request"
+        );
+
+        // Positive control: the torn upload burned nothing — the same name uploads cleanly after.
+        let resp = app
+            .oneshot(upload_request(
+                "/v1/artifacts/rootfs",
+                Body::from(b"whole".to_vec()),
+            ))
+            .await
+            .expect("response");
+        assert_eq!(resp.status(), StatusCode::OK, "the name is still free");
+        assert_eq!(
+            std::fs::read(dir.join("rootfs")).expect("read back"),
+            b"whole"
         );
     }
 

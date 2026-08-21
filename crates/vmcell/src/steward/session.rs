@@ -218,6 +218,10 @@ impl SessionMux {
     /// Returns [`Error::Steward`] if the underlying connection has already closed.
     pub async fn open(&self, spec: SessionSpec) -> Result<Session> {
         let id = SessionId(self.next_id.fetch_add(1, Ordering::Relaxed));
+        // Read the session's kind off the spec BEFORE it moves into the frame: it
+        // is what `Session::supports_stdin_close` answers from, and the host is
+        // the side that knows it without a round-trip.
+        let pty = spec.pty.is_some();
         // Encode + `MAX_FRAME_BYTES`-check BEFORE touching the registry, so an
         // over-cap spec (huge argv/env) fails loud with zero registry residue.
         let frame = encode_frame(&Message::OpenSession { session: id, spec })?;
@@ -253,6 +257,7 @@ impl SessionMux {
         }
         Ok(Session {
             id,
+            pty,
             event_rx,
             write_tx: self.write_tx.clone(),
             // The SHARED closed-flag, not a copy of it: `Session::send` reads the
@@ -328,6 +333,12 @@ impl Drop for SessionMux {
 #[derive(Debug)]
 pub struct Session {
     id: SessionId,
+    /// Whether this session was opened with a PTY — read once from the
+    /// [`SessionSpec`] at [`SessionMux::open`], because the operation that
+    /// depends on it ([`Session::close_stdin`]) must not need a round-trip to
+    /// learn what the caller already told us. The one field behind
+    /// [`Session::supports_stdin_close`].
+    pty: bool,
     event_rx: mpsc::UnboundedReceiver<SessionEvent>,
     write_tx: mpsc::UnboundedSender<::bytes::Bytes>,
     /// The mux's shared closed-flag (the [`Registry`] `Option`), read by
@@ -359,12 +370,62 @@ impl Session {
         })
     }
 
-    /// Closes the session's stdin (pipe: the child reads EOF; PTY: a no-op — end
-    /// input in-band or with [`close`](Session::close)).
+    /// Whether this session's stdin can be **half-closed** with
+    /// [`close_stdin`](Session::close_stdin) — the ONE host-side predicate for
+    /// that law (§17, Open gaps and future capabilities), so a caller branches on
+    /// the capability instead of on its own memory of how it opened the session.
+    ///
+    /// True for a pipe session; **false for a PTY session**, which has no stdin
+    /// half-close to offer: a pseudo-terminal is one bidirectional object with no
+    /// separate write end to close, and the master cannot be closed without
+    /// tearing down the session's output with it.
+    ///
+    /// The one thing that resembles a half-close on a terminal is the line
+    /// discipline's `VEOF` character, and it is **not** one. It means end-of-input
+    /// only to a reader that is in canonical mode *at the instant it arrives*, and
+    /// reaches any other reader as a literal data byte — so on a raw-mode program
+    /// (an editor, a shell with readline, anything that called `tcsetattr`)
+    /// "closing stdin" would inject `0x04` into its input stream. The mode is
+    /// guest-side and can change between any check and the write that follows it,
+    /// so even a mode-discriminating variant could not be made correct. The
+    /// facility is genuinely absent, and §7.2 (The fail-loud capability contract
+    /// and HostCapabilities) says an absent facility is refused, not approximated.
+    #[must_use]
+    pub fn supports_stdin_close(&self) -> bool {
+        !self.pty
+    }
+
+    /// Closes the session's stdin: the child reads EOF.
+    ///
+    /// **Pipe sessions only.** On a PTY session this is a typed refusal, not a
+    /// silent no-op — see [`supports_stdin_close`](Session::supports_stdin_close)
+    /// for why a pseudo-terminal has no half-close to perform. End a PTY session's
+    /// input in-band (write whatever the program treats as a terminator) or
+    /// terminate it with [`close`](Session::close).
+    ///
+    /// The refusal is decided **here**, from the [`SessionSpec`] the caller opened
+    /// with, so no frame reaches the wire and no guest state is consulted. The
+    /// guest end refuses the same frame for the same reason
+    /// (`vmcell_steward::session::route_stdin_eof`), which is what a
+    /// non-conforming client meets; before both, a PTY `StdinEof` was queued
+    /// in-guest and then discarded by the writer thread — an accepted input that
+    /// was neither honored nor rejected.
     ///
     /// # Errors
+    /// Returns [`Error::CapabilityUnavailable`] on a PTY session — the capability
+    /// check comes first, since "this session has no stdin half-close" is a
+    /// property of the session itself, true whatever the connection is doing.
     /// Returns [`Error::Steward`] if the connection has closed.
     pub async fn close_stdin(&self) -> Result<()> {
+        if !self.supports_stdin_close() {
+            return Err(Error::CapabilityUnavailable {
+                op: "stdin half-close on a PTY session".into(),
+                needed: "a pipe session (open the session without `SessionSpecBuilder::pty`); \
+                         a pseudo-terminal has no write-side half-close, so end input in-band \
+                         or terminate the session with `Session::close`"
+                    .into(),
+            });
+        }
         self.send(Message::StdinEof { session: self.id })
     }
 
@@ -1077,6 +1138,126 @@ mod tests {
             sites[0] > send_at,
             "the one `self.write_tx` site must be inside `Session::send`, not in a mutator that \
              would bypass the closed-flag check"
+        );
+    }
+
+    // §17 (Open gaps and future capabilities), the PTY half-close law, host end:
+    // `close_stdin` on a PTY session is a TYPED REFUSAL that never reaches the
+    // wire. Design §3.3 (Interactive-session wire semantics) called it "a no-op for
+    // a PTY session"; a no-op is precisely what an accepted input may not be, and
+    // the guest end proved it — the frame was queued and then discarded by the
+    // stdin writer thread, so a caller watched the operation vanish.
+    //
+    // Two data-plane assertions, not a proxy signal: (1) the typed error, and
+    // (2) the very next frame the guest peer receives is the `Stdin{ping}` sent
+    // AFTER the refusal — a single ordered writer, so a `StdinEof` emitted by the
+    // refused call would have to arrive first. The `ping` doubles as the positive
+    // control that the refusal left the session fully usable, and the pipe half of
+    // the law is `session_writes_reach_the_peer_while_the_connection_is_live`
+    // below, which asserts a pipe session's `close_stdin` DOES put a `StdinEof` on
+    // the wire — the control against a refusal widened to every session.
+    //
+    // RED on the inverse (drop the `supports_stdin_close` guard in `close_stdin`):
+    // the `expect_err` fires; keep the guard but let the frame through and the
+    // next-frame assert reads `StdinEof` instead of `Stdin`. KVM-free.
+    #[tokio::test]
+    async fn close_stdin_on_a_pty_session_is_refused_and_never_reaches_the_wire() {
+        let (client_io, server_io) = UnixStream::pair().expect("unix pair");
+        let mux = SessionMux::from_framed(Framed::new(ControlStream::Unix(client_io), codec()));
+        let mut guest = Framed::new(server_io, codec());
+
+        let pty = mux
+            .open_spec(SessionSpecBuilder::new(vec!["sh".into()]).pty(24, 80))
+            .await
+            .expect("open a pty session");
+        let pipe = mux
+            .open_spec(SessionSpecBuilder::new(vec!["cat".into()]))
+            .await
+            .expect("open a pipe session");
+        for _ in 0..2 {
+            let _ = guest.next().await.expect("open frame").expect("io");
+        }
+        assert!(
+            !pty.supports_stdin_close(),
+            "a PTY session has no stdin half-close"
+        );
+        assert!(
+            pipe.supports_stdin_close(),
+            "a pipe session does — the capability is what distinguishes them"
+        );
+
+        let err = pty
+            .close_stdin()
+            .await
+            .expect_err("close_stdin on a PTY session must fail loud, not silently vanish");
+        assert!(
+            matches!(err, Error::CapabilityUnavailable { .. }),
+            "an absent facility is a typed CapabilityUnavailable (§7.2, The fail-loud capability              contract and HostCapabilities); got {err:?}"
+        );
+
+        // The wire is untouched: the next frame is the one sent AFTER the refusal.
+        pty.write_stdin(b"ping")
+            .await
+            .expect("a refused close_stdin must leave the session usable");
+        let frame = tokio::time::timeout(Duration::from_secs(5), guest.next())
+            .await
+            .expect("the post-refusal write must reach the peer")
+            .expect("a frame")
+            .expect("io");
+        assert_eq!(
+            postcard::from_bytes::<Message>(&frame).expect("decode"),
+            Message::Stdin {
+                session: pty.id(),
+                data: b"ping".to_vec(),
+            },
+            "the refused close_stdin must not have put a StdinEof on the wire"
+        );
+    }
+
+    // §13 (Cross-cutting invariants), the CALL-SITE half of the PTY half-close law:
+    // the leg above pins the behavior, this pins that `Message::StdinEof` cannot be
+    // built anywhere but behind the one capability predicate. A second mutator (say
+    // a `close_stdin_now`) that encoded its own `StdinEof` would restore the silent
+    // no-op with that leg still green. KVM-free: it reads this file's own source,
+    // scoped to the `impl Session` block so these tests' own text cannot satisfy it.
+    //
+    // RED on the inverse: move the `Message::StdinEof` construction above the
+    // `supports_stdin_close()` guard, or add a second construction site.
+    #[test]
+    fn stdin_eof_is_sent_only_behind_the_one_capability_predicate() {
+        let src = include_str!("session.rs");
+        let start = src
+            .find("impl Session {")
+            .expect("the `impl Session` block must exist");
+        let block_len = src[start..]
+            .find("\n}\n")
+            .expect("the `impl Session` block must be terminated");
+        let block = &src[start..start + block_len];
+
+        let sites: Vec<usize> = block
+            .match_indices("Message::StdinEof")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            sites.len(),
+            1,
+            "`impl Session` must build a `Message::StdinEof` exactly once — behind the capability \
+             check; found {} site(s)",
+            sites.len()
+        );
+        let guard = block
+            .find("if !self.supports_stdin_close()")
+            .expect("`close_stdin` must guard on the one capability predicate");
+        assert!(
+            guard < sites[0],
+            "the capability refusal must come BEFORE the frame is built, or a PTY session's \
+             close_stdin reaches the wire again"
+        );
+        assert_eq!(
+            block.matches(".supports_stdin_close()").count(),
+            1,
+            "one predicate, one call site: the capability question is answered in `close_stdin` \
+             and nowhere else in `impl Session`"
         );
     }
 

@@ -199,6 +199,21 @@ const MAX_PROLOGUE_LINE_BYTES: usize = 256;
 #[cfg(feature = "host-common")]
 const READY_FRAME_READ: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// What the host was doing when it consulted the guest's console — the `op` half of
+/// [`Error::GuestKernelFault`](crate::error::Error::GuestKernelFault), in the host's own words.
+///
+/// One const for all three expiry/abort arms of [`StewardClient::connect_framed`], so a reader
+/// grepping a failure message lands on one spelling rather than three near-misses.
+#[cfg(feature = "host-common")]
+const STEWARD_HANDSHAKE_OP: &str = "steward vsock handshake";
+
+/// The host's own timeout message, kept when the console says nothing about the guest.
+///
+/// Byte-identical to the string [`StewardClient::connect_framed`] has always returned, so a
+/// caller matching on the timeout text sees no change on the path where nothing changed.
+#[cfg(feature = "host-common")]
+const STEWARD_CONNECT_TIMED_OUT: &str = "Steward connection timed out";
+
 /// How the hybrid `CONNECT <port>`/`OK` prologue failed, at the granularity its two
 /// callers interpret differently (§3.2, The host side: StewardClient and SessionMux).
 ///
@@ -725,9 +740,13 @@ impl StewardClient {
     /// prologue is identical on both transports.
     ///
     /// # Errors
-    /// Returns [`Error::Timeout`] if no `Ready` handshake completes within
-    /// `timeout`, or [`Error::Steward`] if a kernel panic is detected in the serial
-    /// log while waiting.
+    /// Returns [`Error::GuestKernelFault`](crate::error::Error::GuestKernelFault) if the guest's
+    /// serial console proves the guest kernel died — immediately once the console shows the kernel
+    /// has **stopped** (waiting longer cannot help), and on budget expiry for any fault class,
+    /// including the advisory ones that do not stop a kernel. Otherwise returns
+    /// [`Error::Timeout`] if no `Ready` handshake completes within `timeout`: a console that is
+    /// healthy, empty or unreadable leaves the host's own timeout in place, so a wedged bridge or a
+    /// busy host still reports itself (§5.4, The guest-kernel contract and the bootstrap seed).
     pub(crate) async fn connect_framed(
         endpoint: &VsockEndpoint,
         timeout: std::time::Duration,
@@ -743,12 +762,27 @@ impl StewardClient {
 
         loop {
             if tokio::time::Instant::now() > deadline {
-                return Err(Error::Timeout("Steward connection timed out".into()));
+                // The budget expired: ask the console whether the GUEST is the reason before
+                // reporting the host's own timeout (`expiry_error` — a healthy or unreadable
+                // console still yields `Error::Timeout`).
+                return Err(crate::vmm::fault::expiry_error(
+                    serial_log,
+                    STEWARD_HANDSHAKE_OP,
+                    STEWARD_CONNECT_TIMED_OUT,
+                ));
             }
 
-            // Watch serial log for kernel panic
-            if serial_log.contains_panic() {
-                return Err(Error::Steward("Panic detected in serial log".into()));
+            // The guest kernel has STOPPED: no later poll can succeed, so fail now — and fail with
+            // the CAUSE the console names, not with `Panic` for every death. `halted()` is the
+            // orthogonal question to `kind()`: a KASAN report that ended in a panic aborts here
+            // (halted) while reporting the KASAN (the cause). A console that shows only an
+            // advisory lockdep splat does NOT abort — the kernel kept running, and §5.5 ships
+            // LOCKDEP kernels on purpose — it merely re-labels the timeout above if the wait
+            // eventually expires.
+            if let Some(guest_fault) = serial_log.classify_fault()
+                && guest_fault.halted()
+            {
+                return Err(guest_fault.into_error(STEWARD_HANDSHAKE_OP));
             }
 
             // The deadline is passed IN, not merely checked between attempts: every
@@ -759,7 +793,12 @@ impl StewardClient {
                 // Terminal: the attempt consumed the whole budget, so there is nothing
                 // left to back off into.
                 Err(ConnectAttemptError::Deadline) => {
-                    return Err(Error::Timeout("Steward connection timed out".into()));
+                    // Same expiry law as the loop-top check: one implementation, both arms.
+                    return Err(crate::vmm::fault::expiry_error(
+                        serial_log,
+                        STEWARD_HANDSHAKE_OP,
+                        STEWARD_CONNECT_TIMED_OUT,
+                    ));
                 }
                 // ONE retry cadence for every failure arm. Before v30 only two of the
                 // five arms slept at all — a failed `CONNECT` write, a non-decodable

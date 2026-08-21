@@ -741,7 +741,50 @@ name = "vmcell"
 #     checkout, the marker is never found and it falls back to the start dir — a consumer wanting a
 #     stable anchor sets `$VMCELL_ARTIFACTS_DIR` (the documented §10.4 route) rather than reading
 #     this.
-version = "0.23.0"
+# 0.23.0 → 0.23.1: ADDITIVE — the netns-scoped network usage type §7.1 has named as forward work
+# since v17 and §17 still lists as an open gap. A PATCH edge on purpose: nothing moves, so the
+# fourteen sibling manifests that pin `vmcell = "0.23.0"` (a `^0.23.0` requirement) keep resolving
+# without an edit, and the whole change is reachable public API a consumer may start calling.
+# `cargo semver-checks` is SILENT by construction on an addition — this entry is the only thing that
+# records it.
+#
+#   * ADDITIVE: `net::usage`, re-exported as `net::NetUsage` / `net::NetUsageTarget`. §7.1's rule
+#     stands unchanged — `ResourceUsage` still has no `net_*` fields, because cgroup v2 has no
+#     network accounting and that read path holds only a cgroup name. The counters live in their own
+#     type read in their own scope: one interface, inside one network namespace.
+#     `NetUsageTarget::for_vm(vm.netns(), vm.segment_membership())` is the one law for *which*
+#     interface carries a VM's traffic (the per-VM tap, or the member tap in a shared segment
+#     netns), and `.read()` returns the counters.
+#
+#   * VANTAGE, and it is the part a consumer must read rather than infer: the counters are the
+#     HOST-SIDE TAP's, and a tap's own `rx`/`tx` are the host kernel's vantage, INVERTED relative to
+#     the guest's (`tun_get_user` — the VMM writing a guest frame in — bumps the device's *rx*).
+#     `NetUsage`'s fields are therefore named from the GUEST's vantage: `guest_tx_bytes` is egress
+#     and equals the tap's `rx_bytes`. The inversion happens in one private function with a unit
+#     test that reddens on a swap, because a mapping read backwards produces numbers that stay
+#     plausible forever.
+#
+#   * NO `Default`, deliberately, and this is the one place a consumer feels it: an all-zero
+#     `NetUsage` is indistinguishable from a real reading of an idle VM, so §7.1 rule 3 ("an unread
+#     counter reported as `0` is the same lie as a missing one") is enforced by making the unread
+#     state UNREPRESENTABLE rather than by a `*_read_ok` boolean beside the numbers. A mode that
+#     cannot be read is a typed `Error::CapabilityUnavailable` — the unprivileged smoltcp NAT has no
+#     tap and no namespace at all — and a namespace or interface that is gone is a loud
+#     `Error::Network`. There is no zeroed reading to mistake for a measurement.
+#
+#   * A DESIGN PREMISE CORRECTED, recorded here because §17 states the sketch as fact: §17 and §7.1
+#     both describe this read as `/sys/class/net/<if>/statistics` *inside the VM netns*. That does
+#     not work as written. sysfs's net view is namespace-tagged per SUPERBLOCK, fixed when the
+#     filesystem was mounted, so a bare `setns(CLONE_NEWNET)` leaves the inherited `/sys` describing
+#     the namespace it was mounted in — which is why `ip netns exec` unshares the mount namespace and
+#     re-mounts `/sys` at all. Verified on this tree's host: inside a fresh netns holding only `lo`,
+#     `ls /sys/class/net` still listed the ROOT namespace's interfaces while `ip link` listed `lo`
+#     alone. The shipped read is one `RTM_GETLINK` + `IFLA_STATS64` on a netlink socket created
+#     AFTER the move (a socket's namespace is fixed at `socket()` time — the documented reason
+#     `net_sys::setns_net` exists), which carries the same `rtnl_link_stats64` fields sysfs renders
+#     as text. `net::usage`'s `counter_reader_gate` holds both halves: the decode is spelled once,
+#     and NO production site reads `/sys/class/net`.
+version = "0.23.1"
 edition = "2024"
 # MSRV is the single workspace floor (`[workspace.package] rust-version`, in lockstep with
 # rust-toolchain.toml via the `just ci` sync assertion) — currently the latest stable, 1.98.0.

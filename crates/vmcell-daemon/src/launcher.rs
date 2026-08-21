@@ -62,10 +62,15 @@ pub trait VmHandle: Send {
     async fn usage(&mut self) -> DaemonResult<ResourceUsageDto>;
     /// Writes a warm snapshot into `dir` (snapshot-eligible configs only).
     async fn snapshot(&mut self, dir: &Path) -> DaemonResult<()>;
-    /// Pauses the guest (CPUs stopped). Mirrors the library `VmInstance` seam; the daemon pause/resume
-    /// **routes** are future work (design future-work, "Pause/resume routes") — not yet reachable over REST.
+    /// Pauses the guest (CPUs stopped). Mirrors the library `VmInstance` seam; reached over REST by
+    /// `POST /v1/vms/{id}/pause`, whose state machine is
+    /// [`Registry::pause`](crate::registry::Registry::pause) (design §11.5, The HTTP REST API and its
+    /// OpenAPI document).
+    ///
+    /// Every host resource stays held — the VMM process, its netns/tap, its cgroup, its scratch dir —
+    /// so a paused VM still pins its artifacts and still costs its slice. Only the vCPUs stop.
     async fn pause(&mut self) -> DaemonResult<()>;
-    /// Resumes a paused guest. Route-unwired (see `pause`).
+    /// Resumes a paused guest (`POST /v1/vms/{id}/resume`).
     async fn resume(&mut self) -> DaemonResult<()>;
     /// Graceful ordered teardown (then verify-gone). Consumes the handle.
     async fn shutdown(self: Box<Self>) -> DaemonResult<()>;

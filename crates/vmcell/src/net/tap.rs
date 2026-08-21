@@ -54,7 +54,10 @@ pub(crate) fn netns_path(name: &str) -> std::path::PathBuf {
 
 /// Runs `f` **inside** the network namespace `netns`, on a thread that exists only for this call.
 ///
-/// The one namespace-move discipline for this module (`ns-run-on-pooled-tokio-worker`). Every
+/// The one namespace-move discipline for this module and its `net::usage` sibling
+/// (`ns-run-on-pooled-tokio-worker`) — [`NetUsageTarget::read`](crate::net::NetUsageTarget::read)
+/// enters a namespace for exactly the same reason a tap setup does, so it enters through this and
+/// not through a second `setns` (which `scripts/ban-inline-setns.sh` would catch anyway). Every
 /// caller here is reached synchronously from the async `setup_env`, so the thread that would be
 /// moved is a pooled tokio runtime worker — exactly what [`crate::net_sys::setns_net`]'s contract
 /// forbids: `setns(CLONE_NEWNET)` moves the *calling thread*, and a worker left behind in a VM's
@@ -72,7 +75,7 @@ pub(crate) fn netns_path(name: &str) -> std::path::PathBuf {
 ///
 /// # Errors
 /// [`Error::Network`] if the namespace cannot be opened or entered, or if `f` panicked.
-fn in_netns<F, T>(netns: &str, f: F) -> Result<T>
+pub(crate) fn in_netns<F, T>(netns: &str, f: F) -> Result<T>
 where
     F: FnOnce() -> T + Send,
     T: Send,
@@ -139,7 +142,7 @@ where
     })
 }
 
-fn run_with_rtnetlink<F, Fut, T>(f: F) -> std::result::Result<T, String>
+pub(crate) fn run_with_rtnetlink<F, Fut, T>(f: F) -> std::result::Result<T, String>
 where
     F: FnOnce(rtnetlink::Handle) -> Fut + Send,
     Fut: std::future::Future<Output = std::result::Result<T, String>>,
@@ -1454,7 +1457,7 @@ mod tests {
 /// (a `read_dir` root, a NUL-terminated C string for the post-fork `open`), so no signature can force
 /// a future call site through the composer — only a scan can see it.
 #[cfg(test)]
-mod netns_layout_gate {
+pub(crate) mod netns_layout_gate {
     use std::collections::BTreeMap;
 
     /// `(file relative to `crates/vmcell/src`, production occurrences of the layout literal)`.
@@ -1481,10 +1484,14 @@ mod netns_layout_gate {
 
     /// Every `.rs` file under this crate's `src`, as `(relative path, production text)`.
     ///
+    /// `pub(crate)` because it is the crate's **one** source walker for a call-site scan:
+    /// `net::usage`'s `counter_reader_gate` asks the same question of a different needle, and a
+    /// second copy of a tree walk is a second thing that can silently start walking the wrong tree.
+    ///
     /// "Production" is everything before a file's unit-test module: a test that recomputes the
     /// layout independently is the *judge* of the law (`in_netns_reports_an_absent_namespace…`,
     /// `segment_names_and_gateway_come_from_the_shared_laws`), not a violation of it.
-    fn production_sources() -> Vec<(String, String)> {
+    pub(crate) fn production_sources() -> Vec<(String, String)> {
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut out = Vec::new();
         let mut stack = vec![src.clone()];

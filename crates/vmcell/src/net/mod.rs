@@ -16,8 +16,12 @@ pub mod segment;
 /// unprivileged userspace networking with smoltcp.
 pub mod smoltcp;
 
+/// Per-VM network byte counters: the netns-scoped usage type (§7.1, What is read and enforced).
+pub mod usage;
+
 pub use segment::{NetSegment, NetSegmentRef, SegmentMember, SegmentMembership};
 pub use tap::{NetNamespace, cleanup_orphan_netns};
+pub use usage::{NetUsage, NetUsageTarget};
 
 #[cfg(feature = "net-unprivileged")]
 pub use smoltcp::backend::SmoltcpProcess;

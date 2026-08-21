@@ -1325,3 +1325,174 @@ async fn a_stewardless_placement_is_rejected_400_over_rest() {
         "a refused create must leave no VM behind"
     );
 }
+
+// design §11.5 (The HTTP REST API and its OpenAPI document; §17, Open gaps and future capabilities —
+// "Pause/resume routes"): the vCPU verbs over REST, asserted on the DATA PLANE — the guest's own
+// monotonic clock — not on the state label the daemon reports.
+//
+// A paused guest does not run, so its `/proc/uptime` does not advance while the host's wall clock
+// does. The POSITIVE CONTROL is the same measurement over the same window with no pause in it: there
+// the guest's uptime tracks the host's elapsed time. Without that control, a guest that had simply
+// stopped reporting would pass.
+//
+// The refusal leg rides along: `exec` against a paused VM is a 409 `Conflict` (there is nobody in
+// there to answer), and it works again after the resume.
+#[tokio::test]
+#[ignore = "boots a real VM; needs KVM + blessed runner + artifacts (run via `just test-daemon`)"]
+async fn pause_and_resume_over_rest_stop_and_restart_the_guest_clock() {
+    /// The guest's own uptime in seconds, read through the control plane. Pure shell (`read` from
+    /// `/proc/uptime`), so the measurement does not depend on which utilities the rootfs carries.
+    async fn guest_uptime(c: &DaemonClient, id: &vmcell_daemon_client::dto::VmId) -> f64 {
+        let out = c
+            .exec(
+                id,
+                ExecRequestDto::new(vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "read up rest < /proc/uptime; echo $up".into(),
+                ]),
+            )
+            .await
+            .expect("read the guest's uptime");
+        assert_eq!(out.code, 0, "uptime read failed in-guest");
+        String::from_utf8_lossy(&out.stdout().expect("decode"))
+            .trim()
+            .parse()
+            .expect("/proc/uptime's first field is a float")
+    }
+
+    let d = Daemon::start(Auth::Open).await;
+    let c = d.client("");
+    let vm = c.create("vmlinux", "rootfs.erofs").await.expect("create");
+    let window = Duration::from_secs(3);
+
+    // --- the control: the same window, un-paused ---
+    let control_start = std::time::Instant::now();
+    let before = guest_uptime(&c, &vm.id).await;
+    tokio::time::sleep(window).await;
+    let after = guest_uptime(&c, &vm.id).await;
+    let control_host = control_start.elapsed().as_secs_f64();
+    let control_guest = after - before;
+    assert!(
+        control_guest > control_host - 1.0,
+        "a RUNNING guest's clock tracks the host's: guest advanced {control_guest:.2}s over \
+         {control_host:.2}s of wall clock"
+    );
+
+    // --- the measurement: the same window, paused ---
+    let paused_start = std::time::Instant::now();
+    let before = guest_uptime(&c, &vm.id).await;
+    let info = c.pause(&vm.id).await.expect("pause");
+    assert_eq!(
+        info.state,
+        vmcell_daemon_client::dto::VmState::Paused,
+        "the reply carries the state it moved to"
+    );
+    assert_eq!(
+        c.get(&vm.id).await.expect("get").state,
+        vmcell_daemon_client::dto::VmState::Paused,
+        "and `GET /v1/vms/{{id}}` observes it"
+    );
+
+    // A paused cell has nobody to answer an exec: a prompt 409, not a hang.
+    let err = c
+        .exec(&vm.id, ExecRequestDto::new(vec!["/bin/true".into()]))
+        .await
+        .expect_err("exec against a paused VM");
+    assert_eq!(err.kind(), Some(ErrorKind::Conflict), "got {err}");
+
+    tokio::time::sleep(window).await;
+    let info = c.resume(&vm.id).await.expect("resume");
+    assert_eq!(info.state, vmcell_daemon_client::dto::VmState::Ready);
+    let after = guest_uptime(&c, &vm.id).await;
+    let paused_host = paused_start.elapsed().as_secs_f64();
+    let paused_guest = after - before;
+    assert!(
+        paused_guest < paused_host - 2.0,
+        "a PAUSED guest's vCPUs are stopped: guest advanced {paused_guest:.2}s over \
+         {paused_host:.2}s of wall clock (the control advanced {control_guest:.2}s over \
+         {control_host:.2}s)"
+    );
+
+    c.destroy(&vm.id).await.expect("a resumed VM tears down");
+    assert!(c.ls().await.expect("ls").is_empty(), "no VM left behind");
+}
+
+// design §11.7 (The client library and CLI; §17, Open gaps and future capabilities — "Streaming
+// upload"): a large artifact travels the whole streaming path — the client reads it off disk as the
+// request body is written, and the daemon hashes and writes it chunk by chunk — and the digest the
+// store returns covers the WHOLE body.
+//
+// The digest is checked without a second hasher in this crate: two uploads of identical bytes must
+// agree, and an upload differing in its LAST byte must not. That last byte is the point — a digest
+// computed over only the first chunk (or a body truncated at one) collides here, which is precisely
+// the failure a streaming rewrite risks.
+#[tokio::test]
+#[ignore = "spawns a real vmcelld; needs the blessed runner (run via `just test-daemon`)"]
+async fn a_large_artifact_streams_up_and_is_digested_over_its_whole_body() {
+    let d = Daemon::start(Auth::Open).await;
+    let c = d.client("");
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    // 24 MiB: far past any single read buffer on either side of the wire.
+    let len = 24 * 1024 * 1024;
+    let bytes: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+    let a = dir.path().join("big-a");
+    let b = dir.path().join("big-b");
+    let tail = dir.path().join("big-tail");
+    std::fs::write(&a, &bytes).expect("fixture a");
+    std::fs::write(&b, &bytes).expect("fixture b");
+    let mut altered = bytes.clone();
+    let last = altered.len() - 1;
+    altered[last] ^= 0xff; // ONE byte, in the final chunk
+    std::fs::write(&tail, &altered).expect("fixture tail");
+
+    let info_a = c
+        .upload_artifact("big-a", a.as_path())
+        .await
+        .expect("stream a 24 MiB artifact up");
+    assert_eq!(
+        info_a.size_bytes, len as u64,
+        "every byte of the streamed body was stored"
+    );
+    assert_eq!(info_a.sha256.len(), 64);
+
+    let info_b = c
+        .upload_artifact("big-b", b.as_path())
+        .await
+        .expect("upload b");
+    assert_eq!(
+        info_a.sha256, info_b.sha256,
+        "identical bodies must hash identically"
+    );
+
+    let info_tail = c
+        .upload_artifact("big-tail", tail.as_path())
+        .await
+        .expect("upload tail");
+    assert_ne!(
+        info_a.sha256, info_tail.sha256,
+        "a body differing only in its LAST byte must hash differently — the digest has to cover \
+         the final chunk, not just the first"
+    );
+    assert_eq!(info_tail.size_bytes, len as u64);
+
+    // The store read the same digest back off the sidecar it wrote at upload.
+    assert_eq!(
+        c.get_artifact("big-a").await.expect("get").sha256,
+        info_a.sha256
+    );
+
+    // Create-only survives the streaming path: a second upload of a taken name is a 409, and the
+    // stored bytes are untouched (positive control: a fresh name still uploads).
+    let err = c
+        .upload_artifact("big-a", b.as_path())
+        .await
+        .expect_err("the store has no update");
+    assert_eq!(err.kind(), Some(ErrorKind::AlreadyExists), "got {err}");
+    assert_eq!(
+        c.get_artifact("big-a").await.expect("get").sha256,
+        info_a.sha256,
+        "the refused upload did not overwrite"
+    );
+}

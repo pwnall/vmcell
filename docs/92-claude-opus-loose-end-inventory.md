@@ -108,6 +108,22 @@ seccomp deny-list default-on (per-backend live validation is its stated precondi
 governs ("environmental" is a hypothesis, not a diagnosis). What a diagnosis must explain is why a
 socket bound before `start()` returns is not connectable within 2 s.
 
+**Wave 6 — the first four Tier E features.** A guest kernel fault is now a typed
+`Error::GuestKernelFault` rather than whichever budget expired first: one recognizer, `SerialFault`'s
+cause and its "did the kernel stop" question kept deliberately orthogonal (a KASAN report that ended
+in a panic reports KASAN *and* still tells a waiting caller to give up), evidence rendered through
+`capped_debug`, and an unreadable console falling through to the host's own timeout so "I could not
+look" can never become guest evidence. Proven live against a real panicking guest, and red against
+the pre-change code. The other three — the PTY half-close, the daemon's pause/resume routes and
+streaming upload, and per-VM network byte counters — land beside it.
+
+That wave also produced the pass's sharpest lesson about gates: **E1's own gate shipped broken and
+its self-test caught it.** The first needle extractor read the `*_SIGNATURES` consts a line at a
+time; rustfmt collapses a short array onto one line, so two of the four const lists yielded *zero*
+needles and the scan then scooped unrelated strings — it printed `ok: 11 signatures` while guarding
+eleven of the wrong ones and letting a real inline `contains("Kernel panic")` through. The self-test
+now pins both rustfmt layouts, and that leg is the one that reddens on the old extractor.
+
 ## Tier F — roadmap, needs design first
 
 UFFD/demand-paged `lazy_restore` on any backend. The thin broker + fd-passing (and the

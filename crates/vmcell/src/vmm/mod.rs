@@ -12,6 +12,9 @@ pub mod cloud_hypervisor;
 
 pub use cloud_hypervisor::{ChInstance, CloudHypervisor};
 
+/// Structured guest-kernel fault capture: a serial console → the typed fault it proves (§5.4, The guest-kernel contract and the bootstrap seed).
+pub mod fault;
+
 /// Jailer-equivalent pre-exec hardening of the VMM child (design §12.3, Layer 2 — the jailer-equivalent (JailSpec + apply_jail)).
 pub mod jail;
 
@@ -36,8 +39,25 @@ use std::path::{Path, PathBuf};
 
 /// A trait for reading a serial log.
 pub trait SerialLog: Send + Sync {
-    /// Checks if the log contains a kernel panic.
+    /// Checks if the log contains a kernel panic — "has the guest kernel stopped?".
+    ///
+    /// Kept as the primitive because that is the one question a *waiting* caller needs answered on
+    /// every poll: no later poll of a stopped kernel can succeed. What the guest died *of* is
+    /// [`classify_fault`](Self::classify_fault).
     fn contains_panic(&self) -> bool;
+
+    /// Classify what the log proves about the guest kernel — panic, oops, KASAN report, lockdep
+    /// splat — or `None` for a healthy, empty or unrecognized console
+    /// ([`fault::classify_serial_fault`]).
+    ///
+    /// **Provided, not required**, and the default is the honest reading of an implementation that
+    /// only knows the boolean: `contains_panic()` becomes a [`fault::GuestFault::Panic`] with no
+    /// console line to quote. An implementation that *has* the console text overrides this — the
+    /// classification is only as good as the evidence it was given, and a fake that was never given
+    /// any must not fabricate a class it cannot see.
+    fn classify_fault(&self) -> Option<fault::SerialFault> {
+        self.contains_panic().then(fault::SerialFault::opaque_panic)
+    }
 }
 
 /// A real serial log that reads from a file.
@@ -46,16 +66,33 @@ pub struct RealSerialLog {
     pub path: PathBuf,
 }
 
+impl RealSerialLog {
+    /// The console's current bytes, or `None` if there is no console evidence to read.
+    ///
+    /// An absent or unreadable file is `None` — **not** an empty log — because the two mean
+    /// opposite things to a caller: "the guest printed nothing" is evidence about the guest, while
+    /// "I could not look" is a fact about the host, and a host problem must never be reported as a
+    /// guest fault ([`fault::expiry_error`]).
+    fn read(&self) -> Option<String> {
+        if !self.path.exists() {
+            return None;
+        }
+        std::fs::read_to_string(&self.path).ok()
+    }
+}
+
 impl SerialLog for RealSerialLog {
     fn contains_panic(&self) -> bool {
-        if self.path.exists()
-            && let Ok(log_content) = std::fs::read_to_string(&self.path)
-        {
-            return log_content.contains("Kernel panic")
-                || log_content.contains("panicked at")
-                || log_content.contains("panic - not syncing");
-        }
-        false
+        // ONE panic-signature list, in `fault`; this used to carry its own copy of the three
+        // literals, which is exactly the drift `ban-inline-kernel-fault-signature.sh` now bans.
+        self.read()
+            .is_some_and(|log| fault::log_reports_panic(&log))
+    }
+
+    fn classify_fault(&self) -> Option<fault::SerialFault> {
+        self.read()
+            .as_deref()
+            .and_then(fault::classify_serial_fault)
     }
 }
 

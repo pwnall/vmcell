@@ -5,6 +5,12 @@
 //! (invariant §13, Cross-cutting invariants); no method constructs `dir.join(name)` itself. Create is atomic (temp file +
 //! no-clobber rename) so a truncated upload never leaves a half-written artifact a later boot reads;
 //! create over an existing name is rejected (the "no update" guard), never a silent overwrite.
+//!
+//! Uploads **stream**: [`ArtifactStore::create_streaming`] hands back an [`ArtifactWriter`] the
+//! caller feeds chunk by chunk, hashing and capping as the bytes flow, so a multi-gigabyte rootfs
+//! never sits in the daemon's memory (design §11.7, The client library and CLI; §17, Open gaps and
+//! future capabilities). [`ArtifactStore::create`] is that same path with one chunk — the
+//! create-only/atomic/digest/cap laws exist once.
 
 use crate::dto::ArtifactInfo;
 use crate::error::DaemonError;
@@ -56,12 +62,44 @@ impl ArtifactStore {
     /// Creates an artifact from in-memory bytes. **No update**: a create over an existing name is
     /// rejected atomically (no-clobber rename), never an overwrite.
     ///
+    /// A thin wrapper over the streaming path — [`ArtifactStore::create_streaming`] plus one
+    /// [`ArtifactWriter::write_chunk`] — so the create-only, atomic, digest-sidecar'd and size-capped
+    /// laws are stated **once** and cannot drift between a buffered and a streamed upload (design
+    /// §11.3, The artifact store).
+    ///
     /// # Errors
     /// - [`DaemonError::InvalidName`] — bad name.
     /// - [`DaemonError::PayloadTooLarge`] — over the per-upload size cap.
     /// - [`DaemonError::AlreadyExists`] — an artifact of that name already exists.
     /// - [`DaemonError::Internal`] — an I/O failure while writing or renaming.
     pub fn create(&self, name: &str, bytes: &[u8]) -> Result<ArtifactInfo, DaemonError> {
+        let mut writer = self.create_streaming(name)?;
+        writer.write_chunk(bytes)?;
+        writer.finish()
+    }
+
+    /// Opens a **streaming** create: the caller feeds chunks as they arrive off the network, and the
+    /// store hashes, caps and writes each one as it flows (design §11.7, The client library and CLI;
+    /// §17, Open gaps and future capabilities — "Streaming upload (v1 reads the file into memory)").
+    ///
+    /// Every property of the buffered path survives, and each survives *because* it is enforced
+    /// incrementally rather than against a body the daemon first has to hold in RAM:
+    ///
+    /// * **create-only** — a reserved or already-taken name is refused here, before one byte is read;
+    ///   the authoritative guard is still the no-clobber rename in [`ArtifactWriter::finish`].
+    /// * **atomic** — every chunk lands in a temp file in the same directory, and the artifact appears
+    ///   under its real name only on the closing rename, so a torn upload publishes nothing and a
+    ///   concurrent reader never sees a prefix of one.
+    /// * **digest-sidecar'd at upload** — the SHA-256 is accumulated as the bytes flow, never by a
+    ///   second pass over the stored file.
+    /// * **capped** — the per-upload ceiling is checked *before* each chunk is written, so at most
+    ///   `max_bytes` ever reach the disk however long the client keeps sending.
+    ///
+    /// # Errors
+    /// [`DaemonError::BadRequest`] for the reserved `.sha256` suffix, [`DaemonError::InvalidName`] for
+    /// a name that fails the predicate, [`DaemonError::AlreadyExists`] if the name is taken, or
+    /// [`DaemonError::Internal`] if the temp file cannot be created.
+    pub fn create_streaming(&self, name: &str) -> Result<ArtifactWriter<'_>, DaemonError> {
         // The `.sha256` suffix is reserved for digest sidecars (delta 10); an artifact with that
         // name would shadow a real artifact's sidecar and vanish from `list`. Reject before disk
         // (a 400, not a name-syntax error — the name is well-formed, just reserved). Checked
@@ -74,62 +112,28 @@ impl ArtifactStore {
             )));
         }
         let path = self.path_for(name)?;
-        if bytes.len() as u64 > self.max_bytes {
-            return Err(DaemonError::PayloadTooLarge(format!(
-                "artifact {name:?} is {} bytes; the per-upload cap is {} bytes",
-                bytes.len(),
-                self.max_bytes
-            )));
-        }
-        // A `Booting`-race aside, this early check gives a clean 409 without touching disk; the
-        // no-clobber rename below is the authoritative guard.
+        // A `Booting`-race aside, this early check gives a clean 409 without touching disk — and,
+        // on the streaming path, without draining a multi-gigabyte body first; the no-clobber
+        // rename in `finish` is the authoritative guard.
         if path.exists() {
             return Err(DaemonError::AlreadyExists(format!(
                 "artifact {name:?} already exists (the store has no update; delete then create)"
             )));
         }
-        // Write to a temp file IN THE SAME DIR (so the rename is atomic, not cross-device), flush,
-        // then no-clobber rename into place. A crash mid-write leaves only the temp file.
-        let mut tmp = tempfile::NamedTempFile::new_in(&self.dir).map_err(|e| {
+        // The temp file lives IN THE SAME DIR, so the closing rename is atomic rather than
+        // cross-device. It is a `NamedTempFile`, so every abandoned upload — a torn stream, an
+        // over-cap chunk, a dropped connection, a panic — removes it on `Drop` without the ingest
+        // loop needing an error path of its own.
+        let tmp = tempfile::NamedTempFile::new_in(&self.dir).map_err(|e| {
             DaemonError::Internal(format!("cannot create temp file in {:?}: {e}", self.dir))
         })?;
-        tmp.write_all(bytes)
-            .map_err(|e| DaemonError::Internal(format!("cannot write artifact {name:?}: {e}")))?;
-        tmp.flush()
-            .map_err(|e| DaemonError::Internal(format!("cannot flush artifact {name:?}: {e}")))?;
-        // `persist_noclobber` fails if the destination now exists — the atomic "no update" guard,
-        // closing the check-then-write race above.
-        tmp.persist_noclobber(&path).map_err(|e| {
-            if e.error.kind() == std::io::ErrorKind::AlreadyExists {
-                DaemonError::AlreadyExists(format!("artifact {name:?} already exists"))
-            } else {
-                DaemonError::Internal(format!("cannot persist artifact {name:?}: {}", e.error))
-            }
-        })?;
-        // Compute the digest ONCE, at upload, and persist it in a `<name>.sha256` sidecar so
-        // `list`/`info` read it back in O(1) instead of re-hashing the whole body (delta 10,
-        // §11.3, The artifact store). The sidecar path is derived from the already-validated `path`, never from client
-        // input, so it stays anchored inside the artifacts dir.
-        let digest = hex_sha256(bytes);
-        if let Err(e) = write_sidecar(&path, &digest) {
-            // `create` is ALL-OR-NOTHING: a bare `?` here returned a 500 while leaving the artifact
-            // on disk — a name burned in a create-only store (the client cannot re-create it and
-            // never asked to delete it), holding bytes the client believes were rejected, and
-            // bootable by a later `create` (finding `failed-sidecar-write-leaves-the-artifact`).
-            // Roll back to the state the caller's error reply describes.
-            if let Err(rm) = std::fs::remove_file(&path) {
-                tracing::warn!(
-                    artifact = name,
-                    error = %rm,
-                    "cannot roll back an artifact whose sidecar write failed; the name stays taken"
-                );
-            }
-            return Err(e);
-        }
-        Ok(ArtifactInfo {
+        Ok(ArtifactWriter {
+            store: self,
             name: name.to_string(),
-            size_bytes: bytes.len() as u64,
-            sha256: digest,
+            path,
+            tmp,
+            hasher: Sha256::new(),
+            written: 0,
         })
     }
 
@@ -238,6 +242,118 @@ impl ArtifactStore {
     }
 }
 
+/// One streaming artifact upload in progress: the create-only, atomic, digest-sidecar'd, size-capped
+/// write of [`ArtifactStore::create_streaming`], driven one chunk at a time.
+///
+/// **Abandoning it publishes nothing.** The bytes go to a [`tempfile::NamedTempFile`] whose `Drop`
+/// removes it, and the artifact's real name is claimed only by [`ArtifactWriter::finish`]. A torn
+/// upload — a client that disconnects, a chunk over the cap, a panic in the ingest loop — therefore
+/// leaves neither an artifact nor a temp file, which is what lets the HTTP handler simply drop the
+/// writer on its error path instead of carrying a cleanup path that could itself be wrong.
+///
+/// The borrow of the store is what keeps `max_bytes` and the store directory one fact rather than a
+/// copy carried alongside the write.
+pub struct ArtifactWriter<'a> {
+    store: &'a ArtifactStore,
+    name: String,
+    /// The final, already-validated, dir-anchored path — resolved once at open, never re-derived
+    /// from the client's name at publish time (invariant §13, Cross-cutting invariants).
+    path: PathBuf,
+    tmp: tempfile::NamedTempFile,
+    hasher: Sha256,
+    written: u64,
+}
+
+impl ArtifactWriter<'_> {
+    /// Accepts the next chunk of the upload: caps it, writes it, and folds it into the digest.
+    ///
+    /// The cap is checked **before** the write and against the running total, so an over-cap upload
+    /// is refused at the chunk that crosses the line — not after the whole body has been read into
+    /// memory (which is the property that makes this path streaming at all) and never after more
+    /// than `max_bytes` have reached the disk.
+    ///
+    /// # Errors
+    /// [`DaemonError::PayloadTooLarge`] when this chunk would cross the per-upload cap;
+    /// [`DaemonError::Internal`] on a write failure.
+    pub fn write_chunk(&mut self, chunk: &[u8]) -> Result<(), DaemonError> {
+        let total = self.written.saturating_add(chunk.len() as u64);
+        if total > self.store.max_bytes {
+            return Err(DaemonError::PayloadTooLarge(format!(
+                "artifact {:?} is at least {total} bytes; the per-upload cap is {} bytes",
+                self.name, self.store.max_bytes
+            )));
+        }
+        self.tmp.write_all(chunk).map_err(|e| {
+            DaemonError::Internal(format!("cannot write artifact {:?}: {e}", self.name))
+        })?;
+        self.hasher.update(chunk);
+        self.written = total;
+        Ok(())
+    }
+
+    /// How many bytes of this upload have been accepted so far. What a mid-stream failure reports,
+    /// so a torn upload is diagnosable ("failed after N bytes") instead of opaque.
+    #[must_use]
+    pub fn written(&self) -> u64 {
+        self.written
+    }
+
+    /// Publishes the upload: flushes, claims the name with a **no-clobber** rename, and writes the
+    /// digest sidecar — rolling the artifact back if that sidecar write fails.
+    ///
+    /// # Errors
+    /// [`DaemonError::AlreadyExists`] if the name was taken while the body streamed (the
+    /// authoritative create-only guard, closing the check-then-write race with the early check in
+    /// [`ArtifactStore::create_streaming`]); [`DaemonError::Internal`] on an I/O failure.
+    pub fn finish(self) -> Result<ArtifactInfo, DaemonError> {
+        let Self {
+            name,
+            path,
+            mut tmp,
+            hasher,
+            written,
+            ..
+        } = self;
+        tmp.flush()
+            .map_err(|e| DaemonError::Internal(format!("cannot flush artifact {name:?}: {e}")))?;
+        // `persist_noclobber` fails if the destination now exists — the atomic "no update" guard,
+        // closing the check-then-write race against the early existence check at open.
+        tmp.persist_noclobber(&path).map_err(|e| {
+            if e.error.kind() == std::io::ErrorKind::AlreadyExists {
+                DaemonError::AlreadyExists(format!("artifact {name:?} already exists"))
+            } else {
+                DaemonError::Internal(format!("cannot persist artifact {name:?}: {}", e.error))
+            }
+        })?;
+        // The digest was computed ONCE, as the bytes flowed, and is persisted in a `<name>.sha256`
+        // sidecar so `list`/`info` read it back in O(1) instead of re-hashing the whole body
+        // (delta 10, §11.3, The artifact store). The sidecar path is derived from the
+        // already-validated `path`, never from client input, so it stays anchored inside the
+        // artifacts dir.
+        let digest = hex_digest(hasher);
+        if let Err(e) = write_sidecar(&path, &digest) {
+            // A create is ALL-OR-NOTHING: a bare `?` here returned a 500 while leaving the artifact
+            // on disk — a name burned in a create-only store (the client cannot re-create it and
+            // never asked to delete it), holding bytes the client believes were rejected, and
+            // bootable by a later `create` (finding `failed-sidecar-write-leaves-the-artifact`).
+            // Roll back to the state the caller's error reply describes.
+            if let Err(rm) = std::fs::remove_file(&path) {
+                tracing::warn!(
+                    artifact = name,
+                    error = %rm,
+                    "cannot roll back an artifact whose sidecar write failed; the name stays taken"
+                );
+            }
+            return Err(e);
+        }
+        Ok(ArtifactInfo {
+            name,
+            size_bytes: written,
+            sha256: digest,
+        })
+    }
+}
+
 /// The sidecar path for an artifact, derived by **appending** the suffix to the already-validated,
 /// dir-anchored artifact path. `with_extension` would REPLACE (`rootfs.erofs` -> `rootfs.sha256`)
 /// and collide across artifacts, so append. Anchored on trusted data (the resolved path), never on
@@ -296,10 +412,20 @@ fn artifact_info(name: &str, path: &Path) -> Result<ArtifactInfo, DaemonError> {
     })
 }
 
-fn hex_sha256(bytes: &[u8]) -> String {
+/// The lowercase-hex SHA-256 of `bytes` in one shot. `pub(crate)` so the server's upload gates can
+/// state their expected digest through the store's own hasher rather than a second implementation.
+pub(crate) fn hex_sha256(bytes: &[u8]) -> String {
     let mut h = Sha256::new();
     h.update(bytes);
-    let digest = h.finalize();
+    hex_digest(h)
+}
+
+/// The one hex rendering of a finished SHA-256, shared by the one-shot [`hex_sha256`] and by the
+/// streaming [`ArtifactWriter::finish`] (which finalizes a hasher it fed chunk by chunk). One law,
+/// one predicate: a second rendering could disagree about case or padding and silently invalidate a
+/// sidecar a client compares against.
+fn hex_digest(hasher: Sha256) -> String {
+    let digest = hasher.finalize();
     let mut s = String::with_capacity(64);
     for b in digest {
         use std::fmt::Write as _;
@@ -586,6 +712,195 @@ mod tests {
             .create("k", b"kernel")
             .expect("the name is free again");
         assert!(store.exists("k"));
+    }
+
+    // ---- the streaming upload (design §11.7, The client library and CLI; §17, Open gaps and future
+    // capabilities — "Streaming upload (v1 reads the file into memory)") ----
+
+    /// The temp files a `NamedTempFile` upload leaves in the store dir, by count. Residue and
+    /// mid-flight presence are both read through this one helper.
+    fn temp_files(store: &ArtifactStore) -> usize {
+        std::fs::read_dir(store.dir())
+            .expect("readdir")
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".tmp"))
+            .count()
+    }
+
+    /// A store with a cap big enough for the multi-chunk uploads below.
+    fn big_store() -> (tempfile::TempDir, ArtifactStore) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = ArtifactStore::open(dir.path(), 8 << 20).expect("open");
+        (dir, store)
+    }
+
+    // A body far larger than any single chunk arrives in pieces and is stored byte-exact, with the
+    // digest computed AS IT FLOWED matching a one-shot hash of the whole thing — the end-to-end
+    // property a streaming upload has to keep. RED on the inverse (a `write_chunk` that hashes but
+    // does not write, or writes but does not hash, or that resets the hasher per chunk): the digest
+    // or the on-disk bytes disagree with the reference.
+    #[test]
+    fn a_multi_chunk_stream_is_stored_byte_exact_and_digested_as_it_flows() {
+        let (_d, store) = big_store();
+        // 48 chunks of 64 KiB: 3 MiB, past any single buffer the daemon holds.
+        let chunk: Vec<u8> = (0..64 * 1024).map(|i| (i % 251) as u8).collect();
+        let mut expected = Vec::new();
+        let mut writer = store.create_streaming("rootfs").expect("open the upload");
+        for _ in 0..48 {
+            writer.write_chunk(&chunk).expect("chunk");
+            expected.extend_from_slice(&chunk);
+        }
+        assert_eq!(
+            writer.written(),
+            expected.len() as u64,
+            "the writer counts what it accepted"
+        );
+        let info = writer.finish().expect("publish");
+
+        assert_eq!(info.size_bytes, expected.len() as u64);
+        assert_eq!(
+            info.sha256,
+            hex_sha256(&expected),
+            "the streamed digest must equal a one-shot hash of the same bytes"
+        );
+        assert_eq!(
+            std::fs::read(store.dir().join("rootfs")).expect("read back"),
+            expected,
+            "and the stored bytes must be the ones that were sent"
+        );
+        assert_eq!(
+            std::fs::read_to_string(store.dir().join("rootfs.sha256"))
+                .expect("sidecar")
+                .trim(),
+            info.sha256,
+            "the sidecar is written at upload, from the streamed digest"
+        );
+        assert_eq!(temp_files(&store), 0, "no temp residue after a publish");
+    }
+
+    // The torn upload, with the residue check in the order AGENTS.md prescribes: the temp file
+    // EXISTS mid-flight, and after the abandoned writer is dropped it is gone — and the artifact was
+    // never published, because the name is claimed only by the rename inside `finish`.
+    //
+    // RED on the inverse (a writer that opens the destination file directly, or one that persists
+    // per chunk): the artifact appears under its real name mid-flight and survives the tear, leaving
+    // a truncated image a later boot would read as whole.
+    #[test]
+    fn a_torn_upload_publishes_nothing_and_leaves_no_temp_behind() {
+        let (_d, store) = big_store();
+        let chunk = vec![0xABu8; 64 * 1024];
+        {
+            let mut writer = store.create_streaming("half").expect("open the upload");
+            writer.write_chunk(&chunk).expect("first chunk");
+            writer.write_chunk(&chunk).expect("second chunk");
+            // Mid-flight: the bytes are on disk, under a temp name, and the artifact does not exist.
+            assert_eq!(
+                temp_files(&store),
+                1,
+                "the in-flight upload has a temp file"
+            );
+            assert!(
+                !store.exists("half"),
+                "an in-flight upload must not be readable under its real name"
+            );
+            // …and the client goes away: the writer is dropped without `finish`.
+        }
+        assert_eq!(temp_files(&store), 0, "the temp file goes with the writer");
+        assert!(!store.exists("half"), "nothing was published");
+        assert!(
+            matches!(store.info("half"), Err(DaemonError::NotFound(_))),
+            "and the name reads as absent, not as a truncated artifact"
+        );
+        // Positive control: the torn upload burned nothing — the same name uploads cleanly after.
+        store.create("half", b"whole").expect("the name is free");
+        assert_eq!(store.info("half").expect("info").size_bytes, 5);
+    }
+
+    // The per-upload cap binds the DISK, not just the reply: it is checked before each chunk is
+    // written, so the chunk that would cross it is refused and never lands. RED on the inverse (a
+    // cap checked in `finish`, or after the write): the temp file grows past the ceiling — the whole
+    // point of capping a stream is that an unbounded client cannot fill the artifacts filesystem.
+    #[test]
+    fn the_cap_trips_on_the_chunk_that_crosses_it_and_nothing_past_it_reaches_the_disk() {
+        let (_d, store) = store(); // cap: 1024 bytes
+        let chunk = vec![7u8; 512];
+        let mut writer = store.create_streaming("over").expect("open");
+        writer.write_chunk(&chunk).expect("512");
+        writer.write_chunk(&chunk).expect("1024 — exactly the cap");
+        let err = writer
+            .write_chunk(&chunk)
+            .expect_err("the chunk that crosses the cap must be refused");
+        assert!(
+            matches!(err, DaemonError::PayloadTooLarge(_)),
+            "got {err:?}"
+        );
+        assert_eq!(err.kind().status_code(), 413);
+        assert_eq!(writer.written(), 1024, "the refused chunk was not counted");
+        let on_disk: u64 = std::fs::read_dir(store.dir())
+            .expect("readdir")
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".tmp"))
+            .map(|e| e.metadata().expect("stat").len())
+            .sum();
+        assert_eq!(on_disk, 1024, "at most `max_bytes` ever reach the disk");
+        drop(writer);
+        assert!(
+            !store.exists("over"),
+            "an over-cap upload publishes nothing"
+        );
+        assert_eq!(temp_files(&store), 0, "and leaves no residue");
+    }
+
+    // The create-only and reserved-name laws hold on the streaming path too, and hold BEFORE any
+    // byte is read — a client must not be able to make the daemon drain a multi-gigabyte body for a
+    // request that was always going to be refused. RED on the inverse (checks moved into `finish`):
+    // a temp file appears for each refusal.
+    #[test]
+    fn the_name_laws_refuse_a_streaming_upload_before_it_opens_a_temp_file() {
+        let (_d, store) = big_store();
+        store.create("taken", b"first").expect("seed");
+        for (name, want) in [
+            ("evil.sha256", 400u16), // reserved sidecar suffix
+            ("../escape", 400),      // fails the name predicate
+            ("taken", 409),          // create-only
+        ] {
+            let err = store
+                .create_streaming(name)
+                .err()
+                .unwrap_or_else(|| panic!("{name} must be refused"));
+            assert_eq!(err.kind().status_code(), want, "{name}: {err:?}");
+            assert_eq!(
+                temp_files(&store),
+                0,
+                "{name} was refused before a temp file was opened"
+            );
+        }
+        // Positive control: a fresh, well-formed name opens.
+        let w = store.create_streaming("fresh").expect("a good name opens");
+        assert_eq!(temp_files(&store), 1);
+        drop(w);
+    }
+
+    // The buffered verb IS the streaming verb with one chunk (one law, one predicate): the same
+    // bytes through either door produce the same digest, the same size and the same sidecar. RED on
+    // the inverse (a `create` that re-grows its own copy of the write/hash/persist sequence): the
+    // two paths can then disagree, which is exactly how the sidecar and the ceiling drifted before.
+    #[test]
+    fn the_buffered_create_and_the_streaming_one_agree() {
+        let (_d, store) = big_store();
+        let bytes: Vec<u8> = (0..300_000).map(|i| (i % 256) as u8).collect();
+        let buffered = store.create("one-shot", &bytes).expect("buffered");
+        let mut w = store.create_streaming("streamed").expect("open");
+        for part in bytes.chunks(9_973) {
+            w.write_chunk(part).expect("chunk");
+        }
+        let streamed = w.finish().expect("publish");
+        assert_eq!(buffered.sha256, streamed.sha256);
+        assert_eq!(buffered.size_bytes, streamed.size_bytes);
+        assert_eq!(
+            std::fs::read_to_string(store.dir().join("one-shot.sha256")).expect("sidecar"),
+            std::fs::read_to_string(store.dir().join("streamed.sha256")).expect("sidecar"),
+        );
     }
 
     // Delta 10 residue: delete removes the sidecar too — no orphaned digest survives.

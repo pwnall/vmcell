@@ -79,6 +79,12 @@ impl VmEngine for ProbeEngine {
     async fn stats(&self, _id: &VmId) -> DaemonResult<ResourceUsageDto> {
         Err(DaemonError::Unsupported("stats".to_string()))
     }
+    async fn pause(&self, id: &VmId) -> DaemonResult<VmInfo> {
+        Ok(vminfo(&id.0))
+    }
+    async fn resume(&self, id: &VmId) -> DaemonResult<VmInfo> {
+        Ok(vminfo(&id.0))
+    }
     async fn snapshot(&self, _id: &VmId, _prefix: &str) -> DaemonResult<SnapshotInfo> {
         Err(DaemonError::Unsupported("snapshot".to_string()))
     }

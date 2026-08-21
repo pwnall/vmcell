@@ -111,6 +111,16 @@ enum Command {
         /// The VM id.
         id: String,
     },
+    /// Pause a VM's vCPUs (it keeps every host resource, and still pins its artifacts).
+    Pause {
+        /// The VM id.
+        id: String,
+    },
+    /// Resume a paused VM's vCPUs.
+    Resume {
+        /// The VM id.
+        id: String,
+    },
     /// Write a warm snapshot of a VM into the artifact store.
     Snapshot {
         /// The VM id.
@@ -234,6 +244,14 @@ async fn run(cli: Cli) -> Result<i32, Box<dyn std::error::Error>> {
         }
         Command::Stats { id } => {
             print_json(&client.stats(&VmId(id)).await?)?;
+            Ok(0)
+        }
+        Command::Pause { id } => {
+            print_json(&client.pause(&VmId(id)).await?)?;
+            Ok(0)
+        }
+        Command::Resume { id } => {
+            print_json(&client.resume(&VmId(id)).await?)?;
             Ok(0)
         }
         Command::Snapshot { id, prefix } => {

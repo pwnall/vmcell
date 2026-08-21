@@ -39,8 +39,9 @@ pub enum VmState {
     Booting,
     /// Booted and steward-ready — accepts `exec`.
     Ready,
-    /// Paused (CPUs stopped) via `pause`. Reserved: the daemon pause/resume routes are future work
-    /// (design future-work, "Pause/resume routes"); no current control-plane path produces this.
+    /// Paused (vCPUs stopped) via `POST /v1/vms/{id}/pause`; every host resource is still held, so
+    /// the VM still pins its artifacts. `exec`, `snapshot` and a second `pause` are refused with a
+    /// 409 until `POST /v1/vms/{id}/resume`; `destroy` and `stats` still work.
     Paused,
     /// A snapshot is in progress.
     Snapshotting,

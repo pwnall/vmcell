@@ -78,6 +78,16 @@ impl VmEngine for FakeEngine {
             io_read_ok: true,
         })
     }
+    /// Answers with the MOVED state, so the round trip proves the reply carried this VM's post-verb
+    /// info rather than a default `Ready` the client could have invented locally.
+    async fn pause(&self, id: &VmId) -> DaemonResult<VmInfo> {
+        let mut info = vminfo(&id.0);
+        info.state = VmState::Paused;
+        Ok(info)
+    }
+    async fn resume(&self, id: &VmId) -> DaemonResult<VmInfo> {
+        Ok(vminfo(&id.0)) // back to `Ready`
+    }
     async fn snapshot(&self, _id: &VmId, prefix: &str) -> DaemonResult<SnapshotInfo> {
         Ok(SnapshotInfo {
             artifact_prefix: prefix.to_string(),
@@ -158,6 +168,26 @@ async fn engine_rpc_round_trips_every_op() {
             .await
             .expect("stats")
             .mem_limit_enforced
+    );
+
+    // The vCPU verbs cross as `Info` replies carrying the state each one moved TO — distinct values,
+    // so a `resume` wired to the `Pause` request (or either wired to `Get`) reddens here rather than
+    // shipping. RED on the inverse: swap the two `EngineRequest` variants in `BrokerClientEngine`.
+    assert_eq!(
+        client
+            .pause(&VmId("vm-1".into()))
+            .await
+            .expect("pause")
+            .state,
+        VmState::Paused
+    );
+    assert_eq!(
+        client
+            .resume(&VmId("vm-1".into()))
+            .await
+            .expect("resume")
+            .state,
+        VmState::Ready
     );
     assert_eq!(
         client

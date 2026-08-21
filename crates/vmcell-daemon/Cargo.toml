@@ -55,7 +55,34 @@ name = "vmcell-daemon"
 #   * `bridge::MAX_EXEC_CAPTURE_BYTES` is public so a client can pre-size without a round trip. It is
 #     DERIVED from `MAX_BRIDGE_FRAME_BYTES` (less the reply-envelope reserve, times 3/4 for base64),
 #     so re-tuning the frame cap moves it; read the constant, never a number quoted anywhere.
-version = "0.5.0"
+# 0.5.0 → 0.6.0: the two §17 daemon gaps — the pause/resume ROUTES and the STREAMING artifact upload.
+# Same reasoning as every entry above: `cargo semver-checks` does not cover this crate (§10.4 lists
+# neither it nor its wire), so this line is the only thing that will tell a consumer.
+#   * NEW ROUTES `POST /v1/vms/{id}/pause` and `POST /v1/vms/{id}/resume` (op ids `pauseVm` /
+#     `resumeVm`), authenticated like every other VM verb and served in the OpenAPI document from the
+#     same one table. Both reply `200` with the VM's `VmInfo`, so a client reads the state it moved to
+#     rather than assuming it. Additive: no existing route, request or reply changed.
+#   * `VmState::Paused` is now REACHABLE. It has been in the wire enum since v1, documented as
+#     reserved; a client that treated it as unreachable (an `unreachable!()` arm, a match that folded
+#     it into "ready") now needs a real arm. A paused VM still holds every host resource and still
+#     PINS its artifacts, so `DELETE /v1/artifacts/{name}` still 409s for it; `exec`, `snapshot` and a
+#     second `pause` are 409 `conflict` until the resume, while `stats` and `destroy` keep working.
+#     `snapshot` is refused deliberately: the backend's own snapshot pauses and RESUMES internally,
+#     which would restart the guest behind the daemon's state.
+#   * `PUT /v1/artifacts/{name}` STREAMS. The handler takes the raw body instead of buffering it, and
+#     the store hashes, caps and writes chunk by chunk, so the largest artifact a daemon can accept is
+#     no longer a function of its RAM. Create-only, atomicity and the digest sidecar are unchanged —
+#     the buffered `create` is now literally the streaming path with one chunk. Two client-visible
+#     edges: an over-cap upload is refused AT THE CHUNK THAT CROSSES the cap (a 413 whose message says
+#     "at least N bytes", because the total is not known in advance), and a body that fails
+#     mid-stream — a client that disconnects — is a 400 `bad_request` naming how far it got, where it
+#     previously surfaced as the body extractor's own error. Nothing is published in either case.
+#   * COMPANION, in `vmcell-daemon-client` (0.1.0, unbumped — it has no ledger, and both edges are
+#     additive): `pause`/`resume` verbs, and `upload_artifact` now STREAMS an `UploadBody::Path` off
+#     disk (`tokio::fs::File` → `reqwest::Body`) instead of `std::fs::read`-ing it into memory. A
+#     streamed body has no `Content-Length` — it is sent chunked — which a strict intermediary or a
+#     hand-rolled test server may need to expect. `vmcelld-ctl` gains `pause`/`resume` subcommands.
+version = "0.6.0"
 edition = "2024"
 rust-version.workspace = true
 license = "MIT OR Apache-2.0"
@@ -77,6 +104,11 @@ default = ["server"]
 # registry, the cap-dropped parent serves HTTP over the `VmEngine` RPC).
 server = [
     "dep:axum",
+    # The streaming artifact upload's chunk source: `axum::body::Body::into_data_stream()` yields a
+    # `Stream`, and `StreamExt::next` is how the ingest loop pulls one chunk at a time (§11.7 /
+    # §17, "Streaming upload"). Server-only, so the `default-features = false` client still links
+    # nothing but the DTOs and the name predicate.
+    "dep:futures",
     "dep:tower",
     "dep:tokio",
     "dep:async-trait",
@@ -109,6 +141,7 @@ base64 = "0.23"
 
 # Server-only.
 axum = { version = "0.8", optional = true }
+futures = { version = "0.3", optional = true }
 tower = { version = "0.5", features = ["util"], optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal", "net", "io-util", "time"], optional = true }
 async-trait = { version = "0.1", optional = true }
