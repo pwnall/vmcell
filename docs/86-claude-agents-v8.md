@@ -493,12 +493,24 @@ fragment is the one defended exception shape and never carries a consumer's usbi
   need a delegated subtree and fail without one.
 - Preflight green → run `just test-privileged`, the unprivileged suite, `just test-daemon`, and
   `just test-validator` yourself.
-- Preflight failing only on blessing (runner missing, stale stamp, not `+ep`) → ask the maintainer
-  to run `just bless`, then rerun preflight and the suites. It needs a sudo whenever it falls
-  through its idempotence skip — which is every one of those triggers except the mtime proxy, where
-  the binary is unchanged and it merely re-dates the stamp; a `Cargo.lock` move alone is that arm, so
-  do not promise a sudo either way. Never attempt the bless
-  yourself; never silently skip.
+- Preflight failing only on blessing (runner missing, stale stamp, not `+ep`) → **run `just bless`
+  yourself**, then rerun preflight and the suites. Escalate to the maintainer *only* when it actually
+  needs a `sudo` you cannot supply. That is safe to attempt blind because the recipe stages and swaps:
+  `bless_one` blesses a temp copy and renames it into place, so a declined or non-interactive `sudo`
+  leaves the existing blessing intact rather than replacing it with a cap-less binary — the failure
+  mode is "still stale", never "silently un-capped". Never silently skip.
+  Which arm you get is decided by the recipe's idempotence check, which hashes the freshly *built*
+  runner against the stamp:
+  - **Binary unchanged** → it re-dates the stamp and skips `setcap` entirely. **No sudo.** A
+    `Cargo.lock` move that touches nothing in the runner's own closure is this arm, and so is any
+    codegen-neutral edit — *for the release copy*.
+  - **Binary changed** → `setcap`, which needs a sudo; a non-interactive shell fails with
+    `sudo: a terminal is required to authenticate`. Ask the maintainer, quoting that.
+  The two copies can legitimately disagree, and it is not a bug: `debug` carries DWARF line tables and
+  `release` (cargo's default `debug = false`) carries none, so a comment-only edit above live code
+  shifts the debug binary's bytes and leaves the release binary byte-identical. Expect "only the debug
+  runner needed re-blessing" and do not report it as an anomaly. Never *promise* which arm you will
+  hit before you have run it.
 - Only a genuinely absent facility (`/dev/kvm`, a missing backend binary) downgrades you to
   static-only — say so explicitly and mark every runtime claim unverified. The crosvm matrix is an
   **opt-in recipe** (`just test-crosvm`) because CI lacks the binary; its KVM-free honesty pins

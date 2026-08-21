@@ -139,6 +139,29 @@ first would have bought exactly zero. The roster also turned up a **sixth** home
 missed, `VmConfigBuilder::build`'s own `vmid > 254`, which refused loudly rather than wrapping, which
 is precisely why five review passes had walked past it.
 
+## The live validation, and the one defect it caught
+
+Run 2026-08-21 on a blessed runner, against freshly rebuilt artifacts: `test-privileged` **321/321**,
+`test-daemon` **24/24**, `test-validator` 5/5, `test-crosvm` 35/35, `test-bench` 9/9,
+`test-unprivileged` 8/8, plus the two suites that had never once run on this host —
+`test-usb-passthrough` 1/1 against the camera at `0bda:5634`, and `test-systemd` 2/2. Those two clear
+the standing `usb_host_passthrough_no_designated_device` and `systemd_proof_cell_not_opted_in` skips.
+
+**It caught exactly one defect, in a test that had never been executed** — which is the argument for
+running the battery rather than trusting a green `just ci`. The new pause/resume route's live leg read
+the guest's `/proc/uptime` across a paused window and asserted it stood still. It never can: a KVM
+guest's timebase is the **host's**. Measured here — across a 3.02 s pause the guest's uptime advanced
+the full 3.02 s while the VM's `vcpu*` threads accumulated **zero** ticks and an in-guest spin loop
+completed 1,946 iterations against 1,284,325 over an identical running control. So the *route* was
+right and the *assertion* was unfalsifiable in one direction and false in the other: it would equally
+have "passed" a pause that never reached the VMM, had the numbers fallen the other way. It now
+measures execution two independent ways over three windows, and is red-on-inverse against a route
+reduced to `Ok(())`.
+
+The remaining skips are honest capability absences: four Firecracker ones, and
+`io_max_enforcement_no_io_delegation` — the measured absence D5 recorded, which will run itself on the
+first `io`-delegated host.
+
 ## Tier F — roadmap, needs design first
 
 UFFD/demand-paged `lazy_restore` on any backend. The thin broker + fd-passing (and the

@@ -1535,61 +1535,175 @@ async fn a_stewardless_placement_is_rejected_400_over_rest() {
 }
 
 // design §11.5 (The HTTP REST API and its OpenAPI document; §17, Open gaps and future capabilities —
-// "Pause/resume routes"): the vCPU verbs over REST, asserted on the DATA PLANE — the guest's own
-// monotonic clock — not on the state label the daemon reports.
+// "Pause/resume routes"): the vCPU verbs over REST, asserted on what a pause *is* — the guest stops
+// EXECUTING — measured two independent ways across three windows (running → paused → resumed).
 //
-// A paused guest does not run, so its `/proc/uptime` does not advance while the host's wall clock
-// does. The POSITIVE CONTROL is the same measurement over the same window with no pause in it: there
-// the guest's uptime tracks the host's elapsed time. Without that control, a guest that had simply
-// stopped reporting would pass.
+// NOT ON THE GUEST'S CLOCK, and that is the whole lesson of this test. Its first version read
+// `/proc/uptime` across the window and asserted it stood still. It never can: a KVM guest's timebase
+// is the HOST's. This guest's `current_clocksource` is `tsc` — the raw host TSC, which counts on
+// whether or not a vCPU is scheduled — and the alternative, `kvm-clock`, is a pvclock structure
+// derived from that same host TSC. Measured on this tree: across a 3.02 s pause the guest's
+// `/proc/uptime` advanced 3.02 s while its vCPU thread burned 0 ms of host CPU and its in-guest spin
+// loop completed 0.15 % of a running window's iterations. A guest clock is a proxy signal for "the
+// guest ran", and a false one in both directions — it would have "passed" just as readily against a
+// pause that never reached the VMM at all, had the numbers fallen the other way. Do not restore it.
+//
+// The two real measurements, over the same windows:
+//
+//   * guest side — a detached spin loop appends one byte per iteration to a file on the overlay's
+//     tmpfs upper, so the file's SIZE counts iterations the guest actually completed. Bytes cannot
+//     be written while no vCPU runs, and unlike a clock they cannot be caught up afterwards.
+//   * host side — the `vcpuN` threads of this VM's own `cloud-hypervisor` process, `utime + stime`
+//     out of `/proc`. This one leans on no guest semantics whatsoever: a paused vCPU is a thread
+//     that is off-CPU, whatever the guest believes about time.
+//
+// The third (resumed) window is what keeps the paused window's two zeros honest: a workload that had
+// simply DIED would score zero across the pause as well. It proves the loop was alive the whole time
+// — and that `resume` restarts it, the other half of the claim this test's name makes.
 //
 // The refusal leg rides along: `exec` against a paused VM is a 409 `Conflict` (there is nobody in
 // there to answer), and it works again after the resume.
 #[tokio::test]
 #[ignore = "boots a real VM; needs KVM + blessed runner + artifacts (run via `just test-daemon`)"]
-async fn pause_and_resume_over_rest_stop_and_restart_the_guest_clock() {
-    /// The guest's own uptime in seconds, read through the control plane. Pure shell (`read` from
-    /// `/proc/uptime`), so the measurement does not depend on which utilities the rootfs carries.
-    async fn guest_uptime(c: &DaemonClient, id: &vmcell_daemon_client::dto::VmId) -> f64 {
+async fn pause_and_resume_over_rest_stop_and_restart_the_guest_s_execution() {
+    /// Where the in-guest spin loop counts. One spelling, shared by the loop and the reader below.
+    const SPIN: &str = "/tmp/vmcell-pause-work";
+    /// `/proc` CPU times are in USER_HZ units, which is 100 on every Linux port — that is the
+    /// `/proc` ABI, not `CONFIG_HZ`. (`sysconf(_SC_CLK_TCK)` returns the same number and needs an
+    /// `unsafe` call to reach.)
+    const USER_HZ: u64 = 100;
+
+    /// Iterations the in-guest spin loop has completed, read back through the control plane: it
+    /// appends one byte per iteration, so the file's size *is* the count.
+    async fn work_done(c: &DaemonClient, id: &vmcell_daemon_client::dto::VmId) -> u64 {
         let out = c
             .exec(
                 id,
                 ExecRequestDto::new(vec![
                     "/bin/sh".into(),
                     "-c".into(),
-                    "read up rest < /proc/uptime; echo $up".into(),
+                    format!("wc -c < {SPIN}"),
                 ]),
             )
             .await
-            .expect("read the guest's uptime");
-        assert_eq!(out.code, 0, "uptime read failed in-guest");
+            .expect("read the in-guest work counter");
+        assert_eq!(
+            out.code, 0,
+            "the work counter is unreadable in-guest: {out:?}"
+        );
         String::from_utf8_lossy(&out.stdout().expect("decode"))
             .trim()
             .parse()
-            .expect("/proc/uptime's first field is a float")
+            .expect("`wc -c` prints a byte count")
+    }
+
+    /// `utime + stime`, in USER_HZ ticks, summed over the vCPU threads of the `cloud-hypervisor`
+    /// process `ch`.
+    ///
+    /// Panics unless it finds exactly `vcpus` of them: a scan that matched nothing would report a
+    /// motionless zero and make every assertion below vacuously true (AGENTS.md — a zero-hit scan is
+    /// a misconfigured gate, never a green one).
+    fn vcpu_ticks(ch: libc::pid_t, vcpus: usize) -> u64 {
+        let mut total = 0u64;
+        let mut found = 0usize;
+        for entry in std::fs::read_dir(format!("/proc/{ch}/task"))
+            .expect("the VMM's thread list")
+            .flatten()
+        {
+            let tid = entry.file_name();
+            let tid = tid.to_string_lossy();
+            // Cloud Hypervisor names its vCPU threads `vcpu0`, `vcpu1`, … A thread that exits
+            // between the readdir and this read is not one of them (they live as long as the VM).
+            if !std::fs::read_to_string(format!("/proc/{ch}/task/{tid}/comm"))
+                .unwrap_or_default()
+                .trim_end()
+                .starts_with("vcpu")
+            {
+                continue;
+            }
+            let stat = std::fs::read_to_string(format!("/proc/{ch}/task/{tid}/stat"))
+                .expect("a vcpu thread's stat");
+            // Split at the LAST `") "`: field 2 (`comm`) is parenthesized and may itself contain
+            // spaces or parens, which is how left-counting /proc parsers go wrong. What follows is
+            // field 3 (state), putting utime (field 14) and stime (15) at offsets 11 and 12.
+            let after_comm = stat
+                .rsplit_once(") ")
+                .expect("a stat line carries a parenthesized comm")
+                .1;
+            let fields: Vec<&str> = after_comm.split_whitespace().collect();
+            let at = |i: usize| -> u64 {
+                fields
+                    .get(i)
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or_else(|| {
+                        panic!("no numeric field {i} in /proc/{ch}/task/{tid}/stat: {stat:?}")
+                    })
+            };
+            total += at(11) + at(12);
+            found += 1;
+        }
+        assert_eq!(
+            found, vcpus,
+            "expected {vcpus} `vcpu*` threads under /proc/{ch}/task — a scan that finds none \
+             measures a motionless zero and proves nothing about a pause"
+        );
+        total
     }
 
     let d = Daemon::start(Auth::Open).await;
     let c = d.client("");
     let vm = c.create("vmlinux", "rootfs.erofs").await.expect("create");
-    let window = Duration::from_secs(3);
+    let vcpus = usize::from(vm.vcpus);
+    // This VM's own VMM process: `ch_pids_for_vmid` matches the per-VM `--api-socket` path, so it
+    // cannot pick up another test's guest.
+    let ch = match ch_pids_for_vmid(vm.vmid).as_slice() {
+        [pid] => *pid,
+        found => panic!(
+            "expected exactly one cloud-hypervisor for vmid {}, found {found:?}",
+            vm.vmid
+        ),
+    };
 
-    // --- the control: the same window, un-paused ---
-    let control_start = std::time::Instant::now();
-    let before = guest_uptime(&c, &vm.id).await;
+    // The workload, which OUTLIVES the `exec` that starts it: the steward kills a one-shot child's
+    // process group on the way out only when that child is still running (`kill_unexited`), and this
+    // shell has exited by then. The redirection is load-bearing too — a background job still holding
+    // the exec's stdout pipe would keep that call from ever returning.
+    let started = c
+        .exec(
+            &vm.id,
+            ExecRequestDto::new(vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                // The `: >` first, in the same call, so the counter file EXISTS before the reader
+                // below can race the loop's first append.
+                format!(": > {SPIN}; (while :; do printf . >> {SPIN}; done) >/dev/null 2>&1 &"),
+            ]),
+        )
+        .await
+        .expect("start the in-guest spin loop");
+    assert_eq!(started.code, 0, "the spin loop did not start: {started:?}");
+
+    let window = Duration::from_secs(2);
+    let window_ticks = window.as_secs() * USER_HZ;
+
+    // --- window 1: RUNNING (the positive control) ---
+    let mark = work_done(&c, &vm.id).await;
+    let ticks = vcpu_ticks(ch, vcpus);
     tokio::time::sleep(window).await;
-    let after = guest_uptime(&c, &vm.id).await;
-    let control_host = control_start.elapsed().as_secs_f64();
-    let control_guest = after - before;
+    let running_ticks = vcpu_ticks(ch, vcpus) - ticks;
+    let running_work = work_done(&c, &vm.id).await - mark;
     assert!(
-        control_guest > control_host - 1.0,
-        "a RUNNING guest's clock tracks the host's: guest advanced {control_guest:.2}s over \
-         {control_host:.2}s of wall clock"
+        running_ticks >= window_ticks / 2,
+        "the control workload has to actually burn a vCPU or the paused window proves nothing: \
+         {running_ticks} ticks over a {window_ticks}-tick window"
+    );
+    assert!(
+        running_work > 1_000,
+        "the in-guest spin loop is not counting: {running_work} iterations over {window:?}"
     );
 
-    // --- the measurement: the same window, paused ---
-    let paused_start = std::time::Instant::now();
-    let before = guest_uptime(&c, &vm.id).await;
+    // --- window 2: PAUSED ---
+    let mark = work_done(&c, &vm.id).await;
     let info = c.pause(&vm.id).await.expect("pause");
     assert_eq!(
         info.state,
@@ -1601,6 +1715,11 @@ async fn pause_and_resume_over_rest_stop_and_restart_the_guest_clock() {
         vmcell_daemon_client::dto::VmState::Paused,
         "and `GET /v1/vms/{{id}}` observes it"
     );
+    // Sampled INSIDE the pause at both ends, so the host-side figure covers the paused window itself
+    // rather than the REST calls that bracket it. (The guest-side one cannot be: reading the counter
+    // needs a running guest, so its window is the wider one — which only ever counts *against* the
+    // assertion.)
+    let ticks = vcpu_ticks(ch, vcpus);
 
     // A paused cell has nobody to answer an exec: a prompt 409, not a hang.
     let err = c
@@ -1610,16 +1729,33 @@ async fn pause_and_resume_over_rest_stop_and_restart_the_guest_clock() {
     assert_eq!(err.kind(), Some(ErrorKind::Conflict), "got {err}");
 
     tokio::time::sleep(window).await;
+    let paused_ticks = vcpu_ticks(ch, vcpus) - ticks;
     let info = c.resume(&vm.id).await.expect("resume");
     assert_eq!(info.state, vmcell_daemon_client::dto::VmState::Ready);
-    let after = guest_uptime(&c, &vm.id).await;
-    let paused_host = paused_start.elapsed().as_secs_f64();
-    let paused_guest = after - before;
+    let paused_work = work_done(&c, &vm.id).await - mark;
     assert!(
-        paused_guest < paused_host - 2.0,
-        "a PAUSED guest's vCPUs are stopped: guest advanced {paused_guest:.2}s over \
-         {paused_host:.2}s of wall clock (the control advanced {control_guest:.2}s over \
-         {control_host:.2}s)"
+        paused_work * 20 <= running_work,
+        "a PAUSED guest completes no work: {paused_work} spin-loop iterations across the pause \
+         against {running_work} over the running control (its /proc/uptime, by contrast, advances \
+         right through a pause — see this test's comment)"
+    );
+    assert!(
+        paused_ticks * 20 <= running_ticks,
+        "a PAUSED VM's vCPU threads are off-CPU: {paused_ticks} ticks across the pause against \
+         {running_ticks} over the running control"
+    );
+
+    // --- window 3: RESUMED — the loop was alive all along, and `resume` restarted it ---
+    let mark = work_done(&c, &vm.id).await;
+    let ticks = vcpu_ticks(ch, vcpus);
+    tokio::time::sleep(window).await;
+    let resumed_ticks = vcpu_ticks(ch, vcpus) - ticks;
+    let resumed_work = work_done(&c, &vm.id).await - mark;
+    assert!(
+        resumed_ticks >= window_ticks / 2 && resumed_work >= running_work / 4,
+        "a RESUMED guest runs again — and a still-idle one would mean the paused window measured a \
+         dead workload, not a stopped vCPU: {resumed_ticks} ticks / {resumed_work} iterations, \
+         against {running_ticks} / {running_work} before the pause"
     );
 
     c.destroy(&vm.id).await.expect("a resumed VM tears down");
