@@ -6951,3 +6951,87 @@ dependence.
 none was looked at. `just ci` green is a claim about the local host; it is not a claim about CI, and
 this repo's own `test-unit-undelegated` recipe and `ci_obtains_the_facility` step both exist because
 that difference has cost it before. Check the run after pushing, not nine commits later.
+
+## The 2026-08-21 A/B benchmark pass: what regressed, what only looked like it, and two controls that were not controls
+
+**Why this pass is an A/B and not a matrix re-run.** Every substrate line in
+`docs/benchmark-results.md` — and in every design revision — is an Intel Core Ultra 7 258V (Lunar
+Lake, 8c/8t, 30 GiB). The host this pass ran on is a 13th Gen i7-1370P, 20 threads, 59 GiB. The
+canonical absolute milliseconds are therefore uninterpretable here in either direction, and the
+only thing that could answer *"did the last 65 commits regress anything"* is the thing AGENTS.md
+already names as the sole admissible evidence: an **interleaved same-session A/B**, HEAD against
+`05fe674` (the commit the 2026-07-17 canonical matrix was measured at), alternating which arm leads
+so a monotonic host drift cannot favour one of them.
+
+**Two controls were stated and not true. Both are now guards, because both were invisible.**
+
+1. *The guest kernel.* The driver exported `$VMCELL_KERNEL` to pin both arms to one `vmlinux`. The
+   baseline arm's `bench-vm` **predates that variable** and composes `<artifacts_dir>/vmlinux`
+   itself, so the export bound only the HEAD arm and the two arms booted **6.12.94 vs 6.12.104**
+   for an entire matrix pass. The tell was in every log the whole time — the base arm printed
+   `kernel: vmlinux` where HEAD printed an absolute path — and nothing read it. The same class had
+   already been caught one crate over for `$VMCELL_CH_BIN` (old arms hardcode the PATH name) and
+   shimmed via `PATH`; the kernel got the export but not the proof. **A control is verified by
+   digest, never by "we exported the variable"**, and `bench-ab`'s `guard_same_kernel` is that rule
+   with a red-on-inverse test.
+2. *The arm binaries.* A concurrent experiment overwrote `target/release/bench-vm` with a **patched**
+   build while `git status` stayed clean, so a re-run measured the *fixed* arm and would have
+   reported it as stock. `guard_binaries_unchanged` re-digests each arm against its manifest before
+   any measurement.
+
+**A single p50 is not evidence, and this pass is the proof.** Of six deltas ≥10 % in the first
+single-pass matrix, **five did not survive repeats and one reversed sign**: `fc vsock-rtt` "+108 %"
+→ −3.3 % (n=10, p=0.29), `fc restore teardown` "+87 %" → +0.1 %, `ch net-priv NET-START` "+26 %" →
+−7.2 %, `ch zygote` "−26 %" → +0.3 %, `fc warm restore` "+19 %" → −2.7 %, and `ch session-connect`
+"−22 %" → **+23 %**. The mechanism hunt for the "+108 %" Firecracker result ran to completion
+against a finding that did not exist. Repeats plus a rank test are not a refinement here; they are
+the difference between a finding and a story.
+
+**What actually regressed: the session path, on all four backends.** `session-connect` (the timed
+region is exactly `connect_sessions()` — a fresh mux dial plus its `Ready` handshake) came back
++22.9 % CH (p=0.0012), +23.7 % FC (p=0.028), +25.3 % QEMU (p=0.0009), +5.9 % crosvm (p=0.0035) at
+n=10 per arm. Cross-backend means shared host code, and the cause is one line in
+`StewardClient::connect_framed`'s retry loop asking `classify_serial_fault()` where it used to ask
+`contains_panic()`. Confirmed two ways rather than argued: a **dose-response** (`--kernel-verbosity`
+varies only console size — the base arm is flat at 217/227/253 µs, HEAD scales 315/299/**972**) and
+a **surgical isolation** (HEAD against HEAD with only the classifier's body reverted: −35 µs at the
+default verbosity, −577 µs at `verbose`). Fixed by a whole-buffer prefilter (`6a8315d`), with the
+classifier's cost now a tracked micro-benchmark at two console sizes, because it had none and the
+term is O(console bytes) with no bound on the console.
+
+Everything else is flat: cold boot, warm restore, snapshot bytes, host RSS per guest, zygote
+fan-out, net-egress in all three modes, and every `daemon-api` verb, on all four backends.
+
+**`expiry_error` is NOT a defect — do not "fix" it.** Two independent review passes in this cycle
+flagged `fault::expiry_error` for classifying without a `.halted()` guard, on the theory that a
+non-halting fault turns a host timeout into a guest-fault report. That is the **designed**
+behaviour, and `steward/mod.rs` says so at the site: an advisory splat "does NOT abort — the kernel
+kept running … it merely **re-labels the timeout above** if the wait eventually expires." A lockdep
+splat explaining a hang is the feature. Recorded here because the flag was raised twice and will be
+raised again.
+
+**A real guest-kernel BUG, on the shutdown path, on Firecracker.** Every graceful FC teardown on
+this host prints `Missing ENDBR` → `kernel BUG at arch/x86/kernel/cet.c:132!` → `Oops: invalid
+opcode` **after** `SendCtrlAltDel`, in the `reboot: Restarting system` path. A *live* FC guest's
+console is clean — captured mid-run, 62 lines, zero fault signatures — so this is not a boot
+problem and it does not affect a connect-time classification. It does mean an FC console that has
+begun shutting down carries a fault signature, which is worth knowing before reading one. Whether
+6.12.94 also does it is **unresolved**: the per-VM directory is reclaimed at teardown and the
+capture lost the race three times. Not chased further; recorded so the next reader starts ahead.
+
+**Retired: the `pre_exec` / `posix_spawn` watch item.** `docs/benchmark-results.md` carried a
+standing note that `build_vmm_cmd` installing its `pre_exec` closure unconditionally costs a VMM
+spawn its `posix_spawn` fast path, "unmeasured, and the next matrix re-run is where it would show."
+This was that re-run: the create phase shows no consistent movement (CH COLD +7.0 %, CH RESTORE
++1.5 %, FC COLD −3.7 %, FC RESTORE +12.4 %, every one of them overlapping). The note is retired
+rather than carried, per the rule that an entry is retired when it is empirically disproven.
+
+**Two host facts that are not vmcell defects but invalidate claims made on this box.**
+`cloud-hypervisor` on `PATH` here is a `cargo install --git` **v54.0.0** — the unreleased `main`
+build README.md warns about, ~237 commits past the pinned v53.0, changing vsock local-port
+ownership and RST-reply behaviour, i.e. the steward's transport. The pinned v53.0 was not installed
+at all; this pass installed it beside (checksum-verified) and pinned both arms to it through `PATH`
+*and* `$VMCELL_CH_BIN`, because only one arm honours the variable. Separately, CI pins Firecracker
+**v1.16.1** while `/usr/local/bin/firecracker` here is **v1.16.0**, so its vsock-after-restore fix
+is not in effect in these numbers. Neither is a regression; both are reasons a number from this box
+is not automatically a number about CI.

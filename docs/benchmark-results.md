@@ -4,7 +4,11 @@ Performance results for the `vmcell` framework: hot-path overheads (micro-benchm
 KVM lifecycle/density/size metrics (macro-benchmarks). Per design §16 (Performance) these are **tracked metrics,
 not pass/fail gates** — absolute numbers are hardware-bound and only meaningful with their substrate.
 
-> **Canonical numbers: the 2026-07-17 full backend×mode matrix** (directly below) — the re-run that
+> **Newest regression evidence: the 2026-08-21 A/B** (directly below) — a different host, so it is
+> *not* a canonical absolute table; it is the interleaved two-arm comparison that answers "did this
+> regress".
+>
+> **Canonical numbers: the 2026-07-17 full backend×mode matrix** — the re-run that
 > adds **crosvm** as the fourth backend (`vmcell-crosvm`, design §2.5), alongside fresh same-session
 > CH/FC/QEMU controls confirming no regression. The **2026-07-15** matrix beneath it is the prior
 > canonical (it added the first QEMU restore/suspend numbers after the suspend/resume + session-
@@ -21,6 +25,78 @@ not pass/fail gates** — absolute numbers are hardware-bound and only meaningfu
 > 2026-07-03 (`pcts` in `crates/vmcell-bench/src/bin/bench-vm.rs`), so every p95/p99 in a section
 > dated before that is an upper bound, not a comparable tail — the p50s are unaffected, and the
 > 2026-07-04 matrix is the first measured on the corrected estimator.
+
+## Regression A/B (2026-08-21, HEAD `0d2c010` vs `05fe674`) — **different host, not a new canonical**
+
+**Read this before comparing it to anything below.** This pass ran on a **13th Gen Intel Core
+i7-1370P** (20 threads, 59 GiB) — *not* the Core Ultra 7 258V (Lunar Lake, 8c/8t) every other
+section in this file was measured on. Absolute milliseconds do not cross that gap in either
+direction, so **the 2026-07-17 matrix above remains canonical for absolute numbers** and nothing
+here supersedes it. What this pass answers is the other question — *did the 65 commits since
+`05fe674` regress anything* — and the only admissible evidence for that is what design §16 already
+says it is: an **interleaved, same-session A/B** on one host, alternating which arm leads.
+
+**Method.** Two arms: HEAD `0d2c010` and `05fe674` (the commit the canonical matrix was measured
+at), each with its own host lib *and its own guest rootfs*, because guest-side code is baked into
+`rootfs.erofs` and that is half of what changed. Held constant and **verified by digest, not by
+intent**: the guest kernel (one `vmlinux`, 6.12.104, byte-identical in both arms' artifact dirs),
+the VMM binaries (Cloud Hypervisor **v53.0**, the pinned release — `PATH` on that host carried an
+unreleased v54.0.0 `main` build; Firecracker v1.16.0; QEMU 10.2.1; crosvm), the blessed runner, a
+delegated cgroup scope, and the CPU-frequency pin. 184 wrapped runs, zero failures, plus repeat
+rounds of n=10 per arm with a Mann-Whitney two-sided rank test. Reproduce with `just bench-ab`.
+
+**Verdict: no core metric regressed. One narrow path did.**
+
+**Flat** (medians, n=10 per arm; every rank test p > 0.11):
+
+| metric | CH | FC | QEMU | crosvm |
+| --- | --- | --- | --- | --- |
+| cold boot p50 | 346 → 346 ms | 812 → 812 ms | 1008 → 1007 ms | 1413 → 1413 ms |
+| warm restore p50 | 58 → 59 ms | 36 → 36 ms | 376 → 376 ms | 88 → 88 ms |
+
+Also flat, within single-pass noise: `vsock-rtt` exec round-trip, suspend-size (byte-identical),
+host RSS per guest (57/57/59/57 MiB), zygote fan-out, `net-egress` in all three modes, KSM dedup,
+and every `daemon-api` verb (`create` 353 → 352 ms, `restore` 542 → 543 ms, `exec`/`list` sub-ms,
+`destroy` 264 → 263 ms — all n.s. at n=10).
+
+**Regressed: the session path, on all four backends** (n=10 per arm):
+
+| metric | base → head | Δ | p |
+| --- | --- | --- | --- |
+| `session-connect` QEMU | 198 → 248 µs | +25.3 % | 0.0009 |
+| `session-connect` CH | 236 → 290 µs | +22.9 % | 0.0012 |
+| `session-connect` FC | 228 → 282 µs | +23.7 % | 0.028 |
+| `session-connect` crosvm | 134 → 142 µs | +5.9 % | 0.0035 |
+| `session-open` crosvm / QEMU / FC | 698 → 731 / 714 → 754 / 722 → 744 µs | +2.9…+5.5 % | 0.005…0.026 |
+
+Cause: `StewardClient::connect_framed`'s retry loop asks `classify_serial_fault()` where it used to
+ask `contains_panic()` — a line-by-line scan, ~18 needles per line, five passes, and on a *healthy*
+console nothing short-circuits. Confirmed by dose-response (`--kernel-verbosity` varies only console
+size: base flat at 217/227/253 µs, HEAD 315/299/**972**) and by surgical isolation (HEAD vs HEAD
+with only that scan reverted: −35 µs default, −577 µs verbose). **Fixed** in `6a8315d` by a
+whole-buffer prefilter; the classifier now carries its own tracked micro-benchmark, which is why
+the cost was invisible for a release.
+
+**Micro-benchmarks** (`criterion`, in-process, two rounds each arm — same host, so comparable to
+each other but not to the 2026-07-01 table below):
+
+| benchmark | base | head | Δ |
+| --- | --- | --- | --- |
+| `cache_key_generation` | 703 ns | 1,116 ns | **+59 %** |
+| `math_30_ipv4_parse` | 64.8 ns | 98.5 ns | **+52 %** |
+| `protocol_encode` / `protocol_decode` | 177 / 245 ns | 181 / 248 ns | +2 % / +1 % |
+| `in_memory_tar2erofs_empty` | 3.00 µs | 3.14 µs | ~flat |
+
+Both large movers are tens-to-hundreds of nanoseconds against a multi-second VM lifecycle, and both
+have plausible causes in landed work (the cache key folds more inputs; the vmid ceiling moved
+252 → 9999, and `math_30_ipv4_parse` benches the real `/30` helper). Tracked, not gated.
+
+**The methodology finding, which outranks the numbers.** Of six single-pass deltas ≥ 10 % in the
+first matrix pass, **five did not survive repeats and one reversed sign** — `fc vsock-rtt` "+108 %"
+became −3.3 % (p=0.29), `ch session-connect` "−22 %" became +23 %. A single p50 from one run of a
+default-size mode is not evidence on this host; a mechanism hunt was run to completion against one
+of the phantoms before the repeats came back. Quote medians over repeats with a rank test, or say
+"no evidence".
 
 ## Full backend×mode matrix (2026-07-17, HEAD `05fe674`) — CANONICAL
 
@@ -960,10 +1036,12 @@ delegated cgroup scope; `scripts/run-bench.sh` is the one-invocation form. Two f
   (exit 1) rather than mislabeling the results table — the daemon backend is CH and it boots the
   store's plain `vmlinux`. `perf-matrix.sh` already passes `--backend cloud-hypervisor`; an
   out-of-tree runbook passing either flag must drop it.
-- `build_vmm_cmd` installs its `pre_exec` closure **unconditionally** (the SIGINT/SIGTERM `SIG_DFL`
-  reset has to hold even with no netns and a no-op jail), so a VMM spawn no longer takes std's
-  `posix_spawn` fast path. One extra `fork`+`exec` against a multi-hundred-ms boot; unmeasured, and
-  the next matrix re-run is where it would show.
+- ~~`build_vmm_cmd` installs its `pre_exec` closure unconditionally … the next matrix re-run is
+  where it would show.~~ **Retired 2026-08-21, empirically.** That re-run happened (the A/B at the
+  top of this file) and the create phase shows no consistent movement: CH COLD +7.0 %, CH RESTORE
+  +1.5 %, FC COLD −3.7 %, FC RESTORE +12.4 %, every one of them overlapping between arms. The
+  premise was also over-scoped — the shipped default `JailConfig::hardened()` is not `is_noop()`,
+  so the closure was already installed on every shipped spawn before the change.
 
 ---
 *This doc is canonical for every measured number; each section states its own substrate and method.
