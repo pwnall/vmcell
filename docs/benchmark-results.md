@@ -73,9 +73,26 @@ Cause: `StewardClient::connect_framed`'s retry loop asks `classify_serial_fault(
 ask `contains_panic()` — a line-by-line scan, ~18 needles per line, five passes, and on a *healthy*
 console nothing short-circuits. Confirmed by dose-response (`--kernel-verbosity` varies only console
 size: base flat at 217/227/253 µs, HEAD 315/299/**972**) and by surgical isolation (HEAD vs HEAD
-with only that scan reverted: −35 µs default, −577 µs verbose). **Fixed** in `6a8315d` by a
-whole-buffer prefilter; the classifier now carries its own tracked micro-benchmark, which is why
+with only that scan reverted: −35 µs default, −577 µs verbose). `6a8315d` fixes it with a
+whole-buffer prefilter, and the classifier now carries its own tracked micro-benchmark, which is why
 the cost was invisible for a release.
+
+**But the fix does not close the regression, and the re-measurement says so.** With the prefilter in,
+the same interleaved A/B (n=10 per arm) still reports `session-connect` +35.8 % CH (187 → 254 µs,
+p=0.0004), +35.7 % QEMU (p=0.0045), +20.8 % FC (p=0.0065) and `session-open` +14.9 % CH (p=0.0002).
+The dose-response says exactly what the fix did and did not do:
+
+| `--kernel-verbosity` | base | head, before the prefilter | head, after |
+| --- | --- | --- | --- |
+| quiet | 186 µs | 315 µs | 234 µs |
+| balanced | 179 µs | 299 µs | 226 µs |
+| debug | 198 µs | 972 µs | 320 µs |
+
+Most of the console-size **slope** is gone (debug 972 → 320 µs), which is the classifier. What remains
+is a **constant ≈47 µs per connect at every verbosity, including `quiet`** — plus a small residual
+slope — and the classifier cannot explain it: it now costs ≈4.3 µs on a 24-line console. **Open, with
+the mechanism unidentified.** Recorded rather than attributed, because the first attribution was made
+before the re-measurement and was wrong to claim closure.
 
 **Micro-benchmarks** (`criterion`, in-process, two rounds each arm — same host, so comparable to
 each other but not to the 2026-07-01 table below):

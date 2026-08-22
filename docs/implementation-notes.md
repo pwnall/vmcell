@@ -7002,6 +7002,18 @@ term is O(console bytes) with no bound on the console.
 Everything else is flat: cold boot, warm restore, snapshot bytes, host RSS per guest, zygote
 fan-out, net-egress in all three modes, and every `daemon-api` verb, on all four backends.
 
+**The fix is partial, and the correction matters more than the fix.** Re-measuring after `6a8315d`
+landed — same controls, n=10 per arm — `session-connect` is *still* +35.8 % on CH (187 → 254 µs,
+p=0.0004), +35.7 % QEMU, +20.8 % FC. The dose-response separates what was fixed from what was not:
+at `quiet`/`balanced`/`debug` the head arm went 315/299/**972** µs before the prefilter to
+234/226/**320** µs after, against a base of 186/179/198. So the console-size **slope** was the
+classifier and is largely gone; a **constant ≈47 µs per connect at every verbosity** was never the
+classifier and remains **unattributed**. The first pass attributed the whole regression to the one
+mechanism it had found — a dose-response and a surgical isolation both said that mechanism was real,
+and neither said it was the only one. Two confirmations of a cause are not a measurement of the
+remainder: the only thing that could establish closure was re-running the A/B after the fix, which is
+what turned "fixed" into "partially fixed, rest open".
+
 **`expiry_error` is NOT a defect — do not "fix" it.** Two independent review passes in this cycle
 flagged `fault::expiry_error` for classifying without a `.halted()` guard, on the theory that a
 non-halting fault turns a host timeout into a guest-fault report. That is the **designed**
