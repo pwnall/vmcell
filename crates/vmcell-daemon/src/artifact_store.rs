@@ -345,9 +345,20 @@ impl ArtifactStore {
             )));
         }
         let path = self.path_for(name)?;
-        // A `Booting`-race aside, this early check gives a clean 409 without touching disk — and,
-        // on the streaming path, without draining a multi-gigabyte body first; the no-clobber
-        // rename in `finish` is the authoritative guard.
+        // A `Booting`-race aside, this early check gives a clean 409 without touching disk: the
+        // STORE never opens a temp file, never hashes, and never reads a byte for a request it was
+        // always going to refuse — that property is unchanged and is what this ordering buys.
+        //
+        // What it no longer decides on its own is what the HANDLER does with the body afterwards.
+        // A refusal that closes the connection with the client's body still unread makes the kernel
+        // send RST, which destroys the 409 out of the client's receive buffer, so the client sees a
+        // transport error instead of the status this line took care to produce early. So the
+        // handler applies two rules over this `Err` (`server::MAX_REFUSAL_DRAIN_BYTES`, which
+        // carries the citations and the measurements): a client that offered to withhold its body
+        // (`Expect: 100-continue`) is answered having read ZERO bytes, exactly as before; any other
+        // client has a BOUNDED prefix — `min(--max-artifact-bytes, 64 MiB)`, and only for as long as
+        // the drain's deadline allows — read and discarded so the refusal is deliverable. Bandwidth only: still nothing hashed, buffered or written
+        // here. The no-clobber rename in `finish` remains the authoritative guard.
         if path.exists() {
             return Err(DaemonError::AlreadyExists(format!(
                 "artifact {name:?} already exists (the store has no update; delete then create)"

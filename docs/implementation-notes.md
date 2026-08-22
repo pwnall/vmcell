@@ -7061,3 +7061,185 @@ at all; this pass installed it beside (checksum-verified) and pinned both arms t
 **v1.16.1** while `/usr/local/bin/firecracker` here is **v1.16.0**, so its vsock-after-restore fix
 is not in effect in these numbers. Neither is a regression; both are reasons a number from this box
 is not automatically a number about CI.
+
+## The flaky 24 MiB re-upload: why `Expect: 100-continue` is the right mechanism and only half of it exists
+
+**The defect, with its mechanism named.** `crates/vmcelld/tests/integration.rs`'s
+`a_large_artifact_streams_up_and_is_digested_over_its_whole_body` streams a 24 MiB `PUT`, then
+re-uploads the same name expecting a typed `409 AlreadyExists`, and instead gets a **transport
+error** — on the first try, on every commit tested including ones predating the 2026-08-21 benchmark
+pass. `nextest`'s retries normally hide it (`24 passed (1 flaky)`); CI exhausted all four once, which
+is how it surfaced. This is the `docs/historical/45` rule in action: *"environmental" is a hypothesis,
+not a diagnosis* — so here is the mechanism.
+
+`ArtifactStore::create_streaming` refuses a taken name **before the body is polled**
+(`artifact_store.rs:347-352`), deliberately: "a clean 409 without touching disk — and, on the
+streaming path, without draining a multi-gigabyte body first." The consequence is at the TCP layer,
+not the HTTP one: a peer that closes its read side while data is still queued sends **RST**, and
+Linux then discards the already-received 409 from the client's receive queue. Whether the client
+reads its response or an error is a socket-buffer race, which is exactly the shape of a flake that
+survives retries.
+
+**`Expect: 100-continue` (RFC 9110 §10.1.1) is the correct mechanism, and the server already
+implements it perfectly.** hyper 1.11.0 parses the token at `proto/h1/role.rs:317-321`, tags the
+request `Wants::EXPECT` (`conn.rs:303-320`), and — this is the load-bearing part — emits the interim
+response **lazily, only from inside `poll_read_body`** (`conn.rs:409-420`), never on receipt of
+headers. When the handler answers before polling the body, `poll_drain_or_close_read`
+(`conn.rs:849-864`) explicitly *skips* sending the 100. Measured against a real `axum::serve`
+listener with a client that genuinely withholds: **20/20 typed 409, the server having read the request
+head and ZERO body bytes, with `HTTP/1.1 409` as the first bytes back on the wire.** A handler made to
+sleep 800 ms before reading the body received its `100 Continue` at 802 ms, which is the lazy
+emission proven rather than assumed.
+
+**The client half does not exist in the locked stack, and cannot be reached from `reqwest`.**
+`hyper-1.11.0/src/proto/h1/role.rs:1173` hardcodes `expect_continue: false` in `Client::parse`;
+`Client::encode` (`role.rs:1195-1240`) never inspects `header::EXPECT`; `dispatch.rs:347-437` goes
+straight from `write_head` to pumping body frames, gated on `state.writing` alone and never on a
+received 1xx. `grep -rni '100-continue\|expect_continue' reqwest-0.13.4/src/` returns nothing, and
+`reqwest`'s `execute_request` (`async_impl/client.rs:2632-2652`) rebuilds a fresh `hyper::Request`
+copying only method/uri/version/headers/body, so even `hyper::ext::on_informational` cannot be
+attached through it. **Setting the header from `reqwest` is decorative**: measured, a 24 MiB `PUT` to
+an early-409 route got a typed 409 on **0/20** attempts with the header and 0/20 without, and an
+interleaved 100-iteration probe measured 4 transport errors with `Expect` against 3 without — noise.
+
+**So the shipped design is two rules, one predicate each**, and only the first is `Expect`-driven:
+
+1. **The client offered to withhold** — refuse having read **zero** body bytes. Already true; the
+   value of stating it is that the second rule is exactly what would silently destroy it, so the
+   invariant is now asserted on BYTES READ rather than on the status (a status-only assertion is
+   green whether or not the body was drained).
+2. **Otherwise** — read and **discard** the body up to the site's `DrainBudget`, then answer, so the
+   refusal is deliverable. Nothing is hashed, buffered, or written; the store's
+   create-only/atomic/digest guarantees are untouched. Past the budget the connection still dies and
+   the client still sees a transport error — stated in the rustdoc rather than hidden, because a
+   bounded drain is a bounded promise.
+
+The `Expect` predicate matches hyper's own rule exactly, in all **three** of its conditions, because
+a *different* reading of the same request on the two sides of one connection is a second law waiting
+to diverge: the last `Expect` header wins and must `eq_ignore_ascii_case("100-continue")` whole
+(`role.rs:317-321`); an **empty** body ignores the expectation (`conn.rs:303-306`); and the version
+must be **greater than HTTP/1.0** (`conn.rs:311`). The first cut folded in only the header, and
+claimed "exactly" for all three — both missing conditions fail in the direction that LOSES refusals
+(a 1.0 client's body arrives unasked and would not have been drained). Emptiness is read off
+`Body::size_hint`, which is hyper's own `DecodedLength` (`incoming.rs:303-323`), rather than from a
+second `Content-Length`/`Transfer-Encoding` parser free to disagree with it.
+
+**What was rejected, and why.** Speaking HTTP/2 between the client and the daemon also fixes it and
+was measured at 20/20 against the same `axum::serve` listener (which already runs
+`hyper_util`'s auto builder, so h2c needs no server change) — but it changes the wire protocol for
+every consumer of the client library to buy a property a bounded drain buys locally. Loosening the
+test's assertion was rejected outright: the 409 is a real create-only property, and a test that
+accepts "409 or a transport error" cannot tell the guard working from the guard gone.
+
+### As built — eight deviations from the plan above, each recorded rather than silent
+
+Items 1–3 are the landing pass; 4–7 are the adversarial review's findings, and 8 is the independent
+re-check's, each fixed with the gate named in it.
+
+**1. There are THREE refusal sites, not one.** The plan named the store's pre-body refusal
+(`create_streaming`); the same undeliverable-response defect exists verbatim at the **auth layer**
+(a 401/403 is decided before `next.run(req)` ever polls the body, so a client streaming an artifact
+at a mistyped key got a transport error instead of its typed status) and at the **cap**, mid-stream
+(a 413 raised at the chunk that crosses `--max-artifact-bytes`, with the rest of the body still
+coming). All three route through the one predicate and the one drain. The cap site deliberately does
+**not** consult `Expect`: by then hyper has emitted its `100 Continue` at the first body poll and the
+client is demonstrably sending, so "it offered to withhold" is no longer true of the bytes in flight.
+
+**2. The mid-stream drain gets a FRESH budget, not `budget - writer.written()`.** The plan sketched
+the latter; it computes **zero** in the ordinary case, because a body refused *at* the cap has by
+definition already consumed the whole `min(cap, 64 MiB)` budget — the arm would have been a no-op
+exactly where it is needed, and its gate reddens on that formula. The bound stays honest: a refused
+upload costs at most `cap + budget` read bytes against the `cap` the same client may already spend on
+the accept path.
+
+**3. A gate for this class has to be sized against hyper's own read buffer, or it is vacuous.**
+When the handler stops reading, `poll_drain_or_close_read` (`hyper-1.11.0/src/proto/h1/conn.rs:847-864`)
+still gets **one** `poll_read_body`, which can absorb up to `DEFAULT_MAX_BUFFER_SIZE`
+(`proto/h1/io.rs:22` — `8192 + 4096*100`, ≈408 KiB) and, if that finishes the body, leaves the
+connection in `Reading::KeepAlive` with the response already delivered. The first cut of the cap gate
+used a 1.5 MiB body against a 1 MiB cap: with the drain **deleted**, hyper drained the ~0.5 MiB tail
+itself and the gate stayed **green** on the inverse it was written against. It is now a 7 MiB body
+against a 4 MiB cap — a ~3 MiB tail, seven times that buffer and still inside the budget — and the
+409/403 gates use 768 KiB for the same reason. Any future test of "did the handler drain?" needs the
+same margin; the byte count alone does not supply it.
+
+**4. The drain is bounded in TIME as well as in bytes, and the pre-auth refusal has its own much
+smaller budget.** A byte ceiling does not bound a drain: a client that sends one byte and then
+nothing never reaches it, so the drain simply pends. As first cut that was a *new unauthenticated
+exposure* — `auth_layer` drains before authenticating, so a `PUT` with a wrong key, a declared
+megabyte and one byte sent held a daemon connection and its task open indefinitely, where the
+pre-change daemon closed on the 401 immediately. So the budget is a `DrainBudget { bytes, deadline }`
+with two constructors: `authenticated` (`min(--max-artifact-bytes, 64 MiB)` / 30 s) and
+`unauthenticated` (1 MiB / 2 s). The deadline is an absolute `Instant` taken at construction and
+spent through `timeout_at` on **every** poll — a per-chunk relative timeout bounds only the gaps
+between polls and lets a steady drip run forever, which is the shape the paused-clock gate
+(`the_drain_deadline_bounds_the_whole_drain_not_the_gap_between_chunks`) exists to discriminate: the
+wire gate passes under that inverse and only the clock gate reddens. The pre-auth ceiling is not
+smaller than 1 MiB for a measured reason — hyper absorbs ~408 KiB by itself in the one
+`poll_read_body` of `poll_drain_or_close_read`, so a smaller budget would buy nothing observable.
+And the budget is minted **at** each refusal site rather than carried from the start of the request:
+one taken when the head was parsed is already expired by the time a slow multi-gigabyte upload
+reaches the mid-stream cap.
+
+**5. `DrainEnd::Budget`/`Deadline` is logged at WARN, and the cap refusal drops its writer first.**
+Both drain call sites discard the `DrainOutcome`, so the log line is the only place "the daemon knows
+this refusal will not be received" reaches an operator; the deliverable arms stay at `debug` so the
+signal keeps its meaning. And the mid-stream cap arm `drop(writer)`s before awaiting the drain: the
+writer owns an open `NamedTempFile` holding up to a full `--max-artifact-bytes` of an upload that is
+already doomed, and the drain that follows may run for the whole of `MAX_REFUSAL_DRAIN_TIME`.
+
+**6. A gate for rule 1 that asserts "zero body bytes" has to send body bytes.** The first cut's
+`server_read == head.len()` was a tautology: its client sends nothing, so the count holds whether or
+not the drain ran (it passes under the unconditional-drain inverse; that leg reddens on the hang and
+on the `100 Continue`, not on the number). The gate now also runs the client that BREAKS its offer —
+`Expect: 100-continue` and then 4 MiB pushed — and bounds the count by hyper's own unasked read
+(≈408 KiB, `io.rs:22`), which is the tightest bound any such gate can carry: hyper fills its read
+buffer whatever the handler does. Under the unconditional-drain inverse that count lands at
+head + 1 MiB. The same leg is why the chunked arm exists: `reqwest::Body::from(File)` →
+`wrap_stream` has no exact size hint, so the production client sends `Transfer-Encoding: chunked`
+with no `Content-Length` — the budget counts DECODED bytes while the wire carries framing on top of
+them, and no gate covered that shape at all.
+
+**7. A gate that asserts on a LOG needs one process-wide subscriber, or it is silently
+suppressible.** `tracing::subscriber::set_default` is thread-local, but a callsite's `Interest` is
+cached **process-wide** at first hit — and when exactly one dispatcher is registered, that cache is
+computed from whatever the *registering thread's* default happens to be
+(`tracing-core-0.1.36/src/callsite.rs:410-414`, the `Rebuilder::JustOne` arm). `cargo test` runs the
+whole crate in one process, so a sibling gate reaching the drain's `warn!` from a thread with no
+subscriber cached `Interest::never()` for the run and the log gate's own event was skipped before
+dispatch: a 1-in-26 red on the full suite, `left: 0, right: 1`, reproduced 4/4 by holding the gate's
+subscriber for 400 ms while a sibling registered the callsite. The fix is a `Once`-installed global
+no-op subscriber that is interested in everything (`keep_log_gates_observable`), which every log gate
+in `server.rs` calls first; the scoped counter still wins on its own thread. Worth stating because
+the failure mode is a *false green* in the other direction — a log claim can quietly stop being
+checked, on any test in any crate that counts events through a scoped subscriber.
+
+**8. `DrainEnd` has four arms and only three were driven.** `Failed` — the client's body errors
+mid-drain — was neither covered nor recorded, which is the half of AGENTS.md rule 4 that reads
+"error branches … cover it or record it". It is now a leg of
+`an_undeliverable_refusal_is_warned_about_and_a_deliverable_one_is_not`, because the claim it
+carries is a LOG claim: `Failed` must stay at `debug`, since a peer that went away is not an
+operator's problem and warning about it would dilute the one line that is. The leg asserts the arm
+(`end == Failed`), the bytes discarded before the failure (non-vacuity: a drain that never pulled
+the chunk would report zero and assert nothing), and that the warn count is exactly where the budget
+leg left it. Red on both inverses: moving `Failed` into the `warn!` arm takes that count to 2, and
+making the error arm report `Eof` takes `end` to `Eof`.
+
+**The end-to-end defect is reproduced and closed on this host, which no gate in the crate can
+show.** With `crates/vmcell-daemon/src/server.rs` reverted to its pre-drain state,
+`a_large_artifact_streams_up_and_is_digested_over_its_whole_body` fails **4 times in 28**
+`--retries=0` runs, always as
+`assertion left == right failed: got transport error: error sending request for url … left: None,
+right: Some(AlreadyExists)` — the RST destroying the 409, exactly as diagnosed. With the drain in
+place the same test passes **41/41** (30 solo runs, 10 solo runs, and one full `just test-daemon`,
+24/24 with no nextest retry). That measurement is the reason the flake is called closed rather than
+quiet: a green live suite alone would not distinguish the two.
+
+**Why the gates own both ends of the wire.** They accept and serve the connection themselves —
+`TokioIo` + `TowerToHyperService` + hyper's HTTP/1 connection server, the pieces `axum::serve`
+composes (`axum-0.8.9/src/serve/mod.rs:385-396`) — with the socket wrapped in a byte-counting
+adapter, because the invariant rule 1 protects is a **number** (zero body bytes) and `axum::serve`
+owns its accepted stream. `hyper-util`'s `server-auto` was deliberately not used: it pulls
+`hyper/http2` and with it `h2`, `indexmap` and a second `hashbrown` into the workspace lock for a
+dev-dependency, and the defect is HTTP/1.1-specific — `auto` hands an HTTP/1.1 connection to exactly
+this server.

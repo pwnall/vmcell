@@ -162,7 +162,43 @@ name = "vmcell-daemon"
 #     below stays `^0.23.0`, as every sibling's does — the workspace resolves it by path, and
 #     tightening one pin while thirteen others stayed loose would say something about resolution
 #     that is not true.
-version = "0.8.0"
+# 0.8.0 → 0.9.0: **a refusal you can actually receive.** As with every entry above,
+# `cargo semver-checks` does not cover this crate and no signature a client links moved — every edge
+# below is a REPLY a client sees change, so this line is the only thing that will tell them.
+#   * A `PUT /v1/artifacts/{name}` the daemon REFUSES now returns its typed status — 409
+#     `already_exists`, 400 `bad_request`, 413 `payload_too_large`, and the auth layer's 401/403 —
+#     deterministically and on the FIRST attempt, for any body the refusal drain can absorb: up to
+#     `min(--max-artifact-bytes, 64 MiB)` within 30 s once the request AUTHENTICATED, and up to
+#     1 MiB within 2 s for the 401/403 the auth layer decides before it did. Before, a refusal decided before the body was polled raced the body still in flight:
+#     the daemon closed its read side with data unread, the kernel turned that close into an RST,
+#     and an RST discards the client's receive buffer — destroying a response the daemon had already
+#     written. A client that treated a transport error on re-upload as "probably already exists" now
+#     gets the real answer, and one that retried a 24 MiB upload to learn it can stop.
+#   * The connection SURVIVES a refusal whose body was drained to its END (keep-alive intact) where
+#     it previously closed, so a pooling client sees fewer reconnects. That is the drained rule
+#     only: a refusal the client OFFERED to withhold (`Expect: 100-continue`) is answered having
+#     read no body at all, and the body being unfinished hyper cannot reuse that connection — the
+#     typed status is delivered and the connection then closes, as before.
+#   * PAST EITHER bound — the byte ceiling or the deadline — the connection is still cut and the
+#     client still sees a transport error, and the daemon logs that at WARN
+#     (`undeliverable_refusal`, naming the budget and the remedy) so an operator is not left
+#     diagnosing it twice. This is a bounded promise, named rather than hidden. The remedy at any
+#     size is `Expect: 100-continue`, which the daemon honors by answering having read ZERO body
+#     bytes (curl sends it automatically for large `-T` uploads; `reqwest` 0.13.4 does not implement
+#     the client half at all — hyper hardcodes `expect_continue: false` at `proto/h1/role.rs:1173` —
+#     so the header is decorative from `vmcell-daemon-client` and is deliberately NOT set there).
+#   * OPERATIONAL COST: a refused upload now costs the daemon bandwidth — up to
+#     `min(--max-artifact-bytes, 64 MiB)` read and discarded per refusal, plus the same again if the
+#     refusal is the mid-stream cap. Never disk, never RAM beyond one chunk. It is NOT confined to
+#     requests that reached a handler: the auth layer's 401/403 is decided in MIDDLEWARE, before any
+#     handler runs, and drains too — on its own far smaller budget (1 MiB, 2 s) precisely because
+#     nothing has authenticated at that point, so an anonymous caller can neither buy the
+#     authenticated ceiling nor hold a connection by dripping. Lower `--max-artifact-bytes` lowers
+#     the authenticated half.
+#   * COMPANION, in `vmcell-daemon-client` (0.1.0, unbumped — it has no ledger and nothing moved):
+#     none. `upload_artifact` is unchanged; it simply now receives the status the daemon always
+#     intended to send.
+version = "0.9.0"
 edition = "2024"
 rust-version.workspace = true
 license = "MIT OR Apache-2.0"
@@ -240,5 +276,28 @@ ignored = ["async-trait"]
 # `test-util` is what lets the periodic sweeper's SCHEDULER be gated: `#[tokio::test(start_paused =
 # true)]` runs its cadence on a virtual clock, so a 300-second interval is exercised in microseconds
 # instead of being the one part of the feature no test executes.
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "test-util"] }
+#
+# `net` + `io-util` are the refusal-drain gates' (server.rs) — they hand-write an HTTP/1.1 request
+# onto a REAL socket, because the defect they cover (an RST destroying a response the server already
+# wrote) does not exist above the transport and a `oneshot` against the `Router` value cannot see it.
+# Declared here explicitly rather than inherited from the optional `[dependencies] tokio` above:
+# feature unification across dependency kinds is a resolver property, not a promise this file makes,
+# and `vmcell-daemon-client`'s own wire tests already carry the same explicit declaration.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "test-util", "net", "io-util"] }
 tempfile = "3"
+# The server half of those same gates: the connection is accepted and served BY THE TEST, so the
+# socket can be wrapped in a byte-counting adapter and the gate can assert on how many bytes the
+# server actually read off the wire — the invariant "a withheld body is refused having read ZERO
+# bytes" is a number, and a status-only assertion passes even when the drain ran. The pieces are the
+# ones `axum::serve` itself composes (axum-0.8.9/src/serve/mod.rs:385-396): `TokioIo`,
+# `TowerToHyperService`, and hyper's own connection server, so the gate drives the production stack
+# rather than a lookalike.
+#
+# `hyper/http1` deliberately, NOT hyper-util's `server-auto`: `auto` is what `axum::serve` picks so
+# it can also answer h2c, and enabling it here would pull `hyper/http2` — and with it `h2`,
+# `indexmap` and a second `hashbrown` — into the workspace lock for a dev-dependency. The whole
+# defect (an RST destroying an already-written response) is HTTP/1.1-specific, and `auto` delegates
+# an HTTP/1.1 request to exactly this connection server. Both crates are already in the tree via
+# axum, at these versions; this only names them.
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["service", "tokio"] }
