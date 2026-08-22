@@ -11,8 +11,10 @@
 # WHY A ROSTER AND NOT A BARE "EVERY RECIPE HAS A CALLER". Some recipes legitimately have no
 # machine caller: the opt-in live suites (`test-crosvm`, `test-systemd`, `test-usb-passthrough`)
 # are kept off CI for a NAMED reason — an absent binary, a full-Debian pull, a designated device —
-# and the reviewer/operator entry points (`ci`, `daemon`, `install-hooks`,
-# `test-unit-undelegated`) are typed by a human by design. Demanding a caller for those would
+# the reviewer/operator entry points (`ci`, `daemon`, `install-hooks`,
+# `test-unit-undelegated`) are typed by a human by design, and the A/B measurements
+# (`bench-ab-prepare`, `bench-ab`) produce a tracked metric rather than a verdict, so there is
+# nothing for a machine caller to assert on. Demanding a caller for those would
 # force a fake one, which is worse than the hole. So the gate asserts the two-way equality
 # instead: an un-called recipe must be ON the roster below with its reason, and a roster entry
 # that HAS acquired a caller (or names a recipe that no longer exists) is stale — i.e. a
@@ -20,6 +22,13 @@
 #
 # THE ROSTER — every entry is a recipe with no machine caller, and the reason it has none:
 #
+#   bench-ab                The A/B comparison itself (design §16). It boots VMs through two
+#                           PREPARED arms and a blessed runner, and a benchmark is a tracked
+#                           metric, never a pass/fail gate — a CI caller would be asserting on a
+#                           number that legitimately moves with the host.
+#   bench-ab-prepare        Builds and stages one arm from a git ref (a full release build in its
+#                           own worktree, plus that arm's own rootfs in a builder micro-VM). WHICH
+#                           two refs are being compared is the human's question by definition.
 #   ci                      The aggregate. AGENTS.md's "Done means" row is `just ci` green LOCALLY;
 #                           ci.yml deliberately invokes its constituents as separate jobs (for
 #                           parallelism and per-job runners) rather than the aggregate, so nothing
@@ -69,6 +78,8 @@ root="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 # THE ROSTER, as data. Kept beside the prose above so the two cannot drift: the prose explains an
 # entry, this list IS the entry.
 roster=(
+  bench-ab
+  bench-ab-prepare
   ci
   daemon
   install-hooks

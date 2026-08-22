@@ -19,6 +19,17 @@ vmcell-qemu = { path = "../vmcell-qemu", version = "0.1.0", optional = true }
 vmcell-crosvm = { path = "../vmcell-crosvm", version = "0.1.0", optional = true }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
+# The library half (`src/lib.rs`) serialises the machine-readable bench report and the A/B arm
+# manifests. Both are JSON: `serde_json` was already here for the daemon-mode legs, and `serde`'s
+# derive is what stops the report from being a hand-rolled formatter the next consumer scrapes with
+# a regex (which is the defect `src/report.rs` exists to close).
+serde = { version = "1", features = ["derive"] }
+# Arm manifests pin `bench-vm`, `vmcelld`, the kernel and the rootfs BY CONTENT. The 2026-08-21
+# pass trusted paths: a concurrent build swapped a staged binary mid-run and an old arm booted a
+# different vmlinux than the driver believed it had exported. Same version the rest of the
+# workspace resolves (`vmcell`, `vmcell-daemon`, `vmcell-kernel-builder`), so this adds no new
+# entry to `Cargo.lock`.
+sha2 = "0.11"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "fs", "net", "process", "sync", "time", "signal"] }
 serde_json = "1"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream", "blocking"] }
@@ -61,4 +72,14 @@ vmcell-artifact-validator = { path = "../vmcell-artifact-validator", version = "
 [[bin]]
 name = "bench-vm"
 path = "src/bin/bench-vm.rs"
+required-features = ["cloud-hypervisor"]
+
+# `bench-ab` drives `bench-vm` children; it mirrors that binary's `required-features` deliberately.
+# A `bench-ab` built where `cloud-hypervisor` is off is a comparator whose arms cannot exist — the
+# same class `just test-bench`'s features guard refuses by name, one level up: cargo would still set
+# `CARGO_BIN_EXE_bench-vm`, so the harness would drive whatever STALE binary an earlier,
+# differently-featured build left in target/ and report it as this run.
+[[bin]]
+name = "bench-ab"
+path = "src/bin/bench-ab.rs"
 required-features = ["cloud-hypervisor"]

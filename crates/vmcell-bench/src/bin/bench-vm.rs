@@ -40,6 +40,7 @@
 )]
 
 use clap::Parser;
+use std::collections::BTreeMap;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -53,6 +54,63 @@ use vmcell::orchestrator::{MicroVm, VmidAllocator};
 use vmcell::steward::protocol::ExecRequest;
 use vmcell::steward::session::SessionSpecBuilder;
 use vmcell::vmm::{VmInstance, Vmm};
+use vmcell_bench::metrics;
+use vmcell_bench::report::{BenchReport, BinSource, Metric, REPORT_SCHEMA_VERSION, Unit};
+
+/// Whether the human-readable lines go to stderr instead of stdout. Set ONCE, in `main`, from
+/// `--report`.
+///
+/// WHY A PROCESS-WIDE FLAG. `--report json` promises **one** [`BenchReport`] on stdout, and this
+/// harness writes ~100 human lines from a dozen mode functions and a nested helper module. A
+/// per-call-site format argument would be a hundred chances to leave one line on stdout, and one
+/// stray line is the difference between a parseable report and the 2026-08-21 regex scraping this
+/// whole feature exists to retire. The lines are not suppressed — a run that self-skipped half its
+/// matrix must still say so — they move to stderr, where the parent reads them as the diagnosis.
+static HUMAN_LINES_TO_STDERR: AtomicBool = AtomicBool::new(false); // allow-global-state: the process's OUTPUT STREAM choice, not shared program state — written once in `main` from `--report` before any output and only ever read; it holds no borrowed state and there is nothing for a seam to inject, since the thing it selects (`println!` vs `eprintln!`) is already process-global. The alternative is a format argument threaded through ~100 call sites in a dozen mode functions and a nested helper module, i.e. a hundred chances to leave one line on the stdout that `--report json` promises carries exactly one report
+
+/// Reads the [`HUMAN_LINES_TO_STDERR`] routing decision. `Relaxed` is the whole ordering
+/// requirement: the store happens in `main` before any benchmark starts, so no reader races it.
+fn human_lines_to_stderr() -> bool {
+    HUMAN_LINES_TO_STDERR.load(Ordering::Relaxed)
+}
+
+/// Prints one human-readable line, on the stream `--report` selected.
+///
+/// Every former `println!` in this binary is a `say!`: see [`HUMAN_LINES_TO_STDERR`] for why the
+/// choice is one flag rather than a hundred call-site decisions.
+macro_rules! say {
+    ($($arg:tt)*) => {{
+        if crate::human_lines_to_stderr() {
+            eprintln!($($arg)*);
+        } else {
+            println!($($arg)*);
+        }
+    }};
+}
+
+/// What `--report` emits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReportFormat {
+    /// The human table this harness has always printed, on stdout. The default: nothing existing
+    /// changes shape.
+    Text,
+    /// One [`BenchReport`] as JSON on stdout, with the human lines on stderr.
+    Json,
+}
+
+/// Parses `--report`, rejecting anything else at parse time (H-BIN-1) rather than defaulting.
+///
+/// A silently-defaulted `--report jsonn` would print the text table to a parent expecting JSON,
+/// which fails at the parse step with the report's own bytes as the confusing evidence.
+fn parse_report_format(s: &str) -> Result<ReportFormat, String> {
+    match s {
+        "text" => Ok(ReportFormat::Text),
+        "json" => Ok(ReportFormat::Json),
+        other => Err(format!(
+            "invalid report format '{other}' (expected: text, json)"
+        )),
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Macro-benchmarking harness for vmcell VMs")]
@@ -134,6 +192,17 @@ struct Args {
     /// other modes. An unknown value is rejected at parse time.
     #[arg(long, default_value = "plain", value_parser = parse_net_mode)]
     net_mode: String,
+
+    /// Output format: `text` (default — the human table, unchanged) or `json` (one
+    /// machine-readable `BenchReport` on stdout, with every human line on stderr).
+    ///
+    /// `json` exists because the 2026-08-21 A/B driver scraped this harness's table with regexes,
+    /// and three of them broke in ways that produced a plausible float rather than an error:
+    /// crosvm's log spam interleaved with the rows, the `Cold Boot (WARM-CACHE: …)` parenthetical
+    /// moved the value's column, and the padded phase names shifted the split. An unknown value is
+    /// rejected at parse time.
+    #[arg(long, default_value = "text", value_parser = parse_report_format)]
+    report: ReportFormat,
 }
 
 /// Validates the `--profile` flag, rejecting any value other than `default`,
@@ -231,6 +300,27 @@ impl Args {
     }
 }
 
+/// THE ONE SPELLING of "how many measurement iterations produced no sample": what the mode set
+/// out to take, minus what it collected.
+///
+/// WHY A SUBTRACTION AND NOT A COUNTER. It shipped as a `dropped += 1` per failure arm, and every
+/// loop that gives up on a failed boot walks straight past the increment: `run_bench`'s
+/// create/restore arm `break`s, so do the vsock and both egress RTT loops, `phase_budget_path`
+/// passed a literal `0` for both counts, and `zygote`'s steward-ready row passed a literal `0`
+/// beside a live counter. So the ONE failure mode this accounting exists for — a boot that failed,
+/// which is disproportionately a SLOW boot — reported `dropped = 0` over a truncated sample set,
+/// and `bench-ab`'s `SampleLoss` verdict, whose entire job is to refuse a verdict over exactly
+/// that survivorship bias, stayed green on the arm that was losing samples. A `break` cannot walk
+/// past a subtraction.
+///
+/// `saturating_sub` rather than a panic: a mode that collected more than it planned is a bug in
+/// the caller's own bookkeeping, and aborting a completed matrix over it would destroy the numbers
+/// that would let anyone diagnose it. It reads as "nothing dropped", which the sample count beside
+/// it contradicts loudly.
+fn dropped_iterations(planned: usize, collected: usize) -> usize {
+    planned.saturating_sub(collected)
+}
+
 /// Formats the trailing `dropped=/warmup_failed=` accounting for a report line so a
 /// silently-shrunk sample count is visible (H-BIN-2). Empty when nothing was dropped.
 fn accounting_suffix(dropped: usize, warmup_failed: usize) -> String {
@@ -241,18 +331,287 @@ fn accounting_suffix(dropped: usize, warmup_failed: usize) -> String {
     }
 }
 
+/// One measured sample as the report carries it.
+///
+/// A latency is a `u128` of whole µs/ms and the report is `f64`, so the conversion happens in one
+/// named place rather than at forty `as` sites. Lossless below 2^53 — a sample large enough to lose
+/// a digit here is ~285 million years, and a benchmark that ran that long has a different problem.
+fn sample_as_f64(v: u128) -> f64 {
+    v as f64
+}
+
+/// Everything a run measured, in the shape [`BenchReport`] carries.
+///
+/// WHY A COLLECTOR AND NOT TWO FORMATTERS. `--report text` and `--report json` must not be able to
+/// disagree about a value, and the way two renderers disagree is that one of them is edited. So
+/// there is exactly one place a number is computed — [`Recorder::measure`] / [`Recorder::scalar`],
+/// both of which RETURN what they recorded — and every human line prints the returned metric's own
+/// fields. A row and its JSON field are then the same `f64` by construction, not by review.
+///
+/// The 2026-08-21 pass is the defect history: its driver re-derived the table's numbers with
+/// regexes, and the numbers it got were not the numbers the harness had measured.
+struct Recorder {
+    /// Poison-tolerant because a lock poisoned by a panicking benchmark still holds the samples
+    /// collected before the panic, and this harness's own panic path (`MicroVm::Drop`) is a
+    /// teardown, not a data corruption.
+    inner: std::sync::Mutex<Collected>,
+}
+
+/// The mutable half of a [`Recorder`].
+#[derive(Default)]
+struct Collected {
+    metrics: Vec<Metric>,
+    notes: Vec<String>,
+    /// Names recorded that [`metrics::METRIC_DIRECTIONS`] does not carry — see
+    /// [`Recorder::register`].
+    unregistered: std::collections::BTreeSet<String>,
+}
+
+impl Recorder {
+    fn new() -> Self {
+        Self {
+            inner: std::sync::Mutex::new(Collected::default()),
+        }
+    }
+
+    /// Runs `f` against the collected state, recovering a poisoned lock rather than propagating it.
+    fn with<R>(&self, f: impl FnOnce(&mut Collected) -> R) -> R {
+        match self.inner.lock() {
+            Ok(mut guard) => f(&mut guard),
+            // A previous panic poisoned the lock. The data behind it is still every sample taken
+            // before that panic, and dropping it would turn one failed iteration into a run with no
+            // report at all.
+            Err(poisoned) => f(&mut poisoned.into_inner()),
+        }
+    }
+
+    /// Notes a metric name the direction roster does not carry.
+    ///
+    /// WHY THE EMITTER REFUSES AND THE COMPARATOR DOES NOT. `bench-ab` compares two git refs, so a
+    /// metric the *other* ref emits and this build has never heard of is the tool working; it
+    /// degrades that to a loud `Neutral`. But a metric THIS tree emits with no entry in
+    /// `vmcell_bench::metrics::METRIC_DIRECTIONS` is a hole in the roster, and the pre-fix
+    /// comparator turned exactly that hole into a silent "lower is better" — which prints
+    /// IMPROVEMENT when a benefit gets worse. So every name goes through here, and
+    /// [`refuse_unregistered_metrics`] stops the report before it can be compared.
+    ///
+    /// Recorded rather than panicked: this runs after a full matrix of VM boots, and the human
+    /// lines on stderr are still the run's diagnosis. The refusal happens once, at the exit, and
+    /// names every offender instead of the first one.
+    fn register(&self, name: &str) {
+        if metrics::direction(name).is_none() {
+            self.with(|c| c.unregistered.insert(name.to_string()));
+        }
+    }
+
+    /// Every metric name recorded that the direction roster does not carry, sorted.
+    fn unregistered_metrics(&self) -> Vec<String> {
+        self.with(|c| c.unregistered.iter().cloned().collect())
+    }
+
+    /// Computes a metric's percentiles ONCE (through the shared nearest-rank [`pcts`]), records it,
+    /// and hands it back for the caller's text line. `None` when there were no samples.
+    ///
+    /// `name` is the stable snake_case identifier a comparator keys on — never the display label,
+    /// which carries padding, the `(WARM-CACHE: …)` parenthetical and the backend in parentheses.
+    ///
+    /// `planned` is how many MEASUREMENT iterations the mode set out to take (post-warmup), and
+    /// the metric's `dropped` count is derived from it through [`dropped_iterations`] rather than
+    /// accepted from the caller — see that function for the four call sites whose hand-kept
+    /// counters were walked past by a `break` or written as a literal `0`.
+    fn measure(
+        &self,
+        name: &str,
+        unit: Unit,
+        samples: &mut [u128],
+        planned: usize,
+        warmup_failed: usize,
+    ) -> Option<Metric> {
+        self.register(name);
+        let dropped = dropped_iterations(planned, samples.len());
+        let (p50, p95, p99, max) = pcts(samples)?;
+        let metric = Metric::new(
+            name,
+            unit,
+            samples.len(),
+            sample_as_f64(p50),
+            sample_as_f64(p95),
+            sample_as_f64(p99),
+            sample_as_f64(max),
+        )
+        .with_dropped(dropped)
+        .with_warmup_failed(warmup_failed);
+        self.with(|c| c.metrics.push(metric.clone()));
+        Some(metric)
+    }
+
+    /// Records a single number (a footprint total, a snapshot size, a share) and returns it, so the
+    /// text line that prints it reads the recorded value rather than recomputing one beside it.
+    ///
+    /// A scalar carries the same value in all four percentile fields: the report has one metric
+    /// shape, and a consumer that compares `p50` across arms then works uniformly instead of
+    /// special-casing "this kind has no distribution". `n` is what the number summarises (the guest
+    /// count, the sample count), so a per-guest mean over three guests is not read as one over ten.
+    fn scalar(&self, name: &str, unit: Unit, n: usize, value: f64) -> f64 {
+        self.register(name);
+        self.with(|c| {
+            c.metrics
+                .push(Metric::new(name, unit, n, value, value, value, value));
+        });
+        value
+    }
+
+    /// Records a note verbatim (a self-skip, a capability refusal, an honesty caveat).
+    fn note(&self, text: impl Into<String>) {
+        self.with(|c| c.notes.push(text.into()));
+    }
+
+    /// Prints a caveat AND records it, through one call so the two cannot diverge — `None` is a
+    /// run with nothing to disclose.
+    ///
+    /// A run that skipped half its matrix and a run that measured all of it must not be
+    /// indistinguishable in the JSON artifact — that is the "control silently did not apply" shape
+    /// of the 2026-08-21 defect, one layer up: the numbers were there, the reason they were the
+    /// wrong numbers was not. Four caveats shipped as bare `say!`s inside an `if` at their call
+    /// site and reached no report at all: the tmpfs snap-dir warning, the KSM acceleration
+    /// refusal, the incomplete host-pid attribution, and the zygote's full-copy fan-out. Each one
+    /// answers "are these two arms comparable", which is the one question the JSON exists for.
+    ///
+    /// It takes an `Option` because the DECISION belongs in a named composer (see
+    /// [`snap_dir_tmpfs_caveat`] and its siblings), not in an `if` beside the printing: a
+    /// condition spelled at the call site is a condition no test drives, which is exactly how
+    /// these four came to be printed and never recorded.
+    fn caveat(&self, text: Option<String>) {
+        if let Some(text) = text {
+            say!("{text}");
+            self.note(text);
+        }
+    }
+
+    /// A self-skip / capability refusal — a caveat whose condition is "the facility was absent",
+    /// already decided by the caller's own capability probe. One body ([`Recorder::caveat`]), two
+    /// names, because a skip reads as a skip at its thirteen call sites.
+    fn skip(&self, text: String) {
+        self.caveat(Some(text));
+    }
+
+    /// Everything collected, in emission order.
+    fn drain(&self) -> (Vec<Metric>, Vec<String>) {
+        self.with(|c| (std::mem::take(&mut c.metrics), std::mem::take(&mut c.notes)))
+    }
+}
+
+/// THE CAVEAT COMPOSERS. Each answers "does this run have something to disclose about the numbers
+/// it is about to print", and each is the entire decision — the call site is
+/// `rec.caveat(<composer>(…))` with no `if` of its own, so every arm of the decision is reachable
+/// from a unit test and the printed text and the recorded note are one string by construction.
+/// `bench-vm`'s own call-site scan (`every_caveat_is_recorded_not_just_printed`) is what keeps
+/// that shape; the class it closes is four caveats that printed and reached no report.
+///
+/// The warm-restore snapshot directory is RAM-backed, so the restore latency about to be measured
+/// is optimistic (§16, Performance, snap-dir caveat). `None` when this is not a restore run (the
+/// snapshot directory does not shape a cold-boot number) or when the directory is on a real
+/// filesystem.
+fn snap_dir_tmpfs_caveat(snap_dir: &Path, is_restore: bool, on_tmpfs: bool) -> Option<String> {
+    (is_restore && on_tmpfs).then(|| {
+        format!(
+            "warning: snap-dir {} is on tmpfs; warm-restore latency will be optimistic (§16, \
+             Performance) — an arm measured here is not comparable against one whose snapshots \
+             went to a real filesystem",
+            snap_dir.display()
+        )
+    })
+}
+
+/// The KSM scanner could not be accelerated, so the dedup window may not have converged.
+///
+/// This one qualifies a metric whose direction is INVERTED: `footprint_ksm_pages_sharing_delta` is
+/// the roster's HigherIsBetter entry, so an arm that failed to accelerate the scanner reports a
+/// smaller delta — which the comparator reads as the change having deduplicated less. Without the
+/// note in the report, the reader cannot tell that from a real regression.
+fn ksm_acceleration_caveat(accelerated: bool) -> Option<String> {
+    (!accelerated).then(|| {
+        format!(
+            "footprint: WARN could not accelerate KSM (need CAP_DAC_OVERRIDE via the runner); \
+             dedup may be partial, so `{}` under-reports here",
+            metrics::FOOTPRINT_KSM_PAGES_SHARING_DELTA
+        )
+    })
+}
+
+/// The KSM scanner knobs were restored but the pages merged during this run stay merged (N-BIN-2).
+///
+/// A note rather than a line that scrolls away because of what `bench-ab` does with these runs: it
+/// INTERLEAVES two arms on one host, so the merges this arm caused are part of the next arm's
+/// starting state. `None` when the mergeable lever was off and nothing was merged.
+fn ksm_residue_caveat(mergeable: bool) -> Option<String> {
+    mergeable.then(|| {
+        "KSM note: the scanner knobs were restored, but pages merged during this run stay merged \
+         (host KSM state is not fully reset), so a later arm on this host starts from a partly \
+         deduplicated baseline"
+            .to_string()
+    })
+}
+
+/// Fewer host PIDs resolved than guests booted, so the per-VM memory totals are deflated
+/// (M-BIN-7). `None` when every guest's PID was resolved.
+fn pid_attribution_caveat(resolved: usize, guests: usize) -> Option<String> {
+    (resolved < guests).then(|| {
+        format!(
+            "footprint: warning — resolved {resolved}/{guests} host pids; per-VM memory \
+             attribution is incomplete, so every total below is a floor"
+        )
+    })
+}
+
+/// The zygote fan-out paid a full byte copy per clone instead of a reflink. `None` on a reflinking
+/// filesystem, which is the configuration the published fan-out numbers assume.
+///
+/// A full-copy fan-out and a reflinked one differ by the size of the suspend image per clone, so
+/// two arms that disagree about this are not measuring the same operation — and nothing in the
+/// numbers themselves says which one happened.
+fn zygote_cow_caveat(cow: vmcell::CowSupport) -> Option<String> {
+    (!cow.is_reflink()).then(|| {
+        format!(
+            "zygote: CoW is {cow:?}, so every clone paid a full byte copy of the suspend image \
+             (reflink needs $TMPDIR and the master on one reflink-capable fs); fan-out numbers \
+             here are not comparable against an arm that reflinked"
+        )
+    })
+}
+
 /// Reports p50/p95/p99/max for a sample set, collapsed onto the single [`pcts`]
 /// helper (L-BIN-7) instead of a duplicate hand-rolled `floor` index that lacked the
 /// nearest-rank clamp (H-BIN-1-revisited). `dropped`/`warmup_failed` surface any
 /// iterations discarded during collection.
-fn report(name: &str, latencies: &mut [u128], dropped: usize, warmup_failed: usize) {
-    let acct = accounting_suffix(dropped, warmup_failed);
-    match pcts(latencies) {
-        Some((p50, p95, p99, max)) => println!(
-            "{name}: count={}{acct} p50={p50}ms p95={p95}ms p99={p99}ms max={max}ms",
-            latencies.len()
+///
+/// `name` is the human label (it carries the `(WARM-CACHE: …)` parenthetical) and `metric` is the
+/// stable identifier the JSON report keys on; the printed numbers are the recorded metric's own
+/// fields, so the row and the field cannot drift apart. This row is milliseconds on both of its
+/// call sites, which is why the unit is fixed here rather than passed.
+///
+/// `planned` is the post-warmup iteration count the mode set out to take; the printed suffix and
+/// the recorded metric read the loss out of the same [`dropped_iterations`] law, so the row and
+/// the JSON field cannot disagree about how lossy the run was either.
+fn report(
+    rec: &Recorder,
+    name: &str,
+    metric: &str,
+    latencies: &mut [u128],
+    planned: usize,
+    warmup_failed: usize,
+) {
+    let acct = accounting_suffix(dropped_iterations(planned, latencies.len()), warmup_failed);
+    match rec.measure(metric, Unit::Millis, latencies, planned, warmup_failed) {
+        Some(m) => say!(
+            "{name}: count={}{acct} p50={}ms p95={}ms p99={}ms max={}ms",
+            m.n,
+            m.p50,
+            m.p95,
+            m.p99,
+            m.max
         ),
-        None => println!("{name}: No successful runs{acct}"),
+        None => say!("{name}: No successful runs{acct}"),
     }
 }
 
@@ -281,7 +640,7 @@ mod best_effort {
     /// microseconds — but only on the failure path, where the sample is already anomalous.
     pub(super) async fn shutdown<V: Vmm>(vm: MicroVm<V>) {
         if let Err(e) = vm.shutdown().await {
-            println!("warning: graceful VM shutdown failed ({e}); Drop is the real teardown");
+            say!("warning: graceful VM shutdown failed ({e}); Drop is the real teardown");
         }
     }
 
@@ -296,7 +655,7 @@ mod best_effort {
         match std::fs::remove_dir_all(dir) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => println!("warning: could not remove {}: {e}", dir.display()),
+            Err(e) => say!("warning: could not remove {}: {e}", dir.display()),
         }
     }
 
@@ -327,12 +686,14 @@ mod best_effort {
 
 async fn run_bench<V: Vmm>(
     vmm: &V,
+    rec: &Recorder,
     name: &str,
+    metric: &str,
     args: &Args,
     allocator: VmidAllocator,
     is_restore: bool,
 ) -> anyhow::Result<()> {
-    println!("Starting benchmark: {name}");
+    say!("Starting benchmark: {name}");
     let mut latencies = Vec::new();
 
     // L-BIN-7: resolve artifact paths and build the VM config through the SAME
@@ -355,18 +716,17 @@ async fn run_bench<V: Vmm>(
         args.backend,
         std::process::id()
     ));
-    if is_restore && is_tmpfs(&snap_dir) {
-        println!(
-            "warning: snap-dir {} is on tmpfs; warm-restore latency will be optimistic (§16, Performance)",
-            snap_dir.display()
-        );
-    }
+    rec.caveat(snap_dir_tmpfs_caveat(
+        &snap_dir,
+        is_restore,
+        is_tmpfs(&snap_dir),
+    ));
     // Best-effort pre-clean of a stale snapshot dir left by a prior aborted run; a
     // missing dir (the common case) is not an error worth surfacing.
     best_effort::discard_dir(&snap_dir);
 
     if is_restore {
-        println!("Creating baseline snapshot for restore benchmark...");
+        say!("Creating baseline snapshot for restore benchmark...");
         let mut base_vm = match MicroVm::start(vmm, cfg.clone(), &env).await {
             Ok(vm) => vm,
             // M-BIN-1: a baseline-snapshot failure is an attempted-and-failed run, not
@@ -409,7 +769,6 @@ async fn run_bench<V: Vmm>(
     // H-BIN-2: post-warmup steward-connect failures shrink the sample set — count and
     // print them (with the iteration + error) instead of letting the count silently
     // drop. Warmup failures are tracked separately since they never count as samples.
-    let mut dropped = 0usize;
     let mut warmup_failed = 0usize;
 
     for i in 0..(args.iters() + args.warmup) {
@@ -436,12 +795,12 @@ async fn run_bench<V: Vmm>(
                     Err(e) => {
                         // H-BIN-2: a silent `if let Ok(_steward)` hid steward-connect
                         // failures; surface each and account for the discarded sample.
-                        println!("{name}: iteration {i} steward-connect failed: {e}");
-                        if i >= args.warmup {
-                            dropped += 1;
-                        } else {
+                        say!("{name}: iteration {i} steward-connect failed: {e}");
+                        if i < args.warmup {
                             warmup_failed += 1;
                         }
+                        // No post-warmup counter: `dropped_iterations(planned, collected)` at the
+                        // report below derives the loss, and derives it for the `break` arm too.
                     }
                 }
                 // Best-effort per-iteration teardown; `Drop` is the guaranteed path,
@@ -449,7 +808,7 @@ async fn run_bench<V: Vmm>(
                 best_effort::shutdown(vm).await;
             }
             Err(e) => {
-                println!("{name}: iteration {i} create/restore failed: {e}");
+                say!("{name}: iteration {i} create/restore failed: {e}");
                 break;
             }
         }
@@ -461,10 +820,25 @@ async fn run_bench<V: Vmm>(
         best_effort::discard_dir(&snap_dir);
     }
 
+    let label = bench_label(name, is_restore, page_cache_dropped);
+    // The WARM-CACHE annotation is a note, not just a label: `metric` is the stable identifier a
+    // comparator keys on, so the caveat would otherwise vanish from the JSON entirely — and an arm
+    // that could drop the page cache compared against one that could not is precisely the
+    // silently-inapplicable control this harness exists to make visible.
+    if label != name {
+        rec.note(label.clone());
+    }
+    // `args.iters()`, NOT `dropped`: the parameter is the PLANNED count and `dropped_iterations`
+    // subtracts the survivors from it. Passing the loss counter here made `saturating_sub` floor to
+    // zero on every realistic run, so a run that lost three of ten reported `dropped=0` — and a
+    // comparator that cannot see the loss ranks a lossy arm against a whole one (a failed boot is
+    // disproportionately a SLOW boot, so the lossy arm looks faster).
     report(
-        &bench_label(name, is_restore, page_cache_dropped),
+        rec,
+        &label,
+        metric,
         &mut latencies,
-        dropped,
+        args.iters(),
         warmup_failed,
     );
 
@@ -500,26 +874,42 @@ async fn main() -> anyhow::Result<()> {
     validate_mode(&args.mode)?;
     validate_daemon_api_knobs(&args)?;
     validate_vm_params(&args)?;
+
+    // ONE store, before the first `say!`: `--report json` owns stdout for the machine-readable
+    // report, so every human line in this process moves to stderr. Set here, after validation
+    // (whose refusals are clap's/anyhow's own stderr) and before any output of ours.
+    if args.report == ReportFormat::Json {
+        HUMAN_LINES_TO_STDERR.store(true, Ordering::Relaxed);
+    }
+    let rec = Recorder::new();
+
     // Resolve the §10.4 artifact contract here too, before any side effect: a `--kernel <label>`
     // that contradicts a `$VMCELL_KERNEL` redirect must exit non-zero at the boundary, not after
     // the CPU-freq pin and a mode's first boot. The modes re-resolve (it is pure); this call is
     // the early refusal AND the source of the attribution line below.
     let (artifacts_dir, kernel, rootfs) = artifact_paths(args.kernel.as_deref())?;
 
-    println!("Running benchmarks with backend: {}", args.backend);
+    // Resolved here rather than beside the line that prints it, because the `daemon-api` branch
+    // below returns before that line and the report needs the pair on EVERY path. Honest for that
+    // mode too: the `vmcelld` this spawns inherits this process's environment and resolves Cloud
+    // Hypervisor through the same `$VMCELL_CH_BIN` (`vmcell::artifact::ch_binary_path`), and
+    // `validate_daemon_api_knobs` has already refused any other backend for it.
+    let (vmm_bin, vmm_bin_source) = vmm_binary(&args.backend)?;
+
+    say!("Running benchmarks with backend: {}", args.backend);
     // The RESOLVED paths, not a re-derived filename: with `$VMCELL_KERNEL`/`$VMCELL_ROOTFS` set,
     // the files this run boots are not under the artifacts dir at all, and a run's attribution
     // must name what it actually measured (`bench-ignores-contract-artifact-overrides`).
-    println!(
+    say!(
         "kernel: {} (label={})",
         kernel.display(),
         args.kernel.as_deref().unwrap_or("default")
     );
-    println!("rootfs: {}", rootfs.display());
-    println!("artifacts dir: {artifacts_dir}");
+    say!("rootfs: {}", rootfs.display());
+    say!("artifacts dir: {artifacts_dir}");
     // H-BIN-1: echo the resolved profile/verbosity/console so a run's actual knobs
     // are visible (and provably not silently defaulted from a rejected typo).
-    println!("{}", resolved_knobs_line(&args));
+    say!("{}", resolved_knobs_line(&args));
 
     // Pin CPU frequency for the whole run (design §16, Performance, noise floor): every online
     // CPU is set to the `performance` governor with turbo disabled, and the prior
@@ -529,21 +919,25 @@ async fn main() -> anyhow::Result<()> {
     let _freq_pin =
         match vmcell::cpufreq::CpuFreqPin::engage(vmcell::cpufreq::SysfsCpuFreq::system()) {
             Ok(pin) if pin.is_pinned() => {
-                println!(
+                say!(
                     "cpufreq: pinned {} CPU(s) to `performance` + turbo off (restored on exit)",
                     pin.pinned_cpus()
                 );
                 Some(pin)
             }
             Ok(pin) => {
-                println!(
+                // A NOTE, not just a line: an arm whose CPUs were pinned compared against one
+                // whose were not is a comparison of two noise floors, and the JSON artifact is
+                // where a comparator can still see that after the terminal has scrolled away.
+                rec.skip(
                     "cpufreq: NOT pinned (need CAP_DAC_OVERRIDE via vmcell-test-runner) — \
-                 latency numbers carry CPU-scaling noise"
+                     latency numbers carry CPU-scaling noise"
+                        .to_string(),
                 );
                 Some(pin)
             }
             Err(e) => {
-                println!("cpufreq: pin unavailable: {e}");
+                rec.skip(format!("cpufreq: pin unavailable: {e}"));
                 None
             }
         };
@@ -554,46 +948,46 @@ async fn main() -> anyhow::Result<()> {
     // (`validate_daemon_api_knobs`); the ones it merely does not apply are disclosed here, next
     // to the header, so the results table cannot be read as a `--mem-mib 4096` run.
     if args.mode == "daemon-api" {
-        println!("{}", daemon_api_ignored_knobs_line());
-        return run_daemon_api(&args).await;
+        let ignored = daemon_api_ignored_knobs_line();
+        say!("{ignored}");
+        rec.note(ignored);
+        run_daemon_api(&rec, &args).await?;
+        return emit_report(&args, &rec, &vmm_bin, &vmm_bin_source, &kernel, &rootfs);
     }
 
     let allocator = VmidAllocator::new();
 
     // `bench-ignores-contract-bin-resolvers`: the binary comes from the §10.4 contract
-    // `VMCELL_*_BIN` resolver, not a hardcoded name — resolved ONCE here and echoed (H-BIN-1's
-    // rule: a run states the knobs it actually used), so a results table can be attributed to the
-    // VMM build it measured instead of "whatever `crosvm` was first on PATH".
-    let vmm_bin = vmm_binary(&args.backend)?;
-    println!(
-        "vmm binary: {vmm_bin} (via ${})",
-        vmm_bin_resolver(&args.backend).map_or("?", |(var, _)| var)
-    );
+    // `VMCELL_*_BIN` resolver, not a hardcoded name — resolved ONCE above and echoed here
+    // (H-BIN-1's rule: a run states the knobs it actually used), so a results table can be
+    // attributed to the VMM build it measured instead of "whatever `crosvm` was first on PATH".
+    // The parenthetical states which of those two it WAS; see [`resolve_vmm_binary`].
+    say!("{}", vmm_binary_line(&vmm_bin, &vmm_bin_source));
 
     match args.backend.as_str() {
         #[cfg(feature = "cloud-hypervisor")]
         "cloud-hypervisor" => {
-            let vmm = vmcell::vmm::cloud_hypervisor::CloudHypervisor::new(vmm_bin);
-            println!("Capabilities: {:?}", vmm.capabilities());
-            run_mode(&vmm, "cloud-hypervisor", &args, allocator.clone()).await?;
+            let vmm = vmcell::vmm::cloud_hypervisor::CloudHypervisor::new(vmm_bin.clone());
+            say!("Capabilities: {:?}", vmm.capabilities());
+            run_mode(&vmm, &rec, "cloud-hypervisor", &args, allocator.clone()).await?;
         }
         #[cfg(feature = "firecracker")]
         "firecracker" => {
-            let vmm = vmcell_firecracker::Firecracker::new(vmm_bin);
-            println!("Capabilities: {:?}", vmm.capabilities());
-            run_mode(&vmm, "firecracker", &args, allocator.clone()).await?;
+            let vmm = vmcell_firecracker::Firecracker::new(vmm_bin.clone());
+            say!("Capabilities: {:?}", vmm.capabilities());
+            run_mode(&vmm, &rec, "firecracker", &args, allocator.clone()).await?;
         }
         #[cfg(feature = "qemu")]
         "qemu" => {
-            let vmm = vmcell_qemu::Qemu::new(vmm_bin);
-            println!("Capabilities: {:?}", vmm.capabilities());
-            run_mode(&vmm, "qemu", &args, allocator.clone()).await?;
+            let vmm = vmcell_qemu::Qemu::new(vmm_bin.clone());
+            say!("Capabilities: {:?}", vmm.capabilities());
+            run_mode(&vmm, &rec, "qemu", &args, allocator.clone()).await?;
         }
         #[cfg(feature = "crosvm")]
         "crosvm" => {
-            let vmm = vmcell_crosvm::Crosvm::new(vmm_bin);
-            println!("Capabilities: {:?}", vmm.capabilities());
-            run_mode(&vmm, "crosvm", &args, allocator.clone()).await?;
+            let vmm = vmcell_crosvm::Crosvm::new(vmm_bin.clone());
+            say!("Capabilities: {:?}", vmm.capabilities());
+            run_mode(&vmm, &rec, "crosvm", &args, allocator.clone()).await?;
         }
         // Unreachable after `validate_backend`, but fail loud rather than
         // silently succeed if the two ever drift.
@@ -603,7 +997,154 @@ async fn main() -> anyhow::Result<()> {
         ),
     }
 
+    emit_report(&args, &rec, &vmm_bin, &vmm_bin_source, &kernel, &rootfs)
+}
+
+/// The knobs that shape the numbers, as the report carries them.
+///
+/// `iterations` is the RESOLVED count (`Args::iters`, which defaults to 200 for `vsock-rtt` and 10
+/// elsewhere), not the raw `Option`: an unset flag and its per-mode default produce different
+/// sample sizes, and "the knob was unset" is not a thing a comparator can compare.
+fn run_knobs(args: &Args) -> BTreeMap<String, String> {
+    let mut knobs = BTreeMap::new();
+    let mut put = |k: &str, v: String| {
+        knobs.insert(k.to_string(), v);
+    };
+    put("profile", args.profile.clone());
+    put("kernel_verbosity", format!("{:?}", args.kernel_verbosity));
+    put("console", format!("{:?}", args.console));
+    put("mem_mib", args.mem_mib.to_string());
+    put("iterations", args.iters().to_string());
+    put("warmup", args.warmup.to_string());
+    put("count", args.count.to_string());
+    put("restore_mode", format!("{:?}", args.restore_mode));
+    put("ksm_mergeable", args.ksm_mergeable.to_string());
+    put("net_mode", args.net_mode.clone());
+    put("snap_dir", args.snap_dir.clone());
+    knobs
+}
+
+/// Refuses a run that recorded a metric name `vmcell_bench::metrics::METRIC_DIRECTIONS` has no
+/// direction for.
+///
+/// THE HOLE THIS CLOSES. The A/B comparator's direction rule used to be
+/// `metric != "footprint_ksm_pages_sharing_delta"` — every other name defaulted to "lower is
+/// better". A new metric that is a *benefit* (guest memory kept, pages deduped) therefore printed
+/// `IMPROVEMENT` when it got worse and `REGRESSION` when it got better, and nothing anywhere could
+/// see that: the default was silent by construction. The roster is now exhaustive, and this is what
+/// keeps it exhaustive — the emitting side refuses rather than shipping a name the comparator would
+/// have to guess about.
+///
+/// The refusal is late (after the matrix ran) on purpose: the alternative is a panic in the middle
+/// of a benchmark, and the measured lines are already on stderr. It names EVERY offender, because
+/// fixing them one exit code at a time is how a roster gets abandoned.
+///
+/// # Errors
+/// Returns an error naming each unregistered metric and the roster to add it to.
+fn refuse_unregistered_metrics(rec: &Recorder) -> anyhow::Result<()> {
+    let unknown = rec.unregistered_metrics();
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "this run recorded {} metric name(s) with no entry in \
+         `vmcell_bench::metrics::METRIC_DIRECTIONS`: {}. A comparator cannot say REGRESSION or \
+         IMPROVEMENT about a quantity whose direction nobody declared — the rule it replaced \
+         assumed every metric was a cost, so a BENEFIT that got worse printed IMPROVEMENT. THE \
+         FIX: add each name to the roster in `crates/vmcell-bench/src/metrics.rs` with its \
+         direction (`LowerIsBetter` for a cost, `HigherIsBetter` for a benefit, `Neutral` for a \
+         share of a whole, which has no direction at all).",
+        unknown.len(),
+        unknown.join(", ")
+    )
+}
+
+/// Emits the machine-readable report on stdout under `--report json`; a no-op under `--report
+/// text`, whose report IS the table already printed.
+///
+/// WHY ONLY ON THE SUCCESS PATH. A failed run's metric set is a partial matrix, and a comparator
+/// that pooled it with a complete one would rank samples that measured different amounts of work —
+/// the "confident numbers from an assumption nobody checked" shape this whole harness exists to
+/// close. The non-zero exit is the signal, and the human lines (on stderr in this mode) are the
+/// diagnosis.
+///
+/// # Errors
+/// Propagates a serialization failure. It cannot be swallowed: a `--report json` invocation that
+/// printed nothing and exited 0 is indistinguishable, to the parent, from a run that produced an
+/// empty report.
+fn emit_report(
+    args: &Args,
+    rec: &Recorder,
+    vmm_bin: &str,
+    vmm_bin_source: &BinSource,
+    kernel: &Path,
+    rootfs: &Path,
+) -> anyhow::Result<()> {
+    // BEFORE the format check, because a `--report text` run that emits a directionless metric is
+    // the same hole one command away from being compared.
+    refuse_unregistered_metrics(rec)?;
+    // Straight to stdout, unconditionally: in this mode stdout carries the report and nothing else
+    // (see `HUMAN_LINES_TO_STDERR`), so this is the one write that must NOT go through `say!`.
+    if let Some(json) = stdout_report(args, rec, vmm_bin, vmm_bin_source, kernel, rootfs)? {
+        println!("{json}");
+    }
     Ok(())
+}
+
+/// The exact text `--report json` writes to stdout, or `None` under `--report text`.
+///
+/// WHY THE ROUTING IS A VALUE AND NOT AN `if` AROUND A `println!`. This one branch IS the
+/// parent/child contract — `bench-ab` parses this process's stdout with
+/// [`BenchReport::from_json`] — and the other half of the `--report` promise, that `text` is byte
+/// for byte what it always was. Inverted (text dumping JSON onto the human table's stdout, json
+/// emitting nothing at all), the whole suite stayed green: nothing could see the decision, because
+/// the decision was spelled inside the one function whose output is a side effect. Returning the
+/// text moves both arms into a unit test and leaves `emit_report` with a `println!` and nothing to
+/// get wrong.
+///
+/// # Errors
+/// Propagates a serialization failure.
+fn stdout_report(
+    args: &Args,
+    rec: &Recorder,
+    vmm_bin: &str,
+    vmm_bin_source: &BinSource,
+    kernel: &Path,
+    rootfs: &Path,
+) -> anyhow::Result<Option<String>> {
+    if args.report != ReportFormat::Json {
+        return Ok(None);
+    }
+    let report = build_report(args, rec, vmm_bin, vmm_bin_source, kernel, rootfs);
+    Ok(Some(report.to_json()?))
+}
+
+/// Assembles the report from what the run actually resolved and measured.
+///
+/// Split from [`emit_report`] so the assembly is testable without capturing stdout: the printing is
+/// one line, and the part worth a gate is that the run's *attribution* — which binary, resolved
+/// how, which kernel, which knobs — is the report's, not a caller's recollection.
+fn build_report(
+    args: &Args,
+    rec: &Recorder,
+    vmm_bin: &str,
+    vmm_bin_source: &BinSource,
+    kernel: &Path,
+    rootfs: &Path,
+) -> BenchReport {
+    let (metrics, notes) = rec.drain();
+    BenchReport {
+        schema_version: REPORT_SCHEMA_VERSION,
+        backend: args.backend.clone(),
+        mode: args.mode.clone(),
+        vmm_binary: vmm_bin.to_string(),
+        vmm_binary_source: vmm_bin_source.clone(),
+        kernel: kernel.to_path_buf(),
+        rootfs: rootfs.to_path_buf(),
+        knobs: run_knobs(args),
+        metrics,
+        notes,
+    }
 }
 
 /// The design §10.4 contract binary resolvers, as `(backend, env var, default binary)`.
@@ -635,22 +1176,60 @@ fn vmm_bin_resolver(backend: &str) -> Option<(&'static str, &'static str)> {
 /// Resolves `backend`'s VMM binary through `lookup` — the env reader, injected so the contract
 /// behavior (override wins, else the documented default) is unit-testable **without** mutating
 /// the process environment (this repo has no `set_var` anywhere: it is `unsafe` in edition 2024
-/// and races sibling tests in a shared test process).
-fn resolve_vmm_binary(backend: &str, lookup: impl Fn(&str) -> Option<String>) -> Option<String> {
+/// and races sibling tests in a shared test process) — **and the provenance of the answer**.
+///
+/// WHY THE SOURCE IS PART OF THE ANSWER, and not re-derived by the caller. The attribution line
+/// this feeds used to read `(via $VMCELL_CH_BIN)` unconditionally — it printed the name of the
+/// variable the resolver *would* have consulted, whether or not the variable was set. Its own
+/// comment said it exists so a results table can be attributed to the VMM build it measured
+/// "instead of whatever `crosvm` was first on PATH", which is precisely the distinction the line
+/// could not make. On 2026-08-21 that same class cost a whole matrix: the driver believed its
+/// exports had applied because it had written them, and an arm that predates the variable resolved
+/// the bare name off PATH. Only the resolving process can answer "where did this path come from",
+/// so it answers here, once, and both the printed line and [`BenchReport::vmm_binary_source`] read
+/// that one answer.
+fn resolve_vmm_binary(
+    backend: &str,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Option<(String, BinSource)> {
     // No emptiness/validity filtering: the validator's getters do `env::var(..).unwrap_or(default)`
     // verbatim, and a *different* interpretation of the same var here would be a second law.
-    vmm_bin_resolver(backend)
-        .map(|(var, default)| lookup(var).unwrap_or_else(|| default.to_string()))
+    vmm_bin_resolver(backend).map(|(var, default)| match lookup(var) {
+        Some(path) => (
+            path,
+            BinSource::EnvVar {
+                name: var.to_string(),
+            },
+        ),
+        // The documented default is a bare binary NAME, so `execve` finds it — or does not — on
+        // PATH. Nothing the operator set decided it, which is exactly what `Path` states.
+        None => (default.to_string(), BinSource::Path),
+    })
 }
 
-/// The VMM binary this run should execute for `backend`, read from the process environment
-/// through the §10.4 contract var.
+/// The run-header attribution line: the binary this run executes, and where that path came from.
+///
+/// A composer rather than an inline `format!` so the PATH case is unit-testable without touching
+/// the process environment (this repo has no `set_var`: it is `unsafe` in edition 2024 and races
+/// sibling tests in a shared test process). The parenthetical is [`BinSource`]'s own `Display`, the
+/// one rendering of a resolution, shared with the A/B harness's guard message — so "via $VAR" is
+/// unprintable for a run that searched PATH.
+fn vmm_binary_line(bin: &str, source: &BinSource) -> String {
+    format!("vmm binary: {bin} ({source})")
+}
+
+/// The VMM binary this run should execute for `backend` **and how it was resolved**, read from the
+/// process environment through the §10.4 contract var.
+///
+/// One function, not a bare-path convenience beside a provenance-carrying one: the pair is the
+/// whole answer, and the two-function shape is how a caller ends up printing a variable name it
+/// never read (see [`resolve_vmm_binary`]).
 ///
 /// # Errors
 /// Returns an error when `backend` has no [`VMM_BIN_RESOLVERS`] entry — i.e. the table and the
 /// `--backend` dispatch drifted. Failing loud beats falling back to the bare backend name, which
 /// is exactly the hardcoding this resolver replaced.
-fn vmm_binary(backend: &str) -> anyhow::Result<String> {
+fn vmm_binary(backend: &str) -> anyhow::Result<(String, BinSource)> {
     resolve_vmm_binary(backend, |var| std::env::var(var).ok()).ok_or_else(|| {
         anyhow::anyhow!(
             "no VMCELL_*_BIN resolver for --backend '{backend}' (design §10.4 contract)"
@@ -839,32 +1418,53 @@ fn validate_vm_params(args: &Args) -> anyhow::Result<()> {
 /// two cannot silently drift.
 async fn run_mode<V: Vmm>(
     vmm: &V,
+    rec: &Recorder,
     backend: &str,
     args: &Args,
     allocator: VmidAllocator,
 ) -> anyhow::Result<()> {
     match args.mode.as_str() {
         "latency" => {
-            run_bench(vmm, "Cold Boot", args, allocator.clone(), false).await?;
+            run_bench(
+                vmm,
+                rec,
+                "Cold Boot",
+                metrics::COLD_BOOT,
+                args,
+                allocator.clone(),
+                false,
+            )
+            .await?;
             if vmm.capabilities().snapshot_restore {
-                run_bench(vmm, "Warm Restore", args, allocator.clone(), true).await?;
+                run_bench(
+                    vmm,
+                    rec,
+                    "Warm Restore",
+                    metrics::WARM_RESTORE,
+                    args,
+                    allocator.clone(),
+                    true,
+                )
+                .await?;
             } else {
                 // CLI-4 / §16 (Performance) visible-skip: a backend that does not advertise
                 // `snapshot_restore` can't run Warm Restore (all three shipped backends now do,
                 // §2.5, The capability matrix — this guards a re-gated or hypothetical backend).
                 // Print the reason rather than silently dropping the benchmark; a genuine
                 // capability skip is success (Ok), not a failure (M-BIN-1).
-                println!("Warm Restore: backend {backend} has no snapshot support; skipping");
+                rec.skip(format!(
+                    "Warm Restore: backend {backend} has no snapshot support; skipping"
+                ));
             }
             Ok(())
         }
-        "footprint" => run_footprint(vmm, backend, args, allocator).await,
-        "suspend-size" => run_suspend_size(vmm, backend, args, allocator).await,
-        "phase-budget" => run_phase_budget(vmm, backend, args, allocator).await,
-        "vsock-rtt" => run_vsock_rtt(vmm, backend, args, allocator).await,
-        "net-egress" => run_net_egress(vmm, backend, args, allocator).await,
-        "zygote" => run_zygote(vmm, backend, args, allocator).await,
-        "session" => run_session(vmm, backend, args, allocator).await,
+        "footprint" => run_footprint(vmm, rec, backend, args, allocator).await,
+        "suspend-size" => run_suspend_size(vmm, rec, backend, args, allocator).await,
+        "phase-budget" => run_phase_budget(vmm, rec, backend, args, allocator).await,
+        "vsock-rtt" => run_vsock_rtt(vmm, rec, backend, args, allocator).await,
+        "net-egress" => run_net_egress(vmm, rec, backend, args, allocator).await,
+        "zygote" => run_zygote(vmm, rec, backend, args, allocator).await,
+        "session" => run_session(vmm, rec, backend, args, allocator).await,
         other => anyhow::bail!(
             "unknown --mode '{other}' (valid: {})",
             VALID_MODES.join(", ")
@@ -1064,7 +1664,7 @@ fn require_artifacts(name: &str, dir: &str, kernel: &Path, rootfs: &Path) -> any
         return Ok(());
     }
     let missing = missing.join(", ");
-    println!("{name}: No successful runs (missing artifacts in {dir}: {missing})");
+    say!("{name}: No successful runs (missing artifacts in {dir}: {missing})");
     anyhow::bail!("{name}: missing artifacts in {dir}: {missing}");
 }
 
@@ -1337,6 +1937,7 @@ fn mean_u64(v: &[u64]) -> u64 {
 // ----------------------------------------------------------------------------
 async fn run_footprint<V: Vmm>(
     vmm: &V,
+    rec: &Recorder,
     backend: &str,
     args: &Args,
     allocator: VmidAllocator,
@@ -1363,12 +1964,12 @@ async fn run_footprint<V: Vmm>(
         let mut vm = match MicroVm::start(vmm, cfg.clone(), &env).await {
             Ok(v) => v,
             Err(e) => {
-                println!("footprint: boot {i} failed: {e}");
+                say!("footprint: boot {i} failed: {e}");
                 break;
             }
         };
         if let Err(e) = vm.steward(None).await {
-            println!("footprint: steward connect {i} failed: {e}");
+            say!("footprint: steward connect {i} failed: {e}");
             // Best-effort teardown of the just-booted guest before bailing; `Drop`
             // guarantees the real teardown, so a shutdown error is not actionable.
             best_effort::shutdown(vm).await;
@@ -1392,7 +1993,7 @@ async fn run_footprint<V: Vmm>(
 
     let n = vms.len();
     if n == 0 {
-        println!("footprint: No successful runs");
+        say!("footprint: No successful runs");
         anyhow::bail!("footprint: no guests booted");
     }
 
@@ -1409,11 +2010,7 @@ async fn run_footprint<V: Vmm>(
         // on some kernels (7.x), so bump it opportunistically without requiring it.
         let accel = write_ksm("run", "1") && write_ksm("pages_to_scan", "20000");
         let _ = write_ksm("sleep_millis", "5");
-        if !accel {
-            println!(
-                "footprint: WARN could not accelerate KSM (need CAP_DAC_OVERRIDE via the runner); dedup may be partial"
-            );
-        }
+        rec.caveat(ksm_acceleration_caveat(accel));
         Some(saved)
     } else {
         None
@@ -1495,62 +2092,123 @@ async fn run_footprint<V: Vmm>(
     let marg_mean_shmem = mean_u64(&marginals_shmem);
 
     let (anon_note, shmem_note) = footprint_mem_notes(backend);
-    println!(
+    say!(
         "=== FOOTPRINT (backend={backend} N={n} mem_mib={}) ===",
         args.mem_mib
     );
     // M-BIN-7: surface incomplete host-pid attribution instead of silently reporting
     // deflated totals as if every VM resolved.
-    if resolved < n {
-        println!(
-            "footprint: warning — resolved {resolved}/{n} host pids; per-VM memory attribution is incomplete"
-        );
-    }
-    println!(
+    rec.caveat(pid_attribution_caveat(resolved, n));
+    // Both halves of each row are recorded, not just the total: a per-guest mean is integer
+    // division of the MiB total by the guest count, so a consumer handed only the total would have
+    // to re-derive the number the table shows — the "re-derive it downstream" step that produced
+    // the wrong figures on 2026-08-21.
+    let per_guest = |total_kb: u64| (total_kb / 1024) / n as u64;
+    say!(
         "host RssAnon total = {} MiB  (per-guest mean = {} MiB)  [{anon_note}]",
-        tot_anon / 1024,
-        (tot_anon / 1024) / n as u64
+        rec.scalar(
+            metrics::FOOTPRINT_RSS_ANON_TOTAL,
+            Unit::Mib,
+            n,
+            sample_as_f64(u128::from(tot_anon / 1024))
+        ),
+        rec.scalar(
+            metrics::FOOTPRINT_RSS_ANON_PER_GUEST,
+            Unit::Mib,
+            n,
+            sample_as_f64(u128::from(per_guest(tot_anon)))
+        )
     );
-    println!(
+    say!(
         "host RssFile total = {} MiB  (per-guest mean = {} MiB)  [shared-erofs page cache]",
-        tot_file / 1024,
-        (tot_file / 1024) / n as u64
+        rec.scalar(
+            metrics::FOOTPRINT_RSS_FILE_TOTAL,
+            Unit::Mib,
+            n,
+            sample_as_f64(u128::from(tot_file / 1024))
+        ),
+        rec.scalar(
+            metrics::FOOTPRINT_RSS_FILE_PER_GUEST,
+            Unit::Mib,
+            n,
+            sample_as_f64(u128::from(per_guest(tot_file)))
+        )
     );
-    println!(
+    say!(
         "host RssShmem total = {} MiB  (per-guest mean = {} MiB)  [{shmem_note}]",
-        tot_shmem / 1024,
-        (tot_shmem / 1024) / n as u64
+        rec.scalar(
+            metrics::FOOTPRINT_RSS_SHMEM_TOTAL,
+            Unit::Mib,
+            n,
+            sample_as_f64(u128::from(tot_shmem / 1024))
+        ),
+        rec.scalar(
+            metrics::FOOTPRINT_RSS_SHMEM_PER_GUEST,
+            Unit::Mib,
+            n,
+            sample_as_f64(u128::from(per_guest(tot_shmem)))
+        )
     );
-    println!("per-step total host RssAnon  (MiB) 1..N = {step_anon:?}");
-    println!("per-step total host RssShmem (MiB) 1..N = {step_shmem:?}");
-    println!(
-        "marginal host RssAnon  per added guest (MiB): mean={marg_mean}  series={marginals:?}  [VMM overhead only]"
+    say!("per-step total host RssAnon  (MiB) 1..N = {step_anon:?}");
+    say!("per-step total host RssShmem (MiB) 1..N = {step_shmem:?}");
+    say!(
+        "marginal host RssAnon  per added guest (MiB): mean={}  series={marginals:?}  [VMM overhead only]",
+        rec.scalar(
+            metrics::FOOTPRINT_MARGINAL_RSS_ANON,
+            Unit::Mib,
+            n,
+            sample_as_f64(u128::from(marg_mean))
+        )
     );
-    println!(
-        "marginal host RssShmem per added guest (MiB): mean={marg_mean_shmem}  series={marginals_shmem:?}  [guest-RAM touched; step N - step N-1]"
+    say!(
+        "marginal host RssShmem per added guest (MiB): mean={}  series={marginals_shmem:?}  [guest-RAM touched; step N - step N-1]",
+        rec.scalar(
+            metrics::FOOTPRINT_MARGINAL_RSS_SHMEM,
+            Unit::Mib,
+            n,
+            sample_as_f64(u128::from(marg_mean_shmem))
+        )
     );
     let sharing_delta = ksm_sharing_after.saturating_sub(ksm_sharing_before);
-    println!(
-        "KSM pages_sharing: before={ksm_sharing_before} after={ksm_sharing_after} delta={sharing_delta} (~{} MiB dedup'd @4KiB)",
+    say!(
+        "KSM pages_sharing: before={ksm_sharing_before} after={ksm_sharing_after} delta={} (~{} MiB dedup'd @4KiB)",
+        rec.scalar(
+            metrics::FOOTPRINT_KSM_PAGES_SHARING_DELTA,
+            Unit::Count,
+            n,
+            sample_as_f64(u128::from(sharing_delta))
+        ),
         sharing_delta * 4 / 1024
     );
-    println!("KSM pages_shared:  before={ksm_shared_before} after={ksm_shared_after}");
-    if args.ksm_mergeable {
-        // N-BIN-2: restoring `run`/`pages_to_scan` re-disables the scanner but does
-        // NOT un-merge pages already deduped during this run, so the host KSM state is
-        // not byte-for-byte what it was before. Say so rather than imply a full reset.
-        println!(
-            "KSM note: the scanner knobs were restored, but pages merged during this run stay merged (host KSM state is not fully reset)"
-        );
-    }
-    println!(
+    say!("KSM pages_shared:  before={ksm_shared_before} after={ksm_shared_after}");
+    rec.caveat(ksm_residue_caveat(args.ksm_mergeable));
+    say!(
         "guest MemTotal = {} MiB  MemAvailable mean = {} MiB",
-        guest_total / 1024,
-        mean_u64(&guest_avail) / 1024
+        rec.scalar(
+            metrics::FOOTPRINT_GUEST_MEM_TOTAL,
+            Unit::Mib,
+            n,
+            sample_as_f64(u128::from(guest_total / 1024))
+        ),
+        rec.scalar(
+            metrics::FOOTPRINT_GUEST_MEM_AVAILABLE,
+            Unit::Mib,
+            n,
+            sample_as_f64(u128::from(mean_u64(&guest_avail) / 1024))
+        )
     );
-    println!(
+    // Recorded in BYTES and printed back as KiB: the report's `Unit` has no KiB, and inventing one
+    // for a single row would put a unit in the schema that only this line ever emits. The division
+    // is exact (the recorded value is `kib * 1024`), so the printed row is byte-identical to the
+    // integer it used to print.
+    say!(
         "guest pid1 (steward) RSS mean = {} KiB",
-        mean_u64(&pid1_rss)
+        rec.scalar(
+            metrics::FOOTPRINT_GUEST_PID1_RSS,
+            Unit::Bytes,
+            n,
+            sample_as_f64(u128::from(mean_u64(&pid1_rss)) * 1024)
+        ) / 1024.0
     );
 
     // Best-effort teardown of every resident guest; `Drop` is the guaranteed path,
@@ -1566,6 +2224,7 @@ async fn run_footprint<V: Vmm>(
 // ----------------------------------------------------------------------------
 async fn run_suspend_size<V: Vmm>(
     vmm: &V,
+    rec: &Recorder,
     backend: &str,
     args: &Args,
     allocator: VmidAllocator,
@@ -1574,7 +2233,9 @@ async fn run_suspend_size<V: Vmm>(
     require_artifacts("suspend-size", &dir, &kernel, &rootfs)?;
     if !vmm.capabilities().snapshot_restore {
         // Genuine capability skip → success (M-BIN-1), not a failure.
-        println!("suspend-size: backend {backend} has no snapshot support; skipping");
+        rec.skip(format!(
+            "suspend-size: backend {backend} has no snapshot support; skipping"
+        ));
         return Ok(());
     }
     let cfg = build_cfg(args, kernel, rootfs, false, true);
@@ -1637,23 +2298,40 @@ async fn run_suspend_size<V: Vmm>(
             .unwrap_or_default()
     };
 
-    println!(
+    say!(
         "=== SUSPEND-SIZE (backend={backend} mem_mib={}) ===",
         args.mem_mib
     );
-    println!(
-        "total snapshot bytes = {total} ({:.1} MiB)",
-        total as f64 / 1048576.0
+    // Every printed number here comes back out of the recorder, so the MiB rendering and the JSON
+    // byte count are two views of one value rather than two computations of it.
+    let total_bytes = rec.scalar(
+        metrics::SUSPEND_TOTAL_BYTES,
+        Unit::Bytes,
+        1,
+        sample_as_f64(u128::from(total)),
     );
-    println!(
-        "memory file = {} : {mem_size} bytes ({:.1} MiB)",
+    say!(
+        "total snapshot bytes = {total_bytes} ({:.1} MiB)",
+        total_bytes / 1048576.0
+    );
+    let mem_bytes = rec.scalar(
+        metrics::SUSPEND_MEMORY_FILE_BYTES,
+        Unit::Bytes,
+        1,
+        sample_as_f64(u128::from(mem_size)),
+    );
+    say!(
+        "memory file = {} : {mem_bytes} bytes ({:.1} MiB)",
         fname(&mem_path),
-        mem_size as f64 / 1048576.0
+        mem_bytes / 1048576.0
     );
-    println!("memory-file share of total = {share:.1}%");
-    println!("all files:");
+    say!(
+        "memory-file share of total = {:.1}%",
+        rec.scalar(metrics::SUSPEND_MEMORY_FILE_SHARE, Unit::Percent, 1, share)
+    );
+    say!("all files:");
     for (p, s) in &files {
-        println!("  {s:>12}  {}", fname(p));
+        say!("  {s:>12}  {}", fname(p));
     }
 
     // Best-effort cleanup of the measured snapshot dir now that it's been reported.
@@ -1682,20 +2360,53 @@ async fn build_baseline_snapshot<V: Vmm>(
     Ok(())
 }
 
-fn report_phase(name: &str, v: &mut [u128], total_mean_us: u128) {
+/// One phase-budget row: the phase's distribution and its share of the whole.
+///
+/// `metric` is QUALIFIED BY PATH (`phase_cold_connect`, `phase_restore_teardown`) because the COLD
+/// and RESTORE paths print the same four row names — `create`/`connect`/`exec`/`teardown` — and the
+/// 2026-08-21 collector, keying on the printed name, silently kept only the first path's numbers
+/// and reported them as both. The share rides beside the distribution as its own `Percent` metric:
+/// it is computed from the phase MEAN, which no percentile field carries, so a consumer handed only
+/// the four percentiles could not recover it.
+///
+/// `planned` is the post-warmup iteration count the path set out to take. It used to be a literal
+/// `0` for both loss counts, and `phase_budget_path` `break`s out of its loop on the first failed
+/// create or connect — so eight phase rows, two totals and eight shares reported a clean sample
+/// set over however many iterations happened before the first failure, and `bench-ab` ranked them
+/// against a complete arm with no idea it was doing so.
+fn report_phase(
+    rec: &Recorder,
+    name: &str,
+    metric: &str,
+    v: &mut [u128],
+    planned: usize,
+    total_mean_us: u128,
+) {
     let n = v.len() as u128;
     let mean = v.iter().sum::<u128>().checked_div(n).unwrap_or(0);
-    let (p50, p95, _p99, max) = pcts(v).unwrap_or((0, 0, 0, 0));
     let share = if total_mean_us > 0 {
         (mean as f64) * 100.0 / (total_mean_us as f64)
     } else {
         0.0
     };
-    println!("  {name}: p50={p50}µs p95={p95}µs max={max}µs  share={share:.1}%");
+    match rec.measure(metric, Unit::Micros, v, planned, 0) {
+        Some(m) => say!(
+            "  {name}: p50={}µs p95={}µs max={}µs  share={:.1}%",
+            m.p50,
+            m.p95,
+            m.max,
+            rec.scalar(&metrics::share_metric(metric), Unit::Percent, m.n, share)
+        ),
+        // Unreachable from both call sites — `phase_budget_path` bails on an empty sample set
+        // before it reports — and deliberately records NOTHING rather than a fabricated zero
+        // metric: a comparator must not rank a row that was never measured.
+        None => say!("  {name}: No successful samples"),
+    }
 }
 
 async fn phase_budget_path<V: Vmm>(
     vmm: &V,
+    rec: &Recorder,
     backend: &str,
     args: &Args,
     cfg: &VmConfig,
@@ -1706,6 +2417,14 @@ async fn phase_budget_path<V: Vmm>(
         "RESTORE"
     } else {
         "COLD"
+    };
+    // The metric-name half of `label`. Qualifying by PATH is the whole point (see `report_phase`),
+    // and deriving it from the same `snap_dir.is_some()` is what keeps the printed path and the
+    // recorded path from ever naming different things.
+    let path = if snap_dir.is_some() {
+        "restore"
+    } else {
+        "cold"
     };
     let iters = args.iters();
     let mut p_create = Vec::new();
@@ -1731,7 +2450,7 @@ async fn phase_budget_path<V: Vmm>(
         let mut vm = match vm_res {
             Ok(v) => v,
             Err(e) => {
-                println!("phase-budget {label}: iter {i} create failed: {e}");
+                say!("phase-budget {label}: iter {i} create failed: {e}");
                 break;
             }
         };
@@ -1740,7 +2459,7 @@ async fn phase_budget_path<V: Vmm>(
         let connect_ok = vm.steward(None).await.is_ok();
         let t_connect = t1.elapsed();
         if !connect_ok {
-            println!("phase-budget {label}: iter {i} connect failed");
+            say!("phase-budget {label}: iter {i} connect failed");
             // Best-effort teardown before bailing; `Drop` guarantees teardown.
             best_effort::shutdown(vm).await;
             break;
@@ -1780,27 +2499,64 @@ async fn phase_budget_path<V: Vmm>(
     }
 
     if p_create.is_empty() {
-        println!("phase-budget {label} ({backend}): No successful runs");
+        say!("phase-budget {label} ({backend}): No successful runs");
         anyhow::bail!("phase-budget {label} ({backend}): no successful post-warmup samples");
     }
 
     let sum = |v: &[u128]| -> u128 { v.iter().sum() };
     let runs = p_create.len() as u128;
     let total_mean = (sum(&p_create) + sum(&p_connect) + sum(&p_exec) + sum(&p_teardown)) / runs;
-    println!(
+    say!(
         "=== PHASE-BUDGET {label} (backend={backend} n={}) ===",
         p_create.len()
     );
-    report_phase("create  ", &mut p_create, total_mean);
-    report_phase("connect ", &mut p_connect, total_mean);
-    report_phase("exec    ", &mut p_exec, total_mean);
-    report_phase("teardown", &mut p_teardown, total_mean);
-    println!("  TOTAL (sum of phase means) ~= {total_mean} µs");
+    report_phase(
+        rec,
+        "create  ",
+        &metrics::phase_metric(path, "create"),
+        &mut p_create,
+        iters,
+        total_mean,
+    );
+    report_phase(
+        rec,
+        "connect ",
+        &metrics::phase_metric(path, "connect"),
+        &mut p_connect,
+        iters,
+        total_mean,
+    );
+    report_phase(
+        rec,
+        "exec    ",
+        &metrics::phase_metric(path, "exec"),
+        &mut p_exec,
+        iters,
+        total_mean,
+    );
+    report_phase(
+        rec,
+        "teardown",
+        &metrics::phase_metric(path, "teardown"),
+        &mut p_teardown,
+        iters,
+        total_mean,
+    );
+    say!(
+        "  TOTAL (sum of phase means) ~= {} µs",
+        rec.scalar(
+            &metrics::phase_total_metric(path),
+            Unit::Micros,
+            p_create.len(),
+            sample_as_f64(total_mean)
+        )
+    );
     Ok(())
 }
 
 async fn run_phase_budget<V: Vmm>(
     vmm: &V,
+    rec: &Recorder,
     backend: &str,
     args: &Args,
     allocator: VmidAllocator,
@@ -1813,7 +2569,7 @@ async fn run_phase_budget<V: Vmm>(
 
     // Cold-boot path (opt-in budget). A zero-sample cold path is an attempted-and-
     // failed run → propagate (M-BIN-1).
-    phase_budget_path(vmm, backend, args, &cfg, &env, None).await?;
+    phase_budget_path(vmm, rec, backend, args, &cfg, &env, None).await?;
 
     // Restore path (the hot path) — build the baseline snapshot once.
     if vmm.capabilities().snapshot_restore {
@@ -1827,7 +2583,7 @@ async fn run_phase_budget<V: Vmm>(
         let baseline = build_baseline_snapshot(vmm, &cfg, &env, &snap_dir).await;
         let restore_res = match baseline {
             Ok(()) => {
-                phase_budget_path(vmm, backend, args, &cfg, &env, Some(snap_dir.clone())).await
+                phase_budget_path(vmm, rec, backend, args, &cfg, &env, Some(snap_dir.clone())).await
             }
             Err(e) => Err(anyhow::anyhow!(
                 "phase-budget: baseline snapshot failed: {e}"
@@ -1839,7 +2595,9 @@ async fn run_phase_budget<V: Vmm>(
         restore_res?;
     } else {
         // Genuine capability skip → success; the cold path already ran.
-        println!("phase-budget: backend {backend} has no restore; cold path only");
+        rec.skip(format!(
+            "phase-budget: backend {backend} has no restore; cold path only"
+        ));
     }
     Ok(())
 }
@@ -1849,6 +2607,7 @@ async fn run_phase_budget<V: Vmm>(
 // ----------------------------------------------------------------------------
 async fn run_vsock_rtt<V: Vmm>(
     vmm: &V,
+    rec: &Recorder,
     backend: &str,
     args: &Args,
     allocator: VmidAllocator,
@@ -1886,12 +2645,11 @@ async fn run_vsock_rtt<V: Vmm>(
     let mut rtts = Vec::with_capacity(iters);
     // H-BIN-2: count exec failures that shrink the sample set instead of the silent
     // `if r.is_ok()` drop, and surface the error rather than a bare `break`.
-    let mut dropped = 0usize;
     for i in 0..iters {
         let steward = match vm.steward(None).await {
             Ok(a) => a,
             Err(e) => {
-                println!("vsock-rtt: iteration {i} steward-connect failed: {e}");
+                say!("vsock-rtt: iteration {i} steward-connect failed: {e}");
                 break;
             }
         };
@@ -1901,8 +2659,7 @@ async fn run_vsock_rtt<V: Vmm>(
         match r {
             Ok(_) => rtts.push(dt),
             Err(e) => {
-                println!("vsock-rtt: iteration {i} exec failed: {e}");
-                dropped += 1;
+                say!("vsock-rtt: iteration {i} exec failed: {e}");
             }
         }
     }
@@ -1910,20 +2667,26 @@ async fn run_vsock_rtt<V: Vmm>(
     // shutdown error must not corrupt the collected RTT report below.
     best_effort::shutdown(vm).await;
 
-    let acct = accounting_suffix(dropped, 0);
-    println!(
+    // Through the one law, so the printed row and the JSON field cannot disagree about how lossy
+    // the run was — they did while this read the raw counter and `measure` below took `planned`.
+    let acct = accounting_suffix(dropped_iterations(iters, rtts.len()), 0);
+    say!(
         "=== VSOCK-RTT (backend={backend} n={}{acct} cmd={argv:?}) ===",
         rtts.len()
     );
-    match pcts(&mut rtts) {
-        Some((p50, p95, p99, max)) => {
-            println!(
-                "  per-round-trip exec latency: p50={p50}µs p95={p95}µs p99={p99}µs max={max}µs"
+    match rec.measure(metrics::VSOCK_RTT, Unit::Micros, &mut rtts, iters, 0) {
+        Some(m) => {
+            say!(
+                "  per-round-trip exec latency: p50={}µs p95={}µs p99={}µs max={}µs",
+                m.p50,
+                m.p95,
+                m.p99,
+                m.max
             );
             Ok(())
         }
         None => {
-            println!("  No successful runs");
+            say!("  No successful runs");
             // M-BIN-1: attempted but zero samples → fail loud.
             anyhow::bail!("vsock-rtt: no successful exec round-trips");
         }
@@ -2022,14 +2785,15 @@ fn egress_curl(url: &str) -> Vec<String> {
 /// netns + nft + MITM proxy). Each self-skips where its facility is absent.
 async fn run_net_egress<V: Vmm>(
     vmm: &V,
+    rec: &Recorder,
     backend: &str,
     args: &Args,
     allocator: VmidAllocator,
 ) -> anyhow::Result<()> {
     match args.net_mode.as_str() {
-        "plain" => run_net_egress_plain(vmm, backend, args, allocator).await,
-        "tls" => run_net_egress_filtered(vmm, backend, args, allocator, false).await,
-        "privileged" => run_net_egress_filtered(vmm, backend, args, allocator, true).await,
+        "plain" => run_net_egress_plain(vmm, rec, backend, args, allocator).await,
+        "tls" => run_net_egress_filtered(vmm, rec, backend, args, allocator, false).await,
+        "privileged" => run_net_egress_filtered(vmm, rec, backend, args, allocator, true).await,
         // Pre-validated by `parse_net_mode`; fail loud rather than silently succeed if the
         // two ever drift.
         other => anyhow::bail!("net-egress: unknown --net-mode '{other}'"),
@@ -2041,6 +2805,7 @@ async fn run_net_egress<V: Vmm>(
 /// endpoint (asserting a real egress byte, not a proxy signal — §15/AGENTS.md).
 async fn run_net_egress_plain<V: Vmm>(
     vmm: &V,
+    rec: &Recorder,
     backend: &str,
     args: &Args,
     allocator: VmidAllocator,
@@ -2049,7 +2814,9 @@ async fn run_net_egress_plain<V: Vmm>(
     // QEMU; Firecracker has none). A capability skip is success (Ok), not a failure
     // (M-BIN-1).
     if !vmm.capabilities().unprivileged_vhost_user_net {
-        println!("net-egress: backend {backend} has no unprivileged vhost-user-net; skipping");
+        rec.skip(format!(
+            "net-egress: backend {backend} has no unprivileged vhost-user-net; skipping"
+        ));
         return Ok(());
     }
     let (dir, kernel, rootfs) = artifact_paths(args.kernel.as_deref())?;
@@ -2090,7 +2857,6 @@ async fn run_net_egress_plain<V: Vmm>(
 
     // --- Phase A: start latency WITH the smoltcp NAT set up on the boot path ---
     let mut starts = Vec::new();
-    let mut start_dropped = 0usize;
     let mut boot_retries = 0usize;
     for i in 0..(iters + args.warmup) {
         let mut attempt = 0usize;
@@ -2106,10 +2872,8 @@ async fn run_net_egress_plain<V: Vmm>(
                             }
                         }
                         Err(e) => {
-                            println!("net-egress: net-start iter {i} steward-connect failed: {e}");
-                            if i >= args.warmup {
-                                start_dropped += 1;
-                            }
+                            say!("net-egress: net-start iter {i} steward-connect failed: {e}");
+                            if i >= args.warmup {}
                         }
                     }
                     best_effort::shutdown(vm).await;
@@ -2123,7 +2887,7 @@ async fn run_net_egress_plain<V: Vmm>(
                         );
                     }
                     boot_retries += 1;
-                    println!(
+                    say!(
                         "net-egress: net-start iter {i} transient boot failure (attempt {attempt}, retrying): {e}"
                     );
                 }
@@ -2131,14 +2895,16 @@ async fn run_net_egress_plain<V: Vmm>(
         }
     }
     if boot_retries > 0 {
-        println!(
+        say!(
             "net-egress: NET-START recovered {boot_retries} transient smoltcp-bringup boot failure(s) via retry"
         );
     }
     report(
+        rec,
         "NET-START (boot with smoltcp NAT)",
+        metrics::NET_START,
         &mut starts,
-        start_dropped,
+        iters,
         0,
     );
 
@@ -2156,7 +2922,7 @@ async fn run_net_egress_plain<V: Vmm>(
                             "net-egress: egress VM boot failed after {attempt} attempts: {e}"
                         );
                     }
-                    println!(
+                    say!(
                         "net-egress: egress VM transient boot failure (attempt {attempt}, retrying): {e}"
                     );
                 }
@@ -2193,12 +2959,11 @@ async fn run_net_egress_plain<V: Vmm>(
     }
 
     let mut rtts = Vec::with_capacity(iters);
-    let mut dropped = 0usize;
     for i in 0..iters {
         let steward = match vm.steward(None).await {
             Ok(a) => a,
             Err(e) => {
-                println!("net-egress: egress iter {i} steward-connect failed: {e}");
+                say!("net-egress: egress iter {i} steward-connect failed: {e}");
                 break;
             }
         };
@@ -2207,37 +2972,35 @@ async fn run_net_egress_plain<V: Vmm>(
         let dt = t.elapsed().as_micros();
         match r {
             Ok(o) if o.code == 0 && !o.stdout.is_empty() => rtts.push(dt),
-            Ok(o) => {
-                println!(
-                    "net-egress: egress iter {i} curl code={} stdout={}B (no egress byte)",
-                    o.code,
-                    o.stdout.len()
-                );
-                dropped += 1;
-            }
-            Err(e) => {
-                println!("net-egress: egress iter {i} exec failed: {e}");
-                dropped += 1;
-            }
+            Ok(o) => say!(
+                "net-egress: egress iter {i} curl code={} stdout={}B (no egress byte)",
+                o.code,
+                o.stdout.len()
+            ),
+            Err(e) => say!("net-egress: egress iter {i} exec failed: {e}"),
         }
     }
     best_effort::shutdown(vm).await;
     // `responder` stays alive until here; its Drop reaps the host thread.
 
-    let acct = accounting_suffix(dropped, 0);
-    println!(
+    let acct = accounting_suffix(dropped_iterations(iters, rtts.len()), 0);
+    say!(
         "=== NET-EGRESS (backend={backend} n={}{acct} url={url}) ===",
         rtts.len()
     );
-    match pcts(&mut rtts) {
-        Some((p50, p95, p99, max)) => {
-            println!(
-                "  in-guest curl round-trip (guest→NAT→host→guest): p50={p50}µs p95={p95}µs p99={p99}µs max={max}µs"
+    match rec.measure(metrics::NET_EGRESS_RTT, Unit::Micros, &mut rtts, iters, 0) {
+        Some(m) => {
+            say!(
+                "  in-guest curl round-trip (guest→NAT→host→guest): p50={}µs p95={}µs p99={}µs max={}µs",
+                m.p50,
+                m.p95,
+                m.p99,
+                m.max
             );
             Ok(())
         }
         None => {
-            println!("  No successful egress round-trips");
+            say!("  No successful egress round-trips");
             anyhow::bail!("net-egress: no egress samples");
         }
     }
@@ -2300,6 +3063,7 @@ fn mitm_proxy_config() -> vmcell::config::ProxyConfig {
 /// without the vhost-user-net device.
 async fn run_net_egress_filtered<V: Vmm>(
     vmm: &V,
+    rec: &Recorder,
     backend: &str,
     args: &Args,
     allocator: VmidAllocator,
@@ -2311,15 +3075,17 @@ async fn run_net_egress_filtered<V: Vmm>(
     // Self-skip per variant (a capability skip is success, M-BIN-1).
     if privileged {
         if !vmcell::HostCapabilities::probe().privileged_net_available() {
-            println!("net-egress[{label}]: no CAP_NET_ADMIN / netns dir; skipping");
+            rec.skip(format!(
+                "net-egress[{label}]: no CAP_NET_ADMIN / netns dir; skipping"
+            ));
             return Ok(());
         }
         // Reap orphan `vmcell-net-*` netns from prior aborted/hard-killed runs before we start.
         let _ = vmcell::net::cleanup_orphan_netns(&sweep_prefix);
     } else if !vmm.capabilities().unprivileged_vhost_user_net {
-        println!(
+        rec.skip(format!(
             "net-egress[{label}]: backend {backend} has no unprivileged vhost-user-net; skipping"
-        );
+        ));
         return Ok(());
     }
 
@@ -2355,7 +3121,6 @@ async fn run_net_egress_filtered<V: Vmm>(
 
     // --- Phase A: start latency WITH the filtered-egress net setup on the boot path ---
     let mut starts = Vec::new();
-    let mut start_dropped = 0usize;
     let mut boot_retries = 0usize;
     for i in 0..(iters + args.warmup) {
         let mut attempt = 0usize;
@@ -2371,12 +3136,10 @@ async fn run_net_egress_filtered<V: Vmm>(
                             }
                         }
                         Err(e) => {
-                            println!(
+                            say!(
                                 "net-egress[{label}]: net-start iter {i} steward-connect failed: {e}"
                             );
-                            if i >= args.warmup {
-                                start_dropped += 1;
-                            }
+                            if i >= args.warmup {}
                         }
                     }
                     best_effort::shutdown(vm).await;
@@ -2390,7 +3153,7 @@ async fn run_net_egress_filtered<V: Vmm>(
                         );
                     }
                     boot_retries += 1;
-                    println!(
+                    say!(
                         "net-egress[{label}]: net-start iter {i} transient boot failure (attempt {attempt}, retrying): {e}"
                     );
                 }
@@ -2398,7 +3161,7 @@ async fn run_net_egress_filtered<V: Vmm>(
         }
     }
     if boot_retries > 0 {
-        println!(
+        say!(
             "net-egress[{label}]: NET-START recovered {boot_retries} transient boot failure(s) via retry"
         );
     }
@@ -2407,7 +3170,15 @@ async fn run_net_egress_filtered<V: Vmm>(
     } else {
         "NET-START (boot with smoltcp NAT + MITM proxy)"
     };
-    report(start_label, &mut starts, start_dropped, 0);
+    // Qualified by variant for the same reason the phase rows are qualified by path: `tls` and
+    // `privileged` are two different egress surfaces printing one row name, and an unqualified
+    // `net_start` would let a comparator pool them.
+    let start_metric = if privileged {
+        metrics::NET_START_PRIVILEGED
+    } else {
+        metrics::NET_START_TLS
+    };
+    report(rec, start_label, start_metric, &mut starts, iters, 0);
 
     // --- Phase B: steady MITM egress round-trip (one warm VM, N HTTPS-through-proxy curls) ---
     let mut vm = {
@@ -2422,7 +3193,7 @@ async fn run_net_egress_filtered<V: Vmm>(
                             "net-egress[{label}]: egress VM boot failed after {attempt} attempts: {e}"
                         );
                     }
-                    println!(
+                    say!(
                         "net-egress[{label}]: egress VM transient boot failure (attempt {attempt}, retrying): {e}"
                     );
                 }
@@ -2490,13 +3261,12 @@ async fn run_net_egress_filtered<V: Vmm>(
     }
 
     let mut rtts = Vec::with_capacity(iters);
-    let mut dropped = 0usize;
     for i in 0..iters {
         let (argv, cenv) = mitm_curl(&format!("h{i}.probe.local"));
         let steward = match vm.steward(None).await {
             Ok(a) => a,
             Err(e) => {
-                println!("net-egress[{label}]: egress iter {i} steward-connect failed: {e}");
+                say!("net-egress[{label}]: egress iter {i} steward-connect failed: {e}");
                 break;
             }
         };
@@ -2505,18 +3275,12 @@ async fn run_net_egress_filtered<V: Vmm>(
         let dt = t.elapsed().as_micros();
         match r {
             Ok(o) if o.code == 0 && o.stdout.starts_with(b"vmcell-mitm-ok") => rtts.push(dt),
-            Ok(o) => {
-                println!(
-                    "net-egress[{label}]: egress iter {i} MITM curl code={} stdout={}B (no MITM byte)",
-                    o.code,
-                    o.stdout.len()
-                );
-                dropped += 1;
-            }
-            Err(e) => {
-                println!("net-egress[{label}]: egress iter {i} exec failed: {e}");
-                dropped += 1;
-            }
+            Ok(o) => say!(
+                "net-egress[{label}]: egress iter {i} MITM curl code={} stdout={}B (no MITM byte)",
+                o.code,
+                o.stdout.len()
+            ),
+            Err(e) => say!("net-egress[{label}]: egress iter {i} exec failed: {e}"),
         }
     }
     best_effort::shutdown(vm).await;
@@ -2526,22 +3290,31 @@ async fn run_net_egress_filtered<V: Vmm>(
         let _ = vmcell::net::cleanup_orphan_netns(&sweep_prefix);
     }
 
-    let acct = accounting_suffix(dropped, 0);
+    let acct = accounting_suffix(dropped_iterations(iters, rtts.len()), 0);
     let tag = if privileged {
         "NET-EGRESS-PRIV (MITM via tap+nft+proxy)"
     } else {
         "NET-EGRESS-TLS (MITM via smoltcp+proxy)"
     };
-    println!("=== {tag} (backend={backend} n={}{acct}) ===", rtts.len());
-    match pcts(&mut rtts) {
-        Some((p50, p95, p99, max)) => {
-            println!(
-                "  in-guest HTTPS-through-MITM-proxy round-trip (cert mint + TLS handshake): p50={p50}µs p95={p95}µs p99={p99}µs max={max}µs"
+    say!("=== {tag} (backend={backend} n={}{acct}) ===", rtts.len());
+    let rtt_metric = if privileged {
+        metrics::NET_EGRESS_PRIVILEGED_RTT
+    } else {
+        metrics::NET_EGRESS_TLS_RTT
+    };
+    match rec.measure(rtt_metric, Unit::Micros, &mut rtts, iters, 0) {
+        Some(m) => {
+            say!(
+                "  in-guest HTTPS-through-MITM-proxy round-trip (cert mint + TLS handshake): p50={}µs p95={}µs p99={}µs max={}µs",
+                m.p50,
+                m.p95,
+                m.p99,
+                m.max
             );
             Ok(())
         }
         None => {
-            println!("  No successful MITM egress round-trips");
+            say!("  No successful MITM egress round-trips");
             anyhow::bail!("net-egress[{label}]: no MITM egress samples");
         }
     }
@@ -2559,13 +3332,16 @@ async fn run_net_egress_filtered<V: Vmm>(
 /// fan-out (CH + QEMU); Firecracker degrades to the single-clone control.
 async fn run_zygote<V: Vmm>(
     vmm: &V,
+    rec: &Recorder,
     backend: &str,
     args: &Args,
     allocator: VmidAllocator,
 ) -> anyhow::Result<()> {
     let caps = vmm.capabilities();
     if !caps.snapshot_restore {
-        println!("zygote: backend {backend} has no snapshot support; skipping");
+        rec.skip(format!(
+            "zygote: backend {backend} has no snapshot support; skipping"
+        ));
         return Ok(());
     }
     // FC rotates no host paths → only a single clone is representable (`spawn_clones`
@@ -2576,10 +3352,10 @@ async fn run_zygote<V: Vmm>(
         requested
     } else {
         if requested > 1 {
-            println!(
+            rec.skip(format!(
                 "zygote: backend {backend} does not rotate host paths; measuring the \
                  single-clone control (n=1), not {requested}"
-            );
+            ));
         }
         1
     };
@@ -2621,22 +3397,21 @@ async fn run_zygote<V: Vmm>(
     };
     best_effort::shutdown(base).await;
     let cow = zygote.probe_cow_support();
-    println!(
-        "zygote master ready (fan-out={clone_count}); CoW support: {cow:?} \
-         (reflink needs $TMPDIR + master on one reflink-capable fs; else a full copy)"
-    );
+    say!("zygote master ready (fan-out={clone_count}); CoW support: {cow:?}");
+    rec.caveat(zygote_cow_caveat(cow));
 
     // --- Timed fan-out: N clones restored + resumed concurrently per iteration ---
     let mut fanout = Vec::new(); // wall-clock to `clone_count` live+resumed clones
     let mut ready = Vec::new(); // + time to steward-ready across all clones
-    let mut dropped = 0usize;
     for i in 0..(args.iters() + args.warmup) {
         let t_fan = Instant::now();
         let mut clones = match zygote.spawn_clones(vmm, clone_count, &env).await {
             Ok(c) => c,
             Err(e) => {
-                println!("zygote: iteration {i} fan-out failed: {e}");
-                dropped += 1;
+                // Counted by subtraction at the report (`dropped_iterations`), which is also what
+                // finally gives the `ready` row below a real loss count — it passed a literal `0`
+                // beside this live counter, so a fan-out that failed reported a clean sample set.
+                say!("zygote: iteration {i} fan-out failed: {e}");
                 continue;
             }
         };
@@ -2656,10 +3431,7 @@ async fn run_zygote<V: Vmm>(
                     ready.push(ready_ms);
                 }
             }
-            Err(e) => {
-                println!("zygote: iteration {i} clone steward-ready failed: {e}");
-                dropped += 1;
-            }
+            Err(e) => say!("zygote: iteration {i} clone steward-ready failed: {e}"),
         }
         for c in clones {
             best_effort::shutdown(c).await;
@@ -2667,27 +3439,50 @@ async fn run_zygote<V: Vmm>(
     }
     best_effort::discard_dir(&master);
 
-    let acct = accounting_suffix(dropped, 0);
-    println!(
+    let acct = accounting_suffix(dropped_iterations(args.iters(), fanout.len()), 0);
+    say!(
         "=== ZYGOTE (backend={backend} fan-out={clone_count} n={}{acct} cow={cow:?}) ===",
         fanout.len()
     );
-    let per_clone = |p: u128| p / clone_count.max(1) as u128;
-    match pcts(&mut fanout) {
-        Some((p50, p95, p99, max)) => {
-            println!(
-                "  fan-out to {clone_count} resumed clones: p50={p50}ms p95={p95}ms p99={p99}ms max={max}ms  (per-clone p50≈{}ms)",
-                per_clone(p50)
+    // `.floor()` reproduces the integer division this printed before the numbers started coming
+    // out of the recorder — the per-clone figure is a rounded-down whole millisecond, not a rank.
+    let per_clone =
+        |p: f64| (p / f64::from(u32::try_from(clone_count.max(1)).unwrap_or(u32::MAX))).floor();
+    match rec.measure(
+        metrics::ZYGOTE_FANOUT,
+        Unit::Millis,
+        &mut fanout,
+        args.iters(),
+        0,
+    ) {
+        Some(m) => {
+            say!(
+                "  fan-out to {clone_count} resumed clones: p50={}ms p95={}ms p99={}ms max={}ms  (per-clone p50≈{}ms)",
+                m.p50,
+                m.p95,
+                m.p99,
+                m.max,
+                per_clone(m.p50)
             );
         }
         None => {
-            println!("  No successful fan-outs");
+            say!("  No successful fan-outs");
             anyhow::bail!("zygote: no successful fan-outs");
         }
     }
-    if let Some((p50, p95, p99, max)) = pcts(&mut ready) {
-        println!(
-            "  + time to steward-ready across all clones: p50={p50}ms p95={p95}ms p99={p99}ms max={max}ms"
+    if let Some(m) = rec.measure(
+        metrics::ZYGOTE_STEWARD_READY,
+        Unit::Millis,
+        &mut ready,
+        args.iters(),
+        0,
+    ) {
+        say!(
+            "  + time to steward-ready across all clones: p50={}ms p95={}ms p99={}ms max={}ms",
+            m.p50,
+            m.p95,
+            m.p99,
+            m.max
         );
     }
     Ok(())
@@ -2708,6 +3503,7 @@ async fn run_zygote<V: Vmm>(
 /// Works on all four backends (sessions ride the same vsock; no capability gate).
 async fn run_session<V: Vmm>(
     vmm: &V,
+    rec: &Recorder,
     backend: &str,
     args: &Args,
     allocator: VmidAllocator,
@@ -2734,7 +3530,6 @@ async fn run_session<V: Vmm>(
     // from the cached one-shot `steward()` client vsock-rtt reuses. Prove liveness (run one
     // command to `code==0`) before counting the sample, then drop the mux.
     let mut connect_rtts = Vec::with_capacity(iters);
-    let mut conn_dropped = 0usize;
     for _ in 0..args.warmup {
         if let Ok(mux) = vm.connect_sessions(None).await
             && let Ok(mut s) = mux.open_spec(SessionSpecBuilder::new(argv.clone())).await
@@ -2749,8 +3544,7 @@ async fn run_session<V: Vmm>(
         let mux = match vm.connect_sessions(None).await {
             Ok(m) => m,
             Err(e) => {
-                println!("session: connect iter {i} failed: {e}");
-                conn_dropped += 1;
+                say!("session: connect iter {i} failed: {e}");
                 continue;
             }
         };
@@ -2762,8 +3556,6 @@ async fn run_session<V: Vmm>(
         drop(mux);
         if live {
             connect_rtts.push(dt);
-        } else {
-            conn_dropped += 1;
         }
     }
 
@@ -2785,50 +3577,66 @@ async fn run_session<V: Vmm>(
         }
     }
     let mut open_rtts = Vec::with_capacity(iters);
-    let mut open_dropped = 0usize;
     for i in 0..iters {
         let t = Instant::now();
         let outcome = match mux.open_spec(SessionSpecBuilder::new(argv.clone())).await {
             Ok(mut s) => s.wait().await,
             Err(e) => {
-                println!("session: open iter {i} failed: {e}");
-                open_dropped += 1;
+                say!("session: open iter {i} failed: {e}");
                 continue;
             }
         };
         let dt = t.elapsed().as_micros();
         if outcome.code == 0 {
             open_rtts.push(dt);
-        } else {
-            open_dropped += 1;
         }
     }
     drop(mux);
     best_effort::shutdown(vm).await;
 
-    println!("=== SESSION (backend={backend} cmd={argv:?}) ===");
-    let acct_c = accounting_suffix(conn_dropped, 0);
-    match pcts(&mut connect_rtts) {
-        Some((p50, p95, p99, max)) => println!(
-            "  session-connect (2nd vsock handshake) n={}{acct_c}: p50={p50}µs p95={p95}µs p99={p99}µs max={max}µs",
-            connect_rtts.len()
+    say!("=== SESSION (backend={backend} cmd={argv:?}) ===");
+    let acct_c = accounting_suffix(dropped_iterations(iters, connect_rtts.len()), 0);
+    match rec.measure(
+        metrics::SESSION_CONNECT,
+        Unit::Micros,
+        &mut connect_rtts,
+        iters,
+        0,
+    ) {
+        Some(m) => say!(
+            "  session-connect (2nd vsock handshake) n={}{acct_c}: p50={}µs p95={}µs p99={}µs max={}µs",
+            m.n,
+            m.p50,
+            m.p95,
+            m.p99,
+            m.max
         ),
         None => {
-            println!("  session-connect: No successful runs{acct_c}");
+            say!("  session-connect: No successful runs{acct_c}");
             anyhow::bail!("session: no successful mux connects");
         }
     }
-    let acct_o = accounting_suffix(open_dropped, 0);
-    match pcts(&mut open_rtts) {
-        Some((p50, p95, p99, max)) => {
-            println!(
-                "  session-open (open→spawn→exit) n={}{acct_o}: p50={p50}µs p95={p95}µs p99={p99}µs max={max}µs",
-                open_rtts.len()
+    let acct_o = accounting_suffix(dropped_iterations(iters, open_rtts.len()), 0);
+    match rec.measure(
+        metrics::SESSION_OPEN,
+        Unit::Micros,
+        &mut open_rtts,
+        iters,
+        0,
+    ) {
+        Some(m) => {
+            say!(
+                "  session-open (open→spawn→exit) n={}{acct_o}: p50={}µs p95={}µs p99={}µs max={}µs",
+                m.n,
+                m.p50,
+                m.p95,
+                m.p99,
+                m.max
             );
             Ok(())
         }
         None => {
-            println!("  session-open: No successful runs{acct_o}");
+            say!("  session-open: No successful runs{acct_o}");
             anyhow::bail!("session: no successful session opens");
         }
     }
@@ -2933,20 +3741,31 @@ async fn daemon_destroy(http: &reqwest::Client, base: &str, id: &str) -> anyhow:
 
 /// Reports a daemon op's µs samples as ms (one decimal) through the shared nearest-rank
 /// `pcts` — the ONE percentile law (no second copy, unlike the retired python `pctl`).
-fn report_daemon_op(name: &str, samples: &mut [u128]) {
-    match pcts(samples) {
-        Some((p50, p95, p99, max)) => {
-            let ms = |us: u128| us as f64 / 1000.0;
-            println!(
+fn report_daemon_op(rec: &Recorder, name: &str, samples: &mut [u128], planned: usize) {
+    // The metric keeps the raw sample unit (µs) and the row renders it as ms: the one recorded
+    // value is what both the table cell and the JSON field are computed from, so the display
+    // rounding cannot become a second, disagreeing number. The metric name is derived from the op
+    // name rather than passed, because these five rows ARE the op names — `daemon_create`,
+    // `daemon_restore`, … — and a separate argument would be a second place to typo one.
+    match rec.measure(
+        &metrics::daemon_metric(name),
+        Unit::Micros,
+        samples,
+        planned,
+        0,
+    ) {
+        Some(m) => {
+            let ms = |us: f64| us / 1000.0;
+            say!(
                 "  {name:8}: count={} p50={:.1}ms p95={:.1}ms p99={:.1}ms max={:.1}ms",
-                samples.len(),
-                ms(p50),
-                ms(p95),
-                ms(p99),
-                ms(max)
+                m.n,
+                ms(m.p50),
+                ms(m.p95),
+                ms(m.p99),
+                ms(m.max)
             );
         }
-        None => println!("  {name:8}: No successful samples"),
+        None => say!("  {name:8}: No successful samples"),
     }
 }
 
@@ -2954,7 +3773,7 @@ fn report_daemon_op(name: &str, samples: &mut [u128]) {
 /// `vmcelld` HTTP + broker bridge. `list` (no VMM work) is the pure bridge floor; `restore`
 /// exercises `restore_cow`. Spawns its own `vmcelld` (inheriting the runner's ambient caps),
 /// times each op with `Instant`, and reports via `pcts`.
-async fn run_daemon_api(args: &Args) -> anyhow::Result<()> {
+async fn run_daemon_api(rec: &Recorder, args: &Args) -> anyhow::Result<()> {
     // The daemon binary sits next to this one (same cargo profile dir: target/<profile>/).
     let exe =
         std::env::current_exe().map_err(|e| anyhow::anyhow!("daemon-api: current_exe: {e}"))?;
@@ -2990,7 +3809,7 @@ async fn run_daemon_api(args: &Args) -> anyhow::Result<()> {
     let warmup = args.warmup;
     let total = iters + warmup;
 
-    println!(
+    say!(
         "=== DAEMON-API (vmcelld HTTP + broker bridge; port={port} n={iters} warmup={warmup}) ==="
     );
 
@@ -3115,12 +3934,12 @@ async fn run_daemon_api(args: &Args) -> anyhow::Result<()> {
     }
     daemon_destroy(&http, &base, &src_id).await?;
 
-    report_daemon_op("create", &mut create_us);
-    report_daemon_op("restore", &mut restore_us);
-    report_daemon_op("exec", &mut exec_us);
-    report_daemon_op("list", &mut list_us);
-    report_daemon_op("destroy", &mut destroy_us);
-    println!("=== DAEMON-API done ===");
+    report_daemon_op(rec, "create", &mut create_us, iters);
+    report_daemon_op(rec, "restore", &mut restore_us, iters);
+    report_daemon_op(rec, "exec", &mut exec_us, iters);
+    report_daemon_op(rec, "list", &mut list_us, iters);
+    report_daemon_op(rec, "destroy", &mut destroy_us, iters);
+    say!("=== DAEMON-API done ===");
 
     // Explicit graceful teardown (rather than waiting for the drop) so a hiccup surfaces here;
     // `store` cleanup follows on its own drop.
@@ -3180,22 +3999,32 @@ mod tests {
             ("qemu", "/opt/vmm/qemu-dev"),
             ("crosvm", "/opt/vmm/crosvm-dev"),
         ] {
+            // The expected variable name comes from the ONE table, not a literal copied beside it:
+            // a test that re-spells the var would keep passing while the table drifted, and it
+            // would also be a second `"VMCELL_CH_BIN"` read for
+            // `scripts/ban-ch-binary-resolver-copies.sh` to account for.
+            let (var, _) = vmm_bin_resolver(backend).expect("every backend has a resolver");
             assert_eq!(
-                resolve_vmm_binary(backend, overridden).as_deref(),
-                Some(want),
-                "{backend} must resolve through its VMCELL_*_BIN override"
+                resolve_vmm_binary(backend, overridden),
+                Some((
+                    want.to_string(),
+                    BinSource::EnvVar {
+                        name: var.to_string()
+                    }
+                )),
+                "{backend} must resolve through its VMCELL_*_BIN override, and say so"
             );
         }
 
         // Unset → the documented default binary name (PATH resolution), per backend.
         let unset = |_: &str| None;
         assert_eq!(
-            resolve_vmm_binary("qemu", unset).as_deref(),
-            Some("qemu-system-x86_64")
+            resolve_vmm_binary("qemu", unset),
+            Some(("qemu-system-x86_64".to_string(), BinSource::Path))
         );
         assert_eq!(
-            resolve_vmm_binary("cloud-hypervisor", unset).as_deref(),
-            Some("cloud-hypervisor")
+            resolve_vmm_binary("cloud-hypervisor", unset),
+            Some(("cloud-hypervisor".to_string(), BinSource::Path))
         );
 
         // A backend with no table entry resolves to nothing (and `vmm_binary` then fails loud)
@@ -3228,14 +4057,14 @@ mod tests {
             ("crosvm", harness::crosvm_bin()),
         ] {
             assert_eq!(
-                vmm_binary(backend).expect("every backend has a resolver"),
+                vmm_binary(backend).expect("every backend has a resolver").0,
                 contract,
                 "{backend}: bench-vm and the validator harness must resolve one binary"
             );
         }
         // The CH leg is also the library's own pipeline law — same var, same default.
         assert_eq!(
-            vmm_binary("cloud-hypervisor").expect("CH resolver"),
+            vmm_binary("cloud-hypervisor").expect("CH resolver").0,
             vmcell::artifact::ch_binary_path()
         );
     }
@@ -3581,6 +4410,902 @@ mod tests {
         let line = resolved_knobs_line(&a);
         assert!(line.contains("profile: low-latency"), "{line}");
         assert!(line.contains("VirtioConsole"), "{line}");
+    }
+
+    // THE PROVENANCE DEFECT (2026-08-21, and this is the fix's gate). The attribution line read
+    //
+    //     println!("vmm binary: {vmm_bin} (via ${})", vmm_bin_resolver(..).map_or("?", |(v,_)| v));
+    //
+    // — the name of the variable the resolver WOULD consult, printed whether or not it was set. So
+    // a run that found `cloud-hypervisor` on PATH reported itself as pinned by $VMCELL_CH_BIN, and
+    // the line's own comment says it exists to distinguish exactly those two cases ("instead of
+    // whatever `crosvm` was first on PATH"). The same believing-the-export-applied mistake cost a
+    // whole A/B matrix one crate over.
+    //
+    // RED ON THE INVERSE: restore the unconditional `(via $…)` and the PATH assertions below fail
+    // — both the `contains("via $")` one and the exact-line one. The env-set leg is the positive
+    // control: the variable IS named when it was actually read, so the fix cannot be "never print
+    // the variable".
+    #[test]
+    fn a_path_resolution_is_never_attributed_to_an_env_var() {
+        let unset = |_: &str| None;
+        for backend in supported_backends() {
+            let (bin, source) =
+                resolve_vmm_binary(backend, unset).expect("every backend has a resolver");
+            assert_eq!(
+                source,
+                BinSource::Path,
+                "{backend} with no override is PATH"
+            );
+            let line = vmm_binary_line(&bin, &source);
+            assert!(
+                !line.contains("via $"),
+                "{backend}: a PATH resolution must not name an environment variable: {line}"
+            );
+            assert_eq!(line, format!("vmm binary: {bin} (found on PATH)"));
+        }
+
+        // Positive control: when the variable really was read, the line names it. The variable's
+        // name comes from the one table (see the sibling test) rather than a literal here.
+        let (ch_var, _) = vmm_bin_resolver("cloud-hypervisor").expect("CH resolver");
+        let (bin, source) = resolve_vmm_binary("cloud-hypervisor", |var| {
+            (var == ch_var).then(|| "/opt/vmm/ch-dev".to_string())
+        })
+        .expect("CH resolver");
+        assert_eq!(
+            vmm_binary_line(&bin, &source),
+            format!("vmm binary: /opt/vmm/ch-dev (via ${ch_var})")
+        );
+        // Which variable `cloud-hypervisor` maps to is already pinned by
+        // `vmm_binary_honors_contract_env_overrides` (its lookup answers only for the contract
+        // name), so re-spelling the literal here would only add a second read for
+        // `scripts/ban-ch-binary-resolver-copies.sh` to account for.
+    }
+
+    // The report is the run's own attribution: the binary it executed AND how that path was
+    // resolved, the kernel and rootfs it booted, the resolved knobs, and everything the recorder
+    // collected. RED on the inverse (a report assembled from `args.backend`'s hardcoded default
+    // binary, or one that drops the recorder's notes): the source, metric or note assert fails.
+    #[test]
+    fn the_report_carries_what_the_run_actually_resolved_and_measured() {
+        let args = <Args as clap::Parser>::parse_from(["bench-vm", "--report", "json"]);
+        let rec = Recorder::new();
+        rec.skip("Warm Restore: backend firecracker has no snapshot support; skipping".to_string());
+        let mut samples: Vec<u128> = vec![41, 42, 43];
+        assert!(
+            rec.measure("cold_boot", Unit::Millis, &mut samples, 0, 0)
+                .is_some()
+        );
+        let report = build_report(
+            &args,
+            &rec,
+            "/opt/vmm/ch-dev",
+            &BinSource::EnvVar {
+                name: "VMCELL_CH_BIN_FOR_THIS_FIXTURE".to_string(),
+            },
+            Path::new("/artifacts/vmlinux"),
+            Path::new("/artifacts/rootfs.erofs"),
+        );
+        assert_eq!(report.schema_version, REPORT_SCHEMA_VERSION);
+        assert_eq!(report.backend, "cloud-hypervisor");
+        assert_eq!(report.mode, "latency");
+        assert_eq!(report.vmm_binary, "/opt/vmm/ch-dev");
+        assert_eq!(
+            report.vmm_binary_source,
+            BinSource::EnvVar {
+                name: "VMCELL_CH_BIN_FOR_THIS_FIXTURE".to_string()
+            }
+        );
+        assert_eq!(report.kernel, PathBuf::from("/artifacts/vmlinux"));
+        assert_eq!(report.metric("cold_boot").map(|m| m.p50), Some(42.0));
+        assert_eq!(report.notes.len(), 1, "{:?}", report.notes);
+        assert_eq!(
+            report.knobs.get("iterations").map(String::as_str),
+            Some("10")
+        );
+        // …and it round-trips through the codec it ships over, which is what the parent parses.
+        let json = report.to_json().expect("serialize");
+        assert_eq!(BenchReport::from_json(&json).expect("parse"), report);
+    }
+
+    // H-BIN-1's rule applied to the new flag: an unknown `--report` must be rejected at parse time,
+    // not defaulted. A silently-defaulted `--report jsonn` prints the human table to a parent that
+    // is about to `serde_json::from_str` it. RED on the inverse (a `_ => Text` arm): the typo
+    // asserts fail.
+    #[test]
+    fn report_format_parser_rejects_typos_and_defaults_to_text() {
+        assert!(parse_report_format("jsonn").is_err());
+        assert!(parse_report_format("JSON").is_err());
+        assert!(parse_report_format("").is_err());
+        assert_eq!(parse_report_format("text"), Ok(ReportFormat::Text));
+        assert_eq!(parse_report_format("json"), Ok(ReportFormat::Json));
+        // The DEFAULT is the whole compatibility promise: nothing existing changes shape.
+        let a = <Args as clap::Parser>::parse_from(["bench-vm"]);
+        assert_eq!(a.report, ReportFormat::Text);
+    }
+
+    // The text row and the JSON field must not be able to disagree about a value, which they can
+    // only guarantee by being the same value. `measure` computes it ONCE and hands back what it
+    // recorded; every row prints that. RED on the inverse (a `measure` that records one metric and
+    // returns a freshly-computed other, or that records nothing): the equality below fails.
+    #[test]
+    fn the_recorded_metric_is_the_one_the_row_prints() {
+        let rec = Recorder::new();
+        let mut samples: Vec<u128> = (1..=20).collect();
+        // 23 planned, 20 collected → 3 dropped, DERIVED. Passing the drop count in is what let
+        // four call sites report a clean sample set over a truncated one (`dropped_iterations`).
+        let returned = rec
+            .measure("cold_boot", Unit::Millis, &mut samples, 23, 1)
+            .expect("20 samples");
+        let (metrics, notes) = rec.drain();
+        assert_eq!(metrics, vec![returned.clone()]);
+        assert!(notes.is_empty());
+        // …and it is the shared nearest-rank answer, not a second percentile law: `pcts` over
+        // 1..=20 is p50=10, p95=19, p99=20 (`percentile_nearest_rank_correctness`).
+        assert_eq!(
+            (returned.p50, returned.p95, returned.p99),
+            (10.0, 19.0, 20.0)
+        );
+        assert_eq!(returned.n, 20);
+        assert_eq!((returned.dropped, returned.warmup_failed), (3, 1));
+
+        // An empty sample set records NOTHING: a comparator must not rank a row nobody measured.
+        let rec = Recorder::new();
+        assert!(
+            rec.measure("cold_boot", Unit::Millis, &mut [], 0, 0)
+                .is_none()
+        );
+        assert!(rec.drain().0.is_empty());
+    }
+
+    // THE SUPPLY SIDE OF `bench-ab`'s SAMPLE-LOSS VERDICT. That comparator refuses to call a row
+    // whose `Metric::dropped` is non-zero, because a boot that failed is disproportionately a SLOW
+    // boot and the lossy arm therefore looks faster — survivorship bias with a p-value attached.
+    // The predicate was gated; what fed it was not. Every loop here that gives up on a failed boot
+    // `break`s, walking past the `dropped += 1` it used to depend on, and `report_phase` passed a
+    // literal `0` — so the arm that was losing samples reported a clean sample set and the gate
+    // stayed green over exactly the run it exists to refuse.
+    //
+    // RED on the inverse (`measure` taking a caller-supplied `dropped` again, or
+    // `dropped_iterations` returning 0): the seven-dropped assert fails, on the funnel AND on the
+    // `report` forwarder that every latency row goes through.
+    #[test]
+    fn a_truncated_sample_set_reports_its_loss_with_no_counter_to_walk_past() {
+        // Ten planned boots, three survived — the shape of a run whose fourth create failed.
+        let rec = Recorder::new();
+        let mut survivors: Vec<u128> = vec![40, 41, 42];
+        let m = rec
+            .measure(metrics::COLD_BOOT, Unit::Millis, &mut survivors, 10, 0)
+            .expect("three surviving samples");
+        assert_eq!(
+            (m.n, m.dropped),
+            (3, 7),
+            "a p50 over three of ten planned boots must declare the seven, or the comparator ranks              it against a complete arm as if it were one"
+        );
+
+        // …and through the forwarder the latency rows actually call, so the fix is not one the
+        // call sites can be written around.
+        let rec = Recorder::new();
+        let mut survivors: Vec<u128> = vec![40, 41, 42];
+        report(&rec, "Cold Boot", metrics::COLD_BOOT, &mut survivors, 10, 2);
+        let recorded = rec.drain().0;
+        let m = recorded.first().expect("one metric");
+        assert_eq!((m.n, m.dropped, m.warmup_failed), (3, 7, 2));
+
+        // The floor: nothing lost is nothing declared, so the column stays silent on a clean
+        // matrix. Without this a `dropped` that was always non-zero would satisfy the asserts
+        // above and disqualify every row in the table.
+        let rec = Recorder::new();
+        let mut all: Vec<u128> = vec![40, 41, 42];
+        let m = rec
+            .measure(metrics::COLD_BOOT, Unit::Millis, &mut all, 3, 0)
+            .expect("three samples");
+        assert_eq!((m.n, m.dropped), (3, 0));
+        // A caller that collected more than it planned is its own bug and must not underflow into
+        // a usize the size of the address space.
+        assert_eq!(dropped_iterations(3, 10), 0);
+    }
+
+    // The report module's stated rule, gated at the emitting side: phase-budget rows are qualified
+    // BY PATH, because COLD and RESTORE print the same four row names and the 2026-08-21 collector
+    // — keying on the printed name — silently kept only the first path and reported it as both.
+    // RED on the inverse (an unqualified `create`/`connect`/… metric name, or a share that is
+    // printed but not recorded): the name asserts, or the share assert, fail.
+    #[test]
+    fn phase_rows_are_qualified_by_path_so_cold_and_restore_cannot_collide() {
+        let rec = Recorder::new();
+        let mut cold: Vec<u128> = vec![100, 200, 300];
+        let mut restore: Vec<u128> = vec![10, 20, 30];
+        report_phase(&rec, "connect ", "phase_cold_connect", &mut cold, 3, 1000);
+        report_phase(
+            &rec,
+            "connect ",
+            "phase_restore_connect",
+            &mut restore,
+            3,
+            1000,
+        );
+        let names: Vec<String> = rec.drain().0.into_iter().map(|m| m.name).collect();
+        assert_eq!(
+            names,
+            vec![
+                "phase_cold_connect",
+                "phase_cold_connect_share",
+                "phase_restore_connect",
+                "phase_restore_connect_share",
+            ],
+            "the two paths must occupy four distinct metric names"
+        );
+    }
+
+    // A self-skip is a NOTE, not just a line that scrolls away: a run that skipped half its matrix
+    // and a run that measured all of it must not be indistinguishable in the JSON artifact. RED on
+    // the inverse (a `say!` beside the skip instead of `rec.skip`, or `skip` no longer forwarding
+    // to the one `caveat` body): the note assert fails.
+    //
+    // TWO MODES, not one: the class is "this run measured something other than what the table
+    // implies", and it is spread across the matrix — a latency run without snapshot support and a
+    // net-egress run without a vhost-user-net device skip for unrelated reasons and both must
+    // reach the artifact. A one-mode fixture is how the four caveats beside these (see
+    // `a_caveat_fires_exactly_when_its_condition_holds`) went a whole review without one.
+    #[test]
+    fn a_self_skip_is_recorded_as_a_note_verbatim() {
+        let rec = Recorder::new();
+        rec.skip("Warm Restore: backend firecracker has no snapshot support; skipping".to_string());
+        rec.skip(
+            "net-egress[tls]: backend firecracker has no unprivileged vhost-user-net; skipping"
+                .to_string(),
+        );
+        let (metrics, notes) = rec.drain();
+        assert!(metrics.is_empty());
+        assert_eq!(
+            notes,
+            vec![
+                "Warm Restore: backend firecracker has no snapshot support; skipping",
+                "net-egress[tls]: backend firecracker has no unprivileged vhost-user-net; skipping",
+            ],
+            "every skip, in the order the matrix hit them"
+        );
+    }
+
+    // THE PARENT/CHILD CONTRACT, both arms. `--report json` puts exactly one report on stdout and
+    // `--report text` puts NOTHING there (its report is the table already printed). Inverting the
+    // branch — text dumping JSON into the human table, json emitting nothing — left the whole
+    // suite green while breaking both halves of the promise at once: the parent parses this
+    // stdout, and "nothing existing changes shape" is what makes `text` the default.
+    // RED on the inverse (`!=` flipped to `==` in `stdout_report`): the text arm's `is_none` and
+    // the json arm's `expect` fail.
+    #[test]
+    fn only_the_json_format_puts_a_report_on_stdout() {
+        let emitted = |argv: &[&str]| {
+            let args = <Args as clap::Parser>::parse_from(argv);
+            let rec = Recorder::new();
+            let mut samples: Vec<u128> = vec![41, 42, 43];
+            assert!(
+                rec.measure(metrics::COLD_BOOT, Unit::Millis, &mut samples, 0, 0)
+                    .is_some()
+            );
+            stdout_report(
+                &args,
+                &rec,
+                "/usr/bin/cloud-hypervisor",
+                &BinSource::Path,
+                Path::new("/artifacts/vmlinux"),
+                Path::new("/artifacts/rootfs.erofs"),
+            )
+            .expect("a declared metric serializes")
+        };
+
+        // TEXT: nothing on stdout at all — not an empty document, not a `null`.
+        assert!(
+            emitted(&["bench-vm"]).is_none(),
+            "the default format must leave stdout to the human table"
+        );
+        assert!(emitted(&["bench-vm", "--report", "text"]).is_none());
+
+        // JSON: one document, and it is a report the PARENT can read — asserted through
+        // `BenchReport::from_json`, the same call `bench-ab` makes on this stdout, rather than
+        // through a substring.
+        let json = emitted(&["bench-vm", "--report", "json"]).expect("json emits a report");
+        let parsed = BenchReport::from_json(&json).expect("the parent parses this stdout");
+        assert_eq!(parsed.metric(metrics::COLD_BOOT).map(|m| m.p50), Some(42.0));
+        assert_eq!(parsed.schema_version, REPORT_SCHEMA_VERSION);
+    }
+
+    /// Every caveat composer, with an input that makes it fire and one that does not.
+    ///
+    /// The roster is a `const` because the call-site scan below reads it: a composer added here
+    /// and left uncalled fails there, and one called from an `if` at its call site fails there
+    /// too.
+    const CAVEAT_COMPOSERS: [&str; 5] = [
+        "snap_dir_tmpfs_caveat",
+        "ksm_acceleration_caveat",
+        "ksm_residue_caveat",
+        "pid_attribution_caveat",
+        "zygote_cow_caveat",
+    ];
+
+    // THE CAVEATS ARE RECORDED, NOT JUST PRINTED — the decision half. Four of these shipped as a
+    // bare `say!` inside an `if` at the call site, so they reached the terminal and never the
+    // JSON: an arm whose snapshots were RAM-backed, whose KSM scanner never accelerated, whose
+    // per-VM totals were deflated, or whose zygote paid a full copy per clone was
+    // indistinguishable in the artifact from an arm where none of that happened. RED on the
+    // inverse (any composer returning `Some` unconditionally, or `None` unconditionally): its
+    // fires/silent pair fails by name.
+    #[test]
+    fn a_caveat_fires_exactly_when_its_condition_holds() {
+        // The snapshot directory only shapes a RESTORE number, so a cold-boot run on tmpfs has
+        // nothing to disclose — that third `false` leg is the one an `if is_tmpfs(..)` alone
+        // would have got wrong.
+        let dir = Path::new("/dev/shm/vmcell-bench-snap");
+        let fired = snap_dir_tmpfs_caveat(dir, true, true).expect("a restore run on tmpfs");
+        assert!(fired.contains("/dev/shm/vmcell-bench-snap"), "{fired}");
+        assert!(fired.contains("optimistic"), "{fired}");
+        assert_eq!(snap_dir_tmpfs_caveat(dir, false, true), None);
+        assert_eq!(snap_dir_tmpfs_caveat(dir, true, false), None);
+
+        // The KSM one names the metric it qualifies, and that metric is the roster's inverted
+        // one: a smaller `pages_sharing` delta here is a measurement failure, not less dedup.
+        let fired = ksm_acceleration_caveat(false).expect("an unaccelerated scanner");
+        assert!(
+            fired.contains(metrics::FOOTPRINT_KSM_PAGES_SHARING_DELTA),
+            "the caveat must name the metric it qualifies: {fired}"
+        );
+        assert_eq!(
+            vmcell_bench::metrics::direction(metrics::FOOTPRINT_KSM_PAGES_SHARING_DELTA),
+            Some(vmcell_bench::metrics::Direction::HigherIsBetter),
+            "if this stops being a benefit, the caveat's wording is wrong"
+        );
+        assert_eq!(ksm_acceleration_caveat(true), None);
+
+        // Merged pages outlive the run, which is what makes them the NEXT interleaved arm's
+        // starting state.
+        assert!(
+            ksm_residue_caveat(true)
+                .expect("mergeable")
+                .contains("not fully reset")
+        );
+        assert_eq!(ksm_residue_caveat(false), None);
+
+        let fired = pid_attribution_caveat(3, 10).expect("seven pids unresolved");
+        assert!(fired.contains("3/10"), "{fired}");
+        assert_eq!(pid_attribution_caveat(10, 10), None);
+
+        let fired = zygote_cow_caveat(vmcell::CowSupport::FullCopy).expect("a non-reflink fs");
+        assert!(fired.contains("full byte copy"), "{fired}");
+        assert_eq!(zygote_cow_caveat(vmcell::CowSupport::Reflink), None);
+
+        // …and every one of them, once it fires, lands in the report verbatim. This is the class
+        // the four defects belonged to: the decision was right and the note was never taken.
+        let rec = Recorder::new();
+        rec.caveat(pid_attribution_caveat(3, 10));
+        rec.caveat(zygote_cow_caveat(vmcell::CowSupport::FullCopy));
+        rec.caveat(ksm_acceleration_caveat(true)); // silent: records nothing
+        let (metrics_taken, notes) = rec.drain();
+        assert!(metrics_taken.is_empty());
+        assert_eq!(
+            notes,
+            vec![
+                pid_attribution_caveat(3, 10).expect("fires"),
+                zygote_cow_caveat(vmcell::CowSupport::FullCopy).expect("fires"),
+            ]
+        );
+    }
+
+    // THE CALL-SITE HALF, over the production source. A composer with a red-on-inverse unit test
+    // proves the decision; it proves nothing about whether the call site takes the note — and
+    // "printed but never recorded" was the whole finding. Two directions, because either one
+    // alone is satisfiable by the defect:
+    //
+    //   A. every composer's call site is `rec.caveat(<composer>(…))` — no `if` of its own, no
+    //      `say!` beside it, and at least one call site per composer;
+    //   B. every `.caveat(` argument is a listed composer (or the `skip` forwarder's `Some(text)`),
+    //      so a caveat cannot come back as a condition spelled at the call site.
+    //
+    // A zero-length scan is `gate misconfigured` and fails: the only way to open nothing is to
+    // have been pointed at nothing.
+    // RED on the inverse (any site reverted to `if cond { say!(…) }`, or a composer called
+    // anywhere but at `rec.caveat(`): the layer-A assert names the composer.
+    #[test]
+    fn every_caveat_is_recorded_not_just_printed() {
+        let production = production_half_of_this_file();
+        assert!(
+            production.len() > 10_000,
+            "gate misconfigured: the production half scanned to {} bytes",
+            production.len()
+        );
+
+        // --- Layer A: each composer is called, and only ever as `rec.caveat`'s argument.
+        for composer in CAVEAT_COMPOSERS {
+            let needle = format!("{composer}(");
+            let mut call_sites = 0_usize;
+            let mut rest = production.as_str();
+            let mut scanned = 0_usize;
+            while let Some(at) = rest.find(&needle) {
+                // Indexed into the WHOLE production half, not into `rest`: `rest` is a suffix,
+                // and reading the prefix out of it silently yields nothing past the first hit.
+                let before = production.get(..scanned + at).unwrap_or_default();
+                let is_definition = before.ends_with("fn ");
+                if !is_definition {
+                    assert!(
+                        before.ends_with("rec.caveat("),
+                        "`{composer}` is called somewhere other than `rec.caveat(…)`. A caveat \
+                         composed and then printed — or decided by an `if` beside the printing — \
+                         is a caveat the JSON report never carries, which is exactly how the \
+                         tmpfs, KSM, pid-attribution and zygote caveats reached the terminal and \
+                         nothing else."
+                    );
+                    call_sites += 1;
+                }
+                let consumed = at + needle.len();
+                rest = rest.split_at(consumed).1;
+                scanned += consumed;
+            }
+            assert!(
+                call_sites >= 1,
+                "gate misconfigured: `{composer}` is in CAVEAT_COMPOSERS but nothing calls it; a \
+                 caveat nobody can reach is not a caveat"
+            );
+        }
+
+        // --- Layer B: nothing else reaches `caveat`.
+        let mut recorded = 0_usize;
+        let mut rest = production.as_str();
+        while let Some(at) = rest.find(".caveat(") {
+            let after = rest.split_at(at + ".caveat(".len()).1;
+            let argument: String = after
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            // The forwarder is admitted by its EXACT spelling, not by "starts with `Some`": a
+            // `rec.caveat(Some(format!(…)))` is the inline condition this layer exists to
+            // refuse, and it would pass a looser check.
+            let is_forwarder = after.starts_with("Some(text));");
+            assert!(
+                CAVEAT_COMPOSERS.contains(&argument.as_str()) || is_forwarder,
+                "`.caveat({argument}…)` names neither a listed composer nor `Recorder::skip`'s \
+                 one `Some(text)` forward. The decision belongs in a named composer with its own \
+                 fires/silent test; an inline one is a condition no test drives."
+            );
+            recorded += 1;
+            rest = after;
+        }
+        assert!(
+            recorded >= CAVEAT_COMPOSERS.len(),
+            "gate misconfigured: {recorded} `.caveat(` sites found for {} composers plus the \
+             forwarder",
+            CAVEAT_COMPOSERS.len()
+        );
+    }
+
+    // The knobs travel RESOLVED. `--iterations` is an `Option` whose per-mode default (200 for
+    // vsock-rtt, 10 elsewhere) decides the sample size, and "unset" is not something a comparator
+    // can compare — two arms with the same unset flag and different modes measured different
+    // amounts of work. RED on the inverse (`args.iterations` written through as-is): the
+    // vsock-rtt assert reads "None"/"" instead of 200.
+    #[test]
+    fn run_knobs_carry_the_resolved_iteration_count() {
+        let a = <Args as clap::Parser>::parse_from(["bench-vm", "--mode", "vsock-rtt"]);
+        let knobs = run_knobs(&a);
+        assert_eq!(knobs.get("iterations").map(String::as_str), Some("200"));
+        let b = <Args as clap::Parser>::parse_from(["bench-vm", "--mode", "latency"]);
+        assert_eq!(
+            run_knobs(&b).get("iterations").map(String::as_str),
+            Some("10")
+        );
+        // The knobs the run header echoes are all present, so a JSON reader can attribute the
+        // numbers to the same configuration the text header names (H-BIN-1).
+        for key in [
+            "profile",
+            "kernel_verbosity",
+            "console",
+            "mem_mib",
+            "warmup",
+        ] {
+            assert!(knobs.contains_key(key), "knobs must carry {key}: {knobs:?}");
+        }
+    }
+
+    /// Identifiers that legitimately stand in for a metric name at a `measure`/`scalar` call
+    /// site, each with the reason it is not a `metrics::` path there.
+    ///
+    /// An entry is a decision, not a backlog: adding a name silences the scan below for that call
+    /// site, so what the next reader reviews is the reason. Both of these are *forwarders* — they
+    /// carry a name their caller chose — and the ban on bare roster literals is what keeps that
+    /// caller honest: with no roster literal anywhere in the production half, a forwarder can only
+    /// have been handed a `metrics::` path, or a name the roster does not carry at all, which
+    /// `Recorder::register` refuses at the exit.
+    const METRIC_NAME_FORWARDERS: [(&str, &str); 2] = [
+        (
+            "metric",
+            "the `&str` parameter of `report`/`report_phase`; its callers pass the `metrics::` \
+             path (or a composer), and the label beside it is the human row name",
+        ),
+        (
+            "rtt_metric",
+            "a local bound to one of two `metrics::` consts by the privileged/unprivileged branch",
+        ),
+    ];
+
+    /// `text` with its `//` comments removed, string literals left intact.
+    ///
+    /// WHY THE SCAN BELOW NEEDS THIS. A comment is the right place to quote a metric name — the
+    /// refusal in `refuse_unregistered_metrics` explains itself by quoting the one-line rule it
+    /// replaced, `metric != "footprint_ksm_pages_sharing_delta"` — and a ban that reddens on its
+    /// own documentation is a ban that gets deleted. The ban is about *code*, so the scan reads
+    /// code.
+    ///
+    /// String-aware rather than a naive cut at `//`, because this file builds `http://` URLs: a
+    /// line-truncating stripper would silently shorten those lines and could hide a real call site
+    /// behind one. There are no block comments or raw strings here (the scan's own call-site floor
+    /// is what notices if that stops being true).
+    fn strip_line_comments(text: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        let mut chars = text.chars().peekable();
+        let mut in_string = false;
+        let mut in_comment = false;
+        while let Some(c) = chars.next() {
+            if in_comment {
+                if c == '\n' {
+                    in_comment = false;
+                    out.push(c);
+                }
+                continue;
+            }
+            if in_string {
+                out.push(c);
+                if c == '\\' {
+                    // An escape consumes the next character, so `\"` does not end the literal.
+                    if let Some(next) = chars.next() {
+                        out.push(next);
+                    }
+                } else if c == '"' {
+                    in_string = false;
+                }
+                continue;
+            }
+            if c == '"' {
+                in_string = true;
+                out.push(c);
+                continue;
+            }
+            if c == '/' && chars.peek() == Some(&'/') {
+                in_comment = true;
+                continue;
+            }
+            out.push(c);
+        }
+        out
+    }
+
+    /// The production half of this file: everything before its own `#[cfg(test)]` module.
+    ///
+    /// Scanning the tests too would be wrong in both directions — a test SHOULD assert against a
+    /// literal metric name (asserting against the composer that produced it is vacuous), and a
+    /// fixture may deliberately record a name the roster does not carry.
+    fn production_half_of_this_file() -> String {
+        let path =
+            vmcell::artifact::workspace_root().join("crates/vmcell-bench/src/bin/bench-vm.rs");
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("gate misconfigured: cannot read {}: {e}", path.display()));
+        let marker = "\n#[cfg(test)]\nmod tests {";
+        let cut = text.find(marker).unwrap_or_else(|| {
+            panic!(
+                "gate misconfigured: no `{}` in {} — the scan cannot tell production from tests",
+                marker.trim(),
+                path.display()
+            )
+        });
+        let production = text
+            .get(..cut)
+            .unwrap_or_else(|| panic!("gate misconfigured: cannot split {}", path.display()));
+        strip_line_comments(production)
+    }
+
+    // THE ROSTER'S CALL-SITE GATE. A direction roster with a red-on-inverse unit test proves the
+    // roster; it proves nothing about whether the metric names this binary emits are the names in
+    // it. The rule it replaced was one line — "everything is a cost except the one exception I
+    // remembered" — so a new metric got a direction nobody chose, and a BENEFIT that got worse
+    // printed IMPROVEMENT. Three layers, in order of how early they catch it:
+    //
+    //   A. every `measure`/`scalar` name argument is a `metrics::` path (or a listed forwarder),
+    //   B. no roster name appears as a bare string literal, so nothing can drift by re-spelling,
+    //   C. `Recorder::register` + `refuse_unregistered_metrics` catch a name that is neither —
+    //      at the exit of the run that emitted it, which is the only place a forwarded name is
+    //      knowable at all.
+    //
+    // A zero-length scan is `gate misconfigured` and fails: the only way to open nothing is to have
+    // been pointed at nothing. The roster's OWN completeness (composed names ↔ composers, both
+    // directions) is `vmcell_bench::metrics`'s `the_composers_and_the_roster_agree_in_both_directions`;
+    // this gate is its complement and asserts the roster is non-empty so a gutted roster cannot make
+    // it vacuously green.
+    // RED on the inverse (any `metrics::COLD_BOOT` reverted to `"cold_boot"`, or a new
+    // `rec.scalar("something_new", …)` added): the literal ban or the call-site rule fails by name.
+    #[test]
+    fn every_metric_name_this_binary_emits_comes_from_the_roster() {
+        let production = production_half_of_this_file();
+        assert!(
+            production.len() > 10_000,
+            "gate misconfigured: the production half scanned to {} bytes",
+            production.len()
+        );
+        let roster: Vec<&str> = metrics::names().collect();
+        assert!(
+            roster.len() > 40,
+            "gate misconfigured: the direction roster holds {} names; this binary emits ~50, so a \
+             roster this short cannot be what the ban below is checking against",
+            roster.len()
+        );
+
+        // --- Layer A: every recorder call site names its metric through `metrics::`.
+        let mut call_sites = 0_usize;
+        for opener in [".measure(", ".scalar("] {
+            let mut rest = production.as_str();
+            while let Some(at) = rest.find(opener) {
+                let after = rest.split_at(at + opener.len()).1;
+                let argument = after.trim_start();
+                // A bare literal stops the identifier scan at its opening quote, which would
+                // report the offender as an empty string. Show what is actually written there.
+                let head: String = if argument.starts_with('"') {
+                    argument
+                        .char_indices()
+                        .take_while(|(i, c)| *i == 0 || *c != '"')
+                        .map(|(_, c)| c)
+                        .chain(std::iter::once('"'))
+                        .collect()
+                } else {
+                    argument
+                        .chars()
+                        .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '&' || *c == ':')
+                        .collect()
+                };
+                let ok = head.trim_start_matches('&').starts_with("metrics::")
+                    || METRIC_NAME_FORWARDERS
+                        .iter()
+                        .any(|(name, _)| head.trim_start_matches('&') == *name);
+                assert!(
+                    ok,
+                    "a `{opener}` call names its metric as `{head}`, which is neither a \
+                     `metrics::` path nor a listed forwarder. A metric name spelled at the call \
+                     site is a name the direction roster cannot see, and the roster is what stops \
+                     the comparator guessing a direction. Add it to \
+                     `vmcell_bench::metrics` and emit through the constant, or add the \
+                     identifier to METRIC_NAME_FORWARDERS WITH its reason."
+                );
+                call_sites += 1;
+                rest = after;
+            }
+        }
+        assert!(
+            call_sites >= 20,
+            "gate misconfigured: only {call_sites} recorder call sites found; this binary has \
+             tens of them, so the scan is not reading what it thinks it is"
+        );
+
+        // --- Layer B: no roster name is spelled as a bare literal anywhere in production.
+        for name in &roster {
+            let literal = format!("\"{name}\"");
+            assert!(
+                !production.contains(&literal),
+                "the metric name {literal} is spelled as a bare string literal in this binary. \
+                 That is a second place the name lives, and the two have to agree forever; emit \
+                 `metrics::` instead so the roster entry and the emitted string are one fact."
+            );
+        }
+    }
+
+    /// The four recorder entry points that take a planned-iterations count, as
+    /// `(call, 0-based index of the planned argument, argument count)`.
+    ///
+    /// The arity travels with the index so a signature that grows or reorders an argument fails
+    /// this gate loudly instead of silently letting it check the wrong slot.
+    const PLANNED_ARG_CALL_SITES: [(&str, usize, usize); 4] = [
+        (".measure(", 3, 5),
+        ("report(", 4, 6),
+        ("report_phase(", 4, 6),
+        ("report_daemon_op(", 3, 4),
+    ];
+
+    /// The top-level, comma-separated arguments of the call whose `(` sits at `open`.
+    ///
+    /// String- and nesting-aware, so `&metrics::phase_metric(path, "create")` is ONE argument and
+    /// a `&mut [u128]` is not three. `None` when the parentheses never close — a scanner bug, and
+    /// the caller asserts on it rather than skipping the site.
+    fn call_arguments(text: &str, open: usize) -> Option<Vec<String>> {
+        let mut depth = 0_usize;
+        let mut in_string = false;
+        let mut escaped = false;
+        let mut args: Vec<String> = Vec::new();
+        let mut current = String::new();
+        for c in text.get(open..)?.chars() {
+            if in_string {
+                current.push(c);
+                if escaped {
+                    escaped = false;
+                } else if c == '\\' {
+                    escaped = true;
+                } else if c == '"' {
+                    in_string = false;
+                }
+                continue;
+            }
+            match c {
+                '"' => {
+                    in_string = true;
+                    current.push(c);
+                }
+                '(' | '[' | '{' => {
+                    depth += 1;
+                    if depth > 1 {
+                        current.push(c);
+                    }
+                }
+                ')' | ']' | '}' => {
+                    depth = depth.checked_sub(1)?;
+                    if depth == 0 {
+                        if !current.trim().is_empty() {
+                            args.push(current.trim().to_string());
+                        }
+                        return Some(args);
+                    }
+                    current.push(c);
+                }
+                ',' if depth == 1 => {
+                    args.push(current.trim().to_string());
+                    current.clear();
+                }
+                _ => current.push(c),
+            }
+        }
+        None
+    }
+
+    // THE DROP-ACCOUNTING CALL-SITE GATE, and it is the half that was missing. `bench-ab` refuses
+    // to call a row whose `Metric::dropped` is non-zero — survivorship bias with a p-value
+    // attached, since a boot that failed is disproportionately a SLOW boot and the lossy arm
+    // therefore looks faster. That predicate had a red-on-inverse test. What FED it did not: the
+    // count arrived as a caller-kept `dropped += 1`, and `run_bench`'s create/restore arm, the
+    // vsock loop and both egress RTT loops all `break` past the increment, `phase_budget_path`
+    // passed a literal `0`, and `zygote`'s steward-ready row passed a literal `0` beside a live
+    // counter. Every one of those reported a CLEAN sample set over a truncated one.
+    //
+    // The count is now `dropped_iterations(planned, collected)`, which a `break` cannot walk past
+    // — so the thing worth gating is that no call site quietly declares it planned nothing.
+    // A zero-length scan is `gate misconfigured` and fails: the only way to open nothing is to
+    // have been pointed at nothing.
+    //
+    // RED on the inverse (any site reverted to `0` for its planned count, e.g.
+    // `rec.measure(metrics::ZYGOTE_STEWARD_READY, Unit::Millis, &mut ready, 0, 0)`): the zero
+    // assert names the offending call.
+    #[test]
+    fn no_recorder_call_site_hardcodes_its_planned_iteration_count() {
+        let production = production_half_of_this_file();
+        assert!(
+            production.len() > 10_000,
+            "gate misconfigured: the production half scanned to {} bytes",
+            production.len()
+        );
+        let mut sites = 0_usize;
+        for (needle, planned_index, arity) in PLANNED_ARG_CALL_SITES {
+            let mut from = 0_usize;
+            let mut per_needle = 0_usize;
+            while let Some(offset) = production.get(from..).and_then(|rest| rest.find(needle)) {
+                let at = from + offset;
+                from = at + needle.len();
+                // `report(` must not match `build_report(` / `stdout_report(` / `emit_report(`.
+                // Only for the needles that START with an identifier character: `.measure(` is
+                // ALWAYS preceded by one (`rec.measure`), so applying the rule to it matched
+                // nothing at all — which the per-needle floor below is what caught.
+                let needs_boundary = needle
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_alphanumeric() || c == '_');
+                let boundary_ok = !needs_boundary
+                    || at == 0
+                    || !production
+                        .get(..at)
+                        .and_then(|before| before.chars().next_back())
+                        .is_some_and(|c| c.is_alphanumeric() || c == '_');
+                if !boundary_ok {
+                    continue;
+                }
+                let open = at + needle.len() - 1;
+                let args = call_arguments(&production, open).unwrap_or_else(|| {
+                    panic!("gate misconfigured: unbalanced parentheses after `{needle}` at {at}")
+                });
+                assert_eq!(
+                    args.len(),
+                    arity,
+                    "`{needle}` at byte {at} has {} arguments, not the {arity} this gate knows how                      to read: {args:?}. The signature moved — update PLANNED_ARG_CALL_SITES,                      because an index into the wrong slot is a gate that checks nothing.",
+                    args.len()
+                );
+                let planned = args
+                    .get(planned_index)
+                    .map(String::as_str)
+                    .unwrap_or_default();
+                let bare = planned.trim_end_matches("usize").trim_end_matches('_');
+                // A LOSS COUNTER in the planned slot is the same defect as a literal zero, and it
+                // is the one that actually shipped: four sites passed their `dropped` /
+                // `start_dropped` accumulator here, and because that counter is smaller than the
+                // surviving sample count on any realistic run, `planned.saturating_sub(collected)`
+                // floored to 0 and a run that lost three of ten reported a clean sweep. The
+                // literal-zero assertion below could not see it — the argument is an identifier,
+                // not "0" — so the class needs its own arm. Names, not values, are what a source
+                // scan can check; a planned count is an iteration count and is never spelled
+                // "dropped".
+                assert!(
+                    !bare.contains("dropped"),
+                    "`{needle}` at byte {at} passes `{bare}` as its PLANNED count, but that names a \
+                     loss counter. `Metric::dropped` is `planned - collected`, so a counter here \
+                     underflows to zero and the run reports no loss at all — `bench-ab` then ranks \
+                     a truncated arm against a complete one, and a failed boot is disproportionately \
+                     a SLOW boot, so the lossy arm looks FASTER. Pass the post-warmup iteration \
+                     count the loop set out to take (`iters` / `args.iters()`)."
+                );
+                assert_ne!(
+                    bare, "0",
+                    "`{needle}` at byte {at} declares it planned ZERO iterations, so every sample                      it lost is invisible: `Metric::dropped` is `planned - collected`, and a                      planned count of 0 makes a truncated run report a clean one. `bench-ab` then                      ranks it against a complete arm and prints a verdict. Pass the post-warmup                      iteration count the loop set out to take."
+                );
+                sites += 1;
+                per_needle += 1;
+            }
+            assert!(
+                per_needle > 0,
+                "gate misconfigured: no `{needle}` call sites found; the scan is not reading what                  it thinks it is"
+            );
+        }
+        assert!(
+            sites >= 15,
+            "gate misconfigured: only {sites} planned-count call sites found across              {} entry points; this binary has more than that",
+            PLANNED_ARG_CALL_SITES.len()
+        );
+    }
+
+    // THE FUNNEL'S REFUSAL — layer C, and the only layer that can see a name arriving through a
+    // forwarder. RED on the inverse (`refuse_unregistered_metrics` deleted from `emit_report`, or
+    // `Recorder::register` no longer called from `measure`/`scalar`): the `expect_err` fails.
+    #[test]
+    fn a_metric_with_no_declared_direction_refuses_the_report() {
+        let args = <Args as clap::Parser>::parse_from(["bench-vm", "--report", "json"]);
+        let emit = |rec: &Recorder| {
+            emit_report(
+                &args,
+                rec,
+                "/usr/bin/cloud-hypervisor",
+                &BinSource::Path,
+                Path::new("/artifacts/vmlinux"),
+                Path::new("/artifacts/rootfs.erofs"),
+            )
+        };
+
+        // A name nobody declared a direction for — the shape a new metric arrives in.
+        let rec = Recorder::new();
+        let _ = rec.scalar("brand_new_quantity", Unit::Count, 1, 7.0);
+        let mut samples: Vec<u128> = vec![1, 2, 3];
+        let _ = rec.measure("another_new_one", Unit::Millis, &mut samples, 0, 0);
+        let err = emit(&rec)
+            .expect_err("a metric with no declared direction must not reach a comparator")
+            .to_string();
+        assert!(err.contains("brand_new_quantity"), "{err}");
+        assert!(err.contains("another_new_one"), "every offender: {err}");
+        assert!(err.contains("METRIC_DIRECTIONS"), "name the fix: {err}");
+
+        // A metric whose samples are EMPTY records nothing but is still checked: a name is wrong
+        // whether or not it produced a number.
+        let rec = Recorder::new();
+        let _ = rec.measure("empty_but_undeclared", Unit::Millis, &mut [], 0, 0);
+        assert!(emit(&rec).is_err(), "an empty sample set is still a name");
+
+        // THE POSITIVE CONTROL. Without it a refusal that fired on everything would satisfy the
+        // three asserts above.
+        let rec = Recorder::new();
+        let _ = rec.scalar(metrics::SUSPEND_TOTAL_BYTES, Unit::Bytes, 1, 4096.0);
+        let mut samples: Vec<u128> = vec![41, 42, 43];
+        assert!(
+            rec.measure(metrics::COLD_BOOT, Unit::Millis, &mut samples, 0, 0)
+                .is_some()
+        );
+        emit(&rec).expect("declared metrics emit a report");
     }
 
     // N-BIN-5: the tmpfs check must match the LONGEST mount-point prefix, not the

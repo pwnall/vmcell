@@ -5,7 +5,7 @@
 v30 delta registers with their as-built records (`docs/implementation-notes.md`), the **docs/78 and
 docs/81 review passes** — 93 + 76 verified findings against the landed v30 system, their fix waves,
 the adversarial completeness audit, and the CI-repair pass — and the **v33 design**
-(`docs/83-claude-fable-design-v33.md` — the serial-nexus consumer-platform pass) with its ten-delta
+(`docs/historical/83-claude-fable-design-v33.md` — the serial-nexus consumer-platform pass) with its ten-delta
 register (§18) and its new cross-cutting laws (C8, F6, F7). Its job is to stop the **classes** of
 defect those sources found from recurring — not to re-list individual findings. This **v7 rubric**
 supersedes v6 (`docs/75`, reissued to `docs/historical/`); v7 **re-bases every v30 "delta N"

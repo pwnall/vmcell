@@ -76,8 +76,24 @@ exempt_suffix=(
   # its production half for this variable name, so the needle appears in its test half. Removing this
   # entry does not make the CLI cleaner — it deletes the gate that closed A2.
   "/vmcell-cli/src/main.rs"
+  # `BenchReport`'s PROVENANCE VALUE, not a resolver. `BinSource::EnvVar { name }` records which
+  # variable a run ACTUALLY read — the fact the 2026-08-21 pass could not state, having printed
+  # "via $VMCELL_CH_BIN" for an arm that resolved the bare name off PATH. These three are the
+  # fixtures of the round-trip test and of `a_path_resolution_never_renders_as_via_a_variable`,
+  # which is the gate on that defect; nothing here reads the environment.
+  "/vmcell-bench/src/report.rs"
+  # The same recorded value one module over: `guard_vmm_binaries`' mismatch message renders each
+  # arm's `BinSource`, so its red-on-inverse fixtures build an `EnvVar` arm to render.
+  "/vmcell-bench/src/ab.rs"
+  # `bench-ab`'s DELIBERATE NON-SEAL, which is the opposite of a resolver: the A/B driver strips
+  # $VMCELL_KERNEL/$VMCELL_ROOTFS/$VMCELL_PINS from every child and must NOT strip this one, because
+  # pinning the VMM binary is the documented shim for an arm that predates the variable (the outcome
+  # is checked from the reports by `guard_vmm_binaries`). Both hits are that decision: the seal
+  # test's assertion that the variable survives into the child, and the `UNSEALED_BY_DESIGN` entry
+  # carrying its reason. Neither reads the environment.
+  "/vmcell-bench/src/bin/bench-ab.rs"
 )
-exempt_count=(1 1 2 1)
+exempt_count=(1 1 2 1 3 2 2)
 
 mapfile -d '' -t files < <(
   for d in "${dirs[@]}"; do

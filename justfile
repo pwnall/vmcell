@@ -340,6 +340,126 @@ test-bench features="cloud-hypervisor,firecracker,qemu":
         --no-default-features --features {{features}} --run-ignored all \
         --no-tests=fail -E 'binary(benchmark)'
 
+# ONE ARM of an A/B comparison (design §16): build a git ref in its own worktree, stage it, and pin
+# BY DIGEST what it will boot. Run it once per arm, then compare the two with the `bench-ab` recipe
+# below:
+#
+#   just bench-ab-prepare main base
+#   just bench-ab-prepare my-optimization head
+#
+# BOTH REFS MUST CARRY `bench-vm --report json`. The comparison parses each child's stdout as one
+# JSON BenchReport, so an arm built from a ref that predates that flag cannot be compared at all —
+# `prepare` probes the staged binary's `--help` and refuses there, seconds in, rather than at the
+# first child after a release build AND an artifact build that boots a builder micro-VM. That flag
+# landed WITH this harness, so "compare against the last release" is not expressible yet: comparing
+# against an older ref means backporting the flag onto a branch off it and preparing THAT. The
+# example above therefore names two branches. It used to name `v0.22.0`, which was wrong twice
+# over — no tag carries the flag, and this repository carries no tags at all.
+#
+# WHY A `prepare` VERB AND NOT A `cargo build` LINE. On 2026-08-21 a benchmark pass compared HEAD
+# against the previous release through ad-hoc shell, and three of its answers were wrong:
+#   * the table it was compared against had been measured on ANOTHER MACHINE, so absolute
+#     milliseconds could not answer "did we regress" at all — only an interleaved, same-host,
+#     same-session A/B can;
+#   * a control silently did not apply. The driver exported $VMCELL_KERNEL to pin both arms to one
+#     guest kernel, but the OLD arm's `bench-vm` predates that variable and composes
+#     <artifacts_dir>/vmlinux itself, so the two arms booted two different kernels for an entire
+#     matrix while the driver reported one. (The same class had already been caught for
+#     $VMCELL_CH_BIN and shimmed via PATH; the kernel got the export but never the proof.)
+#   * an arm's binary was swapped underneath a run — a concurrent experiment overwrote
+#     target/release/bench-vm while `git status` stayed clean, so a run measured the patched code
+#     and reported it as stock.
+# What this recipe produces answers all three: a staged arm under target/ab-arms/<label>/ whose
+# arm.json records bench-vm, vmcelld, the kernel and the rootfs by sha256. The kernel digests are
+# what the same-kernel control compares; the two binaries are re-digested before EVERY child of the
+# comparison, not once at start-up, because the swap that motivated it landed mid-matrix.
+#
+# THE CONTROL IS A FILE COPY, and that is the trap worth reading twice. `prepare` copies THIS
+# checkout's vmlinux into the arm's own artifacts dir, because an environment variable does not
+# reach an arm built before the variable existed. So whatever kernel resolves here is the kernel
+# BOTH arms boot: build it deliberately first with `vmcell build --kernel-source host-make`. A bare
+# `vmcell build` REPLACES a host-made vmlinux with a prebuilt one lacking CONFIG_KVM_INTEL /
+# CONFIG_HW_RANDOM_VIRTIO — the arms would still agree, on a kernel that reddens nested_virt and
+# snapshot_restore in both of them, which is an agreement about nothing.
+#
+# NEEDS /dev/kvm: the arm's rootfs is built by the ARM'S OWN CLI, which boots a builder micro-VM (a
+# rootfs built by HEAD's pipeline would make every guest-side delta a comparison of one tree against
+# itself). Needs NO blessing and no wrapper of its own: nothing here MEASURES anything, so none of
+# the substrate discipline the comparison below carries applies — what a `prepare` needs on this
+# host is exactly what a plain `vmcell build` needs, and no more. The git worktree under
+# target/ab-worktrees/<label> is REUSED on a re-prepare, so a second call for the same label skips
+# the checkout; `git worktree remove` is how you force a fresh one.
+#
+# The FEATURES argument is an accepted input rather than a constant because an old ref does not
+# necessarily carry today's default feature set (`crosvm` graduated into it only recently), and
+# `cargo build --features` naming a feature a ref never had fails by name. Empty forwards nothing.
+# Everything else `bench-ab prepare` accepts — notably `--kernel`, to name a control kernel other
+# than this checkout's — is reachable by running the binary directly; this is the common path.
+#
+# Build and digest-pin ONE A/B arm from a git ref: `bench-ab-prepare <git-ref> <label> [features]`.
+bench-ab-prepare git_ref label features="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # An `if`, not `[[ … ]] && args+=(…)`: under `set -e` a false AND-list is a non-zero command in
+    # the middle of the script and would exit before cargo ever ran, with no output and status 1.
+    args=(prepare --git-ref '{{git_ref}}' --label '{{label}}')
+    if [[ -n '{{features}}' ]]; then args+=(--features '{{features}}'); fi
+    # RELEASE, the profile `prepare` builds each arm with (`cargo build --release` inside the
+    # worktree), so the driver is not the one debug artifact in the room: it sha256s this arm's
+    # kernel and rootfs here, and `run` re-digests each arm's staged binaries before EVERY child —
+    # a debug `sha2` makes that slow enough to tempt someone into dropping the digest checks, which
+    # are the entire difference between this tool and the shell that got it wrong.
+    cargo run --locked --release -p vmcell-bench --bin bench-ab -- "${args[@]}"
+
+# THE COMPARISON (design §16): run two prepared arms interleaved and print a rank-tested table.
+# Arm A is the BASELINE and arm B is the candidate — a row reads `REGRESSION` when B is worse — so
+# the order is `just bench-ab <old> <new>`.
+#
+# NOT WRAPPED, and this is the one live entry point in this file that must not be. Every other suite
+# here is invoked as `systemd-run --user --scope -p Delegate=yes scripts/with-delegated-scope.sh
+# just <recipe>`; `bench-ab` composes that same wrapper ITSELF, once per `bench-vm` child, because
+# each child needs its own delegated scope and the blessed runner. Wrapping the recipe on top makes
+# every child a SECOND wrap, which cannot work: the first wrap shrank the bounding set to
+# PRIVILEGED_CAPS, dropping the transient CAP_SETPCAP that is still `+ep` on the runner FILE, and
+# `execve` then returns EPERM rather than degrading. That is the same footgun `test-bench`'s header
+# documents from the other side — there it killed five tests at 0.008s with a bare `os error 1`.
+# `bench-ab` refuses up front when it sees a non-empty CapAmb and names `--no-wrap` as the fix, so
+# the failure is loud rather than silent; that is not a reason for the recipe to create it.
+#
+# NEEDS /dev/kvm and a blessed runner: the `runner` variable at the top of this file, installed by
+# `just bless`. `bench-ab`'s own default (`DEFAULT_RUNNER_REL`) MIRRORS that path and names the
+# variable at its definition site, so a move here is a move there too; when they disagree the binary
+# says which path it looked for and that it was not there, rather than spawning nothing.
+#
+# It REFUSES to run on a violated control rather than warning and continuing: every arm's kernel
+# must be the same bytes, and each arm's staged binaries must still digest to what its manifest
+# recorded. A violated control produces confident wrong numbers, which is worse than no numbers.
+#
+# REPEATS: the default of five is not a round number, it is above the floor. A single p50 is not
+# evidence — of the six deltas of 10% or more in the first single-pass matrix of that 2026-08-21
+# pass, five evaporated under repeats and one reversed sign. Below four repeats per arm the table prints
+# `insufficient repeats` and NO verdict at all, because an exact two-sided rank test over three per
+# arm cannot reach p<0.05 even when the two arms are perfectly separated, so "no evidence" there
+# would be a statement about the sample size rather than about the code. The argument is FORWARDED,
+# never re-checked here: `bench-ab` owns that law (it refuses 0 by name and clap rejects a
+# non-number), and a second copy of a rule in a recipe is the copy that drifts.
+#
+# The default spec matrix, `--spec` for any other cell, and `--format json` for a future
+# tracked-metrics consumer all live in the binary; run it directly for anything past this
+# two-label common path. Benchmarks stay tracked metrics, not gates (design §16), which is why
+# neither this recipe nor its `prepare` sibling is on the `gates` roster — and why both are on
+# scripts/ban-orphan-recipe.sh's, as human entry points with no machine caller.
+#
+# Interleaved A/B of two prepared arms: `bench-ab <baseline> <candidate> [repeats]`. Do NOT wrap it.
+bench-ab label_a label_b repeats="5":
+    # Building HEAD's driver cannot disturb an arm: `prepare` STAGED each arm's binaries under
+    # target/ab-arms/<label>/ (the blessed runner refuses to exec a target outside its own workspace
+    # target/, and `bench-vm` finds `vmcelld` as its own SIBLING, so staging into target/release/
+    # would have left an old arm measuring HEAD's daemon), and their digests are re-checked before
+    # every child.
+    cargo run --locked --release -p vmcell-bench --bin bench-ab -- \
+        run --arm {{label_a}} --arm {{label_b}} --repeats {{repeats}}
+
 # Opt-in crosvm live matrix. crosvm is a secondary backend whose binary is NOT installed on the
 # build/CI hosts, so it is deliberately kept OUT of `test-privileged` (adding it there would hard-fail
 # every KVM host lacking a `crosvm` binary). Its KVM-FREE gates (unit tests, capability-honesty pins,

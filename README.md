@@ -640,3 +640,38 @@ list (`just test-bench cloud-hypervisor,crosvm`) for the §5 reason — CI has n
 **relative** invariants graduate to a CI guard, because only they survive a substrate change, and an
 absolute latency would redden on any slower box. Evidence for a lever is an interleaved same-session
 A/B delta and nothing else.
+
+**Measuring one.** `bench-ab` (same crate) is what produces that A/B delta, and it exists because
+the ad-hoc shell version of it got three things wrong in a single pass: it compared against a table
+measured on another machine; its guest-kernel control was exported but never verified, so an arm
+built before that override existed composed its own kernel path and ignored it; and one arm's binary
+was replaced by a concurrent build mid-run while `git status` stayed clean. So `just
+bench-ab-prepare <git-ref> <label>` builds each arm in its own worktree, stages it under
+`target/ab-arms/<label>/` — where the blessed runner will consent to exec it, and where `bench-vm`
+finds that arm's own `vmcelld` as its sibling rather than HEAD's — copies this checkout's `vmlinux`
+in (the control is a *file copy*, precisely because an environment override does not reach an arm
+that predates it), and pins all four by digest. `just bench-ab <baseline> <candidate>` then runs the
+two arms interleaved so host drift cannot favour either, re-checks those digests before every child,
+and prints rows ranked by a tie-corrected Mann-Whitney p — **Holm-Bonferroni corrected across the
+rows that can receive a verdict**, because twenty uncorrected tests at p < 0.05 print a phantom
+verdict more often than not under a true null — each marked `REGRESSION`, `IMPROVEMENT` or `no evidence`. The raw p stays in the table
+beside the adjusted one. Three outcomes are deliberately *not* verdicts: `insufficient repeats`
+(below four per arm — a single p50 is not evidence, and most of the apparent deltas in that pass's
+first single-shot matrix did not survive repetition), `sample loss` (an arm whose percentiles are
+over a shrunken sample set — the boots that survive a failing run are the fast ones, so the broken
+arm wins; read both from what the arm declared dropped **and** from the two arms' surviving
+iteration counts, since the other arm is by construction an older build whose own accounting the
+fix cannot reach), and `no direction` (a compositional share, where making one phase faster raises
+every other phase's share; or a metric this build has no roster entry for). Every metric's direction
+is an explicit `LowerIsBetter`/`HigherIsBetter`/`Neutral` roster entry — printed per row in the
+`better` column, because a signed delta on a benefit reads as a win to anyone scanning a table of
+latencies — and `bench-vm` refuses to emit a metric the roster does not carry — "everything is a cost unless I remembered otherwise" prints
+IMPROVEMENT when a benefit gets worse. Each arm's own `bench-vm` notes are printed, and a note one
+arm reported and the other did not (`cpufreq: NOT pinned`) is a loud warning: that is two noise
+floors, not one comparison. It is the one live entry point that is deliberately *not* wrapped in a delegated
+scope and the runner — it wraps each `bench-vm` child itself, exactly once, and refuses by name if
+it finds itself already inside the privilege window. Comparing against a baseline stored from
+another host is deliberately absent: that is the mistake it was built to retire. Both refs must
+carry `bench-vm --report json` — the comparison reads each child's stdout as one report, so
+`prepare` probes the staged binary and refuses an older arm there, rather than at the first child
+after a release build and an artifact build in a builder micro-VM.

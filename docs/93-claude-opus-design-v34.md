@@ -1,0 +1,5864 @@
+# vmcell — Design Document (v34)
+
+> **v34 (2026-08-21) is the regression-harness pass.** It adds no product capability: the change is
+> to how this project *answers a question it already claimed to answer*. §16 has always said that
+> only same-session interleaved A/B deltas are evidence, and until now that rule had no
+> implementation — every comparison was assembled by hand, from shell, against a table in
+> `docs/benchmark-results.md`. A benchmark pass on 2026-08-21 showed the bill for that, and none of
+> it was exotic:
+>
+> - the recorded table had been measured on a **different machine**, so its absolute milliseconds
+>   could not answer "did we regress" in either direction;
+> - a control was **stated and not true** — `$VMCELL_KERNEL` binds only arms new enough to read it,
+>   so two arms booted different guest kernels for a whole matrix while the driver reported one;
+> - an arm's binary was **swapped underneath a run** by a concurrent experiment, with `git status`
+>   clean throughout;
+> - and of six single-pass deltas ≥10 %, **five did not survive repeats and one reversed sign** —
+>   after a mechanism investigation had already run to completion against one of the phantoms.
+>
+> v34 turns each of those into code: `bench-ab` (§16), a two-arm harness whose controls are verified
+> by digest rather than asserted, whose numbers travel as typed data rather than scraped stdout, and
+> whose verdicts come from repeats and a rank test rather than from one p50. The one product change
+> in this pass is the fix that pass found — a whole-buffer prefilter in `classify_serial_fault`,
+> which the connect-retry loop was running line-by-line against a growing console.
+>
+> Everything else below is v33 unchanged, including every heading: the `§` references in
+> `crates/*/src` resolve against this file.
+
+> **v33 (2026-08-15) is the second consumer-platform pass.** vmcell's second out-of-repo consumer —
+> serial-nexus, a serial-port control system whose packaging and kernel-facing test tiers want to run
+> inside micro-VM cells — filed a considered feature-request document
+> (serial-nexus `docs/vmcell-requirements.md`, requests **R1–R7**; current-state claims measured
+> against the 0.14 tree at `079c17f`, 2026-08-15, and re-verified against HEAD while writing this
+> revision). Its thesis, which this revision adopts: **one predicate conflates two independent facts**
+> — control-plane availability and PID-1 identity are stored as the single test `cfg.init.is_some()`
+> — and untying them turns systemd, `debian-latest`, ext4, and a consumer's own guest handler from
+> special cases into ordinary **artifacts** the platform already knows how to register, key, cache,
+> and validate. The requests, under the same explicit generality directive as the v30 pass (every
+> capability general, stably interfaced, pay-for-what-you-use):
+>
+> - **R1** — steward placement declared (`Pid1` / `Service` / `None`), never inferred from `init=` (§3.5);
+> - **R2** — the artifact registry covers rootfs images and guest handlers, not only kernels, with
+>   **lazy** selection (§10.5);
+> - **R3** — a cell's feature set is an **intersection** of what its artifacts declare and what its
+>   backend/host support, with provenance on every removal (§7.4);
+> - **R4** — the conformance kit checks **both directions**: a present feature that does not work is
+>   an error, an absent one that works is a warning, an undecidable absence is `Unverified` (§10.6);
+> - **R5** — the steward becomes a **library** with named parameterizations; the binary a thin
+>   wrapper that can run as PID 1 or as a service under somebody else's init (§3.5);
+> - **R6** — repacking works from outside a vmcell checkout, xattr policy is a property of the
+>   **artifact**, and an ext4 producer exists beside the erofs packer (§4.2, §4.7);
+> - **R7** — every registration is a **digest**; a path is an override, never a registration (§10.5).
+>
+> The **new §18 delta register** — ten deltas, replacing the landed v30 register — is the exact
+> boundary between "as built and validated at v32 / `vmcell` 0.14" and "directed by this revision."
+> Deltas 1–7 are the R3+R4-first build order the requester argued for and this document adopts
+> (the kit that can go red on today's facts lands before the features it must validate); deltas 8–10
+> (the ext4 producer, the systemd proof cell, daemon placement exposure) are separable. New
+> subsections: **§3.5** (steward placement and the service-mode steward), **§4.7** (rootfs artifact
+> properties: xattr policy and the ext4 producer), **§7.4** (the feature intersection), **§10.5**
+> (the artifact registry), **§10.6** (the two-directional conformance kit); §1.6, §3.2, §3.4,
+> §4.2, §4.4, §5.3, §5.5, §6.2, §8.1, §9.1–§9.3, §10.2, §10.4, §11.5, §13, §15.4, §16, and §17
+> gain woven additions; **no section renumbers**.
+>
+> v33 also folds in the small set of body corrections the `docs/78`/`docs/81` fix waves and the
+> premise re-verification for this pass surfaced (no standing errata): `PrivilegedEgressRules` lives
+> in the orchestrator, not `net/tap.rs` (§6.2 wording); the steward's fatal core-mount set is
+> **four** mounts in fact (`{tmpfs /mnt, overlay, /proc, /dev}` — the in-code "exactly three" comment
+> understates the code, §3.4); the steward *library* is the reaper **plus** the 961-line `netif`
+> module, not 643 lines total (§3.5); and the validator's absence-direction gap is scoped honestly —
+> `crates/vmcell/tests/nested_virt.rs` already carries one data-plane absence leg
+> (`nested_virt_disabled`), so the gap R4 closes is the **kit's**, not the whole tree's (§10.6).
+>
+> **This document is read by two gates, and both find it by discovery.** `vmcell::vmm::jail`'s
+> deny-list test parses §12.3's roster out of whichever non-historical `docs/*.md` carries that
+> heading; `vmcell-privilege`'s blessing-copy scan locates §10.4's `setcap` line by finding the one
+> `docs/*.md` whose first line is this document's title. Neither pins a filename — the pinned one
+> broke on the v31→v32 reissue — and both **error** rather than pass vacuously when they find
+> nothing, so a reissue moves the design without breaking either, while a *deletion* of what they
+> read reddens. Two consequences bind this reissue mechanically (verified against the gates' own
+> source while writing it): the reissue commit must add this file **and** move the superseded
+> revision to `docs/historical/` atomically (two live title-bearing docs is a hard test failure, not
+> a warning), and §12.3's roster block plus §10.4's one `setcap` line are carried byte-compatible.
+> Superseded revisions live in `docs/historical/` (v32 is
+> `docs/historical/82-claude-opus-design-v32.md`), frozen at the bytes they shipped with; neither
+> gate descends there.
+>
+> **Where this document came from.** **v32 (2026-08-15) was the post-`docs/81` re-base**: the Opus
+> review of the 0.13 tree landed in three fix waves (shipping as `vmcell` 0.14 — read the crate's
+> `Cargo.toml` comment ledger, never a figure quoted here), and v32 re-stated the body as the system
+> is at every place the two disagreed (the never-registered self-hosted CI runner, the §9.2 module
+> map, the fold-over-`API_ROUTES` router, the channel-not-mutex session writer, the
+> uid-drop-before-ambient-raise transition order, the liveness-blind start-up sweep, the withdrawn
+> NAT-flake mechanism). **v31 (2026-08-14)** was the post-landing re-base of the v30 pass: the
+> nine-delta downstream-platform register built, live-validated, and reconciled (`vmcell` 0.13), the
+> `docs/78` review landed in two fix waves, and the body re-stated against the shipped system.
+> **v30** designed the first downstream-consumer pass (usb-teleporter's FR-V1…FR-V6: the kernel
+> toolkit §5.6, segments §6.5, the raw dial §3.2, extra files §4.2, the contract §10.4, USB
+> passthrough §2.4). **v29** added crosvm (§2.5); **v28** restructured for a maintainer and directed
+> the landed 0.9→0.10 pass, introducing the delta-register convention this revision reuses; §18's
+> preamble keeps the register-authoring conventions the v24–v30 passes taught. Section numbering is
+> unchanged since v28; **Appendix E** maps v27 § references (still cited in code comments) to the
+> current numbering.
+---
+
+## 1. Overview
+
+### 1.1 What vmcell is
+
+**vmcell** is a micro-VM runner for isolated environments, driven entirely from one Rust library. On a
+Linux/x86-64 host with KVM it lets you *create a fresh micro-VM, run a command in it over a typed control
+channel, give it shared directories / host-reachable endpoints / logged-and-filtered network egress,
+observe and cap its resource use, optionally snapshot-and-restore it for speed, and tear it down with no
+residue*. Strip away the shares, endpoints, and proxy and what remains — create → restore-or-cold-boot →
+`exec` over vsock → observe/cap → ordered teardown — is a self-contained, workload-agnostic execution
+primitive.
+
+The project's origin and still most demanding consumer is end-to-end integration testing of an
+agent-harness project (a *consumer* of the runner, never the runner itself). The same primitive serves
+three co-equal domains: **low-level systems testing** (a real kernel, full syscall surface, and nested
+virt, per test), **agentic execution** (untrusted AI-agent tool calls in disposable, observable,
+fast-to-restore sandboxes), and **generic serverless / ephemeral functions** (snapshot a warmed runtime
+once, restore per invocation in tens of milliseconds, discard). Nothing in the core
+(`vmm` / `steward` / `orchestrator` / `metrics`) is specific to any of the three; keeping the primitive
+general is a hard design constraint (§13, law G1), not an afterthought.
+
+Concretely, the library (plus a thin CLI and a long-lived daemon) can:
+
+1. Build the VM artifacts (kernel, root filesystem, proxy CA) reproducibly.
+2. Create, configure, start, stop, and destroy micro-VMs programmatically.
+3. Give each VM read-only and read-write shared directories with independent permissions.
+4. Let host-side code stand up private servers the VM can reach (and nothing else can).
+5. Route the VM's web egress through a transparent, logging/filtering Rust proxy.
+6. Drive the VM over a vsock control channel: one-shot `exec` with streamed output, file put, and
+   persistent interactive sessions (PTY, streaming stdin, multiplexed exec).
+7. Monitor and cap each VM's CPU / RAM / disk-I/O.
+8. Optionally expose nested virtualization so a guest can run its own VMs.
+9. Suspend one booted VM and mint many copy-on-write clones from it, with recorded fork/branch lineage.
+
+### 1.2 The three guarantees
+
+The runner delivers three properties **by construction rather than by cleanup**. Stated in testing terms;
+substitute "invocation" or "job" for "test" for the other consumers:
+
+1. **Isolation** — a misbehaving harness, model, or workload cannot disrupt the host.
+2. **Hermeticity** — no state leaks between runs. Each starts from an identical fresh VM, and teardown is
+   *structural*: the VM is discarded, not reset.
+3. **Fidelity** — the in-VM environment matches a real end-user Linux system, including the demanding
+   cases (nested virt, the full syscall surface, a real kernel).
+
+### 1.3 Non-goals
+
+The evaluation-methodology layer is out of scope: scoring, juries, dashboards, MCTS rollback engines,
+stateful API simulation, CI soft-failure statistics. This library is the *substrate* such a layer sits on.
+Two connection points are designed in because they map onto hard requirements: the egress proxy is the
+natural home for record/replay "cassettes" and web-service test doubles, and the vsock control plane is
+the natural transport for an in-guest model-proxy bridge. Everything beyond those hooks — a serverless
+scheduler, an agent-sandboxing frontend, an MCP server — is a layer *on top of* this primitive (§17).
+
+### 1.4 The system at a glance
+
+```
+┌──────────────────────── Host: Linux + KVM (nested=1 if needed) ───────────────────────┐
+│                                                                                        │
+│  vmcell orchestrator  (Rust, tokio)                                                    │
+│   ├─ Vmm trait:  create / restore / capabilities            (+ VmInstance: boot/pause/ │
+│   │     └─ impls:  CloudHypervisor (default) · Firecracker · Qemu · Crosvm  resume/snapshot/kill)│
+│   ├─ per-VM:  cgroup v2 slice → {netns + tap (/30)  |  in-process smoltcp vhost-user NAT}│
+│   ├─ StewardClient / SessionMux (AF_UNIX vsock)  ⇄  vmcell-steward (PID 1)            │
+│   ├─ virtiofsd × N   (one per read-only / read-write data share)                        │
+│   ├─ EgressProxy (hudsucker: hyper+rustls):  {nft TPROXY | smoltcp L4} → log/filter/doubles│
+│   └─ metrics:  read memory.peak / memory.current / cpu.stat / io.stat from the slice    │
+│                                                                                        │
+│   artifact cache:  vmlinux  ·  erofs rootfs (RO, shared)  ·  warm snapshot  ·  proxy CA │
+└────────────────────────────────────────────────────────────────────────────────────────┘
+        │ restore (ms) or cold-boot                          ▲ vsock: Ready/Exec/IO/Exit/PutFile/
+        ▼                                                     │        Resync/Session*
+  ┌──────────────────────── micro-VM (per run, ephemeral) ───────────────────────────┐
+  │ kernel: direct boot, virtio + vsock + virtio-fs + (opt) KVM built-in, no initramfs │
+  │ PID 1: vmcell-steward  (mounts /proc /sys /dev/pts + shares, tmpfs overlay,    │
+  │        brings up lo, reaps children, serves the vsock protocol)                    │
+  │ root: /dev/vda = erofs (RO, shared by all VMs)  +  tmpfs overlay for writes        │
+  │ net: eth0 (kernel ip= boot arg) → default route → host proxy   [opt] /dev/kvm      │
+  └────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**The per-run lifecycle:**
+
+1. **Acquire artifacts** from the cache (kernel, erofs rootfs, snapshot, CA) — built once, reused (§10).
+2. **Allocate per-VM resources:** a cgroup v2 slice, networking (netns+tap on a fresh `/30`, or an
+   in-process smoltcp NAT), a unique vsock **CID**, and a unique **VMID**. The erofs base is mounted
+   read-only and *shared* — no per-VM disk copy; the only writable state is the tmpfs overlay.
+3. **Start the VM:** either **restore** a warm steward-ready snapshot (the fast path: `--restore` →
+   `resume`, never `create`/`boot`) or **cold-boot**. On restore, refresh identity, entropy, and clock —
+   one native in-steward `Resync` round-trip (§8.2).
+4. **Bind shares** (cold/general path): one `virtiofsd` per data share. The snapshot tier attaches *no*
+   virtiofsd — see the eligibility law (§8.1); read-only data there is served as an extra erofs/block
+   image.
+5. **Connect + drive over vsock:** the host retries the handshake until the guest's `Ready` frame arrives
+   (bounded by a timeout), while tailing the serial log so a boot panic fails fast instead of retrying to
+   no avail. Then `Exec` the entrypoint (or open sessions) and stream output.
+6. **Collect results:** outputs from the host side of a read-write share; `memory.peak` / `cpu.stat` /
+   `io.stat` from the cgroup slice; the proxy's request log.
+7. **Tear down (ordered):** force-kill the **VMM process group first**, then virtiofsd, *then* remove the
+   tap/netns/cgroup/overlay/sockets. Removing a netns while the VMM still holds interfaces in it can hang
+   or leak; reaping the process first makes teardown a clean kernel operation. Discard is structural —
+   that *is* the no-leakage guarantee.
+
+### 1.5 The layer map and the two operating modes
+
+The system is a ladder of layers; each section of this document is one rung:
+
+```
+artifact pipeline ──▶ vmlinux · rootfs.erofs · warm snapshot · proxy CA        §10  (build once, cache)
+Vmm trait         ──▶ CloudHypervisor · Firecracker · Qemu · Crosvm            §2   (spawn/boot/restore)
+guest environment ──▶ erofs+overlay · guest kernel · steward · guest tools §3–§5
+per-VM resources  ──▶ cgroup slice · netns+tap | smoltcp NAT · proxy           §6–§7
+control plane     ──▶ StewardClient / SessionMux  ⇄  steward (PID 1) over vsock    §3
+MicroVm           ──▶ the owning handle; RAII: Drop is teardown                §9
+Zygote / Lineage  ──▶ suspend once, CoW-clone many; fork/branch provenance     §8
+vmcelld           ──▶ long-lived owner: REST + registry + store (+ broker)     §11–§12
+```
+
+Cutting across every layer are the **two operating modes** (detailed in §6.1), which govern the network
+datapath, the cgroup-delegation story, snapshot eligibility, how tests split into suites, and which
+operations may degrade vs must fail loud:
+
+- **Unprivileged** — KVM-group access only, no `CAP_*`. Networking is the in-process smoltcp NAT.
+- **Privileged** — `CAP_NET_ADMIN` + `CAP_SYS_ADMIN` + `CAP_DAC_OVERRIDE`, granted to the test binary
+  alone via the capability runner (§15.5) or held by the daemon's broker child (§12.4). Networking is
+  netns+tap with L2 fidelity; the only mode eligible for the snapshot tier.
+
+A mode's prerequisites are probed up front and enforced fail-loud (§7.2); a requested mode whose
+prerequisites are absent errors with the remediation, never a silent degrade.
+
+### 1.6 Key decisions
+
+| Concern | Decision |
+|---|---|
+| Primary VMM | **Cloud Hypervisor**, a subprocess over its REST `--api-socket`. Feature-complete: the default and the fully-featured snapshot tier. |
+| Second VMM | **Firecracker** (MMIO mode) — the density tier and the fastest restore (≈27 ms p50), with two honest constraints: single-lineage host paths and no lazy restore (§2.3). |
+| Fallback VMM | **QEMU `q35`** (never `microvm`) — the escape hatch and most-proven nester. C/GPL *binary*, never linked. |
+| Fourth VMM | **crosvm** (v29, §2.5) — a boot-first secondary: baked-CID snapshot (single-lineage), in-kernel vsock, the most consistent (flake-free) cold boot; opt-in live matrix (`just test-crosvm`). |
+| Control plane | virtio-vsock + a Rust steward; framed `postcard` protocol; one-shot exec plus an additive session layer (PTY / streaming stdin / multiplexed exec). SSH is a human-only debug fallback. |
+| Steward placement | **Declared, never inferred** (v33, §3.5): `StewardPlacement::{Pid1, Service{port}, None}` — the control plane is available whenever a steward is reachable, whatever pid it holds; `Pid1` is the default and byte-identical to today. The steward is a library; the binary runs as PID 1 or as a service under somebody else's init (systemd included). |
+| Artifact identity | **Registered by digest, selected by label, declared by features** (v33, §7.4/§10.5/§10.6): the kernel registry's shape extends to rootfs images and guest handlers; selection is lazy; a cell's feature set is the intersection of artifact declarations × backend capabilities × host facilities, with provenance on every removal; the conformance kit checks declarations in both directions. |
+| Root filesystem | A single **read-only erofs over virtio-blk**, shared by all VMs; per-VM writes go to a tmpfs `overlayfs` upper. No journal → no recovery writes, no concurrent-mount corruption; composes with snapshot. |
+| Shared dirs | virtio-fs, one `virtiofsd` per share, caller-defined mount tags. Mutually exclusive with snapshot (§8.1). |
+| Networking | Per-VM netns + tap + `/30` (privileged) or an in-process smoltcp vhost-user-net NAT (unprivileged). |
+| Egress proxy | A Rust MITM proxy (`hudsucker`), CA baked into the guest trust store; steered via nft TPROXY (privileged) or L4 interception in the NAT (unprivileged). |
+| Limits | One cgroup v2 slice per VM; a *requested* limit that can't be enforced fails loud, never a silent no-op (§7.2). |
+| Guest OS / kernel | Minimal Debian Trixie from OCI-pull (default) or in-VM `mmdebstrap`; direct-boot custom-minimal `vmlinux` (Linux 6.12 LTS), everything built in, no initramfs. |
+| Speed lever | Warm snapshot + restore: ≈5.8× faster than cold boot on CH; the zygote fan-out CoW-clones one suspend image into many VMs; `Lineage` adds fork/branch provenance. |
+| Third entry surface | The long-lived **`vmcelld`** daemon owns VMs across requests behind a bearer-authed REST/OpenAPI API; by default it forks a **setup broker** so the network surface holds no capabilities. |
+| Downstream consumption | Git-dep workspaces are first-class consumers (v30): a **documented toolkit contract** — pins overlay, the `VMCELL_*` env contract, out-of-repo kernel build + validation, rootfs extra-files — kept honest by an out-of-tree example workspace CI builds on every push (§10.4). vmcell ships mechanisms, never consumer content (law G1). |
+| Dependency posture | Prefer in-crate Rust over external tools; permissive licenses only for anything linked; `cargo-deny` on every build is the source of truth (§9.6). |
+
+### 1.7 How to read this document
+
+§2–§12 are the subsystems, each opening with what the piece is and how to drive it before descending into
+mechanics. §13 is the concentrated list of **cross-cutting laws** every change must respect — if you
+remember nothing else, remember §13; each law names its owner and the gate that reddens on its inverse,
+and points back at the section holding the mechanics. §14 is the meta-lessons. §15–§16 are how correctness
+is forced and what the system measures. §17 is the honest edge: what is not done. §18 is the delta
+register for this revision. The appendices record how the design was reached — the load-bearing reversals,
+the dependency experiments, and the contested facts to re-verify per pin; nothing there is required to
+*use* the system, but it is the evidence behind the non-obvious choices.
+
+The body is written in the present tense and describes the system as designed at v33; §18 is the exact
+boundary between "as built and validated" and "directed by this revision." A non-obvious choice (why erofs
+and not ext4; why the snapshot tier excludes unprivileged networking; why a Firecracker snapshot lineage
+shares one host vsock path) is explained inline where the component is described, and **Appendix A**
+records the reversal history behind the ones that were hard-won.
+
+---
+
+## 2. VMM backends and the `Vmm` trait
+
+### 2.1 The trait and the capability descriptor
+
+The VM lifecycle is modeled as a narrow, typed contract so the finicky, subprocess-supervising,
+occasionally-`unsafe` VMM glue stays behind a boundary and the orchestrator stays idiomatic and
+unit-testable (a `FakeVmm` implements the same trait, §9.8). The backends genuinely diverge —
+Firecracker has no virtio-fs, no vhost-user-net, no nested virt; crosvm (v29, §2.5) additionally ships
+without snapshot in its first cut — so the contract is **general with a capability descriptor**, not
+CH-shaped:
+
+```rust
+pub trait Vmm: Send + Sync {
+    type Instance: VmInstance;
+    /// What this backend supports. Callers MUST consult this before invoking an optional op; the
+    /// orchestrator selects a backend per tier from it, and the test/bench matrix SKIPS — never
+    /// fails — a scenario a backend can't run. Reported, not assumed.
+    fn capabilities(&self) -> VmmCapabilities;
+    fn id(&self) -> &str;
+    /// Cold path: spawn + configure the backend, place it in the cgroup slice, ready to boot().
+    async fn create(&self, cfg: &VmConfig, res: &PerVmResources, cgroups: &dyn CgroupFs) -> Result<Self::Instance>;
+    /// Warm path: restore from a snapshot dir. Returns a PAUSED instance — the caller continues with
+    /// resume(), NEVER boot()/create(). Returns Error::Unsupported when capabilities().snapshot_restore
+    /// is false OR cfg carries any vhost-user device (the eligibility law, §8.1). Takes cfg to
+    /// reconstruct the NON-vhost-user device topology — it must NOT attach virtiofsd.
+    async fn restore(&self, snapshot_dir: &Path, cfg: &VmConfig, res: &PerVmResources, cgroups: &dyn CgroupFs) -> Result<Self::Instance>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+// Deliberately EXHAUSTIVE (no #[non_exhaustive]) since the backend extraction: a new capability field
+// must force every backend to declare its stance — a compile error in all five construction sites,
+// never a silent default. vmcell is publish = false, so no external consumer relies on
+// non-exhaustiveness. Adding a field is a breaking bump (the 0.11→0.12 disk_io_throttle precedent;
+// usb_host_passthrough repeated it in the landed v30 pass).
+pub struct VmmCapabilities {
+    pub snapshot_restore: bool,            // CH ✓ · FC ✓ (single-lineage host paths, §2.3) · QEMU ✓ (in-kernel vhost-vsock, §2.4) · crosvm ✓ (baked-CID, FC-pattern, §2.5)
+    pub lazy_restore: bool,                // demand-paged restore. CH ✓ (--restore … prefault=off) · FC ✗ · QEMU ✗ · crosvm ✗
+    pub virtio_fs_shares: bool,            // CH, QEMU ✓ · FC ✗ (block-only) · crosvm ✗ (has --shared-dir; unvalidated, §2.5)
+    pub unprivileged_vhost_user_net: bool, // smoltcp NAT via vhost-user-net: CH, QEMU ✓ · FC ✗ · crosvm ✗ (unvalidated, §2.5)
+    pub nested_virt: bool,                 // expose /dev/kvm to the guest: CH, QEMU ✓ · FC ✗ · crosvm ✗ (documented-unsupported)
+    pub virtio_console: bool,              // ConsoleMode::VirtioConsole: CH, QEMU, crosvm ✓ · FC ✗ — rejected
+                                           //   loud+early on FC, before the cmdline is built (console=hvc0
+                                           //   with no device would silence the log)
+    pub restore_rotates_host_paths: bool,  // scope: the vsock/serial host paths — the TAP is rebound to
+                                           //   res.tap_name on every backend, so this flag never describes
+                                           //   it. CH ✓ (restore config-rewrite moves host paths into the
+                                           //   new scratch dir) · FC ✗ (re-binds the baked vsock UDS
+                                           //   verbatim; its tap rides `network_overrides`, §2.3)
+                                           //   · QEMU ✓ (restore rotates the host-global guest CID, §2.4)
+                                           //   · crosvm ✗ (crosvm bakes+requires the vsock CID on restore
+                                           //   — the FC pattern; reuses the baked CID, §2.5)
+    pub disk_io_throttle: bool,            // per-drive I/O rate limit (§4.6): CH (rate_limiter_config),
+                                           //   FC (rate_limiter), QEMU (throttling.*) ✓ · crosvm ✗
+                                           //   (--block has no bandwidth/iops key) — rejects a throttled
+                                           //   disk fail-loud; extra_block_io_throttle skips it (v29)
+    pub usb_host_passthrough: bool,        // attach a host USB device via xhci + usb-host (§2.4; the
+                                           //   landed v30 pass, delta 9): QEMU ✓ (opt-in live-validated) · CH ✗ (no
+                                           //   upstream USB) · FC ✗ · crosvm ✗ (its xhci is not
+                                           //   Suspendable; vmcell always passes --no-usb, §2.5) —
+                                           //   non-supporting backends reject fail-loud, feature string
+                                           //   == the field name. Deliberately NARROW (USB, not a generic
+                                           //   host_device flag): the flag claims exactly what is
+                                           //   validated; the flag+config+typed-refusal PATTERN is what
+                                           //   generalizes to other device classes (the v28 delta-3
+                                           //   naming lesson — the mem_limit_enforced rename, §7.1:
+                                           //   narrow names for narrow claims)
+}
+
+pub trait VmInstance: Send {
+    async fn boot(&mut self) -> Result<()>;             // cold start (after create)
+    async fn request_shutdown(&mut self) -> Result<()>; // graceful (ACPI) signal only; the grace-poll +
+                                                        //   SIGKILL fallback is MicroVm::shutdown() (§9.4)
+    async fn has_exited(&mut self) -> bool;             // non-blocking try_wait(); trait-default false
+                                                        //   (conservative for fakes)
+    async fn kill(&mut self) -> Result<()>;             // force-terminate the VMM process group
+    async fn pause(&mut self) -> Result<()>;            // REQUIRED before snapshot
+    async fn resume(&mut self) -> Result<()>;           // after snapshot, and after restore
+    async fn snapshot(&mut self, dir: &Path) -> Result<()>; // pauses, writes, resumes (or stays paused for kill)
+    fn vsock_path(&self) -> &Path;                      // AF_UNIX endpoint (changes across restore)
+    fn vsock_endpoint(&self) -> VsockEndpoint;          // default: Unix{vsock_path(), STEWARD_VSOCK_PORT};
+                                                        //   overridden by the AF_VSOCK backends (QEMU
+                                                        //   in-kernel, crosvm) — the endpoint the control
+                                                        //   plane and dial_vsock actually dial (§3.2)
+    fn guest_cid(&self) -> u32;                         // unique per running VM (>= 3)
+    fn serial_log(&self) -> &Path;                      // per-VM panic / early-boot log
+}
+```
+
+Every field of `VmmCapabilities` is a property of the *pinned* VMM build and must be re-confirmed against
+it (Appendix C), not hard-coded from memory. Resource *usage* is read from the cgroup slice, not from the
+instance — `VmInstance` has no `stats()` method; the orchestrator reads counters through the injected
+`CgroupFs` (§7). The same "report, don't assume" discipline applies to the host environment via the
+`HostCapabilities` descriptor probed once at start-up (§7.2).
+
+`restore_rotates_host_paths` carries a second role beyond the restore-time path rewrite: it is the
+**concurrent zygote fan-out gate** (§8.4). Copy-on-write gives each clone its own snapshot *files*, but it
+cannot change a host path a backend bakes into the binary snapshot state; only a backend that rewrites
+host paths per restore can hand N *concurrent* clones distinct **vsock/serial** paths. (The tap is not in
+that set: every backend rebinds it to `res.tap_name` on restore, so it never gates fan-out — §8.2.)
+Reusing the existing capability (rather than a bespoke fan-out flag) keeps one source of truth for one fact.
+
+### 2.2 Cloud Hypervisor — the default and the fully-featured snapshot tier
+
+Feature-complete: snapshot/restore via `--restore`+`resume`, virtio-fs shares, vhost-user-net (so the
+unprivileged NAT), and nested virt. Driven over a hand-written thin REST client (`hyper`/`hyperlocal` over
+the Unix `--api-socket`); **every control RPC over the API socket is bounded at 5 s**, so a wedged VMM
+control socket surfaces as a typed `Error::Timeout` before any outer readiness timeout can mask it.
+**One deliberate exception:** the snapshot RPC's budget is guest-RAM-proportional, sized by the one
+law `vmm::snapshot_request_timeout(mem_mib)` — the flat 5 s ceiling plus the write time a conservative
+floor on sustained throughput implies — because a suspend image tracks guest RAM ~1:1 and a multi-GiB
+guest overruns the flat ceiling by construction, leaving the VM paused with a half-written image. It
+degrades to the flat ceiling for a zero-RAM probe instance, and every backend's snapshot budget routes
+through it rather than carrying its own literal — CH and Firecracker read it directly; QEMU and crosvm
+take the larger of it and their own migration/control floor. Cold
+boot ≈305 ms; warm restore ≈53 ms (§16).
+
+Two lifecycle paths: cold = `vm.create` → `vm.boot`; warm = launch with `--restore` → `vm.resume`
+(**never** `create`/`boot` — CH returns `500 "VM is already created"`). `snapshot` must `vm.pause` first,
+then snapshot, then `vm.resume` (or stay paused if the VM is about to be killed).
+
+**The restore config-rewrite (the one CH restore subtlety, canonical here).** CH `--restore` rebuilds
+every device from the snapshot's `config.json`, which records the *original* instance's now-defunct
+temp-dir paths for the **vsock socket**, **serial file**, and **console file**, plus the ancestor's tap in
+every `net[].tap` — and CH exposes no restore-time override. So the spawn step rewrites all of them *in
+the snapshot dir, before launching*: the socket and serial/console files (in lockstep with `ConsoleMode`)
+to this restore's freshly-minted scratch-dir paths, and every `net[].tap` to this restore's *rotated* tap,
+so the guest's rotated `/30` and its host tap/nft wiring belong to the same vmid (§8.2). Two consequences
+are load-bearing: the rewrite makes a plain `restore()` **single-use** (it mutates the caller's snapshot
+dir — hence the per-clone CoW copy, §8.4), and it is exactly what `restore_rotates_host_paths: true`
+declares. CH also reads the baked `vsock.cid` from the restore config and reports it as `guest_cid()` —
+the restored guest keeps the frozen CID (§8.2).
+
+CH is supervised as an external release binary; only its REST *client* is a crate.
+
+### 2.3 Firecracker — the density tier and the fastest restore
+
+Its draw is density (low memory overhead) plus snapshot, and it has the fastest measured warm restore
+(≈27 ms p50, §16) despite a mid-pack cold boot (≈775 ms) — exactly the density/snapshot-tier role
+it is assigned. Implemented like CH (a hand-written `hyper`-over-Unix client, not `firecracker-rs-sdk`).
+Its device model is deliberately minimal — virtio-{net,block,vsock,balloon,rng} — so it cannot do
+virtio-fs, vhost-user-net, or nested virt, and `capabilities()` reports those `false`. Three
+Firecracker-specific facts:
+
+- **It runs in native MMIO mode** (no `--enable-pci`). The guest kernel ships both virtio-pci (for CH)
+  and virtio-mmio (§5.2), so one `vmlinux` serves CH over PCI and Firecracker over MMIO. MMIO is the
+  default for backend maturity and the shared `vmlinux`, **not** because PCI blocks snapshot — FC v1.16.0
+  supports `--enable-pci` + snapshot (Appendix A, reversal 1).
+- **Snapshot/restore is wired and validated end-to-end**, with three host-side accommodations (the guest
+  steward needed no FC-specific change — its generic re-bind-after-restore loop, §3.4, covers FC too;
+  Appendix A, reversal 8, records the forensic history). First, `MicroVm::snapshot()` invalidates the
+  cached `StewardClient` after a successful backend snapshot — FC severs established vsock connections
+  across pause/snapshot/resume where CH keeps them alive; invalidating uniformly costs at most one cheap
+  reconnect. Second, FC re-binds the snapshot's recorded host vsock UDS path *verbatim* (no load-time
+  override in v1.16), so `restore()` re-creates that baked path's parent directory before
+  `PUT /snapshot/load` (the ancestor's scratch dir is gone by then; `Drop` removes the resurrected dir).
+  The declared contract is `restore_rotates_host_paths: false`, and its scope is **the vsock and serial
+  host paths, not the tap**: a lineage's restores share one host vsock
+  path, so `restore()` runs a fail-loud liveness guard (`reject_live_baked_vsock`, a 100 ms
+  `UnixStream::connect` probe — a live listener is a typed `Error::Vmm` "still in use", never a silently
+  unlinked live VM's socket; a stale file is removed; the TOCTOU window is documented as a misuse guard,
+  not a security boundary). Concurrent restores from one lineage stay unsupported (§17). Third, `create()`
+  attaches the entropy device (`PUT /entropy` → virtio-rng → guest `/dev/hwrng`) — without it the
+  post-restore reseed reports `reseed_applied: false` and restored clones replay frozen CSPRNG state. The
+  wired mechanism: a fresh process + `PUT /snapshot/load {resume_vm:false}` (restore returns paused, the
+  caller resumes), `PATCH /vm` for pause/resume, and a `vmcell_host_paths.json` sidecar. Fourth — and the
+  reason the flag's scope has to be stated — `restore()` sends a **`network_overrides`** entry on
+  `PUT /snapshot/load` (FC 1.8+; validated on 1.16.0) rebinding the snapshotted interface to this
+  restore's fresh tap. Without it FC re-binds the *baked* tap name, whose netns died with the ancestor:
+  the VM restores clean, reports healthy, and has no data plane at all. The override is matched to the
+  snapshotted device **by `iface_id`**, so the create path's `PUT /network-interfaces/<id>` and the
+  override share one `FC_IFACE_ID` const — a mismatch is not an error, it is a silently ignored override
+  that falls back to the baked name. The tapless shape is unaffected (the key is omitted). `lazy_restore`
+  stays an honest `false` (no UFFD backend wired, §17); the capability unit test pins `snapshot_restore`
+  *true* and `restore_rotates_host_paths`/`lazy_restore` false.
+- **Extended-FPU restore is constrained at the CPU layer.** FC restore can mishandle the guest's saved
+  extended-FPU (XSAVE) state, so the boot applies a static **T2 CPU template** (masking the
+  extended-state CPUID bits) plus **`noxsave`** on the guest cmdline as a no-template fallback (gated to
+  `template.is_none()`). The operational consequence: `noxsave` disables guest AVX/AVX2 down to an SSE2
+  floor — a *test-fidelity* cost — so **SIMD-correctness-sensitive tests belong on the CH tier**. The
+  forensic history (the `restore_fpregs_from_fpstate` panic, the rejected `bookworm` downgrade, the Lunar
+  Lake T2 rejection) is Appendix A, reversal 3.
+
+### 2.4 QEMU `q35` — the fallback and most-proven nester
+
+Full feature set (virtio-fs, vhost-user-net, nesting). Use **`q35` with `virtio-net-pci`**, not `microvm`
+— QEMU 10.2.1's `microvm` cannot boot these PVH (the paravirtualized direct-boot entry protocol CH/FC use)
+kernels to userspace at all, and it is the machine type, not the virtio-net device or header size, that is
+the blocker (the early-boot-`#DE` diagnosis, reproduced ~24 ways, is Appendix A, reversal 7). Cold boot
+≈991 ms.
+
+QEMU reports `snapshot_restore: true`, earned **only** in the snapshot-eligible config. Its default
+**unprivileged** external `vhost-device-vsock` daemon is a stateless vhost-user backend that cannot
+migrate (the eligibility law, §8.1), so a `snapshotting` VM instead attaches the privileged **in-kernel
+`vhost-vsock-pci`** device (`guest-cid=` on the device line) — QEMU 10.2 sets no migration blocker on it.
+The selector is `VmConfig::vsock_transport` (`Auto | InKernel | ExternalDaemon`), routed through one
+`uses_in_kernel_vsock` predicate — an **explicit, fail-loud** choice, never the silent daemon-to-in-kernel
+fallback an earlier pass removed (the sin was the silence, not the device). `Auto` follows `snapshotting`
+(the unprivileged default keeps the external daemon for a non-snapshot VM); `InKernel` lets a privileged
+**non-snapshot** QEMU take the deterministic in-kernel transport, shedding the external daemon's ~11%
+bring-up flake; `build()` rejects `snapshotting` + `ExternalDaemon` (a non-migratable vhost-user device
+cannot back a snapshot). `snapshot()` drives QMP `stop` → `migrate file:<dir>/state.bin` → poll
+`query-migrate` to `completed` (a `file:` URI, never `exec:`, which QEMU's `-sandbox …,spawn=deny` would
+kill); `restore()` spawns a topology-congruent VM with `-incoming defer`, drives `migrate-incoming`, polls
+to completion, and returns **paused** for the orchestrator to `resume()`. No sidecar is carried — the
+migration stream (`state.bin`) is the whole snapshot; a pre-spawn `state.bin` existence check is the
+fail-loud-before-spawn guard. The external-daemon config returns `Unsupported` from `snapshot()`/`restore()`.
+Because the in-kernel device exposes the guest on the host **AF_VSOCK** namespace (not the daemon's AF_UNIX
+bridge), the host steward client dials it by CID — the one place the control plane leaves the hybrid
+`CONNECT/OK` handshake (§3.2). `restore_rotates_host_paths` is **`true`**: `restore()` programs a fresh
+allocator-unique `res.guest_cid` on the destination device (the `guest-cid` is a device property, not part
+of the migration stream), and the guest — which binds `VMADDR_CID_ANY:5000` — is reachable at the rotated
+CID even though its cached CID lives in migrated RAM (validated live; the earlier same-CID-only audit is
+superseded). Each concurrent clone thus holds its own host-global CID, so concurrent QEMU zygote fan-out is
+supported (§8.4); the kernel's `VHOST_VSOCK_SET_GUEST_CID` `EADDRINUSE` at realize is the fail-loud backstop.
+Wiring the unprivileged smoltcp NAT to QEMU still requires the carried vendored `vhost`/`vhost-user-backend`
+patch (§9.6), orthogonal to the vsock snapshot path.
+
+**Host-USB passthrough (the landed v30 pass, delta 9 — FR-V5).** QEMU is the one backend whose upstream binary
+attaches a host USB device, so it alone reports `usb_host_passthrough: true`. When
+`VmConfig::usb_host_devices` is non-empty, the spawn appends one `-device qemu-xhci,id=vmcell-xhci`
+plus, per device, `-device usb-host,vendorid=0x<vid>,productid=0x<pid>` — after the extra-disk block,
+before `-kernel` (QEMU runs `-nodefaults`, so no controller exists unless vmcell adds one). The USB argv
+assembly is a **pure, KVM-free-testable args helper** (the `build_crosvm_run_args` precedent — today
+QEMU's argv is assembled inline in `spawn_qemu`, which is why crosvm's arg bugs were pinnable and QEMU's
+would not be). Three host-environment facts are validated live before the flag is true, not assumed:
+the QEMU process must be able to open the device's `/dev/bus/usb/BBB/DDD` node (the blessed-runner path
+inherits ambient `CAP_DAC_OVERRIDE`; an unprivileged run depends on udev permissions and surfaces
+QEMU's own fail-loud open error), the `-sandbox …,spawn=deny` Enforcing filter must tolerate usbfs
+ioctls, and the jailer defaults must not strip the access — any conflict is resolved and recorded,
+never met with a silent sandbox downgrade. `build()` rejects `snapshotting` + a USB device (a
+passed-through device is not migratable), and every non-QEMU backend's `create()` refuses with a typed
+`Error::Unsupported { vmm, feature: "usb_host_passthrough" }`.
+
+**The host gets its device back**, and the unified half of passthrough lives in `vmcell::vmm::usb`
+(resolve, precheck, capture, restore) since `usb_host_passthrough` is a capability — the backend
+contributes only its own argv and the two ordering decisions, claim-before-spawn and
+restore-after-reap. Claiming a device detaches its kernel driver, and QEMU re-attaches
+on none of the paths vmcell drives (teardown ends in a process-group SIGKILL; a killed QEMU runs no
+release path), so passthrough used to leave the host device driverless — measured. Ownership owns
+cleanup: the interface→driver map is captured **before** the spawn (once QEMU has claimed the device
+the sysfs `driver` symlink is gone) and re-bound after the VMM is reaped by the one helper both
+`kill()` and `Drop` call. The rule is *restore what we displaced*, never *make the device work*: an
+interface with no driver at capture time is not recorded, so a blacklisted driver or a device the
+operator keeps unbound for passthrough stays that way. Re-binding needs only write access to
+`/sys/bus/usb/drivers/<driver>/bind`, i.e. `CAP_DAC_OVERRIDE`, which every context that can spawn a
+passthrough VM already holds — no second privileged binary, and a far narrower operation than a
+module reload, since the module never unloaded. The re-bind retries on a bounded deadline because the
+usbfs release is asynchronous (a write issued the instant the leader is reaped fails); a restore that
+still fails is warned with the interface and the manual command, never fatal to teardown. The opt-in gate's guest kernel is a
+`vmlinux-usbhost` label built through the §5.6 toolkit from a **vmcell-owned generic host-controller
+fragment** (xhci + USB core + the one class-smoke driver, and nothing else). Against the requester's
+generality directive this is defended, not assumed: a capability flag must be live-validated (AGENTS.md
+rule 5), live validation requires guest USB-host symbols, and this fragment is vmcell's own
+capability-gate infrastructure — the IKCONFIG example-fragment precedent — carrying **none** of the
+consumer-owned usbip/`vhci_hcd`/gadget/`dummy_hcd` closure the FR withdrew; it is also a recorded,
+deliberate deviation from FR-V5's "downstream-built via FR-V1" phrasing (vmcell acting as its own
+toolkit consumer for its own gate).
+
+### 2.5 crosvm — the fourth backend (v29, boot-first)
+
+crosvm is the ChromeOS Rust VMM, added in v29 as a fourth *secondary* backend (`vmcell-crosvm` crate,
+§9.1) alongside Firecracker and QEMU. **Structurally it follows QEMU, not Firecracker**: it is configured
+by a device model built on one `crosvm run` launch command line (not a post-spawn REST sequence), and its
+control plane is a **side socket driven out-of-band** — but by *re-invoking the crosvm binary as a client*
+(`crosvm resume|suspend|powerbtn|stop <socket>`), a third control shape (neither CH/FC's HTTP-over-Unix nor
+QEMU's QMP-JSON). The socket wire protocol is unstable binary and is **never hand-rolled**, so the crate
+carries no serde/JSON — the same "supervise an external binary, don't SDK-link it" discipline as QEMU/CH.
+
+Lifecycle maps onto the trait as: `create()` launches `crosvm run --disable-sandbox --suspended --no-usb`
+(devices + vCPUs frozen at launch — the create-then-boot split, mirroring QEMU `-S`); `boot()` issues
+`crosvm resume --full` (wake devices **and** vCPUs — a plain `resume` wakes only vCPUs and crosvm errors
+"Trying to wake Vcpus while Devices are asleep"); `pause()`/`resume()` are vCPU-only `crosvm
+suspend`/`resume`; `request_shutdown()` issues `crosvm powerbtn` (ACPI, honored by the PID-1 steward);
+`kill()` best-effort `crosvm stop` then SIGKILLs the process group. Three device/flag facts are
+empirically load-bearing (each validated live, each a KVM-free arg-builder assertion): **`--disable-sandbox`**
+(crosvm's own multiprocess minijail `pivot_root`s into `/var/empty` and forks per-device children,
+incompatible with the single-process supervision model — see the seccomp posture below and §12.2);
+**`--no-usb`** (crosvm attaches a legacy xhci USB controller by default which is not `Suspendable`, so the
+`--suspended`→`resume` device-wake cycle panics on it); and **`resume --full`** (the full-suspend wake).
+The rootfs is the first `--block` device (→ `/dev/vda`, what the shared cmdline's `root=/dev/vda` boots
+from; crosvm's own `root=` auto-append is deliberately unused), extra disks follow in order, and networking
+is a privileged `--net tap-name=…,mac=<mac_math(vmid)>`.
+
+**vsock is in-kernel vhost-vsock on the host AF_VSOCK namespace** — like a snapshot-eligible QEMU, not the
+AF_UNIX hybrid default — so `vsock_endpoint()` returns `VsockEndpoint::Vsock{cid, 5000}` and there is no
+external vsock daemon to own. Validated live in the **privileged** mode; whether `/dev/vhost-vsock` is
+reachable in the **unprivileged** (KVM-group) mode is still an open question (§17).
+
+**Snapshot/restore — the Firecracker pattern, not QEMU's.** `snapshot()` full-suspends the VM (crosvm
+requires all devices asleep to snapshot), runs `crosvm snapshot take <dir>/crosvm-snapshot <sock>`,
+persists a CID sidecar, and resumes the source; `restore()` spawns `crosvm run --suspended --restore
+<snap> …`, returns a paused instance, and the orchestrator's `resume()` issues the completing
+`crosvm resume --full` (a `restored` one-shot flag, consumed only on success). The load-bearing empirical
+finding: **crosvm bakes the vsock CID into the snapshot and rejects a rotated one on restore** ("Virtio
+vsock incorrect cid for restore: Expected N, Actual M", validated live). So — unlike QEMU's rotating CID —
+crosvm reuses the **baked** CID (carried in the `crosvm-host-cid.txt` sidecar, the AF_VSOCK analogue of
+FC's `HOST_PATHS_SIDECAR`), and `restore_rotates_host_paths` is **false**: the vmid/MAC/IP still rotate to
+`res.vmid` via the post-restore resync (§8.2), but the vsock CID does not, so restore-while-alive and
+concurrent restores from one lineage are unsupported (the §17 single-snapshot-CoW gap — exactly FC's
+constraint). The **one non-Suspendable device** is the default xhci USB controller, already dropped via
+`--no-usb`; the block/net/vsock/serial set snapshots cleanly.
+
+**All of crosvm's shipped path is VALIDATED live** — the full `vmm_matrix_test!` set (boot + steward-exec +
+put_file, sessions, concurrency, extra-block, privileged egress/host-endpoint, metrics/cgroup limits,
+**snapshot/restore + extra-block-survives-snapshot + fork/branch lineage**, and every `require_cap!` skip)
+passes on a KVM host with a source-built crosvm via the opt-in `just test-crosvm` (§15.4); it stays out of
+the default `test-privileged` because the binary is absent on CI. The remaining capabilities are
+honest-`false`: `virtio_fs_shares` (crosvm has in-process `--shared-dir type=fs`, framed differently from
+the external-vhost-user `config_has_vhost_user_device` law, unvalidated — `create()` rejects a share),
+`unprivileged_vhost_user_net`, `lazy_restore`, `restore_rotates_host_paths` (baked CID, above), and
+`disk_io_throttle` (crosvm's `--block` has no bandwidth/iops key, unlike CH/FC/QEMU — the divergence that
+added the `disk_io_throttle` capability, §2.6; `create()` rejects a throttled disk fail-loud). `nested_virt`
+is a **hard** documented-unsupported (no working guest `/dev/kvm`). Each `false` self-skips its matrix leg
+via `require_cap!` (recorded to the skip manifest, never a silent green) and carries a KVM-free honesty pin.
+
+### 2.6 The capability matrix
+
+| Capability | CH | Firecracker | QEMU | crosvm *(v29, validated)* |
+|---|---|---|---|---|
+| `snapshot_restore` | **✓** | **✓** *(single-lineage host paths)* | **✓** *(in-kernel vhost-vsock + `migrate`/`-incoming`, §2.4)* | **✓** *(baked-CID reuse, FC-pattern, §2.5)* |
+| `lazy_restore` (demand-paged) | ✓ | ✗ | ✗ | ✗ |
+| `restore_rotates_host_paths` | ✓ *(enables concurrent zygote fan-out, §8.4)* | ✗ *(verbatim baked vsock path — single-lineage)* | ✓ *(restore rotates the host-global guest CID — concurrent fan-out, §2.4/§8.4)* | ✗ *(baked vsock CID reused — single-lineage, FC-like, §2.5)* |
+| `virtio_fs_shares` | ✓ | ✗ (block-only) | ✓ | ✗ *(has `--shared-dir`; unvalidated)* |
+| `unprivileged_vhost_user_net` | ✓ | ✗ | ✓ | ✗ *(unvalidated)* |
+| `nested_virt` | ✓ | ✗ | ✓ | ✗ *(documented-unsupported)* |
+| `virtio_console` | ✓ | ✗ *(rejected fail-loud before the cmdline is built)* | ✓ | ✓ |
+| `disk_io_throttle` (per-drive I/O limit, §4.6) | ✓ *(`rate_limiter_config`)* | ✓ *(`rate_limiter`)* | ✓ *(`throttling.*`)* | ✗ *(no `--block` bandwidth/iops key — rejects fail-loud, v29)* |
+| `usb_host_passthrough` (xhci + usb-host, §2.4, v30) | ✗ *(no upstream USB)* | ✗ | ✓ *(opt-in live-validated, v30 delta 9)* | ✗ *(xhci not `Suspendable` — always `--no-usb`, §2.5)* |
+| cold boot (p50, §16) | ≈305 ms | ≈775 ms | ≈991 ms | ≈1413 ms *(the most consistent — no flake tail)* |
+| warm restore (p50, §16) | ≈53 ms | ≈27 ms | ≈475 ms *(full-memory migrate stream)* | ≈76 ms *(sparse snapshot)* |
+
+The cold-boot/restore inversion pins each backend's role: CH is the feature-complete default, cold-boot
+leader, and fully-featured snapshot tier; Firecracker cold-boots slower than CH but restores fastest,
+earning the density tier; QEMU is the slowest restorer (its restore streams the full memory image via
+`migrate-incoming`), the fallback for the awkward cases, and the most-proven nester; crosvm (v29) is the
+slowest cold-booter but the most *consistent* (in-kernel vsock, no external-daemon flake) with a fast
+sub-100 ms sparse-snapshot restore — the flake-averse single-lineage tier.
+The orchestrator reads roles off `capabilities()`; the test/bench matrix **skips — never fails** — a
+scenario a backend can't run (§15.4).
+
+---
+## 3. The control plane: vsock, the host clients, and the steward
+
+The control plane is the one seam the host and guest share: a framed `postcard` `Message` enum over
+virtio-vsock, a host `StewardClient` for one-shot request/response, a host `SessionMux` for persistent
+interactive sessions, and the in-guest **steward** — PID 1 under the default placement, a service
+under somebody else's init when so declared (§3.5). The serial console is wired to a per-VM log for
+panic capture; SSH is a human-only debugging fallback, never the control plane.
+
+### 3.1 The wire protocol
+
+The shared crate `vmcell-protocol` defines a small length-prefixed, `serde`+`postcard`-framed message enum
+— the **only** code shared between the host and the steward:
+
+```rust
+#[non_exhaustive]
+pub enum Message {
+    // indices 0–7 — the one-shot control plane:
+    Ready, Exec(ExecRequest), Stdout(Vec<u8>), Stderr(Vec<u8>), Exit(i32), PutFile { .. },
+    Resync { unix_secs: u64, unix_nanos: u32, mac: Option<[u8; 6]>, ipv4: Option<Ipv4Reconfig> }, // host→guest, §8.2
+    ResyncAck { clock_error: Option<String>, reseed_applied: bool, mac_applied: bool, ip_applied: bool }, // guest→host
+    // indices 8–15 — the append-only session layer (§3.3), each frame keyed by SessionId:
+    OpenSession  { session: SessionId, spec: SessionSpec }, // 8  host→guest: start a PTY or pipe session
+    Stdin        { session: SessionId, data: Vec<u8> },     // 9  host→guest: feed a running session's stdin
+    StdinEof     { session: SessionId },                    // 10 host→guest: close stdin (pipe: child sees EOF)
+    Winsize      { session: SessionId, rows: u16, cols: u16 }, // 11 host→guest: resize a PTY (SIGWINCH)
+    CloseSession { session: SessionId },                    // 12 host→guest: kill the session's process group
+    SessionStdout{ session: SessionId, data: Vec<u8> },     // 13 guest→host: stdout / merged PTY output
+    SessionStderr{ session: SessionId, data: Vec<u8> },     // 14 guest→host: stderr (pipe sessions only)
+    SessionExit  { session: SessionId, code: i32 },         // 15 guest→host: terminal frame for a session
+}
+pub struct SessionId(pub u64);                        // Copy/Ord/Hash; monotonic per host connection
+pub struct PtyConfig { pub rows: u16, pub cols: u16 } // initial window size for a PTY session
+pub struct SessionSpec { pub command: ExecRequest, pub pty: Option<PtyConfig> } // reuses ExecRequest (§3.3)
+```
+
+**The append-only law.** `postcard` encodes a variant by its zero-based declaration index, so the
+declaration order *is* the wire format: new variants are **appended** (never reordered or removed), the
+one-shot indices 0–7 keep their bytes exactly, and a KVM-free **discriminant-stability** test pins each
+appended variant to its index. The same discipline applies to fields: `Ipv4Reconfig { addr: [u8; 4],
+prefix_len: u8, gateway: [u8; 4] }` carries the rotated `/30` as verbatim octets — endianness-free on the
+wire — and was appended after `mac`/`mac_applied` because `postcard` field order is wire-relevant.
+
+There is **no `Hello`, no `Ping`** — a dead variant and a no-op variant are both the "dead protocol
+advertised as live" smell the review rubric bans; `#[non_exhaustive]` makes re-adding either non-breaking
+if a real use appears. Every variant is live: the guest sends `Ready` as the **first frame** after
+`accept`, and the host blocks for it — this is the handshake the restore path re-runs; the
+`Resync`/`ResyncAck` pair carries the one-shot post-restore state refresh natively (§8.2), replacing what
+were three subprocess `exec`s. Frames are bounded (`MAX_FRAME_BYTES` = 16 MiB, defined once, enforced on
+both encode and decode); the default per-exec timeout is 10 s (`DEFAULT_EXEC_TIMEOUT`).
+
+The one-shot `Exec` deliberately stays **id-less** — a host that wants multiplexing uses the session API
+on a *separate* connection (§3.2), so the heavily-tested one-shot frames are untouched.
+
+### 3.2 The host side: `StewardClient` and `SessionMux`
+
+```rust
+impl StewardClient {
+    pub async fn connect(vsock_path: &Path, port: u32, timeout: Duration, timeouts: &Timeouts, serial_log: &dyn SerialLog) -> Result<Self>;
+    pub async fn reconnect(&mut self, vsock_path: &Path, port: u32, timeout: Duration, timeouts: &Timeouts, serial_log: &dyn SerialLog) -> Result<()>;
+    pub async fn exec(&mut self, cmd: ExecRequest) -> Result<ExecOutcome>;
+    pub async fn put_file(&mut self, dst: &str, bytes: &[u8], timeout: Option<Duration>) -> Result<()>;
+    pub async fn resync(&mut self, unix_secs: u64, unix_nanos: u32, mac: Option<[u8; 6]>, ipv4: Option<Ipv4Reconfig>) -> Result<ResyncOutcome>;
+}
+```
+
+`connect` and `reconnect` take the **identical parameter order** — deliberately, so the two can never be
+transposed at a call site. `timeouts` is the per-VM `Timeouts` knob set (§9.4): the retry backoff starts
+at `connect_backoff_floor`, caps at `connect_backoff_cap`, and resets to the floor once the UDS connects;
+the `OK` handshake line is read under a per-byte `connect_ok_read` deadline.
+
+`connect` opens the host-side vsock endpoint and performs the **readiness handshake**, retrying with
+backoff until the guest is listening and has sent `Ready`, OR a timeout elapses, OR the serial log shows a
+kernel panic (fail fast). The common transport is a host AF_UNIX socket with the Firecracker-style
+hybrid-vsock handshake (the host writes `CONNECT <port>\n`, expects `OK <port>\n`) — CH, Firecracker, and
+QEMU's default external `vhost-device-vsock` daemon. A snapshot-eligible QEMU on the in-kernel
+`vhost-vsock` transport (§2.4) is the one exception: the host dials the guest directly on the **AF_VSOCK**
+namespace by CID, with no bridge and thus no `CONNECT/OK` prologue (the guest's first frame is already
+`Ready`). Each `VmInstance` reports a `VsockEndpoint` (`Unix{path,port}` or `Vsock{cid,port}`) that selects
+the connect branch through the **one** `connect_framed` law; the framed protocol after `Ready` is
+byte-identical, so a single concrete `ControlStream` enum keeps `StewardClient`/`SessionMux` non-generic.
+**Three traps live at this interface** — each presents as "a mysterious timeout" (law C2):
+
+1. The `OK` line must be read **byte-by-byte, never with a buffered reader** — a `BufReader` pre-fetches
+   and then discards the first framed payload.
+2. `reconnect` after a snapshot restore is **not** a no-op — the vsock device is re-created and, on CH,
+   the guest's pre-snapshot listener goes deaf (§3.4, §8.2).
+3. The client tracks a **desync flag**: a send error or a timeout marks the stream desynced, and every
+   later request fails loud until `reconnect()` restores sync, so a stale half-read frame is never
+   mistaken for the next response.
+
+`exec` runs a command, streams stdout/stderr, and returns the exit status. Its timeout is **per-request**
+(`ExecRequest.timeout`) and set long only for the builder-VM `apt`/`mmdebstrap` call — never a single
+global constant, which would force every test exec to wait minutes before failing.
+
+**`SessionMux` — the session multiplexer.** For persistent interactive sessions the host uses
+`vmcell::steward::session`, a multiplexer that owns **its own** vsock connection so it never shares a stream
+with — or interleaves one-shot and session frames against — the cached `StewardClient`. It reuses the
+**one** connect/handshake helper `StewardClient` uses (the byte-by-byte `OK` line + `Ready`), refactored
+into a shared `connect_framed(...)` so the fragile handshake has exactly one implementation.
+
+```rust
+pub struct SessionMux { /* write_tx to the writer task, a demux registry, reader + writer tasks, next-id */ }
+pub struct Session    { /* id, an mpsc receiver of SessionEvent, a clone of write_tx */ }
+pub enum SessionEvent { Stdout(Vec<u8>), Stderr(Vec<u8>), Exit(i32) }
+pub struct SessionSpecBuilder { /* argv → env/cwd/pty(rows,cols)/timeout → SessionSpec */ }
+
+impl SessionMux {
+    /// Connects a fresh session-multiplexing connection to the steward (same handshake as StewardClient).
+    pub async fn connect(vsock_path: &Path, port: u32, timeout: Duration, timeouts: &Timeouts,
+        serial_log: &dyn SerialLog) -> Result<Self>;
+    /// Opens a session: allocates a SessionId, registers its event channel, sends OpenSession, returns a handle.
+    pub async fn open(&self, spec: SessionSpec) -> Result<Session>;
+}
+impl Session {
+    pub fn id(&self) -> SessionId;
+    pub async fn write_stdin(&self, data: &[u8]) -> Result<()>;     // Message::Stdin
+    pub async fn close_stdin(&self) -> Result<()>;                  // Message::StdinEof
+    pub async fn resize(&self, rows: u16, cols: u16) -> Result<()>; // Message::Winsize
+    pub async fn close(&self) -> Result<()>;                        // Message::CloseSession
+    pub async fn recv(&mut self) -> Option<SessionEvent>;           // next output/exit; None once Exit consumed
+    pub async fn wait(&mut self) -> ExecOutcome;                    // drain to Exit, collecting output
+}
+```
+
+A single background **reader task** owns the read half of the connection, decodes each frame, and routes
+`SessionStdout`/`SessionStderr`/`SessionExit` to the matching session's `mpsc` sender from the demux
+registry (`SessionExit` also closes that session's channel). The registry is **closable**, and the
+reader's terminal step closes it: `open()` then checks-closed and inserts in one critical section, so a
+session opened after the reader has gone is a typed `Error::Steward`, not a handle whose `recv()` waits
+forever for a router that no longer exists. Writes from all `Session` handles + the mux go through one
+**`mpsc::UnboundedSender<Bytes>`** into a background **writer task** that is the sink's sole owner — the
+host mirror of the guest's single-writer discipline (law C4). A shared `Arc<Mutex<SplitSink>>` would
+satisfy C4 equally, and earlier revisions of this document sketched one; the channel is what shipped and
+is the better shape, because no lock is held across an await and the sink has exactly one owner rather
+than one holder at a time. It is also what the pure-sink writer task depends on.
+Dropping the `SessionMux` closes the connection, which the guest observes as the read-loop end that
+triggers connection-owns-its-sessions teardown (law C3) — so a host that forgets to `close()` still cannot
+leak guest processes. Per-session queues are **unbounded** and fed only by the *trusted host's own*
+sessions (the guest is the sandboxed workload; the host chose to open and must drain each session) — a
+deliberate, recorded trade (§17), not the untrusted-server-accumulation class the rubric flags.
+
+`MicroVm::connect_sessions(...) -> Result<SessionMux>` is the ergonomic entry: it dials a second
+control-plane connection on the same VM — at the port the declared placement names (§3.5) — and
+refuses fail-loud with the control-plane-disabled `Error::Steward` when the placement is
+`StewardPlacement::None`, exactly as `steward()` does.
+
+**Raw vsock dial (the landed v30 pass, delta 7 — FR-V3).** `MicroVm::dial_vsock(port, timeout)` opens a plain
+byte stream to an arbitrary guest vsock port — the guest process on the other end owns its own
+protocol; no framing, no `Ready`, no steward involvement:
+
+```rust
+impl<V: Vmm> MicroVm<V> {
+    /// Dials a raw byte stream to a guest AF_VSOCK listener on `port`. Independent of the guest
+    /// steward: works under a custom `init=` (the control-plane guard does not apply — the vsock
+    /// DEVICE is attached unconditionally on every backend; only the steward is absent).
+    pub async fn dial_vsock(&self, port: u32, timeout: Duration) -> Result<VsockDial>;
+}
+pub struct VsockDial(/* the crate's ControlStream */);  // AsyncRead + AsyncWrite; public newtype so
+                                                        // ControlStream stays pub(crate) and non-generic
+```
+
+Reuse discipline: the endpoint comes from `instance.vsock_endpoint()` with the port overridden, the
+socket-open goes through the existing `connect_control_stream`, the transport dispatch through the
+existing `hybrid_prologue_port` — and the fragile `CONNECT <port>`/`OK` prologue, today **inline in
+`connect_framed`**, is **extracted into one function** the framed connect and the raw dial share, so the
+handshake keeps exactly one implementation (the same one-law refactor that produced `connect_framed`
+when `SessionMux` arrived; the extraction also fixes the recorded no-backoff busy-retry on a failed
+`CONNECT` write). What the raw dial deliberately does **not** reuse is `connect_framed`'s
+retry-until-deadline loop: that loop exists to outwait a *booting steward* and folds "nobody listens" into
+a terminal `Error::Timeout`, whereas `dial_vsock` is called against a VM the caller already brought up,
+so it **interprets the transport's refusal signals** and fails fast typed — the CH/FC in-VMM muxer
+closes the hybrid stream without an `OK` line (EOF ⇒ a typed no-listener `Error::Steward` naming the
+port), an AF_VSOCK endpoint (QEMU in-kernel, crosvm — dial by `guest_cid()`) surfaces the kernel's
+connect error, and QEMU's external daemon, which accepts a `CONNECT` and never answers a dead port, runs
+out the bounded per-byte read (`Timeouts::connect_ok_read`) into a typed timeout naming the port.
+
+**Half-close does not forward on every backend.** EOF in the *guest→host* direction is portable — the
+host sees EOF when the guest half-closes or exits, on all four. The reverse is a property of each
+backend's vsock bridge, not of the dial; measured 2026-08-11 on the live matrix, five connections per
+backend (write a request, `shutdown()`, drain the guest's echo):
+
+| backend | host-side transport | reply after the host's `shutdown()` |
+| --- | --- | --- |
+| Cloud Hypervisor | in-VMM hybrid muxer over AF_UNIX | arrives — 5/5 |
+| crosvm | in-kernel AF_VSOCK, no bridge | arrives — 5/5 |
+| Firecracker | in-VMM hybrid muxer over AF_UNIX | **discarded — 0/5** |
+| QEMU | external `vhost-device-vsock` daemon over AF_UNIX | **races the teardown — 2/5** |
+
+On FC and QEMU the host's `SHUT_WR` on the bridge socket becomes a teardown of the whole vsock
+connection, dropping whatever the guest had not yet flushed, and the loss is **silent**: the host's next
+read returns `Ok(0)`, an ordinary clean EOF. The portable rule the `VsockDial` rustdoc carries (with this
+table, dated and version-anchored): treat `shutdown()` as end-of-conversation, never as an in-band
+"your turn" signal; frame the guest protocol so a reply's end is knowable without an EOF (length prefix,
+delimiter, fixed size), drain it, and only then half-close. This is **not** a `VmmCapabilities` field
+(§7.2): no operation refuses on it, and the drain-first order works identically on all four, so no
+caller is forced to branch — the flag would ship only for a caller that must branch programmatically.
+The matrix leg asserts the portable order; the two backends where half-close *does* forward are pinned
+positively by `dial_vsock_host_half_close_forwards_on_cloud_hypervisor` / `…_on_crosvm`.
+
+Two documented caveats: a *user* listener gets no
+post-restore re-bind service — only the steward re-binds after a restore re-creates the vhost-vsock
+device (§3.4), so dial afresh after a restore; and on the non-rotating backends (FC, crosvm) the
+endpoint is the baked path/CID (§2.6), exactly as the steward connect already handles. The in-guest test
+listener is a new `echo-server` guest-tools applet (`--vsock <port>` / `--tcp <addr:port>` — one applet
+also serving the §6.5 segment gates), a real listener baked into the erofs like the other applets
+(§4.4); adding it touches `rootfs_injection_manifest` *and* its pin test — the warm-cache rootfs makes
+a missed injection invisible, twice shipped as exactly that regression.
+
+### 3.3 Interactive-session wire semantics
+
+The one-shot path structurally cannot do three things the session layer exists for: **no PTY**
+(`handle_exec` wires the child to anonymous pipes and `Stdio::null()` stdin — `isatty()` false, no line
+discipline, no window size), **no stdin** (stdin deliberately points at `/dev/null` so a `cat`/heredoc
+sees immediate EOF instead of blocking on the serial console — correct for one-shot, forecloses
+interaction), and **no multiplexing** (`Stdout`/`Stderr`/`Exit` carry no id, and one exec owns the
+connection). The session layer is purely additive at the wire and does not touch the one-shot path.
+
+**No open-ack, by construction.** The host may send `Stdin`/`Winsize` immediately after `OpenSession`:
+one vsock connection is a single ordered byte stream and the guest's reader is sequential, so
+`OpenSession` is always processed before any frame the host queued after it. A failed open (bad `argv`,
+PTY-alloc failure) is reported the same way the one-shot path reports a spawn failure —
+**`SessionStderr{id, msg}` then `SessionExit{id, 127}`** — so there is exactly one terminal-frame
+convention and no separate error variant (law C5).
+
+**Timeout semantics: one field, one meaning ("a deadline, or none").** `SessionSpec` embeds `ExecRequest`
+(reuse, not a second copy of argv/env/cwd). `ExecRequest.timeout` is uniformly *an optional kill deadline;
+`None` = no deadline*. The one-shot **host** `exec()` fills `None → Some(DEFAULT_EXEC_TIMEOUT)` before
+sending (so a one-shot child always has a kill thread and cannot outlive the host's abandoned wait); the
+one-shot guest handler additionally `unwrap_or(DEFAULT)`s as belt-and-suspenders. The **session** path
+leaves `None` as `None` — an interactive session is *persistent*, so it has no kill thread unless the
+caller sets one; its lifetime is bounded instead by explicit `CloseSession`, the child exiting, or
+connection teardown. No field is read with two contradictory meanings; the one-shot default is a policy
+applied by the host before the byte leaves, not a second interpretation in the guest.
+
+### 3.4 The guest: `vmcell-steward` as PID 1
+
+Under the default placement (`StewardPlacement::Pid1`, §3.5) the steward runs as the `init=` target
+(`init=/usr/sbin/vmcell-steward`). Its PID-1 contract is larger
+than "serve the protocol," and missing any of it is painful to debug (law C1 — which is scoped to the
+`Pid1` placement; the service-mode contract is §3.5's):
+
+- **Mount** `proc`, `sys`, `devtmpfs`, **`devpts` at `/dev/pts`** (best-effort, right after `devtmpfs` —
+  it is *not* in the fatal core-mount set `{tmpfs /mnt, overlay, /proc, /dev}` — four mounts in fact,
+  not the three the in-code comment used to claim — so a failed mount fails only PTY
+  sessions, which then report `SessionExit(127)`, never the control plane), the virtio-fs tags, and the
+  **tmpfs `overlayfs`** over the read-only erofs root; bring up loopback via `netif::set_loopback_up()` —
+  the same offset-tested, `libc::ifreq`-sized (40-byte) `IfReq` + link-up path the MAC/IP rotation uses,
+  so the steward has exactly one ifreq layout (an earlier inline 18-byte ifreq was a 22-byte out-of-bounds
+  stack write in PID 1 on every boot: the kernel writes back the full 40-byte struct). The proxy CA is
+  *not* installed here — it is baked into the rootfs trust store at build time (§4.2).
+- **Zero netlink** (law C6). The guest IP is set by the kernel `ip=` boot parameter (`CONFIG_IP_PNP=y`,
+  §5.2) in both networking modes, so PID 1 does no `ip link/addr/route` at all; the restore path's
+  in-guest identity writes are device-layer ioctls in the steward's `netif` module (§8.2), not netlink.
+  Guarded *structurally*: `vmcell-steward` has no `rtnetlink` dependency, asserted by a CI
+  `cargo tree` gate — there is no netlink seam to fake because the manual bring-up an early pass added
+  was deleted, not stubbed (Appendix A, reversal 2).
+- **Reap zombies without stealing an exec'd child's exit status.** PID 1 is the universal reaper; the
+  reaper and the exec path coordinate through a shared **`ReaperCoordinator`** with **epoch-based**
+  reservation: the exec path captures `pre_spawn_epoch()` *before* `Command::spawn`, and
+  `reserve(pid, epoch)` discards only a status recorded at or before that epoch (a genuine previous
+  occupant of a reused pid), keeping a post-epoch status as the child's own for immediate delivery. This
+  closes two races: the classic false-`127` steal, and the subtler one where an instant (~1 ms) child
+  exits and is drained by the `WNOHANG` reaper *between* spawn and reserve — the pre-fix unconditional
+  wipe stranded the waiter forever, presenting as a sporadic 10 s "Agent exec timed out" that retries
+  papered over for weeks (§14). The residual misattribution window requires a full pid-space wrap within
+  microseconds.
+- **Never exit on a recoverable condition** — if PID 1 returns, the kernel panics with `Attempted to kill
+  init`. The four core mounts stay fatal; everything else is logged and continued. Two
+  such conditions were live regressions: a virtio-fs tag that is not attached (the exec-only path attaches
+  no shares, so `virtio-fs: tag … not found` must be skipped, not propagated) and a loopback ioctl failure
+  (cosmetic on the data path).
+- **Fork** the workload as a child (never `exec` into it), so the steward stays PID 1 and keeps the channel.
+- **Serve connections in a loop, re-binding after restore.** The steward serves each connection on **its own
+  thread** (a stale pre-snapshot connection whose blocking read may never EOF parks instead of wedging the
+  accept loop) and **re-`bind`s** its listener after a bounded idle period, because on CH the pre-snapshot
+  bound listener goes deaf once the vhost-vsock device is re-created (§8.2). The accept wait is
+  **event-driven**: `serve_vsock` blocks in `poll(2)` on the listener fd for `POLLIN` with the *remaining*
+  re-bind idle window as the timeout (rustix's `event` feature — no new crate; the lean-steward gate stays
+  green), so a host connect wakes the steward sub-millisecond instead of paying a mean half-interval of
+  sleep on every connect. The idle window is an `Instant`-based deadline (last accept or (re)bind +
+  `rebind_idle`), and only a *real* accept restarts it — an `EINTR`'d poll (PID 1 takes `SIGCHLD`, and
+  `poll` never auto-restarts) and a spurious `POLLIN`→`WouldBlock` wakeup re-poll with the recomputed
+  remainder without resetting the deadline, so a deaf post-restore listener still runs out the clock and
+  re-binds. `POLLERR`/`POLLHUP`/`POLLNVAL` and non-`EINTR` poll errors are logged and treated as the
+  deaf-listener case (re-bind, never exit); the poll timeout carries a 1 ms floor so a sub-ms remainder
+  cannot truncate to a busy-spinning `0`. Consequently `guest_accept_poll` paces only the bind-failure
+  retry (§5.3); the pure deadline helpers (`next_deadline`/`remaining_idle`/`poll_timeout_ms`) are
+  unit-tested red-on-inverse.
+- **Dispatch each connection non-blocking, through one writer, owning its sessions.** `serve_connection`
+  splits the accepted stream into a read half (the dispatch loop) and a `try_clone`d write half behind an
+  `Arc<Mutex<VsockStream>>` — the **single per-connection writer** every frame goes through (the initial
+  `Ready`, one-shot output, put-file/resync acks, and all session pump output), via one
+  `send_msg(writer, &msg)` that locks and calls the one `send_framed` (the sole framing law, with the
+  `MAX_FRAME_BYTES` encode-side cap). No two threads ever write the transport concurrently, so multiplexed
+  session frames never interleave-corrupt on the wire (law C4). The loop reads a frame and dispatches
+  without ever blocking on a child:
+  - `Exec`/`PutFile`/`Resync` → the existing handlers (unchanged behavior, now writing through the shared
+    writer; one-shot `Exec` is still synchronous — it drains its child to `Exit` before the loop reads
+    again, and one-shot and sessions are never mixed on one connection).
+  - `OpenSession{id, spec}` → spawn the session (below), register a `SessionHandle` in the per-connection
+    `SessionId → SessionHandle` table, and return immediately — the loop keeps reading.
+  - `Stdin{id, data}` → look up the handle and **queue** the bytes to that session's own **stdin writer
+    thread**, then keep reading. The queue is unbounded (fed only by the trusted host's own sessions — the
+    recorded trade, §17), so the `send` never blocks. The blocking write must not happen here: written
+    inline, a child that stopped reading its stdin filled the 64 KiB pipe and parked the *whole
+    connection*, so `CloseSession` was never dispatched and, on host disconnect, the dispatch loop never
+    returned — `teardown_sessions` never ran and the child outlived its connection, breaking law C3 at the
+    one moment it matters. The writer thread writes in `PIPE_BUF`-sized chunks after `poll`, re-checking a
+    `stdin_closing` flag every 100 ms so teardown's join is bounded even against a child that never
+    drains. A closed/unknown id is dropped at `debug` (the session already ended), never a desync.
+  - `StdinEof{id}` → travels through the **same queue** as the bytes, so a pipe session's write end closes
+    only after everything queued ahead of it is written (an out-of-band close truncates the child's
+    input). A no-op for a PTY session (closing the master would tear down output; a PTY caller ends input
+    with an in-band EOT or `CloseSession` — a half-closed-input refinement is §17).
+  - `Winsize{id, rows, cols}` → `tcsetwinsize(pty_master, …)` for a PTY session (delivers `SIGWINCH`); a
+    debug no-op for a pipe session.
+  - `CloseSession{id}` → `SIGKILL` the session's process group; the waiter reports the resulting
+    `SessionExit`.
+  - A guest→host variant received here means the peer desynced: log loud, close the connection.
+
+  When the loop ends for any reason (disconnect, transport error, desync), the connection **kills every
+  process group it spawned and closes its fds before returning** — its still-open sessions *and* its
+  in-flight one-shot `exec` children, both through the one `teardown_connection` helper, so nothing it
+  started outlives it (law C3). The one-shot table is the sessions table's counterpart and exists for
+  the same reason: a one-shot child used to be known only to the connection thread's own stack frame,
+  so nothing that outlives that frame could reach it. Sessions do not survive snapshot/restore either: a restored VM
+  re-binds the listener and the host reconnects on a fresh connection; the "persistent" in the feature
+  name is *within a session's life across many frames*, not across a VM restore.
+
+**Per session**, `run_session` captures the pre-spawn reaper epoch, spawns, `reserve`s the pid, and runs
+pump + waiter threads exactly like `handle_exec`, but session-tagged:
+
+- **PTY session:** `openpt(RDWR|NOCTTY|CLOEXEC)` → master; `unlockpt`/`grantpt`; open the `ptsname` slave;
+  set the initial `PtyConfig` winsize on the master. The child's `pre_exec` runs `setsid()` (new session +
+  process group, pgid == pid), `ioctl_tiocsctty(slave)` (the slave becomes the controlling terminal), then
+  `dup2` the slave onto fds 0/1/2 — the canonical `login_tty` sequence, each step an async-signal-safe raw
+  syscall via `rustix` (one `unsafe` only to borrow the raw slave fd; the master is `CLOEXEC` so it never
+  reaches the exec'd program). The parent then **closes its slave** so the master EOFs (Linux `EIO`) when
+  the child — the last slave holder — exits; one pump thread reads the master → `SessionStdout` (merged
+  stdout+stderr, one stream). In-guest `isatty(0/1/2)` is true and a host `Winsize` delivers `SIGWINCH`
+  (law C7).
+- **Pipe session:** `process_group(0)` (pgid == pid); stdin/stdout/stderr piped; two pumps →
+  `SessionStdout`/`SessionStderr`; the child's stdin pipe writer is the session's `StdinSink`.
+- **Both:** an optional kill thread iff `spec.command.timeout` is `Some` (§3.3); a waiter thread that
+  `wait_for(pid)`s the reaper, sets `has_exited`, **joins the pump(s)** so all output precedes exit
+  (law C5), sends `SessionExit{id, code}`, and removes the session from the table. Both session kinds
+  share `handle_exec`'s `child_path(base)` PATH augmentation (one law; a session that dropped the
+  guest-tools prefix reddens a unit test).
+
+Because it executes as PID 1 on an already-mounted rootfs that ships `libc6`, the steward could be
+dynamically linked against the rootfs glibc; the shipped `StewardStage` builds it as a **static-glibc
+(crt-static)** binary — self-contained, so it does not depend on the base image's dynamic loader, which is
+why the packer's `libc6` scan (§4.2) is a contract check rather than a hard runtime dependency for this
+build. A dynamic-glibc default and a static-`musl` opt-in are both possible; measured, static-`musl` is
+~6.2% *larger* than dynamic-glibc (§16), so the deciding axis is toolchain availability and
+rootfs-independence, not size.
+
+### 3.5 Steward placement and the service-mode steward (v33 — R1/R5, §18 deltas 4–5)
+
+**The reframe this section exists for: control-plane availability and init identity are two facts,
+and until v33 the tree stored them as one predicate.** `control_plane_disabled` was set from
+`cfg.init.is_some()` at both `MicroVm` construction sites, and seven of the eight places that keyed on
+`cfg.init` were asking "can I reach a steward?" and answering it with "did the caller set `init=`?" —
+only the cmdline builder's `init=` token (§5.3) is genuinely about init identity. The tree already
+contained the counter-example, deliberately: `dial_vsock` (§3.2) never copied the guard, because the
+vsock *device* is attached unconditionally on every backend, and its bypass is pinned by a test that
+drives the real transport under `control_plane_disabled: true`. v33 applies that one decision to the
+other seven sites. The price of the conflation was concrete: booting systemd — or any init system, or
+a container runtime, or a distro image as shipped — cost the entire control plane (`steward()` fails
+loud, no `exec`, no sessions, no snapshot), when nothing about a different PID 1 makes the steward
+unreachable. It also blocked vmcell's own requirements ladder: `docs/requirements.md` item 5's top
+tier ("environment perfectly matches an installed Debian flavor") is unreachable while a Debian
+flavor's own init surrenders the control plane.
+
+**The declared placement.** Where the steward runs is stated, not inferred:
+
+```rust
+// config.rs — stored resolved on VmConfig; the builder derives the default (below)
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum StewardPlacement {
+    /// The kernel starts the steward as PID 1 (`init=/usr/sbin/vmcell-steward`). The default;
+    /// byte-identical cmdline and code path to every release before v33.
+    Pid1,
+    /// The guest's own init starts the steward; the host dials `port`. `VmConfig::init` names the
+    /// init — the two facts are now stated separately.
+    Service { port: u32 },
+    /// No steward anywhere: today's `init=`-with-no-control-plane, said out loud.
+    None,
+}
+impl StewardPlacement {
+    /// Control-plane availability (law C8, first question): `Some(port)` = a steward is expected
+    /// at that vsock port; `None` = no control plane. Read by `steward()`, `connect_sessions()`,
+    /// and the control-plane health gate; none re-derives the fact from `cfg.init`.
+    pub fn steward_port(&self) -> Option<u32>;  // Pid1 => Some(STEWARD_VSOCK_PORT); Service{port} => Some(port); None => None
+    /// Post-restore-resync reachability (law C8, second question — deliberately NOT the same
+    /// predicate: `Service{5000}` and `Pid1` are indistinguishable through `steward_port()`, and
+    /// the eligibility question is about the placement, not the port). `true` only for `Pid1` in
+    /// v33 (`Service`'s post-restore reachability is unmeasured — §17). Read by `snapshot()`'s
+    /// guard and the §8.1 eligibility predicate's placement arm.
+    pub fn resync_reachable(&self) -> bool;     // matches!(self, Pid1)
+}
+```
+
+**Defaulting and validation (F1: honored or rejected at `build()`).** The builder default is derived
+for byte-compatibility — `Pid1` when `init` is `None`, `StewardPlacement::None` when `init` is `Some`
+— so every existing caller keeps its exact semantics; an explicit placement overrides the
+derivation. `build()` rejects the one contradictory pair, `Pid1` + a custom `init` (the kernel
+cannot start the steward as PID 1 if `init=` names something else), with a typed error. Everything
+else composes, including the deliberately-legal gate combination `Service{port}` + `init: None`: the
+kernel starts the steward as PID 1 *and* the host treats it as a service — the steward listens on the
+declared port either way — which is what makes R1's predicate half verifiable **before** R5's
+service-mode steward exists. The §18 delta-4 gate boots exactly this combination and asserts the
+placement field exists end-to-end, `Service` does not take the fail-loud arm, and the health gate
+**ran** for a `Service` placement; the leg that *discriminates* — the one the guard has never had —
+is `Service{port}` + a custom `init` (legal at `build()`; only `Pid1`+init is the contradiction),
+where the assertion is **refusal identity**: `steward()` must proceed to the transport and time out
+the connect budget, never return the control-plane-disabled typed error — so re-keying any site back
+onto `cfg.init.is_some()` turns that leg red on the wrong error, not merely slow. `snapshotting` requires `Pid1`: for `None` the mandatory
+post-restore resync (§8.2) is structurally unreachable, and for `Service` the post-restore question
+— does the guest's init restart the steward after the vhost-vsock device is re-created, or does the
+idle re-bind cover it? — is real and unmeasured, so it stays **rejected until measured** (§17):
+strictly narrower than the pre-v33 rejection, worse for nobody.
+
+**The re-keyed sites, mechanically.** `control_plane_disabled` becomes the derived
+`placement.steward_port().is_none()`; `steward()` / `connect_sessions()` keep their fail-loud bodies
+(the law the pinned test `steward_fails_loud_when_control_plane_disabled` protects — a placement with
+no reachable steward still returns the typed `Error::Steward` immediately, never blocking out the
+connect budget; the message re-words from the init spelling to the declared placement) and dial the
+**declared** port; `snapshot()` and the one config-only eligibility predicate
+(`clone_ineligible_feature`, §8.1) re-key their custom-init arms onto the question they were actually
+asking — *is the post-restore resync reachable* — which is `resync_reachable()`, false for every
+non-`Pid1` placement (the conservative v33 form; deliberately a **second method on the same enum**,
+because `steward_port()` cannot distinguish `Service{5000}` from `Pid1` and the two questions are
+genuinely different facts — the near-miss that made C8 a two-method law). **The control-plane health gate is the site most likely to be missed**: it
+skips `verify_control_plane` and its bounded re-spawn loop whenever `cfg.init.is_some()`, with a
+rationale that is correct for `None` (re-spawning to exhaustion against a listener that never comes
+up) and wrong for `Service` — a steward *is* coming up, and a wedged `vhost-device-vsock` bring-up is
+precisely what the probe exists to catch — so it re-keys to run whenever `steward_port()` is `Some`.
+One sizing consequence rides the re-key, and it is a **branch, not a remark**: the gate's per-attempt
+budget is tuned against `Pid1`
+time-to-ready (~0.7 s p50), and a `Service` steward arrives only after the guest's own init brings
+it up — a systemd ordering chain is slow-but-healthy, and the `Pid1`-tuned constant would tear such a
+cell down and re-boot it to exhaustion by its own health check. So the window is **selected on the
+placement**, by one predicate (`control_plane_probe_budget`): `Pid1` keeps the 4 s constant, `Service`
+gets the caller's **default** connect budget (10 s), and `None` — which never reaches the gate, since
+`start` keys it on `steward_port().is_some()` — takes the `Pid1` floor rather than a third policy
+nobody exercises. The match is exhaustive on purpose: a new placement is a compile error there, not a
+silent inheritance of another placement's window. Two narrowings of the wording this sentence used to
+carry, both deliberate: it is the **per-attempt** window, not one overall window — a re-spawn buys a
+fresh one, and the re-spawn loop exists for QEMU's placement-independent vhost-user vsock bring-up
+race, so collapsing the gate into a single window would shrink a `Service` cell's recovery to one
+attempt. And it is the *default* connect budget, spelled once as a const the two connect sites read
+too, not a **caller-supplied** window: `Timeouts` carries no connect-budget field (§9.3) and the
+caller's window is the per-call `steward(timeout)` argument, which `start()` never sees — threading one
+in would change `MicroVm::start`'s signature on a ledgered contract crate to move a bound the default
+already sizes correctly.
+The pre-v33 tree spelled this predicate **three ways** (raw `cfg.init` in `start()`, the retained
+`control_plane_disabled` field, and `cfg.init` again inside the eligibility predicate), all
+accidentally equivalent; law C8 makes the one method the only spelling, with a source-scan gate on
+the call sites — the completeness-audit lesson that a gate on the extracted predicate is not a gate
+on the claim.
+
+**The port is one shared constant, at last.** `STEWARD_VSOCK_PORT = 5000` moves to `vmcell-protocol` —
+the one crate host and guest already share — retiring the host const's "its mirror on the other side
+of the boundary" doc and the guest's private duplicate; both sides re-export it. A non-default
+`Service` port travels on the existing trusted channel: the cmdline builder emits
+`vmcell_steward_port=<port>` (a `vmcell_`-prefixed token, already reserved against caller spoofing by
+F3's prefix rule), and the steward parses it from `/proc/cmdline` clamped and untrusted like its
+sibling tokens — in **both** modes, since a service-mode steward can read `/proc/cmdline` too.
+`build()` validates the declared port (F1: non-zero, not `u32::MAX` — the AF_VSOCK reserved
+values), and the guest's parse of the token is deliberately **not** silently-forgiving the way the
+tuning tokens are: a garbage `vmcell_steward_port` falling back to the default would leave the host
+dialing one port and the steward bound to another — a mismatch that surfaces only as the health
+gate's loud failure — so the token parse is strict-or-default-with-a-logged-warning and the
+mismatch case is exactly what the health gate exists to catch (stated so the failure reads as the
+diagnosis, not a mystery timeout). No
+token is emitted for the default port; a `Pid1` cell's cmdline is byte-identical to v32's.
+
+**The steward as a library (R5).** The crate's own manifest has claimed the split ("a library … plus
+the thin binary that drives it") while `main.rs` carried 2,867 lines of mounts, vsock serving, exec,
+sessions, and power-off policy against a 1,604-line library (the reaper coordinator *plus* the
+961-line `netif` module — not the 643 lines the requester's sizing assumed). v33 completes the
+split: the library grows the whole steward behind named parameterizations, and `main.rs` shrinks to
+what `daemon-bin`-style wrappers are — read `/proc/cmdline`, install the subscriber, call `run`:
+
+```rust
+// vmcell-steward/src/lib.rs — sketch; names advisory, behavior + gates bind (§18 conventions)
+pub struct StewardOptions {
+    pub placement: GuestPlacement,   // Pid1 | Service — filesystem assembly is implied by Pid1
+                                     //   (no separate toggle: no consumer needs Pid1-sans-assembly,
+                                     //   and an unmotivated parameter is an untested arm)
+    pub vsock_port: u32,             // default vmcell_protocol::STEWARD_VSOCK_PORT
+    pub tools_dir: PathBuf,          // default /vmcell-tools (the handler mount point, §10.5)
+    pub tuning: Tuning,              // accept_poll / rebind_idle; the BINARY parses /proc/cmdline
+    pub on_sigterm: SigtermPolicy,   // PowerOff (Pid1) | Shutdown (Service)
+    pub max_reaped_statuses: usize,  // DEFAULT_MAX_REAPED_STATUSES
+    pub tracing: TracingSetup,       // Install | AlreadyInstalled — a service under a journal, or a
+                                     //   host-side unit test, must be able to decline the global subscriber
+}
+/// Sets PR_SET_CHILD_SUBREAPER under `Service`, and does not under `Pid1`.
+pub fn run(opts: StewardOptions) -> Result<()>;
+```
+
+The binary selects its mode by **`getpid() == 1`** — unforgeable, flagless, and correct in every
+context that matters (a kernel-started steward is pid 1; a systemd- or mini-init-started one is not).
+Two decisions about the split itself, recorded so neither reads as an omission: **`StewardOptions`
+is in-guest surface, deliberately *not* §10.4 downstream contract** — no out-of-repo consumer links
+the steward library (consumers place the *binary*), so the semver-checks scope stays the two
+contract crates and the requester's "join the contract list" ask is answered by this recorded
+decline rather than silence; and **the split itself gets a structural pin**, because the requester's
+named hazard — a library/binary split drifting back into a binary one convenience at a time, with
+nothing noticing because the in-tree binary keeps compiling — is real and per-crate dependency
+gates cannot see a lib/bin boundary inside one crate: a source-scan gate (the
+`virtiofs_pacing_gate` idiom) asserts `main.rs` stays the thin wrapper (no items beyond `main()`
+and the cmdline-parse/tracing-install/getpid shim; red-on-inverse by planting a stray `fn`).
+The per-mode differences, each a parameter rather than a fork of the code:
+
+- **Filesystem assembly** (the tmpfs/overlay/`pivot_root` sequence, §3.4) runs only under `Pid1` —
+  in service mode somebody else assembled the filesystem, and re-running `pivot_root` would be
+  destructive. The fatal-mount policy is `Pid1`-scoped with it.
+- **`PR_SET_CHILD_SUBREAPER` is set under `Service`, and this is the regression that would otherwise
+  be silent.** As pid 1 the steward needs no subreaper bit — every orphan reparents to it by
+  definition. As a service it does: without the bit a double-forking payload reparents to the real
+  init, which reaps it, and the steward's `wait_for(pid)` blocks on a status that will never be
+  recorded — the host sees a hung `exec`, not an error. The reservation/epoch machinery (the
+  false-127 guard, no-`child.wait()` rule) is pid-reuse correctness for children the steward spawned
+  *itself* and carries into service mode intact; `DEFAULT_MAX_REAPED_STATUSES`' orphan bound is
+  dead weight without the subreaper bit and load-bearing again with it — its necessity is a function
+  of placement, which is exactly why placement is a parameter.
+- **SIGTERM policy.** As pid 1, any SIGTERM powers off the guest — exactly right. As a service it
+  would mean `systemctl stop vmcell-steward` powers off the machine and `restart` never returns, so
+  `Service` maps SIGTERM to a graceful shutdown: stop accepting, sweep every live connection's process
+  groups per law C3 — its sessions **and** its in-flight one-shot `exec` children, since the steward
+  *exits* here and an exit that leaves a `sleep 600` running under the real init is exactly the residue
+  C3 forbids — then exit, an exit that is legal precisely because the steward is *not* pid 1 there.
+- **What does not vary:** the wire protocol (`Ready` stays the first frame of every accepted
+  connection; the framing, session, and resync semantics are placement-blind), the credential
+  posture (no uid/gid syscalls anywhere in the crate), the single-writer discipline (C4), the
+  `child_path` tools-dir prepend, and the lean-steward dependency boundary — the library split must
+  keep `cargo tree -e no-dev` free of `tokio`/`hyper`/`rtnetlink`, which is a structural per-member
+  gate, not an aspiration.
+
+**The mini-init applet — vmcell's own gate infrastructure, defended.** Live-validating `Service`
+needs an init that starts the steward as a child, and neither the pinned minimal base (no systemd
+binary at all — verified against the cached layer) nor CI can supply one. So `vmcell-guest-tools`
+gains a **`mini-init`** applet: mount the fatal core set (`/proc`, `/sys`, `/dev`, `/dev/pts`, a
+tmpfs `/tmp`), spawn `/usr/sbin/vmcell-steward` as a child, reap everything forever, and — like the
+real init it stands in for (`Restart=` is what systemd would do) — **restart the steward whenever
+it exits**, with a bounded rapid-failure cap that powers the guest off fail-loud instead of
+crash-looping silently. The restart is what makes the service SIGTERM leg satisfiable at all:
+SIGTERM → the steward sweeps every live connection's process groups per law C3, sessions and
+in-flight one-shot `exec` children alike (the pgroup-residue assertions run on
+this path — the service shutdown's C3 leg, otherwise ungated) → clean exit → mini-init restarts it
+→ the guest stays up and the next `exec` works. Against the generality directive this is the `usbhost`-fragment /
+IKCONFIG-example defense (law G1): a placement capability must be live-validated (AGENTS rule 5),
+live validation requires an init that is not the steward, and this is the smallest generic one — it
+carries no consumer content and is the shape any consumer testing an init-less payload copies.
+The full-systemd leg — a registered `debian-systemd` artifact booting real systemd as PID 1 with the
+steward a unit — is the §18 delta-9 proof cell, opt-in like `test-crosvm` because it needs a pulled
+full-Debian image. Adding an applet touches `GUEST_TOOLS_APPLETS`, the injection manifest, and their
+pin tests, and **means nothing to a live suite until the rootfs is rebuilt with
+`--kernel-source host-make`** — the recorded operational trap, restated here because it has already
+cost a full suite run once.
+
+**What must not regress**, each carried as a named gate in the §18 deltas: the fail-loud law
+(placement `None` answers `steward()` typed-immediately — and now has the negative case it never had,
+since `Service` must *not* take that arm; the amendment strengthens the law by giving the guard its
+first chance to discriminate rather than merely fire); `dial_vsock` stays unkeyed with its gate
+verbatim; the `init=` cmdline site stays keyed on init identity (the one site that genuinely is);
+`Pid1` + `init: None` emits a byte-identical cmdline and takes the identical code path everywhere
+(the pay-for-what-you-use floor: a cell that never names a placement cannot tell v33 landed).
+
+---
+## 4. Storage: root filesystem, disks, and shared directories
+
+### 4.1 The erofs read-only base + tmpfs overlay
+
+The rootfs is a **single read-only erofs image over `virtio-blk`**, shared by all concurrent VMs with
+**no per-VM copy**; per-VM writes go to a **tmpfs `overlayfs` upper** the steward mounts at boot (§3.4). One
+artifact serves every path — cold boot, concurrent shared mounts, and the snapshot tier — because erofs
+over virtio-blk is read-only, shareable, and snapshot-eligible (a plain block device, not vhost-user).
+erofs has **no journal**, which removes two failure modes an earlier ext4-clone-per-VM design hit:
+journal-recovery panics on read-only mounts, and concurrent-mount corruption. It is also a density lever:
+the host page cache holds a single copy of the image for all concurrent guests (§8.3).
+
+If a writable *disk* overlay is ever needed (rare, given the tmpfs overlay), use reflink/qcow2-backing
+rather than a full copy — minding that `FICLONE` reflink works on **XFS or Btrfs**, not ext4, where it
+silently degrades to a full copy. Using virtio-fs as an overlayfs lowerdir is a known sharp edge (needs
+redirect_dir/metacopy) and is avoided — another reason the RO base is erofs, not a virtio-fs mount.
+
+`RootfsSource` has two variants: `Erofs { image }` (the default above) and `Block { image, overlay }` (an
+ext4 fallback for which the cmdline builder auto-emits `rootflags=noload`, §5.3). A `VirtioFs { dir }`
+rootfs variant existed with no consumer and was removed by the v28 pass (its delta 5 — landed;
+implementation-notes.md records it was more woven than the delta's premise claimed).
+
+### 4.2 Rootfs sources and the one packer
+
+There are two rootfs sources, living in two crates: the host-native **OCI bootstrap** in `vmcell`
+(`RootfsStage`), and the full-apt in-VM **`mmdebstrap`** builder in the extracted `vmcell-rootfs-builder`
+crate (§9.1). Both are `vmcell::artifact::Stage` impls, both produce a merged rootfs **tar**, and both
+converge on the *one* shared inject+pack tail owned by `vmcell` (`pack_erofs_with_injection`, §4.3): inject
+`vmcell-steward` + the proxy CA + the `vmcell-guest-tools` helper + the tmpfs/overlay scaffolding
+(injected **after** the source merge, so injected files win any layer collision or whiteout), then stream
+the tree through `am-fs-erofs` in memory. The in-process `tar2erofs`/`oci2erofs` writer is the **only**
+wired erofs path — the designed `mkfs.erofs` shell fallback is unimplemented (§17), so a missing input is
+a hard `Error::Artifact`, never a silent fallback. The in-memory pack avoids creating device nodes or
+root-owned files on the host, so it runs **unprivileged**. Tar **hardlink** entries are materialized — the
+link path receives a full copy of the earlier target's content — and a hardlink whose target is absent
+from the merged tree or is not a regular file is a hard `Error::Artifact`, never a silent `continue` (the
+pinned Debian base ships `usr/bin/perl5.40.1` → `usr/bin/perl`, which a silent-skip packer would drop).
+
+- **Default — OCI pull (host-native, in-Rust).** Resolve a Debian base image to a **manifest digest** (pin
+  the digest, never the tag), pull manifest + config + layers with `oci-client` (no Docker/containerd),
+  verify every blob against its `sha256`, decompress each layer (`flate2`/`zstd`), and apply them honoring
+  **OCI whiteout semantics** (`.wh.<name>` deletions, `.wh..wh..opq` opaque-dir markers) to produce the
+  merged tar. The guest never sees OCI — this is OCI strictly as a *build-time source*, so direct-kernel
+  boot, snapshot/restore, and shared-RO-erofs density are unchanged.
+- **Full apt chain — `mmdebstrap` inside a builder micro-VM.** Reuse `vmcell`'s `resolve_builder_base` to
+  build a builder rootfs via the OCI source, boot it on this project's own CH stack **on the
+  privileged/tap network path with `Egress::Open`** so apt has real outbound egress (a host apt-proxy
+  fallback covers hosts without direct egress), then over the vsock steward run `apt-get install mmdebstrap`
+  followed by `mmdebstrap` against the pinned `snapshot.debian.org` timestamp — emitting the target rootfs
+  as a tar on a read-write share, which then feeds the shared pack tail. Because `mmdebstrap` runs as root
+  inside a controlled guest, apt performs the full `InRelease`/`Release.gpg` chain verification in-guest
+  (refuse-on-mismatch) against the builder base image's own `debian-archive-keyring` — an equivalent trust
+  root pinned transitively by the base-image digest, not a separately-pinned keyring file — and
+  `mmdebstrap`, `apt`, `gpg`, and the shell all leave the host entirely.
+
+The bootstrap chain is acyclic and terminates: kernel + OCI-built builder rootfs → builder VM → in-guest
+`mmdebstrap` → target tar → erofs. The OCI source needs no VM, so the recursion bottoms out there. The
+trade between the two sources is **provenance vs convenience**: the OCI digest pin is *integrity, not
+authenticity* unless a cosign/sigstore signature is also verified; the in-VM source keeps the full apt
+signing chain. Notably the size argument *inverted*: the official OCI slim base is ~34–39% **smaller**
+than an `mmdebstrap` build (it ships `dpkg path-exclude` rules stripping locale/doc/man), so the
+builder-VM source earns its keep on provenance, not size (§16; Appendix A, reversal 6).
+
+**Bring-your-own base image.** `vmcell oci2-erofs IMAGE@sha256:DIGEST -o rootfs.erofs` runs the same
+pipeline against any digest-pinned base image. Two honest constraints, enforced *by the packer* so every
+source gets them for free: it **scans the merged tar for `libc.so.6` and fails loud before packing** if
+absent (a `libc6`-less base would boot to a dead PID 1 if the steward were dynamically linked), and a
+static-`musl` steward for non-glibc bases is an explicit `--steward-musl` opt-in, never a silent fallback.
+
+**Repacking works from outside a vmcell checkout (v33, §18 delta 7 — R6).** The library half always
+did (`pack_erofs_with_injection` is public contract surface); the CLI half had exactly one hard
+checkout dependency — `GuestToolsStage` unconditionally runs
+`cargo build -p vmcell-guest-tools` against `workspace_root()`, in both its `cache_key` and its
+`run`, and unlike the steward it had no prebuilt escape hatch — plus one soft one, the staging/blob
+cache landing under the caller's own `target/` unless `$VMCELL_ARTIFACTS_DIR` says otherwise. v33
+severs both: **`--tools <path>`** is `--steward-musl`'s missing mirror (a prebuilt
+`vmcell-guest-tools` binary injected verbatim, its **content hash** folded into the cache key — F4
+rule 3, never the path string), and **`--work-dir <path>`** makes the staging directory explicit.
+Both flags are additive; their absence reproduces today's behavior exactly. The consumer-position
+gate this closes is real: the example workspace's `oci2-erofs` legs exercised only the fail-fast
+argument boundaries — **no rootfs had ever been packed from the consumer's position in CI** (the
+script's own header says so honestly) — and the delta's gate is a pack that succeeds from a
+non-checkout directory with `--tools` + `--steward-musl`, with the red half being the same run without
+`--tools` failing loud naming `vmcell-guest-tools`, never silently producing an image with no
+applets. The registered-handler route (§10.5) is the durable form of the same severance — a digest,
+not a per-run path; `--tools` is the *override* shape (R7's distinction, §10.5).
+
+**Downstream extra files (the landed v30 pass, delta 6 — FR-V4).** A caller composes its own content into the image
+at pack time — daemons, CLIs, test fixtures — so the image stays the artifact and per-boot `put_file`
+pushes disappear from the hot path:
+
+```rust
+pub struct ExtraFile { pub dest: String, pub src: PathBuf, pub mode: u32 }  // regular files only (v1)
+// vmcell oci2-erofs … --inject dest=/usr/local/bin/acme-daemon,src=./acme,mode=0755   (repeatable)
+```
+
+The parameter threads through the **one** inject+pack tail — `pack_erofs_with_injection` gains
+`extra: &[ExtraFile]` — so both rootfs sources (and any third-party `Stage`, §4.3) get it identically;
+the CLI flag reaches it as a new `RootfsStage` field (the CLI is not a direct packer caller — it
+assembles a `Pipeline`). Semantics, in the packer's own terms: extra files are inserted into the merged
+tree **after** the layer merge (like vmcell's own injections, they win base-image collisions and
+whiteouts — deliberate composition) and **before** the unconditional vmcell injections. Today the
+injection tail has *no* collision handling at all (`entries.insert` is last-wins, and an injected
+symlink would silently clobber a same-dest injected file); extra files make that unacceptable, so the
+tail gains one predicate — **`is_reserved_injection_path(dest)`**, listing exactly the vmcell-owned
+dests (`usr/sbin/vmcell-steward`, the two CA trust-store paths, `vmcell-tools/` and everything
+under it) — and a dest that hits it, or duplicates another extra file, is a build-time
+`Error::Artifact`, never a silent overwrite (one law; the vmcell injections stay unconditional and
+authoritative). Validation: `dest` absolute, UTF-8, no trailing slash; `mode` is honored **explicitly**
+(extra files do not inherit the `injected_file_mode` bin/sbin heuristic — the caller said what they
+meant); missing parents are synthesized `0o755 root:root` exactly as the packer already does; uid/gid 0,
+mtime 0 (the deterministic-emission discipline, §10.3). Symlinks and xattrs stay out of v1 — consistent
+with the recorded PAX-xattr limitation — and the whole tail buffers in memory, so very large extra
+files cost peak RSS (recorded; the alternative for bulk data remains an extra virtio-blk image, §4.6).
+**Cache identity:** `fold_rootfs_injection_identity` folds each extra file as
+`(dest, mode, content-hash)` in sorted-dest order — content that travels, never the `src` path (F4 rule
+3) — and both source stages bump their `STAGE_VERSION` (the recorded v20 precedent: an identity-fold
+change without the bump serves stale images). Gates: KVM-free injection-layer tests (files + modes
+present in the merged tree; reserved-dest and duplicate-dest reject red-on-inverse; the `--inject`
+parser), a cache-key test (content change re-packs), and a live matrix leg that boots an image with an
+injected marker and `cat`s + `stat`s it back **in-guest** before the first exec — the data-plane form of
+FR-V4's acceptance criteria.
+
+### 4.3 The rootfs-construction contract (third-party sources)
+
+A rootfs builder is any `vmcell::artifact::Stage` that produces the merged rootfs tree; this contract lets
+a third party add an alternative source (a different distro bootstrap, a Nix closure, a company-internal
+base) without forking `vmcell`. Three obligations:
+
+1. **Consume seed artifacts from `vmcell`, never re-derive them.** The stage reads from `StageInputs`
+   (§10.2): the `kernel` vmlinux path (required for any source that boots a builder micro-VM; host-native
+   sources ignore it); the injected `steward` / `guest_tools` binaries and the deployment CA (a builder
+   never bakes these itself — obligation 3 — it only needs their content hashes for its cache key); and
+   **resolved pins** flowed from Stage 0 (the builder-base image@digest via `resolve_builder_base`, the
+   `debian_snapshot_timestamp`, any source-specific pin). Pins arrive as data; a builder that reaches for a
+   tag or a live network resolution violates the pin law (§10.2).
+2. **Produce a merged rootfs TAR** — the same interchange the first-party sources emit: a single tar of
+   the complete userland, with OCI whiteout / hardlink semantics already resolved into a flat tree. The
+   builder's output *is* that tar; it stops there.
+3. **Emit the final erofs by calling the shared `pack_erofs_with_injection` — this step belongs to the
+   system, not the builder.** Routing every source through the one injection+pack tail guarantees each
+   rootfs is *identically* injected — a builder that hand-rolled its own erofs could bake a stale steward or
+   skip the CA and silently break the handshake or the guest trust chain. The `libc6` scan, the
+   `--steward-musl` opt-in, and the downstream extra-files parameter with its reserved-path collision
+   guard (v30, §4.2) apply to every source for free.
+
+**Cache-key discipline** (§10.2 rule 3): the builder's `cache_key` is a `blake3` fold of content and
+identity that travel — the seed-kernel content, the builder-base image@digest, the snapshot timestamp, the
+baked-CA content, and the steward source closure plus the guest-tools content — never local
+`PathBuf`s. Re-pointing any of these invalidates the rootfs. Validity is content-addressed (hash the
+output), not existence-of-file; a tampered artifact with an intact `.cache_key` is rejected.
+
+### 4.4 The in-rootfs guest-tools helper
+
+The minimal Debian base omits `iproute2`, `curl`, and `cpu-checker` — tools a handful of integration tests
+need (the snapshot test reads the rotated MAC/IP back through them; the restore path itself is native
+in-steward and spawns nothing, §8.2). Rather than bloat the rootfs with distro packages or weaken the tests,
+the harness ships a small **Rust multicall binary, `vmcell-guest-tools`**:
+
+- `ip` — read-only interface/route/neighbour state from sysfs/procfs, plus `link set <dev> address <mac>`
+  via the `SIOCSIFHWADDR` ioctl (the same ioctl logic the steward's `netif` module performs natively on
+  restore). `ip addr`/`ip route` *write* forms are accepted as no-ops so an orchestrator `&&`-chain
+  succeeds without touching the boot-time IP.
+- `curl` — real HTTP/HTTPS via `reqwest`, honoring proxy env vars and
+  `-k`/`-L`/`--resolve`/`--max-time`/`-H`/`-X`/`-o`/`-w`/`-d`/`--data-binary`. Exit
+  codes are curl-faithful: only a 2xx tunnel establishment counts as `CONNECT` success; a blocked domain's
+  403 is printed the way curl prints it (status to stderr, body to stdout) but exits non-zero; a transport
+  failure exits 7 (`CURLE_COULDNT_CONNECT`) with the full error source chain on stderr — never an "any
+  proxy response → exit 0" probe. Its pure parsers (and its ifreq layout) are unit-tested. **It is not GNU
+  curl and the rootfs carries none**, so law F1 applies to it exactly as to a config field: every accepted
+  flag is honored or rejected at parse time — an unknown option, an unparseable `--max-time`, a
+  malformed `-H`/`--resolve`, an unsupported `--write-out` variable, a flag missing its value all fail
+  loud naming the flag. Silently ignoring `--data-binary`/`-w`/`-o` is what let a test "upload" nothing
+  and still pass.
+- `kvm-ok` — a real `/dev/kvm` probe for the nested-virt test.
+- `echo-server` — the real listener the dial and segment gates need: `--vsock <port>` or
+  `--tcp <addr>:<port>`, echoing until EOF (§3.2/§6.5). Its accept loop paces retries and caps its
+  logging, because PID 1 cannot exit and its stdout *is* the persisted serial console.
+- `mini-init` (v33, §3.5) — the smallest generic init that starts the steward as a service: mounts
+  the core set, spawns and restarts the steward, reaps, powers off on the rapid-failure cap. The
+  service-placement gate's PID 1.
+- `xattr` (v33, §4.7) — read-only `getxattr(2)`/`listxattr(2)` (`xattr get <path> <name>` printing
+  raw hex, `xattr list <path>`), the in-guest readback the xattr-policy gates assert on — real
+  syscalls, no distro packages, the same not-a-weakening posture as its siblings.
+
+Two properties keep it honest. It performs the **real** operations (genuine HTTP, real `/dev/kvm`, real
+procfs reads), so it is not a weakening of any assertion. And it is **baked into the erofs**, not
+delivered over a share: `virtiofsd` cannot enter its sandbox namespace without privilege, so a share would
+fail in the *unprivileged* suite, while the erofs root is served over virtio-blk in both modes. A
+`GuestToolsStage` builds the helper and the packer injects it with one symlink per applet — the
+`APPLETS` table and `rootfs_injection_manifest` are checked against each other, because a one-sided
+edit means a custom-`init=` boot exits 2 and panics the guest kernel; the steward prepends its dir to
+the exec `PATH`. The rootfs cache key folds the helper's content, so a helper
+change re-bakes the rootfs. Because it needs `reqwest` (→ hyper → tokio) for real HTTP, `guest-tools` is
+**not** subject to the lean-steward dependency ban — it is a *guest* binary that runs unprivileged, not part
+of the host stack (§9.7).
+
+### 4.5 Shared directories (virtio-fs)
+
+Shared directories use **virtio-fs, one `virtiofsd` per `Share`**, each on its own Unix socket, with
+`--readonly` for `ReadOnly` shares (the flag is `--readonly`, *not* `--read-only`, which aborts the
+daemon) and `--sandbox namespace`. The VMM config must set **`--memory shared=on`** for *any* virtio-fs
+share to work — without a shared guest-memory region the share does not mount at all (this
+mandatory-for-virtio-fs `shared=on` is distinct from the *opt-in* KSM `shared=off` memfd toggle, §8.3).
+
+**Share tags are caller-defined, not built-ins** (keeping the primitive general): a consumer names
+whatever mount tags it wants on each `Share`, and the guest mounts exactly those. The mechanism: for every
+`Share` in `VmConfig` the orchestrator appends a `vmcell_share=<tag>:<guest_path>:<ro|rw>` token to the
+guest kernel command line (consistent with the `ip=` pattern); the steward reads `/proc/cmdline`,
+mounts each `tag` at its `guest_path` (default `/<tag>`, overridable via `Share::with_guest_path`), and
+applies a read-only mount for `ro` shares. `config::build()` rejects a tag/`guest_path` containing
+`:`/whitespace, a non-absolute `guest_path`, or a duplicate — each with a negative test — and the steward's
+cmdline parser is unit-tested (a malformed token is dropped, never mounted read-write when the host
+declared read-only). The tags vmcell ships in its own tests/builder are `vmcell-in` (ro input),
+`vmcell-bin` (ro, shared across tests so its pages stay hot — the consumer's binaries arrive here so a new
+build does not invalidate the rootfs), and `vmcell-out` (rw output), but they are examples, not
+requirements.
+
+Two implementation subtleties:
+
+- **Subprocess supervision.** A misconfigured `virtiofsd` exits immediately, but if the orchestrator only
+  polls for the socket file, CH hangs forever waiting for the vhost-user socket — so the supervisor
+  surfaces the child's exit/stderr *and* bounds the socket-wait with a timeout.
+- **Service uid.** virtiofsd runs `--sandbox namespace` and, when started as root, drops to the invoking
+  user's `SUDO_UID`. It deliberately refuses to fall back to `nobody` (which would `EACCES` a root-owned
+  share and silently break the mount); root-with-no-usable-uid keeps privileges with a loud warning. A
+  dedicated per-share service-uid allocator is forward work (§17).
+
+**Snapshot interaction:** attaching virtiofsd (a vhost-user device) makes a VM snapshot-ineligible
+(law S1), enforced by construction — `config::build()` rejects `snapshotting` combined with any virtio-fs
+share. Read-only data needed in the snapshot tier is served as an **additional erofs/block image**
+instead, whose cost is the extra image's page cache, not guest anonymous RAM. An in-process
+`fuse-backend-rs` alternative (Appendix B) is gated behind `experiment-fuse`; it does not enforce
+read-only, so a read-only share on that backend is rejected fail-loud with a typed `Error::Unsupported` —
+never a silent write-through.
+
+### 4.6 Extra virtio-blk devices and disk-I/O throttling
+
+`BlockDevice` models one extra raw disk, mirroring `Share`'s ergonomics (`read_only(image)` /
+`read_write(image)` constructors plus `.with_io_limit(DiskIoLimit)`); `VmConfig::extra_disks` attaches
+them in order. The guest kernel enumerates them as **`/dev/vdb`, `/dev/vdc`, …** in attachment order; the
+root disk stays `/dev/vda` (the cmdline hard-codes `root=/dev/vda`). vmcell attaches the **raw** block
+device only — no partitioning, no filesystem, no mount. The guest workload owns the device; **the guest
+steward does not auto-mount extra disks and needs no change** (an unknown `/dev/vdX` is invisible to it).
+Raw exposure is zero new guest code and zero new cmdline token; if auto-mount is ever wanted, model it on
+`vmcell_share=` parsing, best-effort so a bad token never panics PID 1.
+
+**Per-backend wiring — attach *after* the root disk** so the root stays device index 0:
+
+- **Cloud Hypervisor:** push one `ChDisk { path, readonly, direct: false }` per extra disk onto
+  `ch_cfg.disks` after the rootfs arm; CH assigns `/dev/vd{a,b,c}` purely by array order. Every disk is
+  declared `image_type=Raw` **explicitly** — CH v52 auto-detects an unspecified image as raw and disables
+  sector-0 writes, a live-caught bug that also lurked on the `Block` rootfs path back when that path
+  attached the root read-write; it is read-only on every variant now (`root_device_read_only`, §4.7),
+  so only a *writable extra* disk can still meet it.
+- **QEMU:** a split-form `-drive file=…,format=raw,id=extra{i},if=none[,readonly=on],file.locking=off` +
+  `-device virtio-blk-pci,drive=extra{i}` pair per disk, after the rootfs `-drive`. No fixed device cap
+  (PCI slots).
+- **Firecracker:** `PUT /drives/extra{i}` with `is_root_device: false, is_read_only: readonly` after the
+  rootfs PUT. Each consumes one virtio-mmio slot; FC's MMIO region is finite, so a very large list
+  eventually exhausts it — surfacing fail-loud as the backend's typed API error at `create()`, never a
+  silent drop. No arbitrary numeric cap is invented in the library; the exact FC MMIO budget is a
+  backend-internal constant this codebase does not mirror.
+
+**Snapshot composition and restore path-stability.** Plain virtio-blk is **not** a vhost-user device, so
+an extra disk is snapshot-eligible — it does not enter `config_has_vhost_user_device` (law S1), pinned by
+a unit test asserting an extra disk does not flip the predicate (a false positive would wrongly disqualify
+snapshot). A block device's contents live on disk, *outside* the memory snapshot, so a writable extra disk
+carries whatever bytes it holds at restore — correct block-device semantics, not a leak. Both CH and FC
+restore devices from the **paths recorded at snapshot time**, so an extra disk's image path must be
+**stable across a restore** (not inside the deleted per-VM scratch dir) — documented on
+`VmConfig::extra_disks`; the common case (a caller-owned image at a fixed path) needs no restore-time
+rewrite.
+
+**Validation.** `build()` rejects an empty or non-absolute extra-disk image path and a duplicate image
+(two attachments of one backing file — a rw corruption footgun), each with a negative test; existence is
+*not* checked (consistent with rootfs/shares — `build()` never stats paths). All three backends boot off
+virtio-blk, so extra virtio-blk is universally supported — no new capability flag. The KVM matrix test
+attaches a marked image and reads the marker back **in-guest** off `/dev/vdb`; a snapshot variant proves
+the marker survives a restore into a fresh vmid.
+
+**Disk-I/O throttling.** `DiskIoLimit` is a `bandwidth_bytes_per_sec` and/or `iops` cap — the **portable**
+form of disk fault injection (a slow/pressured disk, to test a workload's timeout/retry/backpressure),
+because every backend has a native per-disk rate limiter, including the primary CH (unlike
+error-injection, which is QEMU-`blkdebug`-only and stays forward work, §17). `build()` rejects an
+`io_limit` that limits nothing, or any `0` cap (a `0` bucket never refills → wedged I/O). The CH and
+Firecracker token buckets share **one** conversion (`IO_LIMIT_REFILL_TIME_MS`: a bucket of `size = rate`
+refilled every 1000 ms), so they can never encode the same `DiskIoLimit` as different rates; QEMU takes
+the per-second rate directly (`-drive …,throttling.bps-total=<B>,throttling.iops-total=<N>`). Validated on
+KVM: a 1 MiB/s cap floors a 4 MiB read at ~3 s on every backend, against an un-throttled baseline in the
+same VM.
+
+### 4.7 Rootfs artifact properties: xattr policy and the ext4 producer (v33 — R6, §18 deltas 7–8)
+
+**Xattr policy is a property of the artifact, not of the packer.** The erofs packer strips every
+xattr today, with the rationale recorded at the strip site: the steward and every in-guest exec
+run as root, so file capabilities are moot — and the erofs `Node`/`XattrSpec` plumbing exists but is
+unused (`xattrs: vec![]` at all ten node-construction sites, pinned by
+`tar2erofs::pax_xattrs_are_stripped_under_the_default_policy` — which shipped as
+`test_pax_xattrs_are_not_preserved`, a recorded limitation waiting to be retired, and was renamed by
+delta 7 because it now pins the *default policy's* behavior rather than an unconditional
+drop). **That premise is true of the pinned
+minimal base and false of a full distro image.** The pinned base's single cached layer ships no
+`getcap`/`setcap`/`setfacl`/`getfacl` — nothing in it could even observe a surviving file
+capability, so the strip costs it nothing; a full Debian ships `security.capability` on real
+binaries, and an image that silently packs them away is not "`debian-latest`" — it is
+`debian-latest` with one class of behavior deleted and nothing anywhere saying so. v33 does not
+reverse the strip; it **scopes** it:
+
+- **`XattrPolicy { Strip, Preserve }`** is a per-artifact property, declared in the registry entry
+  (§10.5: `"xattrs": "preserve"`) and defaulting to `Strip` — the default artifact stays
+  byte-identical, at the same density, with the same cache key (the empty-change-folds-to-the-same-key
+  gate). The policy travels as a parameter of the **one** inject+pack tail, so every source and both
+  packers honor one law: under `Preserve`, `tar2erofs` populates each node's xattrs from the tar's
+  PAX headers through the plumbing that already exists; the ext4 tail (below) passes or filters the
+  PAX headers by the same enum. A policy change is an artifact-identity change and re-packs (the
+  fold gains the policy; `STAGE_VERSION` bumps — the recorded v20 precedent). The
+  `Feature::XattrPreserved` declaration is **derived from the policy at registry resolution** —
+  one key states the fact and the feature-manifest sidecar records the derivation; an explicit
+  `xattr_preserved` token in a vmcell-built rootfs entry's `features` map is a hard error naming
+  the derivation (both desync directions unrepresentable — the `Pid1`+init reject shape, F1), and
+  the contradictory-pair reject is a §18 delta-7 red-on-inverse leg.
+- **Both directions are gated** — the cheapest possible instance of §10.6's two-directional shape:
+  `pax_xattrs_are_stripped_under_the_default_policy` stays green for the default artifact and gains
+  the `pax_xattrs_are_preserved_under_the_preserve_policy`
+  twin asserting the same fixture xattr **survives**; the live leg packs a `Preserve` artifact from
+  a base carrying a `security.capability`, boots it, and reads the xattr back **in-guest** — via a
+  new read-only `xattr` guest-tools applet (`xattr get <path> <name>` / `xattr list <path>`,
+  printing raw hex; real `getxattr(2)`, no distro packages — the same not-a-weakening posture as
+  the other applets), with the `Strip` twin of the same base reading nothing as the negative
+  control. vmcell's own injected files (steward, CA, tools) carry no xattrs under either policy —
+  the injections stay unconditional and authoritative (F5).
+- **What R6 does not touch:** the erofs root's properties (read-only, no journal, no per-VM copy,
+  one host page cache across concurrent guests — §4.1/§8.3) and the `rootflags=noload` reasoning
+  all stand; virtiofsd still runs with no `--xattr`/`--posix-acl`/`--xattrmap`, so a *share* still
+  cannot carry a capability xattr — the artifact is the vehicle, not the mount (the requester's own
+  scratch-mount request is subsumed by the declaration route: `XattrPreserved` is a §7.4 feature
+  now, and `PosixAcl` is the recorded §17 candidate that joins the roster when its §10.6 check
+  exists — never a second mount-level descriptor vocabulary).
+
+**The ext4 producer (§18 delta 8 — separable).** `RootfsSource::Block` has been consumable by every
+backend since v22 — `rootfstype` selection and `rootflags=noload` are already emitted — but nothing
+in-tree ever *produced* an ext4 image; the only packer is tar→erofs. v33 adds a producer behind the
+same `Stage` interface, consuming the same merged-tar tail (injections, `libc6` scan, xattr policy,
+reserved-path law all inherited for free — obligation 3 of §4.3), so `Block` finally has an in-tree
+filler for the workloads that need a **POSIX-complete** root — device nodes, xattrs, ACLs, and a
+workload asserting on ext4 semantics, which is exactly what the mount-and-diff gate measures.
+**Not a writable one:** the ext4 root is attached and mounted **read-only**, like the erofs one, and
+`RootfsSource::root_device_read_only` is the one law that says so for every variant. The earlier
+pitch of "a writable, POSIX-complete root" contradicted §5.2's "mounts strictly read-only without
+journal recovery" and §18's *Migration: additive*; writability would have meant rewriting F3's
+reserved-cmdline alias law (`rw` is reserved *because* `rw` + `rootflags=noload` is silent
+corruption), growing the clone-eligibility predicate a `RootfsSource` arm, and dropping `noload` —
+and it would not even have worked under the default `Pid1` placement, where the steward
+unconditionally overlays tmpfs over `/` and every guest write lands in the tmpfs upper. The
+POSIX-completeness motivation is the one that survives, and it needs no write path.
+**The tail the producer sits behind is the general one.** `pack_rootfs_with_injection` is what every
+source calls — the OCI source included — so a registry entry declaring `format: ext4` builds end to
+end; `pack_erofs_with_injection` is the erofs-only *door* onto that tail, kept because §10.4 names it,
+and it refuses any other format by name rather than silently packing erofs (§10.4 lists both).
+Implementation avenue, ranked per §9.6 —
+**a permissive pure-Rust ext4 writer is preferred over the external tool**, and the delta directs
+evaluating the crate route first (an MIT/Apache ext4-writing crate vetted for maturity by a
+mount-and-diff conformance gate: pack, boot, compare the tree in-guest against the tar manifest —
+the same kit that validates everything else); the **validated fallback** is external
+`mkfs.ext4 -d <tarball>` — probed on this host at e2fsprogs 1.47.2: run **unprivileged**, it
+populates the image from a tar preserving root ownership, `security.capability` PAX xattrs
+(read back byte-exact), and device nodes; the one sharp edge is that **parent directories must be
+present in the tar** (no implicit synthesis — `mkfs.ext4` errors loud), which the merged tail
+already guarantees for its own synthesized parents and the delta's gate pins. The tool route is
+version-gated fail-loud (`-d <tarball>` needs e2fsprogs ≥ 1.47.1 with libarchive; the probe
+classifies the error, never silently mis-builds) and recorded as the external-tool exception it is
+(e2fsprogs is a GPL-2 *binary*, spawned, never linked — the QEMU/nft carve-out shape). Either route
+sits behind the one Stage, so graduating from tool to crate later is an implementation swap, not a
+contract change (Appendix B's substitution-experiment pattern). **The ext4 producer adds an
+artifact; it does not move the root** — the erofs default is untouched, which is exactly the
+distinction between an artifact a cell may select and a switch every cell pays for (the requester's
+own framing, preserved).
+
+---
+
+## 5. The guest kernel
+
+### 5.1 The base and the pin
+
+The guest is a minimal **Debian Trixie (13)** rootfs (§4.2) with security support to 2028; the steward
+bypasses distro init, so a larger userland does not grow the boot working set. The committed kernel is
+**Linux 6.12.104** (the Trixie-aligned 6.12 LTS line), direct-booted as a custom-minimal `vmlinux` from
+Debian kernel source. The earlier 6.12.94 bump fixed a from-scratch build break under modern toolchains:
+gcc-15 defaults to C23, where `false`/`bool` are keywords, and `drivers/firmware/efi/libstub` was compiled
+without `-std=gnu11`; every 6.12.x since carries the fix (and CH boots via PVH, never the EFI stub, so
+`CONFIG_EFI_STUB=n` is a clean alternative). The pin tracks the 6.12 LTS line's newest point release —
+6.12.94 → 6.12.104 in the 2026-08-20 dependency pass — which is a security-patch move within one line,
+not a line change; the §16 figures name the kernel they were measured on and are not restated here.
+
+A `vmlinux` reaches the artifacts dir by one of **three producers** (§5.4 is the contract each must
+satisfy). Two are lightweight bootstrap producers in `vmcell`: `KernelStage` host-`make`-compiles from
+pinned source, and `PrebuiltKernelStage` downloads a digest-pinned prebuilt `vmlinux` and verifies its
+sha256 (the bootstrap seed, §5.4). The third is the in-VM download+configure+compile builder in
+`vmcell-kernel-builder` (§9.1): it host-fetches + sha-verifies the pinned kernel *source* tarball, shares
+it read-only into a builder VM, and the guest runs `make defconfig kvm_guest.config` → append the microvm
+fragment + sorted named fragments → `make olddefconfig` → `make -j vmlinux`, then copies `vmlinux` out.
+`vmcell-cli --kernel-source prebuilt|host-make|in-vm` selects among them; all three emit the same
+direct-boot PVH `vmlinux`. **The in-VM producer is reachable only through `build-kernels`**: it boots a
+builder micro-VM, which needs an already-working `vmlinux` published under the `kernel` artifact key, and
+`vmcell build` cannot stage that seed ahead of it — the unlabelled `InVmKernelStage` answers `name()`
+with `kernel` and `out_path()` with `vmlinux`, exactly the pair `PrebuiltKernelStage` uses, so the two
+would share one `vmlinux.cache_key` sidecar and overwrite each other's key every run, making every build
+miss cache and re-run the up-to-2-hour compile. So `vmcell build --kernel-source in-vm` is a **typed
+refusal naming `build-kernels`**, not a copy of its seed staging: the obvious fix is the wrong one. The
+refusal is the first statement of pipeline assembly (nothing is printed, allocated, or downloaded before
+the flag is honored or rejected) rather than a clap-level rejection, so it is the matchable
+`Error::Unsupported` every other CLI refusal is instead of an exit-2 usage error.
+
+### 5.2 The config fragment
+
+The `microvm` fragment is **appended to** `make defconfig kvm_guest.config` — it is *not* a standalone
+config, and `kvm_guest.config` alone omits vsock, virtio-fs, and erofs and causes real boot failures
+(which failure surfaces first is order-dependent: with `kvm_guest.config` alone the boot dies at the erofs
+root-mount panic before userspace; the `EAFNOSUPPORT`-at-vsock symptom needs an intermediate config with
+erofs present but vsock absent). Everything the guest needs is built in (`=y`, no modules → no initramfs):
+
+```text
+# Transport — CH uses virtio-pci; ALSO build virtio-mmio so Firecracker runs in MMIO mode and snapshots
+CONFIG_PCI=y  CONFIG_VIRTIO=y  CONFIG_VIRTIO_PCI=y  CONFIG_VIRTIO_MMIO=y
+# Core paravirtual devices
+CONFIG_VIRTIO_BLK=y  CONFIG_VIRTIO_NET=y  CONFIG_VIRTIO_CONSOLE=y
+CONFIG_HW_RANDOM_VIRTIO=y          # virtio-rng — also feeds the snapshot entropy reseed
+CONFIG_VIRTIO_BALLOON=y            # density lever
+CONFIG_IP_PNP=y                    # guest IP via kernel `ip=` cmdline → PID 1 needs no netlink
+# vsock control plane
+CONFIG_VSOCKETS=y  CONFIG_VIRTIO_VSOCKETS=y   # (+ CONFIG_VIRTIO_VSOCKETS_COMMON)
+# virtio-fs shared dirs
+CONFIG_FUSE_FS=y  CONFIG_VIRTIO_FS=y
+# Filesystems: erofs RO root + tmpfs overlay (+ ext4 only for a block fallback)
+CONFIG_EROFS_FS=y  CONFIG_EROFS_FS_ZIP=y  CONFIG_OVERLAY_FS=y  CONFIG_TMPFS=y  CONFIG_EXT4_FS=y
+# Console / early boot / paravirt clock
+CONFIG_SERIAL_8250=y  CONFIG_SERIAL_8250_CONSOLE=y  CONFIG_DEVTMPFS=y  CONFIG_DEVTMPFS_MOUNT=y
+CONFIG_PARAVIRT=y  CONFIG_KVM_GUEST=y
+# Nested virt: guest exposes /dev/kvm to inner VMs
+CONFIG_KVM=y  CONFIG_KVM_INTEL=y   # or CONFIG_KVM_AMD=y
+CONFIG_VHOST_VSOCK=y               # HOST-side; only needed so an *inner* (L2) VM can use vsock
+```
+
+A few symbols (e.g. `CONFIG_IP_PNP`) the `kvm_guest.config` base already provides and the fragment simply
+guarantees. Three precisions: `CONFIG_VHOST_VSOCK` is host-side (the base guest control plane needs only
+`VSOCKETS` + `VIRTIO_VSOCKETS`; `VHOST_VSOCK` earns its place only for nested virt); the erofs
+decompressor config must match the packer's compressor or the mount fails — the production packer ships
+**uncompressed**, sidestepping the dependency at a size/page-cache cost; and the builder auto-emits
+`rootflags=noload` for the ext4/`Block` fallback rootfs so the ext4 driver mounts strictly read-only
+without journal recovery (recovery is a write and panics on a read-only device — erofs has no journal, so
+the default path needs no such flag).
+
+### 5.3 The kernel command line
+
+```text
+console=ttyS0 loglevel=6 random.trust_cpu=on random.trust_bootloader=on cryptomgr.notests raid=noautodetect
+root=/dev/vda rootfstype=erofs ro panic=1 init=/usr/sbin/vmcell-steward vmcell_vmid=<vmid>
+ip=10.200.<n>.2::10.200.<n>.1:255.255.255.252::eth0:off   # n = (vmid % 254) + 1 (§9.3); only when net != None
+                                          # segment members instead get 10.201.<s>.<k+1>, gateway .1,
+                                          # mask /24, derived from res.segment (v30, §6.5)
+kvm-intel.nested=0 kvm-amd.nested=0   # ALWAYS emitted in both directions (=1/=1 when nested_virt)
+vmcell_share=<tag>:<guest_path>:<ro|rw>   # one per share (§4.5)
+vmcell_accept_poll_ms=20 vmcell_rebind_idle_ms=250   # from the Timeouts profile (§9.4)
+vmcell_steward_port=<port>                # only when placement is Service{port} with a non-default
+                                          # port (§3.5, v33); never emitted on the default path
+```
+
+A single shared `config::build_kernel_cmdline` emits this for every backend (crosvm's `create` calls it
+too, §2.5) — the prior per-backend inline copies diverged (QEMU's had dropped `loglevel=` entirely, a
+≈1400→~1000 ms QEMU cold-boot bug,
+§16). Ordering and conditionals are load-bearing: `rootflags=noload` is auto-emitted only for the `Block`
+rootfs; Firecracker inserts its `noxsave` fallback (when no T2 CPU template is available) right before
+`init=`; and the nested tokens are emitted **explicitly in both directions** — `=0` on false, not omitted
+— because `-cpu host` exposes VMX unconditionally and a modern kernel defaults `nested=Y`, so omitting on
+false would silently leave nesting on.
+
+`loglevel=6` keeps the serial console attached for panic capture (`contains_panic` matches the literal
+panic markers — `Kernel panic`, `panicked at`, `panic - not syncing` — not log-level prefixes; the
+"KERN_EMERG lines" phrasing earlier revisions carried was drift) and boot diagnostics while dropping the
+voluminous `KERN_INFO` device-probe output that otherwise
+dominates cold boot — each line is a synchronous write to the byte-at-a-time 8250 UART; this was the
+single largest cold-boot lever (§16). `loglevel` is set from `VmConfig::kernel_verbosity` (default
+`Balanced`=6; `Quiet`/`Verbose`/`Debug` → 3/7/8). The leading `console=` token is likewise a per-VM knob,
+`VmConfig::console_mode` (default `Uart`→`console=ttyS0`; opt-in `VirtioConsole`→`console=hvc0`, batched
+over a virtqueue so verbose logging avoids the UART VM-exit tax — but only after virtio-pci probe, so it
+forfeits early-boot + pre-virtio panic capture; not supported on Firecracker, rejected fail-loud). The
+cmdline token and the backend's console device are both derived from `console_mode` so they cannot desync.
+
+The `vmcell_*` tuning tokens are parsed by the steward **clamped and untrusted**: `vmcell_share=` (§4.5) and
+`vmcell_accept_poll_ms=`/`vmcell_rebind_idle_ms=` (the guest re-bind cadence, from the `Timeouts` profile
+— so a profile tunes the guest with no rootfs rebuild; the guest re-clamps both into `[1, 10_000]` /
+`[20, 60_000]` ms, garbage/overflow → the compiled default). `cryptomgr.notests` skips the built-in crypto
+self-tests (≈10 ms) and `raid=noautodetect` skips the md RAID autodetect scan (≈2 ms) — the only real
+cmdline-trimmable boot work a debug-verbosity `printk`-timestamp probe found; neither touches
+virtio/vsock/erofs, `ip=` autoconfig, panic capture, or runtime crypto. The same probe **disqualified**
+the fashionable microVM trims, kept out — do not re-derive them: `i8042.nokbd`/`i8042.noaux` target a PS/2
+probe that never runs here, `pci=lastbus=0` a beyond-bus-0 scan ACPI/ECAM already constrains away,
+`tsc=reliable` a calibration kvm-clock already skips (and it carries clock-watchdog risk), and
+`no_timer_check` is auto-set under `CONFIG_KVM_GUEST=y`. `random.trust_cpu=on` avoids a possible CRNG-init
+stall on first `getrandom()`.
+
+**Append-only extra args (law F3).** `VmConfig::extra_kernel_args` are appended **last**, after every
+token above, in caller order. "Append-only" is the safety contract: an extra arg may *add* a parameter but
+never *clobber* a token vmcell owns, enforced by one predicate, `is_reserved_cmdline_arg`: the arg's key
+(text before the first `=`, or the whole bare token — with `-`/`_` **normalized on both sides**
+before the membership test, because the kernel's own parser treats them as one character in
+parameter names: the docs/81 m1 fix) must not be in `RESERVED_CMDLINE_KEYS` (`console`,
+`loglevel`, `root`, `rootfstype`, `rootflags`, `ro`, `panic`, `init`, `ip`, `kvm-intel.nested`,
+`kvm-amd.nested`, `cryptomgr.notests`, `raid`, `random.trust_cpu`, `random.trust_bootloader`, `noxsave`, plus the four owned-token **aliases** the docs/78 pass added — `rw` inverts the owned
+`ro`; `quiet`/`debug`/`ignore_loglevel` override `loglevel=`)
+and must not start with `vmcell_` (the steward *trusts* those tokens, so a caller must not be able to spoof
+one), and the token must be a single whitespace/control-free word (a space would forge a second token —
+the cmdline-injection guard; quoted values with embedded spaces are out of scope). A one-law gate builds a
+cmdline exercising every emitted token (block rootfs + networking + a share + nested) and asserts
+`is_reserved_cmdline_arg` is true for each, so the reserved set can never fall out of sync with the
+builder — add a new builder token without reserving its key and the test goes red.
+
+**The `init=` override — a genuine PID-1 replacement, and only that (v33).** `VmConfig::init`, when
+`Some`, emits `init=<custom>` in place of the fixed steward token — the **only** place either init
+token is constructed; a backend never string-builds `init=`. `build()` validates the path (absolute,
+valid UTF-8, single safe cmdline token). This is the one site in the tree that is genuinely about
+**init identity**, and it stays keyed on `cfg.init` — every other consequence a custom init used to
+carry (no `steward()`, no sessions, no snapshot, the skipped health probe) keys on the **declared
+placement** instead (§3.5), because those were always answers to "is a steward reachable?", a
+question a custom init no longer decides by itself:
+
+- Under `StewardPlacement::None`, `MicroVm::steward()` and `connect_sessions()` fail loud with a
+  typed `Error::Steward` naming the declared placement, instead of hanging for the full connect
+  timeout on a listener that will never answer — today's behavior exactly, said out loud.
+- Under `StewardPlacement::Service`, a custom init **keeps the whole control plane**: the guest's
+  own init starts the steward, the host dials the declared port, and the health probe runs (§3.5).
+- `MicroVm::start()` skips the QEMU control-plane health probe only when the placement is `None` —
+  that probe confirms the *steward's* vsock transport, and only `None` means there is no steward to
+  confirm; without the skip a placement-`None` QEMU VM would re-spawn to exhaustion.
+- `build()` rejects `snapshotting == true` with any non-`Pid1` placement — for `None` the mandatory
+  post-restore resync (which runs *through* the steward) is structurally unreachable, and for
+  `Service` its post-restore reachability is unmeasured (§3.5, §17); a restored steward-less clone
+  would be stranded on frozen identity with silently dead egress and correlated RNG, exactly the
+  trap law S2 forbids.
+
+Under `None`, `start()` still boots and returns the handle — the caller drives/observes the VM
+out-of-band: the serial log, a raw `dial_vsock` to its own listener (§3.2), a read-write extra
+virtio-blk device, a share, or networking. A custom init has no
+writable `/` under **either** root variant — the steward's tmpfs-overlay setup runs only under `Pid1`,
+and the root device is read-only for `Erofs` and `Block` alike (`root_device_read_only`, §4.7: the
+ext4 producer adds a POSIX-complete artifact, not a writable one). So a custom-init VM that needs to
+write mounts its own tmpfs, or pairs with a writable extra disk or a read-write share —
+a caller responsibility, documented on the field. Exposure: the CLI verbs bring the steward up, so
+they don't take `init=`; the daemon exposes `init` + placement over REST **for the `Service`
+placement only** (§11.5, §18 delta 10) — the recorded "no `init=` over REST" rule was scoped by its
+own rationale ("the daemon owns VMs through the control plane") and that rationale permits exactly
+the placement that keeps the control plane; placement `None` stays unexpressible over REST.
+
+### 5.4 The guest-kernel contract and the bootstrap seed
+
+Whichever producer emits it, a guest `vmlinux` must satisfy one contract so it is interchangeable — a
+third party pinning a prebuilt, or porting to a new kernel line, checks against *this*, not a producer's
+internals. **Required output: a direct-boot PVH-ELF `vmlinux`** — CH and Firecracker boot it via the PVH
+entry (never the EFI stub, never a bzImage + bootloader), so `CONFIG_PVH=y` is load-bearing. Every symbol
+below is `=y`, built in — no modules, no initramfs (the guest has no early userspace to load them):
+
+```text
+CONFIG_PVH=y                                        # PVH direct-boot entry — CH/FC boot protocol
+CONFIG_VIRTIO_PCI=y  CONFIG_VIRTIO_MMIO=y           # CH=virtio-pci, FC=virtio-mmio
+CONFIG_VIRTIO_BLK=y  CONFIG_VIRTIO_NET=y  CONFIG_VIRTIO_CONSOLE=y
+CONFIG_VSOCKETS=y  CONFIG_VIRTIO_VSOCKETS=y         # the vsock control plane (§3)
+CONFIG_FUSE_FS=y  CONFIG_VIRTIO_FS=y                # virtio-fs shared dirs (§4.5)
+CONFIG_EROFS_FS=y  CONFIG_EROFS_FS_ZIP=y            # erofs RO root — the decompressor MUST match the packer
+CONFIG_OVERLAY_FS=y  CONFIG_TMPFS=y                 # the tmpfs overlay over the RO erofs (§4.1)
+CONFIG_EXT4_FS=y                                    # the Block rootfs fallback only
+CONFIG_IP_PNP=y                                     # boot-time `ip=` autoconfig → zero netlink in PID 1
+CONFIG_KVM=y  CONFIG_KVM_INTEL=y  CONFIG_KVM_AMD=y  # nested virt: expose /dev/kvm to an inner VM
+CONFIG_HW_RANDOM_VIRTIO=y                           # virtio-rng — feeds the snapshot entropy reseed (§8.2)
+CONFIG_SERIAL_8250=y  CONFIG_SERIAL_8250_CONSOLE=y  # ttyS0 — panic/boot capture
+```
+
+Two contract clauses beyond the symbol list. **Provenance:** the source is verified against a pinned SHA
+before compile, or the prebuilt binary against a pinned sha256 — no tag fetch, no unverified download.
+**Decompressor match:** the production packer packs uncompressed, so plain `CONFIG_EROFS_FS=y` mounts it;
+the ZIP option is required only for compressed images. Because the rootfs is kernel-independent, **one
+`vmlinux` boots any erofs** and one erofs boots under any conformant `vmlinux` — the property both the
+benchmark kernel-sweep and the bootstrap seed rely on.
+
+**The seed-kernel chicken-and-egg.** The in-VM builders need a *working guest kernel* to boot the builder
+VM in which they compile a kernel or build a rootfs, so the bootstrap seed must be produced *without* an
+in-VM build — hence the two bootstrap producers. The seed is not any generic microVM kernel: it must
+already carry EROFS + FUSE/virtio-fs + VSOCK + PVH + overlay built in to boot vmcell's erofs root at all.
+**Empirical finding (validated):** a **Kata Containers** prebuilt `vmlinux.container` (Linux 6.18.35, from
+`kata-static-3.32.0-amd64.tar.zst`) boots under CH against vmcell's erofs root to PID 1 + overlay, so it
+is the pinned bootstrap seed (`kernel_prebuilt` in `pins.json`, downloaded + sha256-verified by
+`PrebuiltKernelStage`). Generic microVM kernels do **not** qualify: a Firecracker CI microVM kernel
+(tested) omits `CONFIG_EROFS_FS`/`CONFIG_FUSE_FS` and panics on the erofs root mount (`VFS: Unable to
+mount root fs`, before any userspace). Host-`make` `KernelStage` remains the guaranteed fallback seed.
+
+### 5.5 Kernel as a benchmark dimension
+
+`pins.json` carries a `kernels` registry (`<label> → {source_url, source_sha256}`) alongside the default
+kernel; `vmcell build-kernels <label>…` builds the named labels to `vmlinux-<label>` (`--all` builds
+the whole registry — the pre-v33 default, kept for the CI nightly matrix; selection-driven is the
+v33 default so a shared pins file's unselected labels tax nobody — §10.5), and `bench-vm --kernel <label>` sweeps
+the §16 suite per kernel (the erofs is kernel-independent, so one rootfs boots under any `vmlinux`). The
+same harness sweeps the perf knobs — `--profile default|low-latency|throughput`, `--kernel-verbosity`, and
+`--console uart|virtio-console` — which is how the §16 backend × preset and console × verbosity matrices
+are produced. The payoff of making kernel a dimension was *disproving* a wrong belief: an interleaved
+sweep of 6.6.143 against 6.12.94 showed the guest kernel version is **not** a material hot-path lever
+(warm restore within ~2%), settling an earlier cross-session "~2× slower" scare as host-load noise (§14).
+
+A config-variant kernel is requested as **(base label, a set of named KConfig fragments)** — e.g.
+`6.12.94 + [KASAN, LOCKDEP]` — with the pins registry mapping each fragment name to a KConfig string
+(`kernel_fragments.<NAME>`) and, as of v30 (its delta 3), each `kernels.<label>` entry optionally
+declaring `fragments: [<NAME>, …]` so the label alone fully determines the build — previously the
+fragment set was reachable only by constructing a `KernelStage` programmatically (`build-kernels` always
+passed `fragments: None`, an undocumented dead end §5.6 closes). Fragments are canonicalized to
+**sorted order** at hash time (so `[KASAN, LOCKDEP]` and `[LOCKDEP, KASAN]` resolve to the same
+artifact); a fragment named but absent from the registry is a hard `Error::Artifact` in `run()` **and
+folds a distinct missing-fragment marker in `cache_key()`** (previously it folded empty bytes, letting
+two stages that differ only in an unresolvable fragment share a key until `run()` failed); a non-zero
+`make olddefconfig` is a fail-loud `Error::Artifact`; labels build in **sorted label order** — today the
+order is sorted only as an unpinned artifact of serde_json's default `BTreeMap` backing (a transitive
+dep enabling `preserve_order` would silently change it), so the delta makes it explicit and pins it;
+and the build-time blow-up (a
+cold KASAN build is ~45–90 min) is bounded by the content-addressed cache — CI batches by label and runs
+the full matrix nightly. PREEMPT_RT is *not* a fragment (it needs an rt-patched source — a separate
+registry source), and KCOV *extraction* needs guest tooling (§17); the fragment only turns the kernel
+capability on.
+
+### 5.6 The downstream kernel toolkit (v30 — FR-V1, the P-blocking request)
+
+vmcell's first out-of-repo consumer permanently owns a guest-kernel config fragment in *its* repo and
+needs to build **and validate** kernels carrying it — with zero vmcell-source edits, no fork of
+`pins.json`, and no reliance on unpromised surface. The toolkit is the kernel-side analogue of an
+out-of-repo codec kit: vmcell ships the *mechanism* (build entry points, the conformance battery, the
+contract), never the fragment (law G1; the requester's own generality directive). It is assembled almost
+entirely from parts that already exist — the labelled-kernel registry (§5.5), the public
+`Stage`/`Pipeline`/`ResolvePinsStage` (§10.2), and the `vmcell-artifact-validator` battery (§9.1) — and
+what v30 adds is the four pieces that made the existing path *semi-public in practice*:
+
+**Build (the landed v30 deltas 1, 3).** A downstream workspace extends the pins registry through the **overlay**
+(`VMCELL_PINS`, §10.2) — adding its own `kernel_fragments.<NAME>` entries (flattened pin key:
+`kernel_fragments_<NAME>`) and a `kernels.<label>` entry carrying **all three** of `source_url`,
+`source_sha256` and `fragments: [<NAME>, …]` (a fragments-only entry is a legal registry entry — it
+declares the label for enumeration — but carries no source to build from, so `KernelStage::run`
+refuses it fail-loud naming the two **overlay** keys to add, `kernels.<label>.source_url` and
+`kernels.<label>.source_sha256`; the flattened `kernel_<label>_source_url` spelling names no key a
+pins document may carry, and pasting it into an overlay is rejected by the top-level namespace check
+§10.2 describes) — and
+builds `vmlinux-<label>` into its own
+`VMCELL_ARTIFACTS_DIR` via either entry point: the CLI (`vmcell build-kernels --pins <file>`, from a
+vmcell checkout) or, from the consumer's own harness, the library
+(`vmcell::artifact::build_labelled_kernel(label, target_dir, overlay_file)` — a thin assembler of
+`ResolvePinsStage → KernelStage` that any git-dep workspace can call. Its producer scope is the
+host-`make` one, the only compiling producer `vmcell` can name: `InVmKernelStage` lives in
+`vmcell-kernel-builder`, which depends on `vmcell`, so naming it here would invert that edge and break
+§9.1's acyclicity — the in-VM producer stays reachable through the composition root
+(`vmcell build-kernels --kernel-source in-vm`). With no in-VM producer there is no `CidAllocator` to
+inject, so the parameter is not a `&HostEnv` carrying nothing but the explicit `target_dir` +
+`overlay_file` (the latter resolving explicit-path-else-`$VMCELL_PINS`). It deliberately
+does **not** ride `ensure_test_artifacts`, which is the vmcell-workspace test bootstrap and structurally
+cannot run downstream — its fingerprint hashes the steward *source closure* out of the vmcell
+workspace tree, §10.2). The default kernel is byte-unchanged for consumers that do not opt in. Two fail-louds
+the pre-v30 tree lacked: requesting a label or fragments with `--kernel-source prebuilt` is a typed
+error (it used to drop both silently and hand back the default seed), and a labelled build reports
+which producer it used.
+
+**The resolved config is an artifact (v30 delta 3).** `make olddefconfig` silently drops any symbol
+whose dependencies are unmet — the classic way a fragment author ships a kernel that quietly lacks the
+one symbol they added. So every *compiling* producer (host-`make` `KernelStage`, `InVmKernelStage`)
+copies the post-`olddefconfig` `.config` out beside the kernel as **`vmlinux-<label>.config`**,
+content-addressed with it (the in-VM builder ships it back on the output share; today both producers
+discard it). A fragment author asserts against the *result*, not the fragment, using the tiny pure
+parser the validator crate gains (`KconfigValues::parse(&str)` → tristate lookup — mechanism, so the
+assertion itself stays downstream). The prebuilt bootstrap seed has no config to copy and ships none —
+recorded honestly; the seed is a bootstrap producer, not a fragment consumer (§5.4).
+
+**Validate (v30 delta 4).** The conformance battery already exists and already takes explicit paths:
+`vmcell_artifact_validator::validate(&ArtifactSet { kernel, rootfs }, &ValidationOptions)` runs the
+named checks (`boot.kernel_banner`, `boot.steward_ready`, `steward.exec_roundtrip`, … at `Core`, plus the
+capability-gated `Extended`/`Full` tiers) and refuses to return a green all-skipped report on a
+KVM-less host. v30 promotes it to contract surface (§10.4) and closes its one FR-relevant gap:
+**failure classification**. A kernel missing a baseline symbol used to fail `boot.kernel_banner` or
+`boot.steward_ready` with a raw serial tail; the `classify` module maps the console onto the §5.4 clause
+it breaks. `classify_serial(&str) -> Option<ContractViolation>` keys on **the emitters' real text**,
+never on a mnemonic — the four `#[non_exhaustive]` variants are `RootDeviceMissing`, `RootFsMount`,
+`VsockTransport` and `NoDirectBootKernel`, each carrying `clause()` (the §5.4 prose) and `symbols()`
+(the unconditionally-`=y` `CONFIG_*` set). Two signature corrections are load-bearing and were found
+only by reading what the emitters print: `VFS: Unable to mount root fs` is the **shared** panic of a
+missing root *device* and a missing root *filesystem*, so `ROOT_DEVICE_SIGNATURES` (which also prints
+`VFS: Cannot open root device`) is checked **first** and gets the virtio symbol set — otherwise a
+kernel built without `CONFIG_VIRTIO_BLK` is told to fix its erofs decompressor; and the vsock clause
+keys on the steward's own PID-1 lines (its boot self-check and its bind failure), because
+`EAFNOSUPPORT` reaches no serial log and the rendered errno prose also appears on an unrelated
+`AF_INET` failure. Rendering is **two** functions, chosen by whether console evidence exists — never by
+convenience: `explain_boot_failure(log, base)` when the console was captured (an empty capture is
+itself evidence: the VM ran and printed nothing ⇒ `NoDirectBootKernel`), and
+`explain_without_serial(base, why)` when there is none, which names candidate causes and keeps the
+§5.4 pointer instead of asserting a clause the evidence does not support. `checks` routes every arm
+reporting a failed `MicroVm::start` or a failed steward handshake through one of the two — three wiring
+points, not one, because a bad kernel fails in three shapes (a garbage file → `Error::VmmApi` at
+`vm.boot`, no timeout and no log; boots-but-silent → the banner budget expiring; boots-then-panics →
+`contains_panic` surfacing fast on the handshake arm). `missing_symbols(violation, &KconfigValues)`
+is the honest other half: the console says which clause broke, delta 3's resolved-config sidecar says
+which symbol `make olddefconfig` dropped, tested with `is_builtin` because `=m` is as broken as absent
+in a guest with no early userspace. The classifier is pure and red-on-inverse-tested on canned logs,
+and `validate()` against a garbage kernel file stays the cheap live red path the smoke test exercises.
+A boot failure it does *not* recognize still reports the named check, what expired, and the serial tail
+with a pointer to the §5.4 contract checklist — the residual class fails named-and-loud too, and a
+newly-understood signature grows the classifier, never the timeout path. `await_kernel_banner(path,
+budget)` computes one `tokio::time::Instant` deadline and bounds its whole loop (which is also what
+makes its failure path unit-drivable on a 50 ms budget); the steward budgets are `Duration`s that
+`connect_framed` turns into an `Instant` one layer down. `validate()` carries **`run_budget`**, which
+bounds the WHOLE run — every level, every boot, end to end — defaulting to `Some(DEFAULT_RUN_BUDGET)`;
+per-check deadlines are unchanged and each still fails loud, and this bounds their sum, so "fails
+loudly, not by hanging" now holds per battery as well as per check. Exceeded is `Error::Timeout`
+naming the budget, the level that outran it, and the checks that completed first — never a hang, and
+never a green report with its tail missing. `None` opts out explicitly, for a caller that bounds the
+run itself. It is deliberately its own constant rather than a reuse of the conformance battery's
+`DEFAULT_BATTERY_BUDGET` (§10.6): the two bound different rosters, and one const for both would
+silently re-budget one when the other's roster grew.
+
+**Kept honest by an out-of-tree example (v30 delta 5).** The pattern's proof is a small example
+workspace, **`examples/downstream-kernel/`** — its own Cargo workspace, deliberately *outside* the
+vmcell workspace, consuming `vmcell` + `vmcell-artifact-validator` the way a git-dep consumer does —
+that carries its own pins overlay and its own deliberately *non-consumer* fragment
+(`CONFIG_IKCONFIG=y` + `CONFIG_IKCONFIG_PROC=y`), builds `vmlinux-ikconfig` through the toolkit, asserts
+its symbols survived in the resolved-config sidecar, runs the validation battery, and proves the
+fragment took effect **on the data plane**: the booted guest has `/proc/config.gz` (a file that exists
+*only* if the fragment survived) and its content round-trips the very config the sidecar recorded. CI
+builds and runs it on every push (its KVM-free legs in their own job, its live leg a step of the
+integration job, both on GitHub-hosted runners — §15.4) — the toolkit
+contract cannot silently drift because its consumer-shaped user is in CI. The fragment choice is the
+point: self-proving, tiny, and owned by vmcell as *example mechanism*, not consumer content.
+
+What the toolkit deliberately does not do, with the FR's own concurrence: no **modules** pipeline
+(fragments build everything `=y`; a modules + rootfs-module-tree work item is out of scope and
+recorded), and no vmcell-shipped consumer fragments (withdrawn by the requester under the generality
+directive — the example fragment above is the mechanism's own proof, not a capability).
+
+---
+## 6. Networking and egress
+
+### 6.1 The two operating modes
+
+The harness runs in one of **two named operating modes**, and the distinction is first-class — it governs
+the network datapath, the cgroup-delegation story, how tests split into suites (§15.4), and which
+operations may degrade vs must fail loud (§7.2). The vocabulary replaces the older "rootless" wording,
+which over-implied "zero privilege":
+
+- **Unprivileged operation** — the process holds **KVM-group access only** (`/dev/kvm` via the `kvm`
+  group, granted once with `usermod -aG kvm $USER`) and **no extra Linux capabilities**. Networking is the
+  in-process smoltcp NAT; cgroup limits use whatever a `systemd-run --user` delegation provides. KVM
+  access is a *group membership*, not a capability, so "unprivileged" means "no `CAP_*`," not "no access."
+- **Privileged operation** — the process holds **`CAP_NET_ADMIN`** (tap, rtnetlink, nft/TPROXY),
+  **`CAP_SYS_ADMIN`** (per-VM netns + `setns`), and **`CAP_DAC_OVERRIDE`**. Networking is the full
+  netns+tap+`/30` path with L2 fidelity; it is the only mode eligible for the snapshot tier (law S1) and
+  the default for fidelity-sensitive tests. The caps are granted to the test binary alone via the
+  capability runner `vmcell-test-runner` (§15.5) — *not* `sudo -E cargo test` — or held by the daemon's
+  broker child (§12.4).
+
+**Why three caps, not two.** `CAP_DAC_OVERRIDE` is load-bearing: the privileged tap path could never
+create a netns without it, because `netns_rs::NetNs::new` must create `/var/run/netns/<n>`, a
+`root:root 0755` directory the dev-uid process can't write (`EPERM`). It also unblocks the benchmark-only
+sysfs/procfs knob writes (CPU-frequency pinning, KSM), since those `root:root` kernfs files honour
+`DAC_OVERRIDE` — whereas `drop_caches`, a procfs sysctl special-cased on `euid==0`, does not.
+
+**Mode selection is probed and fail-loud, not discovered mid-run.** Mode prerequisites are part of the
+start-up `HostCapabilities` probe (§7.2): a privileged run verifies the three caps and that
+`/var/run/netns` is reachable; an unprivileged run verifies KVM-group access. A requested mode whose
+prerequisites are absent errors up front with the remediation. Two host-environment caveats: (1) the
+privileged tap path needs the harness in a non-threaded `domain` cgroup scope and, for limit enforcement,
+in a delegated leaf — run it under `systemd-run --user --scope -p Delegate=yes` (§7.3); (2) modern Ubuntu
+blocks the unprivileged-userns escape hatch by default
+(`kernel.apparmor_restrict_unprivileged_userns=1`); Debian Trixie does not necessarily, so the host distro
+affects whether unprivileged mode gets off the ground. **Cleanup:** a killed privileged run can leak
+`/var/run/netns/<prefix>-net-*` (occasionally colliding with a later vmid); the `sweep_orphans()` free
+function (backed by an injectable `OrphanScanner`, reaping only non-live vmids — and, v30, non-live
+segids for the `-seg-` class (§6.5) — in netns → cgroup → scratch order) cleans these; a fully-automatic periodic sweeper is forward work (§17), though the daemon closes
+its own crash-restart case (§11.4).
+
+### 6.2 `NetConfig` and the two datapaths
+
+```rust
+#[non_exhaustive]
+pub enum NetConfig {
+    Privileged   { egress: Egress },                                  // netns + tap + /30 (CAP_NET_ADMIN)
+    Unprivileged { egress: Egress, host_services_port: Option<u16> }, // in-process smoltcp NAT (no caps)
+    Segment      { segment: NetSegmentRef },                          // shared L2 bridge domain (v30, §6.5)
+    None,
+}
+pub enum Egress { Filtered(ProxyConfig), Blocked, Open }
+```
+
+`Segment` (the landed v30 pass, delta 8 — FR-V2) joins the VM to a shared bridge domain (§6.5). It deliberately
+carries **no `egress` field and no `host_services_port`** — a segment VM's connectivity is
+segment-internal by definition in v30, so the invalid states (a MITM proxy or a NAT forward on a
+segment member) are unrepresentable rather than validated, the same move the v28 pass's delta 4 made
+for `host_services_port` (per-segment filtered egress is recorded forward work, §17). One structural
+caveat the implementer must not miss: `NetConfig` is `#[non_exhaustive]`, so the out-of-tree backends
+match it with wildcard arms and a new variant is **not** a compile error there — the fail-loud channel
+is `PerVmResources` (deliberately exhaustive): segment membership travels as a new `res.segment` field,
+which every backend must acknowledge to compile. The tap-vs-NAT question is answered on **two channels
+held in lockstep**, not one: `net_uses_tap(&NetConfig)` (`Privileged | Segment`) is the
+orchestrator/config-side predicate — exhaustive in-crate, so a new variant is a compile error there —
+while every backend keys its device wiring on `res.tap_name.is_some()`, the stronger signal, and never
+looks at `cfg.net`. That is why a `Segment` variant populating `res.tap_name`/`res.netns_name` took the
+identical tap arm with zero backend edits. Giving `build_ch_net(res)` a `cfg` it does not need would
+move the decision from the exhaustive-struct channel onto a weaker one, so instead the two are joined
+by a fail-loud post-condition run once in `setup_env`: `assert_tap_wiring_matches(net, tap_present)`
+makes a datapath that claims a tap and was handed none — or the reverse — an `Error::Network` at
+construction, not a guest with an unconfigurable `eth0` (§6.5).
+
+`host_services_port` lives **only on the `Unprivileged` variant** — the smoltcp NAT must know *which* host
+port to register as a permanent forward-port, and it is the only datapath that implements the feature, so
+the invalid state (a privileged config carrying the field) is unrepresentable. (It was previously a field
+on both variants, rejected at `build()` on the privileged one, itself a fail-loud replacement for a prior
+silent no-op; the v28 pass's delta 4 — landed — moved the field so the compiler enforces what the
+validator did. Wiring host
+services on the privileged path — a new TPROXY accept rule plus a host binding — remains forward work,
+§17, and would re-add the field there.)
+
+Egress consumption is two exhaustive-match predicates in the **orchestrator** (not `net/tap.rs`,
+which owns only the ruleset rendering): `privileged_egress_rules` →
+`PrivilegedEgressRules::{Tproxy, Blocked, NoRules}` and `nat_egress_plan` → `NatEgressPolicy` —
+the docs/81 M1 resolution (`Blocked` is **honored**: the accepts-nothing ruleset on the tap path,
+no forward port + `Deny` on the NAT path), each matching exhaustively so a future variant is a
+compile error, never a fall-through into the most permissive arm.
+`Egress::Open` — the default — selects "**no interception proxy**"; it is *not* arbitrary outbound egress.
+Connectivity under `Open` is only what the mode's datapath natively provides: the unprivileged NAT reaches
+the registered `host_services_port`/proxy forwards, and the privileged path reaches only what its TPROXY
+ruleset admits — dialing a frame's real destination / host masquerade is not implemented in either mode
+(closing the gap, by real re-origination or a typed `Unsupported`, is recorded in §17). `Open` stays the
+default because the mmdebstrap builder and the lifecycle/host-endpoint tests rely on it, and none of them
+needs arbitrary egress.
+
+**Privileged (`tap`).** A per-VM network namespace, a tap, and a `/30` on `10.200.<n>.0/30` (host `.1`,
+guest `.2`), where the third octet is `n = (vmid % 254) + 1` (§9.3), via `rtnetlink`. Full L2 fidelity;
+the default for fidelity-sensitive tests and the only network path eligible for the snapshot tier. The
+`/30` math is a pure function and unit-tested; the netlink calls and the `nft` invocation are the
+side-effecting part, behind injectable `Netlink` / `NftApplier` seams (§9.8).
+
+**Unprivileged (`userspace`).** An in-process **smoltcp** TCP/IP stack behind a `vhost-user-backend`
+vhost-user-net device — no tap, no `CAP_NET_ADMIN`. Lower-fidelity (a userspace stack), reserved for
+deployability rather than fidelity-sensitive tests, and it cannot be snapshotted (vhost-user-net, law S1).
+`passt` was the first choice for unprivileged networking but is out: smoltcp is in-process, with no
+external dependency and no LSM/seccomp entanglement, so it is the better design regardless (Appendix B,
+Exp 4; the earlier "passt is CH-incompatible via seccomp" reason was wrong — it was a host AppArmor
+af_unix rule, not passt's seccomp, and not CH-specific).
+
+**The NAT's six silent-wedge invariants.** The NAT works only if six invariants hold, and each one
+wedges the link — or corrupts a stream — *silently* (no error, just a dead connection or dropped bytes) if
+violated:
+
+1. smoltcp drops a broadcast frame whose *source* MAC equals the interface MAC, so the host NAT MAC must
+   not collide with the guest's vmid-derived MAC — pin it **outside the range `mac_math(1..=254)` can
+   emit** (backed by a unit test asserting no collision).
+2. Iterate the virtio RX descriptor chain **only when the NAT actually has packets queued** — iterating
+   `vring.iter()` consumes/advances `avail_idx`, so polling it while empty discards the guest's RX
+   buffers.
+3. Call `enable_notification()` on the TX queue inside the `handle_event` loop so the guest kicks the
+   eventfd for the next packet.
+4. Size the socket pool for concurrent *and* keep-alive connections (≈16 sockets per forwarded port), not
+   one-per-port — a single `TcpSocket` per port means an HTTP keep-alive connection holds the only slot.
+5. Bound every host-stream read to the smoltcp socket's free TX capacity
+   (`host_read_budget(send_capacity, send_queue, buf.len())`) so `send_slice` enqueues the *whole* read —
+   `send_slice` enqueues only down to zero free buffer and `can_send()` is true with one free byte, so an
+   unbounded 8 KiB read's unsent tail was silently **dropped**, corrupting any host→guest TCP stream large
+   enough to fill the guest receive window (pinned by the window-filling data-plane test
+   `tests/nat_window_fill.rs` — a >64 KiB host→guest transfer with a digest compare — which reddens on
+   the old unbounded read).
+6. The mirror rule on the **guest→host** half: the drain consumes only the **contiguous** span smoltcp's
+   `recv` closure offers. The two APIs disagree on purpose — `peek_slice` copies *across* the RX ring's
+   wrap and reports the whole queued length, while the `recv` closure's return value feeds
+   `dequeue_many_with`, which **asserts** the count fits the contiguous span. Pairing them (peek the full
+   length, then return it as consumed) panics `run_network` the moment a stream wraps the ring, i.e. on
+   any sustained upload past the ring size — and the panic is silent in the worst way: the vhost thread
+   keeps the device attached, so the guest sees a live link that never drains. The write therefore happens
+   **inside** the `recv` closure, over the slice it was handed, which makes `consumed <= span` true by
+   construction and leaves the wrapped remainder queued for the next tick. Two gates:
+   `guest_to_host_drain_consumes_only_the_contiguous_span` (KVM-free, driven through a real
+   wrap-positioned smoltcp ring) and the live `nat_window_fill_upload` (a 1 MiB guest→host upload against
+   a backpressuring host sink, digest-compared).
+
+### 6.3 Host-served endpoints
+
+A host test server is reachable from the guest and not exposed to other systems — by a different mechanism
+per mode: on the privileged tap path the guest dials the per-VM gateway address (`10.200.<n>.1`) directly,
+while on the unprivileged NAT the server's port is registered up front via `host_services_port` as a
+permanent forward-port. Per-test server config and dynamically-assigned ports are configured *after* the
+server is listening. Arbitrary TCP/UDP works; vsock is available as an alternate, IP-stack-free host↔guest
+channel.
+
+### 6.4 The transparent egress proxy
+
+A `hyper`-based MITM proxy (`hudsucker` supplies the whole MITM stack — `hyper`+`rustls`+`rcgen`). For
+HTTP it splices/logs; for HTTPS it terminates TLS with an on-the-fly cert minted by an in-memory CA
+(`rcgen`) and re-originates upstream. The CA is baked into the guest trust store at rootfs build time, so
+HTTPS interception works in both networking modes.
+
+**CA lifetime — a recorded deviation from per-run CA hygiene.** The CA is minted once **per artifacts
+dir** (default `target/vmcell-artifacts`) and cached: because the CA is baked into the *cached* rootfs, a
+per-run CA would invalidate the guest trust chain on every run. A process-global cache keyed by artifacts
+dir returns the generate-once CA and its parsed authority (re-self-signing per `authority()` call would
+break the chain).
+
+Test doubles let a caller register `(Matcher, Responder)` pairs (and, for the eval layer, a `record_to`
+cassette that logs each **forwarded** request's method+URI, one line per request — request-line logging
+only: it captures neither responses nor blocked requests, so snapshot-and-replay cassettes remain §17
+forward work). HTTPS doubles must **ignore `hyper::Method::CONNECT`** — matching on the `CONNECT` itself
+breaks the tunnel and yields a TLS "unexpected eof." The host-side interface:
+
+```rust
+impl EgressProxy {
+    pub async fn start(cfg: ProxyConfig) -> Result<Self>;             // listen, log, filter, dispatch
+    pub async fn start_transparent(cfg: ProxyConfig) -> Result<Self>; // IP_TRANSPARENT front-end (privileged)
+    pub fn ca_cert_pem(&self) -> &[u8];                               // baked into the rootfs trust store
+    pub fn requests(&self) -> RequestLog;                             // observed requests, for assertions
+    pub fn install_double(&self, matcher: Matcher, responder: Responder); // register a test double
+    pub fn record_to(&self, cassette: &Path);                         // request-line logging (replay is §17 forward work)
+}
+```
+
+`MicroVm::proxy() -> Option<&EgressProxy>` hands the running proxy to the caller so it can read the
+request log, register a double, or obtain the CA cert.
+
+The proxy *process* is mode-independent; how traffic is *steered into it* is not:
+
+- **Privileged:** an nftables **`TPROXY`** ruleset, rendered in Rust and applied via the external
+  `nft -f -` binary (no permissive pure-Rust nftables crate covers the `tproxy`/`socket` expressions,
+  §9.6). TPROXY carries the original destination *in the socket* (no conntrack lookup) and preserves the
+  source. The ruleset **drops udp/443 (QUIC)** rather than intercepting it — a deliberate choice that
+  forces clients onto HTTP/2-over-TCP so all egress stays observable through the proxy (a pure QUIC
+  datapath would be opaque).
+- **Unprivileged:** egress interception at **L4 inside the smoltcp NAT** — cleaner than a privileged
+  front-end, since there is no tap for nftables.
+
+**A documented limitation of the privileged path.** Full MITM interception (terminating TLS and
+reconstructing absolute-form requests) is implemented for the **explicit-proxy** path — a guest that sets
+`http_proxy=<gateway>:<proxy_port>` is fully MITM'd, logged, filtered, and served by doubles. The
+**transparent** redirect of a *raw* 80/443 connection currently only **constrains** egress (it can drop or
+block, and it observes the intended destination), not reconstruct and re-originate the request. Tests that
+need full MITM point the guest at the explicit proxy; the transparent path's contract is "observe/filter
+the destination," which is what the assertions check.
+
+Standing up the privileged transparent path required four host-side fixes worth knowing. Three live in
+`net::tap`: the FIB policy rule needs an explicit `AF_INET` (an `AF_UNSPEC` rule returns `EAFNOSUPPORT`);
+the local route needs `RT_SCOPE_HOST` (not `RT_SCOPE_LINK`, which returns `EINVAL`); and the ruleset must
+`accept iifname <tap> ip daddr <gateway> tcp dport <proxy_port>`. The fourth lives in the proxy itself:
+the privileged Filtered proxy's runtime thread `setns()`s into the per-VM netns to bind its listener (so
+TPROXY-redirected guest connections are deliverable), having first captured `/proc/thread-self/ns/net`,
+and **re-enters the host root netns** after binding — a socket's netns is fixed at `socket()` time, so the
+bound listener keeps receiving from the VM netns while every newly created upstream/DNS socket originates
+in the root netns and reaches real networks. Without the re-entry the upstream leg was trapped in the
+tap-`/30`-only netns and privileged Filtered egress could only ever serve doubles; a re-entry failure
+aborts proxy startup loud. (The integration test proves in-path interception via a registered double — a
+real-external-upstream assertion needs internet in CI.)
+
+### 6.5 VM-to-VM segments (`NetSegment`) — the landed v30 pass, delta 8 (FR-V2)
+
+Until v30, two vmcell VMs could not reach each other at all: each privileged VM sits alone in its own
+netns on an isolated `/30`, and neither egress datapath re-originates toward another guest. A
+**segment** is the opt-in shared L2 domain that changes that — the mechanism behind a two-kernel
+client/server test, a small cluster topology, or fault-injected link testing between real guests. It is
+privileged-capability-class only (the same three caps, probed fail-loud via `HostCapabilities`), and it
+deliberately reuses the existing tap machinery — a segment is *where the taps live*, not a new
+datapath:
+
+```rust
+// vmcell::net::segment
+pub struct NetSegment(/* Arc<SegmentInner> */);       // cheap-clone handle; RAII (below)
+pub type NetSegmentRef = NetSegment;                  // what NetConfig::Segment carries
+impl NetSegment {
+    /// Creates the segment: allocates a segment id, creates netns `<prefix>-seg-<segid>` holding
+    /// bridge `<prefix>-br-<segid>` with the gateway address, ready for members. `prefix` goes
+    /// through the SAME single validator `VmConfig::build()` uses (`validate_resource_prefix` —
+    /// one law; the F2 lockstep and IFNAMSIZ safety rest on it), rejected fail-loud.
+    pub fn new(prefix: &str, env: &HostEnv) -> Result<NetSegment>;
+    pub fn netns_path(&self) -> PathBuf;              // for a harness's own tooling (e.g. `tc netem`)
+    pub fn bridge_name(&self) -> &str;
+    pub fn gateway(&self) -> Ipv4Addr;                // 10.201.<s>.1 — the host side of the bridge
+    /// Dials a TCP listener inside a member guest from the host (FR-V3's privileged shape): the
+    /// socket is created on a dedicated thread INSIDE the segment netns — the §6.4 capture-root →
+    /// setns → socket → re-enter-root pattern — because a socket's netns is fixed at socket() time.
+    /// Bounded, typed refusal; never a hang.
+    pub async fn dial_tcp(&self, addr: SocketAddrV4, timeout: Duration) -> Result<TcpStream>;
+}
+```
+
+**Mechanism.** One **netns per segment** holding one Linux **bridge** (rtnetlink 0.21's typed
+`LinkBridge` builder — the first bridge in the tree, same `Netlink` seam, same dedicated-thread runtime
+discipline as the tap path). A member VM gets **no per-VM netns**: its tap (still `<prefix>-tap-<vmid>`,
+still `TUNSETPERSIST`'d and opened only by the VMM) is created in the *segment* netns and enslaved to
+the bridge, and the VMM child `setns`es into the segment netns through the exact `build_vmm_cmd`
+pre-exec path the per-VM netns uses — a different netns *name*, zero new spawn logic; each backend
+keys its device wiring on `res.tap_name`, kept in lockstep with the config-side `net_uses_tap(cfg)`
+predicate by `assert_tap_wiring_matches` (§6.2), so `Privileged` and `Segment` take the identical tap
+arm with no backend edit. Isolation between
+segments, and between a segment and the per-VM `/30`s, is the netns boundary itself: a third VM off the
+segment has no route, no interface, and no namespace in common with it (the negative-control gate).
+
+**Addressing — one pure function, a disjoint range.** Members share one `/24`:
+`10.201.<s>.0/24` with `s = (segid % 254) + 1` — deliberately a different `/16` from the per-VM
+`10.200.<n>.0/30`s, which fully consume their third-octet space, so the two schemes cannot collide. The
+bridge gateway is `.1`; member slot `k` (1-based, from the segment's slot free-list, freed on member
+teardown) is `.(k + 1)` — 253 members per segment, 254 segments per host. The math is
+`segment_ip_math(segid, slot)` — it takes the segid so the `s = (segid % 254) + 1` derivation is
+written once, the shape `ip_math` uses — a unit-tested sibling of `ip_math` in the same module, with
+`MAX_SEGMENT_ID` / `MAX_SEGMENT_SLOT` as public consts so the two limits are named, not inlined. The guest
+still learns its address from the kernel `ip=` token (gateway `.1`, mask `/24`) — **zero new guest
+code, zero netlink in PID 1** (law C6 untouched); the cmdline builder reads it from the new
+`res.segment: Option<SegmentMembership>` on the (exhaustive) `PerVmResources`, which is also the
+compile-time channel that forces every backend to acknowledge segments (§6.2). Guest MACs are
+`mac_math(vmid)` on **every** arm of **every** backend — vmids are host-unique, so member MACs are
+bridge-unique by the existing collision-freedom law, and the scheme stays outside the NAT's
+reserved-MAC image. That was a premise, not a fact, until delta 8 made it one: `mac_math` reached only
+the *vhost-user* arm, `build_ch_net`'s tap arm emitted `mac: None` (CH generated its own), and QEMU's
+tap arm emitted no `mac=` at all, so every QEMU guest carried QEMU's fixed default
+`52:54:00:12:34:56`. Harmless while each privileged VM owned an isolated `/30` L2 domain; a
+deterministic L2 collision for two QEMU members on one bridge. Both arms now set it, each pinned over
+the shape the process actually receives — CH's serialized `ChNet`, QEMU's *composed* argv.
+
+**Identity and lifetime.** Segment ids come from a **`SegmentIdAllocator`** on `HostEnv`
+(`env.segids`; an additive field — the bundle is documented to grow by field). It does not re-implement
+cross-process claiming: the `VmidAllocator`'s per-id lock-file + `flock`-coordinated claim/reclaim
+internals (the H1 fix) are **extracted and parameterized** (`dir`, range) so both allocators share one
+claim law — the exactly-one-winner race gate re-runs against the generalized core, red-on-inverse as
+before. The lock dir is `/tmp/vmcell-segid`: deliberately un-prefixed bare-`/tmp`, not swept — the same
+recorded cross-process-rendezvous pattern as `/tmp/vmcell-vmid`, adopted on purpose, not by accident.
+`NetSegment` is an `Arc`-backed handle; **every member `MicroVm` holds a clone**, and the netns/bridge
+are deleted when the last holder drops. That makes the "never delete a netns under a live VMM" hazard
+(§1.4 step 7) *structural*: a member's teardown — VMM process group first, then its slot released back
+to the segment, through the same ordered helper as every other resource (law L1; `EnvSetup`'s error
+path included) — necessarily precedes the segment's netns removal, because the member holds the Arc.
+Member teardown never touches the netns; segment teardown owns it.
+
+**Sweep.** `<prefix>-seg-<segid>` joins `vmcell::naming` as a composer + sweep-filter pair (law F2
+extended: one prefix names and sweeps every per-VM *and per-segment* resource; the
+starts-with-its-filter pin gains the new class). The orphan sweep gets the class with its **own live-id
+space**: `sweep_orphans` takes live *segids* alongside live vmids — the existing `trailing_vmid` key
+would otherwise liveness-check a leaked segment netns against the wrong id space. The daemon's start-up
+sweep passes both sets empty, so a hard-killed process's segments are reclaimed exactly like its VMs.
+The **two netns sweep filters are distinct stems** (`<prefix>-net-` and `<prefix>-seg-`), and each
+class must be swept explicitly: a filter is a literal `starts_with`, so `vmcell-seg-1` matched neither
+the test-start sweeper nor the daemon start-up sweep while both passed only the per-VM stem — a leaked
+segment netns was reaped by nothing, and an aborted run poisoned that segid forever. `clean_vmcell_netns`
+and `HostOrphanScanner` now iterate **both** composers, and `naming`'s pin asserts each class's names
+start with its own filter *and* not with the other's.
+
+**Fault injection (`tc netem`).** v30 exposes the *names*, not a typed API: `netns_path()` +
+`tap_name` + `bridge_name()` are stable documented accessors, and a harness (or vmcell's own gate)
+injects delay/loss/partition with `nsenter --net=<netns_path> tc qdisc add dev <tap> root netem …`.
+This is a deliberate simplicity cut, not an oversight: the rtnetlink stack in use has **no typed netem
+support** (netlink-packet-route 0.30 types only fq_codel/ingress, and `QDiscNewRequest` exposes no
+generic kind/options seam), so a typed `SegmentImpairment` API means hand-assembled `TcMessage`s —
+recorded as forward work (§17) rather than shipped half-validated. Tests may shell out; production code
+does not.
+
+**What a segment refuses, typed, at `build()`:** `snapshotting` + `Segment` (restore-time slot and
+addressing semantics are deliberately unspecified in v30 — §17; the consumer topology that wants
+segments is a live two-VM test, not a restore farm), and a member whose `resource_prefix` differs from
+the prefix its segment was created with (one prefix must name every resource in the domain, or the F2
+name/sweep lockstep splits across two prefixes). `Egress` and `host_services_port` are unrepresentable
+on the variant (§6.2). Everything else composes: shares (non-snapshot VMs), extra disks, sessions,
+resource limits.
+
+**Gates.** Live matrix (CH primary; FC/QEMU/crosvm legs cheap — the tap mechanics are shared): two VMs
+on one segment complete a TCP round-trip **in both directions** (the `echo-server` guest-tools applet
+in `--tcp` mode is the listener; guest-tools `curl`/the dialer side drives it), with a third
+off-segment VM's dial to **both** members refused/timed out as the negative
+control against the same targets that just accepted (the positive-control law); `dial_tcp` reaches a
+member listener from the host; a `tc netem` 50 ms delay on one member tap measurably shifts the
+guest↔guest round-trip, and a `netem loss 100%` on the same tap times out an in-flight dial that
+succeeds again once the qdisc is removed (delay and loss/partition are one qdisc mechanism, but the
+partition leg is gated on its own — a bridge that silently healed a partition would pass a delay-only
+gate); teardown leaves the segment netns existing-before/gone-after the last holder drops; the
+sweep gate plants an orphan `<prefix>-seg-*` and reclaims it, leaving a foreign-prefix segment
+untouched. KVM-free: `segment_ip_math` (range, injectivity, disjointness from `ip_math`), the naming
+starts-with pin, the slot free-list (claim/free/exhaustion at 253), the generalized-allocator
+exactly-one-winner race, and every `build()` rejection red-on-inverse.
+
+**Performance.** Members ride the identical tap datapath as privileged VMs — no proxy hop, no
+userspace NAT, kernel-bridged L2 between guests — so per-VM hot-path cost is unchanged and guest↔guest
+throughput is whatever the host bridge does. Segment setup adds one netns + one bridge + one enslave
+per member (rtnetlink round-trips, milliseconds); nothing on the non-segment paths changes.
+
+---
+
+## 7. Resource monitoring and limits
+
+### 7.1 What is read and enforced
+
+One **cgroup v2 slice per VM**, with `ResourceLimits` applied and counters read back through the injected
+`CgroupFs` seam:
+
+```rust
+pub struct ResourceUsage {
+    pub mem_peak_mib: u64,  pub mem_current_mib: u64,
+    pub cpu_usec: u64,      pub io_read_bytes: u64,  pub io_write_bytes: u64,
+    pub mem_limit_enforced: bool,                            // the MEMORY controller is delegated (below)
+    pub mem_read_ok: bool,  pub cpu_read_ok: bool,  pub io_read_ok: bool, // per-metric availability
+}
+pub struct ResourceLimits {   // None => unlimited; maps to cgroup v2 keys
+    pub mem_max_mib: Option<u32>,  // memory.max     pub cpu_max_pct: Option<u32>, // cpu.max
+    pub pids_max:    Option<u32>,  // pids.max       pub io_max:      Option<IoMax>, // io.max
+}
+```
+
+Peak comes for free from `memory.peak`; average is computed from periodic `cpu.stat`/`io.stat` deltas.
+Each read carries an explicit availability boolean rather than silently reporting zero — an unread counter
+reported as `0` is the same lie as a missing one.
+
+`mem_limit_enforced` (renamed from `limits_enforced` by the v28 pass — its delta 3, landed — because the old
+name over-claimed) has a precise, deliberately narrow meaning: it is `true` only when the **memory**
+controller is delegated into the VM's cgroup (`cgroup.controllers` lists it) — the one controller whose
+silent absence lets the memory cap not fire. The read path holds only the cgroup name, so this is *not* a
+per-controller (cpu/pids/io) enforcement guarantee; a caller that needs one consults the individual
+control files.
+
+**There are no network byte counters in `ResourceUsage`.** cgroup v2 exposes no per-cgroup network
+accounting (there is no `net.stat`), and the read path holds only the cgroup name, not the VM's netns or
+interface — so synthesizing `net_rx_bytes`/`net_tx_bytes` fields would be exactly the always-zero lie
+above. Per-VM egress bytes belong in a future *network*-scoped usage type that reads
+`/sys/class/net/<if>/statistics` inside the VM netns; forward work (§17).
+
+### 7.2 The fail-loud capability contract and `HostCapabilities`
+
+An earlier stance — "unprivileged delegation degrades gracefully" — was in practice an invitation to
+**silent no-ops**: a caller asks for a 256 MiB cap, the controller isn't delegated, the write fails, and
+the VM runs *unlimited* while the call returns `Ok`. The rule is reversed: **a missing capability fails
+loud unless the operation is explicitly classified as best-effort** (law F1). Three sub-rules make this
+precise and uniform (they also govern netns/tap in §6.1 and the sysfs knobs in §16):
+
+1. **Every host-facing op declares the OS capabilities it needs** — in its doc-comment and in the
+   queryable **`HostCapabilities`** descriptor: one struct probed once at start-up — by
+   `NetSegment::new`'s privileged-net gate (§6.5), the daemon's `MicroVmLauncher::new` boot log (§11.2),
+   and `bench-vm`'s privileged net-egress self-skip, which are its three production consumers — recording
+   what the host actually offers: the effective capability
+   set, KVM-group access, `/var/run/netns` reachability, which cgroup controllers the current scope
+   delegates, and whether the scope is a non-threaded `domain` leaf. As built, the descriptor is
+   **probed once at start-up and logged**; per-op
+   enforcement keeps its own authoritative fail-loud per-write check (e.g. `metrics::try_apply_limit_at` /
+   `classify_limit_write_err`), so the descriptor is the queryable single source, not a replacement for
+   that per-write typed error. (The v28 pass's delta 8 — landed; implementation-notes.md, Delta 8,
+   carries the as-built reconciliation.)
+2. **A *requested functional* op that needs an absent capability returns a typed error, not `Ok`.** Asking
+   for a resource limit that cannot be enforced is `Err(Error::CapabilityUnavailable { op, needed })` —
+   matchable, carrying the exact missing capability — surfaced before the VM is handed back. The typed
+   error also distinguishes *why* a limit write failed: the kernel refusing the **value** (`EINVAL`, e.g.
+   an `io.max` the device rejects) is `Error::Cgroup`, so the caller is not sent chasing delegation, while
+   a capability/permission errno (`EACCES`/`EPERM`/`EROFS`) is `CapabilityUnavailable`; the errno split is
+   a pure function unit-tested against both inverses.
+3. **Observation degrades; enforcement does not.** *Reads* fall back (read
+   `memory.current`/`memory.peak` straight from sysfs when a higher-level interface is absent) and surface
+   what was unavailable through the `*_read_ok` / `mem_limit_enforced` booleans. A limit the caller *set*
+   is functional (rule 2); a counter the caller *read* is observational (this rule).
+
+A narrow, **explicitly-listed** best-effort tier remains for genuinely non-functional knobs — the §16
+benchmark levers (CPU-frequency pinning, KSM) — which degrade to a visible `warn!` rather than aborting a
+run, since benchmarks are tracked metrics, not gates. The dividing line: *if a caller's assertion can be
+wrong because the op silently did nothing, it is functional and must fail loud; if the only consequence is
+a less-controlled measurement, it is best-effort and warns.*
+
+### 7.3 cgroup delegation mechanics
+
+Limit enforcement runs into cgroup-v2 delegation edges that compound. The cgroup side effects sit behind
+the injected **`CgroupFs`** trait (`create_slice`/`delete_slice`/`read_stats`/`add_task`) with a real impl
+and a recording fake, so sibling-placement, the controller-enable sequence, and the limit-file contents
+are unit-testable with no `/sys` writes. The edges:
+
+- Create the slice directly with `mkdir` + direct sysfs writes — never `cgroups-rs`'s builder, which
+  leaves the cgroup rejecting `cgroup.procs`.
+- Place the VM cgroup as a **sibling** of the harness, not a child (the "no internal processes" rule; the
+  orchestrator strips a `/supervisor` suffix).
+- Write the PID directly to `cgroup.procs`.
+- Run from a **non-threaded `domain`** scope — a threaded scope rejects `cgroup.procs` regardless of
+  `CAP_SYS_ADMIN`.
+- Controller delegation is the gating capability: an undelegated controller makes a *requested* limit fail
+  loud (§7.2) while *reads* fall back to sysfs.
+- `memory.max` alone does **not** bind a CH guest's RAM: CH backs guest memory with a shared memfd, which
+  the kernel reclaims rather than host-OOM-caps, so a 512 MiB guest under a 256 MiB `memory.max` self-OOMs
+  *inside* the guest with the cgroup's `memory.events oom_kill` still `0`. To make the cap bind and
+  produce a real cgroup OOM, `create_slice` also writes **`memory.swap.max=0`** and
+  **`memory.oom.group=1`**.
+
+### 7.4 The feature intersection (v33 — R3, §18 delta 2)
+
+**A cell's feature set is computed, not assumed.** Three capability descriptors exist and, until
+v33, none of them met: `VmmCapabilities` (what the backend supports, §2.1), `HostCapabilities` (what
+the host offers, §7.2), and — nothing at all for an artifact, whose nearest analogues were the
+validator's static clause→symbol map and two steward boot self-checks written to the console as
+*text* and parsed back out of the serial log. The moment a rootfs or a handler is selectable
+(§10.5), "what can this cell do" stops being a property of the backend and becomes a property of the
+**combination** — and the platform has already been bitten by uncentralized multi-source logic once
+(`config_has_vhost_user_device` exists precisely because per-backend copies diverged), so the
+intersection is computed in exactly one place:
+
+```rust
+// vmcell::feature — sketch; names advisory, behavior + gates bind (§18 conventions)
+/// A versioned enum vmcell owns. Not a string, and deliberately not #[non_exhaustive], for the
+/// same reason VmmCapabilities is not: adding a variant must force every declarer to state a
+/// stance rather than silently defaulting to absent.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+pub enum Feature {
+    // one variant per VmmCapabilities field, name-for-name (N-VMM-1 promoted from comment norm to
+    // type law: Feature::name() IS the field name, and the typed-refusal string is composed from it)
+    SnapshotRestore, LazyRestore, VirtioFsShares, UnprivilegedVhostUserNet, NestedVirt,
+    VirtioConsole, RestoreRotatesHostPaths, DiskIoThrottle, UsbHostPassthrough,
+    // artifact-declared properties, each with a §10.6 check behind it (the narrow-name doctrine:
+    // a variant claims exactly what is validated)
+    ControlPlane,        // the artifact carries a steward the declared placement can start —
+                         //   the ARTIFACT half of §3.5's fact (the placement itself contributes
+                         //   through Source::Config: placement None removes ControlPlane with
+                         //   Source::Config provenance; per-op guards stay authoritative)
+    XattrPreserved,      // the rootfs artifact preserved security.* xattrs (§4.7)
+    ProcConfigGz,        // the kernel carries IKCONFIG (the §5.6 example's data-plane proof)
+}
+
+pub enum Source { Backend(&'static str), Kernel(String), Rootfs(String), Handler(String), Host, Config }
+/// Why a feature is not in the set. Never a bare `false`.
+pub struct Removal { pub feature: Feature, pub by: Source, pub reason: &'static str }
+
+pub struct FeatureSet { /* … */ }
+impl FeatureSet {
+    pub fn has(&self, f: Feature) -> bool;
+    /// `None` when present; `Some(&Removal)` names who removed it and why. Under multiple
+    /// removers the set records ALL of them — `removals(f)` returns every one — and
+    /// `why_absent` reports the first in the fixed axis order artifact → backend → host, so the
+    /// answer is deterministic, never insertion-order luck.
+    pub fn why_absent(&self, f: Feature) -> Option<&Removal>;
+    pub fn removals(&self, f: Feature) -> &[Removal];
+}
+// A consumer DEMANDS at construction and gets a named refusal, not a use-site surprise:
+// `require`d features are resolved at MicroVm::start, before anything boots.
+VmConfig::builder(kernel, rootfs).require(Feature::SnapshotRestore)
+```
+
+**Where declarations come from, and what an absent declaration means.** The backend contributes its
+`VmmCapabilities` literal unchanged — the descriptor stays the backend's one declaration input, not
+a parallel vocabulary. The host contributes the **one start-up `HostCapabilities` descriptor** (§7.2
+rule 1), projected into the intersection by `feature::HostDeclaration::from_host_capabilities` — a
+thin newtype, not a second descriptor, so the host axis has exactly one probe. It speaks about
+exactly the features it can decide, which today is `Feature::NestedVirt` and nothing else (from
+`HostCapabilities::nested_virt`, the KVM modules' `nested` parameter); the descriptor's privileged-net
+fields belong to a different reader — `NetSegment::new`'s fail-loud `privileged_net_available` gate
+(§6.5) and the daemon's boot-time capability log (§11.2) — not to the intersection. Growing the axis
+therefore means growing `HostCapabilities` and that one projection, never adding a read beside it —
+which is what makes the derivation stated here true. It was not, before: `HostDeclaration` ran its own
+`/sys/module/*/parameters/nested` read, so the one axis this section named contributed nothing while
+this rule held for everything else. A caller holding the boot-time descriptor (the daemon logs one,
+§11.2) passes it in; `HostDeclaration::probe()` — which `MicroVm::start`/`restore` still use — is that
+same projection over a fresh `HostCapabilities::probe()`, never a second implementation. Nested-virt
+readiness has one conservative direction of its own, recorded at the field: an unreadable module
+parameter resolves *permissive*, because the host axis removes a feature only when it can positively
+say the facility is off. An **artifact** declares through its registry entry (§10.5) and, so the declaration
+travels with the artifact a path-consuming cell actually reads, through a **feature-manifest
+sidecar** emitted beside it at build time (`rootfs-<label>.features` — the resolved-config sidecar's
+sibling, content-addressed with its artifact). The registry entry is the **one authority**; the
+sidecar is its travel form, **emitted from the resolved entry at build time** and parity-gated
+against it at emission — never a second place to declare (a hand-edited sidecar is caught by its
+content-address). Cache identity splits by what a declaration touches: a build-affecting property
+(`xattrs`, §4.7) folds into the **image** identity and re-packs; a declaration-only edit re-emits
+the **sidecar** (content-addressed on its own) and leaves the image key unmoved — a declaration
+change must not rebuild the image it describes. An artifact with no sidecar contributes the
+**baseline declaration** — exactly what the canonical artifacts provide — stated, not silent: the
+canonical artifacts *are* the baseline, so pre-v33 artifacts keep working unchanged, and a sidecar,
+when present, is authoritative for the cell that reads it. `nested_virt` is the worked example of why the intersection earns
+its keep: it is true only when the backend advertises it **and** the kernel artifact declares the
+KVM symbols **and** the host has nested enabled — three axes the pre-v33 tree checked in three
+unrelated places with three different failure shapes.
+
+**Four clauses, each independently load-bearing:**
+
+1. **Unknown feature names are errors, not absences.** Absence is the silent direction: a typo'd
+   declaration that reads as "unsupported" produces a cell that quietly does less, and every
+   downstream check passes because nothing claimed the feature. The enum makes the typo a compile
+   error at a Rust declaration site; the strict parse makes it a hard error naming the token at a
+   pins/sidecar site — the same shape `KconfigValues::parse` already uses, for the same recorded
+   reason ("a silently-empty parse would blame every assertion on 'symbol absent'"). The
+   backend half of the roster is **parity-gated against `VmmCapabilities`**: a unit test asserts
+   the variant names equal the field names in both directions, so a descriptor that grows a field
+   reddens the vocabulary until it states a stance — the exhaustive-literal law extended across
+   the type boundary.
+2. **Provenance on every removal, carried as data.** The seed already exists —
+   `clone_ineligible_feature` is the one predicate in the tree that returns a *reason* rather than a
+   bool — and v33 applies that shape everywhere with the source attached: a consumer reads
+   `snapshot_restore: unavailable (rootfs "debian-systemd" declares no-snapshot)`, never a bare
+   `false`. `Error::Unsupported { vmm, feature }` keeps its public shape; a constructor composes it
+   from a `Removal` so the feature string is `Feature::name()` by construction — which retires the
+   half-observed comment norm (roughly half the refusal sites carried prose strings like
+   `"snapshot with a vhost-user device"`) *and* the substring matchers that norm bred in the tests
+   (`feature.contains("vhost-user")` and five siblings — the assertion-weaker-than-its-comment
+   register, structurally): tests match on `Feature::name()`, never a hand-spelled fragment.
+3. **A consumer can demand at construction.** `require(Feature)` resolves at `MicroVm::start`
+   against the computed set, so "this cell cannot snapshot" is answered before the VM boots, with
+   the removal's provenance in the error — not at the first `snapshot()` call. `build()` still
+   never sees a backend (its config-internal validation is unchanged); the intersection needs the
+   backend + artifacts, which exist at `start`.
+4. **Granularity is decided up front, and recorded.** The roster above is deliberate: one variant
+   per `VmmCapabilities` field (splitting or merging those is the backend descriptor's decision,
+   made there first), plus only artifact properties with a validated §10.6 check behind them. A
+   variant that later splits breaks every declaration in every overlay — so the concurrent-fan-out
+   distinction stays on `RestoreRotatesHostPaths` (already its own field) rather than minting a
+   speculative `Snapshot`/`Restore` split the descriptor does not have — a **recorded decline** of
+   the requester's clause-4 split-now argument: the live distinction it cites (FC/crosvm's
+   single-lineage restores) is already carried by `RestoreRotatesHostPaths`, so the split would be
+   a second spelling of a fact the vocabulary has.
+
+**Pay-for-what-you-use.** The intersection is arithmetic over small sets at `start`, reading
+sidecars already resolved with the artifacts; nothing boots, nothing dials. A cell that never calls
+`require`/`why_absent` computes the same set and pays microseconds; the hot paths (§16) are
+untouched. **One law:** the intersection has exactly one computation site, with a call-site scan —
+the completeness-audit lesson that a gate on the extracted predicate is not a gate on the claim —
+and per-op enforcement keeps its own authoritative typed refusal (the §7.2 rule: the descriptor is
+queryable, never a replacement for the per-write check).
+
+---
+## 8. Snapshot, restore, and cloning
+
+**Vocabulary, once.** A **snapshot directory** (or *suspend image*) is the unit everything in this section
+manipulates: the guest-RAM memory file plus the backend's `config.json`/sidecar, written by
+`snapshot()` from a paused VM. A **zygote master** and a **lineage node** are *roles* a snapshot directory
+plays — an immutable image that clones restore from. A **vhost-user device** is a device whose backend
+runs as a *separate helper process* (virtiofsd, the smoltcp NAT's vhost-user-net, an external vsock
+daemon) talking to the VMM over a Unix socket; because that helper holds device state the VMM cannot
+migrate, attaching one makes the VM unsnapshottable — the eligibility law (S1) every snapshot finding in
+the project's history collapses into.
+
+### 8.1 The warm-snapshot path and the eligibility law
+
+The per-run speed lever is **warm snapshot + restore**: boot the erofs-rootfs base to steward-ready,
+snapshot once, and per-run restore + add a tmpfs overlay. This skips kernel boot on the hot path — ≈5.8×
+faster than cold boot on CH (305→53 ms p50); on Firecracker warm restore is faster still (775→27 ms, ≈29×
+its own cold boot) (§16). The erofs RO base needs no per-run copy; the only writable per-run state is the
+tmpfs overlay. The on-disk size of a suspend image **tracks guest RAM exactly** and is flat in rootfs size
+(a 256 MiB-RAM guest writes an ≈256 MiB memory file whether the rootfs is slim or fat).
+
+**The eligibility law (S1): a VM is snapshot-eligible only if no vhost-user device is attached to it.**
+The consequence: the snapshot tier runs the **privileged/tap network path with a non-vhost-user vsock
+transport and no virtio-fs data shares**. Anything requiring a vhost-user device — the unprivileged NAT
+**or virtio-fs *data* shares, not only a virtio-fs rootfs** — is mutually exclusive with snapshot on the
+same VM. (CH's base control-plane vsock and Firecracker's built-in vsock are safe because they are the
+VMM's *own* implementation, not vhost-user; plain virtio-blk devices compose with snapshot, §4.6.) The
+subtle point: **"attached" means *any* virtiofsd.** A read-only data share is still a vhost-user device;
+there is no "small enough to be safe" exception — the rule is over the device class, not the share's role
+or access mode. (An earlier pass guarded a virtio-fs rootfs + snapshot but let a data `Share` through to
+the backend, which then attached virtiofsd to a VM it was about to snapshot.)
+
+The law is enforced **in code at three boundaries**, so no single missed check can let a vhost-user device
+onto a snapshot-eligible VM:
+
+1. **`config::build()`** rejects `snapshotting == true` combined with **any** virtio-fs data `Share` or
+   `NetConfig::Unprivileged` — a typed validation `Err`, with a negative test per case.
+2. **`orchestrator::restore()`** re-checks against the `cfg` it is handed (defense in depth) and returns
+   `Error::Unsupported`. That check is the one **config-only** predicate,
+   `clone_ineligible_feature(&VmConfig) -> Option<&'static str>`, and it is wider than vhost-user: it also
+   refuses a `NetConfig::Segment` member (§6.5 leaves restore-time slot/addressing unspecified), a
+   **non-`Pid1` steward placement** (v33, §3.5 — the arm's question was always "is the mandatory
+   post-restore resync reachable?": for `None` there is no steward to run the clock/CSPRNG/MAC-IP
+   resync through, so the clone would resume on a frozen clock with a correlated CSPRNG and a stale
+   MAC/IP; for `Service` reachability across the re-created vhost-vsock device is unmeasured, so it
+   stays conservatively refused — §17), and a non-empty **`usb_host_devices`** (a passed-through host
+   device is host state living outside guest RAM; the stream carries the guest's view of the xhci
+   controller, not the device behind it, and a fan-out would leave N guests fighting over one device).
+   `build()` rejects both of those last two *paired with `snapshotting`*, but that is not the same check:
+   the v30 delta-9 premise that "every backend's `restore()` rejects a non-snapshotting config" is
+   **empirically false** — no backend's `restore()` reads `cfg.snapshotting` — so a
+   `{ InKernel, snapshotting: false }` config carrying either reached the backend unguarded. This is why
+   the law is config-only and boundary-independent, and why the wrapping refusal (the prose and the vmm
+   id) is all that is per-boundary. `MicroVm::snapshot()` guards the same placement case through the
+   C8 eligibility method (`resync_reachable()`, retained at construction — **not** `steward_port()`,
+   which cannot distinguish `Service` from `Pid1`), because a live `MicroVm` no longer
+   owns the `VmConfig` the predicate takes,
+   and names itself (`vmm: "orchestrator"`) rather than blaming a backend. The zygote's fail-fast
+   `check_clone_eligible` is the *same law applied earlier* — before CoW copies are minted — and it
+   **wraps the predicate rather than restating it**: while it open-coded its own three arms the pair had
+   already drifted, so a custom-init config was fanned out and only refused per clone at the restore
+   boundary, N copies later.
+3. **Backend `restore()`/`snapshot()`** self-guard on `capabilities().snapshot_restore` *and* the absence
+   of any vhost-user device via the single shared `pub(crate)` predicate
+   `config_has_vhost_user_device(cfg, res)` — returning `Error::Unsupported { vmm, feature }`, never a
+   panic, never a stringly error. The former per-backend copies had already diverged (the Firecracker copy
+   never grew a term the CH copy carried); centralizing on one predicate — pinned by a shared-predicate
+   unit test — makes that divergence class impossible.
+
+The mechanics: snapshot = `pause` → snapshot → (`resume`, or stay paused for immediate kill); restore
+returns a **paused** instance the caller `resume()`s — never `boot()`/`create()`. The in-place
+`config.json`/sidecar path rewrites (§2.2) make a plain `restore()` **single-use** — it mutates the
+caller's snapshot dir, so it is for *one* VM. Minting *many* identical VMs from one suspend image is the
+zygote fan-out (§8.4).
+
+### 8.2 Restore correctness: a restored VM is not a fresh VM
+
+A restored snapshot resumes at the exact instruction it was taken, so restored clones share whatever state
+was frozen in. Four things must be refreshed on **every** restore (law S2), fired once on the first
+post-restore `steward()` call after the vsock reconnect succeeds — as a **single native `Resync`
+round-trip** (§3.1), applied in-steward by syscalls/ioctls with **no subprocess spawn** (this replaced three
+`exec`s — `date`, `sh`+`head`, and the multi-MB `ip` binary — removing them from the restore hot path):
+
+- **Identity (CID) — uniqueness among *live* clones, not a forced numeric change.** The vsock CID must be
+  unique across *concurrently running* restored clones. It is **not** required to differ from a torn-down
+  original: the `CidAllocator` hands out the lowest free CID and reuses freed CIDs by design. So the
+  correct check on a *sequential* restore is "the restored guest has a valid, live CID," **not**
+  `assert_ne!(original_cid, restored_cid)` (which fails precisely *because* reuse is correct). On CH the
+  restored guest keeps the baked CID from the restore config (§2.2); the orchestrator's fresh allocation
+  still reserves host-side uniqueness but is not the guest's identity.
+- **Identity (MAC *and* IP) — rotated at the device layer, "rotate everything".** A snapshot is a zygote:
+  one suspended VM is resumed into many *concurrent* children, each of which must have a distinct network
+  identity (its own netns/tap/`/30`/MAC/IP) so they never collide on the host. The restore path therefore
+  rotates the vmid, and the guest must move its whole network identity to match: the MAC via
+  `SIOCSIFHWADDR`, and the IP + default route via `SIOCSIFADDR`/`SIOCSIFNETMASK`/`SIOCADDRT` — all applied
+  **natively in the steward** (`netif`) as device-layer writes, consistent with zero-netlink-in-PID-1
+  (law C6). The host side rebinds the baked tap to the rotated one on **every** tap-bearing backend, by
+  the route each offers: CH rewrites `net[].tap` in the restore config (§2.2), Firecracker sends a
+  `network_overrides` entry on `PUT /snapshot/load` (§2.3), and QEMU and crosvm re-pass `-netdev
+  tap,ifname=…` / `--net tap-name=…` because their restores rebuild the argv from the fresh
+  `PerVmResources`. So the guest's rotated `/30` and its host-side tap/nft wiring belong to the same
+  vmid, on all four. The guest
+  resumes with the frozen `ip=` of the *original* vmid; an earlier "leave the IP alone" stance left every
+  restored clone on a dead `/30` with silently dead egress. Both are best-effort; the ack reports
+  `mac_applied` / `ip_applied`.
+- **Entropy** — reseed the CSPRNG by copying 32 bytes `/dev/hwrng`→`/dev/urandom` natively in-steward. An
+  unreseeded `getrandom()` can stall first use by seconds, and because every clone resumes at the same
+  frozen instant, RNG reuse is otherwise silent and correlated. Best-effort; the ack's `reseed_applied`
+  records whether it took (which is why FC `create()` attaches virtio-rng, §2.3).
+- **Clock** — a snapshot resumed much later resumes with a stale wall clock. The guest cannot fix this
+  from inside (`hwclock --hctosys` reads the *restored* RTC — the old snapshot time — and sets the clock
+  *backwards*; a restored snapshot may have no network for NTP). The resync is therefore **host-driven and
+  mandatory**: the host reads its clock (through the injected `Clock` seam) and pushes it in the `Resync`
+  message; the steward applies it via `clock_settime`. A guest-side clock-set failure comes back as
+  `ResyncAck.clock_error` and propagates as a typed `Err` **before** the `restored` flag is cleared, so
+  the next `steward()` retries — and a failed resync **also evicts the cached `StewardClient`**: a transport
+  failure marks the client desynced and nothing auto-reconnects it, so leaving it cached would wedge every
+  future `steward()` call; eviction makes the next call re-connect and retry the whole resync. For ephemeral
+  tests a stale clock is cosmetic; for anything asserting on timestamps it is not — so a resync failure
+  surfaces.
+
+**The post-restore vsock reconnect itself is mandatory and was the hardest restore bug to close.** It is
+not a no-op: CH `--restore` re-creates the vhost-vsock device, leaving the guest's pre-snapshot bound
+listener deaf — so the steward serves connections thread-per-connection and **re-`bind`s** after a
+bounded idle for the host's `reconnect` to land (§3.4). This same generic re-bind is exactly what cured
+Firecracker's warm restore — no FC-specific guest fix was needed; the FC-side work was purely host-side
+(§2.3; Appendix A, reversal 8).
+
+### 8.3 Density levers
+
+RAM is the binding limit on parallelism. With DAX unavailable in CH (Appendix C), density rests on:
+
+- **`cache=never`** on virtio-fs shares (minimal footprint).
+- **The shared erofs RO base** — one host-cached copy of the image for all concurrent guests (§4.1).
+- **virtio-balloon / free-page-reporting** for reclaim under host pressure.
+- **KSM — opt-in, and a no-op by default on CH.** CH backs guest RAM with a shared memfd (`shared=on` →
+  it lands in `RssShmem`), and KSM only merges private-anonymous pages, so global KSM deduplicates **0**
+  of default-config guest RAM. The lever is an explicit `VmConfig::ksm_mergeable` that sets CH's
+  `mergeable=on` **and** `shared=off` together (the coupling is mandatory). Measured, it then deduplicates
+  ≈394 MiB / ~84% across 8 identical 256 MiB guests — but `shared=off` is mutually exclusive with every
+  vhost-user path (the NAT, virtio-fs shares), plus KSM scan CPU, so it stays **off by default** and
+  `config::build()` rejects it combined with a vhost-user device.
+
+**Measured footprint (§16):** each CH guest demand-pages ≈58 MiB of its 256 MiB, marginal RAM per added
+guest is dead-linear at ≈58 MiB, and the steward PID 1 is ≈2.4 MiB. So the RAM-tier ceiling on the 30 GiB
+benchmark substrate is ≈13 GiB free / 58 MiB ≈ **~230 idle guests** (≈52 if each faults its full 256 MiB
+under load). The next limits after RAM are one-virtiofsd-per-VM, tap/netns/nft scaling, and host FD/PID
+limits.
+
+### 8.4 The zygote fan-out and the `OverlayStore` seam
+
+Booting the guest kernel to steward-ready is the dominant per-VM cost. When a workload needs *many*
+identical VMs — a warm serverless pool, a fan-out of agent sandboxes, a batch of test cells — the
+**zygote** pattern pays that cost once and clones the *suspended* result:
+
+1. **Suspend once.** Boot one VM to steward-ready and snapshot it while paused. That frozen image is the
+   **zygote master** (`Zygote::suspend`); it is the same snapshot the warm tier already produces — the
+   pipeline's `SnapshotStage` output *is* a zygote master (§10.1).
+2. **Copy-on-write per clone, through the injected `OverlayStore` seam.** To mint a clone, CoW-copy the
+   whole suspend dir into the clone's own scratch dir, then `restore()` + `resume()` from that private
+   copy. The copy is materialized through `overlay::OverlayStore::clone_tree(master, private_dst)` — the
+   production `ReflinkOverlayStore` wraps the `reflink.rs` primitive, so on a reflink-capable host
+   filesystem (XFS, Btrfs, bcachefs) the copy is a near-instant block-level `FICLONE` that shares physical
+   storage with the master until a clone writes, and on any other filesystem (ext4, tmpfs) it degrades to
+   a full byte copy — correct, just not free. The copy is reported as `CowSupport::{Reflink, FullCopy}` so
+   a caller building a large pool on a non-reflink filesystem can warn or pick a different scratch dir.
+   The vetted `reflink-copy` crate owns the ioctl and the fallback, so no new `unsafe` enters the tree.
+3. **Fresh identity per clone.** Each clone allocates a fresh vmid from the shared `VmidAllocator` (hence
+   a distinct `/30`/MAC/IP), its own netns/cgroup/vsock socket, and runs the mandatory post-restore resync
+   on its first `steward()` call (§8.2). So N clones resumed from one frozen instant never collide on the
+   host.
+
+**Why the per-clone copy is load-bearing, not an optimization (law S3).** The single-use restore path
+rewrites the snapshot's `config.json` *in place* (§2.2). Two restores from one shared dir race on that
+file and corrupt it. Restoring from a **private copy** removes the race *and* keeps the zygote master
+byte-for-byte immutable, so the master can be cloned again, indefinitely — the property that makes it a
+*zygote* and not a one-shot snapshot. Two consequences: the integration test asserts the master's
+`config.json` is byte-identical after a fan-out, and the CoW copy lives *inside* the per-VM scratch dir,
+so the existing ordered teardown (law L1) reclaims it — no separate cleanup path to forget, no shared
+inode two clones could race on. Enforced by construction: `restore_cow`/`Zygote` do the copy in the
+orchestrator **before** calling the backend, so no code path can restore a clone directly from the master.
+
+**The `OverlayStore` seam (law S4).** Every other host-mutating edge in vmcell is an injectable trait with
+a production impl and a recording double (`Netlink`/`NftApplier`/`CgroupFs`/`OrphanScanner`); the
+clone-materialization step was a bare free function until it was lifted behind the seam:
+
+```rust
+// vmcell::overlay
+pub trait OverlayStore: Send + Sync + std::fmt::Debug {
+    /// CoW-clones the snapshot directory `src` into a fresh private copy at `dst`.
+    /// `dst` must not exist. The copy is a faithful, INDEPENDENT copy: writing it never
+    /// touches `src` (the master — the S3 immutability contract). Reports whether it was
+    /// a block-level reflink or a full byte copy.
+    fn clone_tree(&self, src: &Path, dst: &Path) -> Result<CowSupport>;
+    /// Side-effect-free probe of whether `dir`'s filesystem gives cheap block-level CoW,
+    /// for an up-front cost signal before minting a pool.
+    fn probe(&self, dir: &Path) -> CowSupport;
+}
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ReflinkOverlayStore;   // production: FICLONE where supported, full byte copy otherwise
+// RecordingOverlayStore (test double) records every (src, dst) and returns a configurable CowSupport.
+```
+
+**Scope:** the seam clones the *suspend directory*, not a rootfs disk. In the snapshot-eligible model the
+rootfs is the shared erofs RO base plus a fresh in-guest tmpfs overlay — there is no host-side writable
+rootfs upper to copy; the only per-clone writable host state is the suspend directory. So `OverlayStore`
+is scoped precisely to CoW-cloning that directory; it deliberately does not reach into per-backend
+block-device attachment (which would import vhost-user and qcow2-backing-chain complexity a
+snapshot-eligible VM does not have). **Injection:** the trait is `Send + Sync + Debug` with synchronous
+methods (object-safe as `Arc<dyn OverlayStore>`), and the orchestrator runs `clone_tree` on a blocking
+thread (`spawn_blocking`) so a large full-copy never stalls the async runtime. The store used by every CoW
+restore is the one in the `HostEnv` handed to the spawn call (§9.3) — one source per process, injectable
+in tests, defaulting to `ReflinkOverlayStore`.
+
+**The concurrent-fan-out gate is a capability, not a flag.** CoW gives each clone its own *files*, but it
+cannot change a path a backend bakes into the binary snapshot state. CH rewrites every host path per
+restore into the clone's own scratch dir (`restore_rotates_host_paths: true`), so N concurrent CH clones
+each get a distinct vsock/serial/tap — fan-out works. Firecracker re-binds the baked vsock UDS verbatim
+(`false`), so two concurrent FC clones would fight over one socket path — and copying the dir does not
+change the baked path. So `Zygote::spawn_clones(n)` **refuses `n > 1` on a non-rotating backend with a
+typed `Error::Unsupported`** rather than letting the clones collide; a *single* FC clone (sequential
+lineage) is fine. This reuses the exact capability the warm tier already declares — a bespoke fan-out
+boolean would be a second source of truth for the same fact, free to drift.
+
+**Cost model.** A `FullCopy` pool costs N×guest-RAM of disk and copy bandwidth (the ext4 case); a
+`Reflink` pool costs ≈N×*dirtied* pages, near-zero at rest, because CH maps the memory file read-mostly
+and only the tiny per-clone `config.json` diverges. RAM is unchanged from §8.3 (each clone still
+demand-faults its own ≈58 MiB); the zygote win is wall-clock and disk, not RAM. `spawn_clones` mints the
+pool **concurrently** and is **all-or-nothing**: if any clone fails, the ones already up are torn down in
+the documented order and the first error is returned — no half-built pool leaks. Measured on CH: a live
+pool of 3 concurrent clones from one zygote, each with a distinct vmid/MAC/vsock and a working `exec`,
+with the master `config.json` byte-identical afterward.
+
+### 8.5 Lineage: fork and branch
+
+The fan-out above is *flat*: one immutable master, many independent clones, no recorded parent→child
+relationship, and no first-class way to freeze a clone that has diverged (run some work) into a *new* fork
+point. The **`Lineage`** handle adds a tree of provenance on top of `Zygote` without a second copy of the
+clone logic:
+
+```rust
+// vmcell::lineage
+pub struct LineageId(u64);                          // Copy/Ord/Hash; monotonic per allocator
+pub struct LineageAllocator(/* Arc<AtomicU64> */);  // Clone; one shared allocator gives globally distinct ids
+pub struct Lineage { /* id, parent, generation, ancestry: Arc<[LineageId]>, allocator, wrapped Zygote */ }
+
+impl Lineage {
+    /// Roots a lineage by suspending a live, steward-ready VM into `dir` (generation 0, no parent).
+    /// `dir` is created if absent.
+    pub async fn fork_from_vm<V: Vmm>(vm: &mut MicroVm<V>, cfg: VmConfig, dir: impl Into<PathBuf>,
+        allocator: LineageAllocator) -> Result<Self>;
+    /// Adopts an existing snapshot dir (e.g. a SnapshotStage artifact) as a root node.
+    pub async fn from_snapshot_dir(dir: impl Into<PathBuf>, cfg: VmConfig, allocator: LineageAllocator) -> Result<Self>;
+
+    pub fn id(&self) -> LineageId;
+    pub fn parent(&self) -> Option<LineageId>;          // None at the root (generation 0)
+    pub fn generation(&self) -> u32;                    // strictly increases along a branch chain
+    pub fn ancestry(&self) -> &[LineageId];             // root .. parent inclusive (this node excluded)
+    pub fn is_ancestor_of(&self, other: &Lineage) -> bool;
+    pub fn master_dir(&self) -> &Path;
+
+    /// fork(): mint ONE live child VM — a CoW clone at this node (delegates to Zygote::spawn_clone).
+    pub async fn fork<V: Vmm>(&self, vmm: &V, env: &HostEnv) -> Result<MicroVm<V>>;
+    /// Concurrent fan-out at this node (delegates to Zygote::spawn_clones; the §8.4 gate applies unchanged).
+    pub async fn fork_many<V: Vmm>(&self, vmm: &V, count: usize, env: &HostEnv) -> Result<Vec<MicroVm<V>>>;
+    /// branch(): freeze a RUNNING descendant `child` into a NEW node whose parent is this node
+    /// (generation + 1, ancestry extended by this node's id). Snapshots `child` into `dir` (created if
+    /// absent) and returns the new node; `child` stays live and the caller owns `dir`'s lifecycle.
+    /// Re-validates snapshot-eligibility (S1) via the same check_clone_eligible predicate.
+    pub async fn branch<V: Vmm>(&self, child: &mut MicroVm<V>, dir: impl Into<PathBuf>) -> Result<Lineage>;
+}
+```
+
+**The tree, concretely.** `fork_from_vm` → node `root` (gen 0). `root.fork()` → a live VM; run work in it;
+`root.branch(vm, dir_b1)` → node `b1` (gen 1, parent `root`, ancestry `[root]`). `b1.fork()` → a live VM;
+`b1.branch(vm, dir_b2)` → node `b2` (gen 2, parent `b1`, ancestry `[root, b1]`). Each node is a complete
+zygote that can be forked, concurrently and repeatedly, independent of the others — the snapshots are
+immutable (S3 extends to branch nodes), so the tree is safe to fan out from any node.
+
+**Why `Lineage` is a handle and not a field on `MicroVm`.** The lineage relationship is caller-visible
+provenance, not per-VM runtime state; threading it as a value keeps it out of the 300-line `MicroVm`
+struct and its nine construction sites (each an opportunity to forget a field). A `Lineage` is cheap to
+clone (`Arc`-backed ancestry), so a caller holds the handles it cares about and asks each to
+`fork`/`branch`. `branch(child, dir)` takes the running descendant explicitly — *you* say where the branch
+diverges from, the git-branch mental model.
+
+**Identity and eligibility reuse — no new laws.** Every forked child is a `Zygote` clone, so it draws a
+fresh vmid (hence a distinct `/30`/MAC/IP) and runs the mandatory post-restore resync; two children of the
+same node — or of two different nodes — never collide, exactly as fan-out siblings do not. `branch` and
+`fork_from_vm` re-check snapshot-eligibility through the same `check_clone_eligible` predicate the zygote
+uses — a typed `Error::Unsupported` at construction, before any snapshot or copy is minted. `fork_many`
+*is* `spawn_clones`, so the concurrent-fan-out gate is the same single source of truth; a **sequential**
+lineage chain (fork one, branch it, fork one, …) works on every backend, which is precisely the
+single-lineage shape Firecracker supports. Lineage identity is **cross-family-safe**: `is_ancestor_of`
+first checks the two nodes share a `LineageAllocator` (`Arc::ptr_eq`), then that `self.id` is in `other`'s
+ancestry — so two nodes minted by distinct allocators are never a false-positive ancestry even when their
+ids collide (each allocator starts at `L1`) (law S5).
+
+### 8.6 One snapshot per node, not a backing chain
+
+A branch is a **flat, self-contained single snapshot**, and copy-on-write happens at the
+**host-filesystem** layer (reflink of that one directory), *not* as a qcow2/overlayfs backing chain. This
+is deliberate and load-bearing:
+
+- **Restore stays O(1) in lineage depth.** If `branch` layered a new overlay over its parent's image, a
+  depth-`k` restore would have to assemble `k` backing layers and the backend would have to walk them —
+  fragile across CH/FC snapshot formats, and a correctness hazard (a restored VM resumes at an exact
+  instruction; a mis-assembled backing chain is silent corruption). Instead, `branch` writes a **complete**
+  new suspend image from the diverged guest (the memory file tracks guest RAM exactly, independent of
+  depth), and `fork` reflink-copies that one directory. Depth costs disk (one guest-RAM image per branch
+  node the caller keeps), never restore complexity.
+- **Backend-agnostic.** Every node is exactly the kind of directory the warm tier and `Zygote` already
+  restore; no backend learns about lineage. The fan-out gate and the eligibility law apply per node
+  unchanged.
+
+The reflink CoW between a node and its live children is where sharing pays off: a pool forked from one
+node costs ≈N×dirtied pages on a reflink filesystem; the lineage adds a *second* axis (depth) whose cost
+is one full image per retained branch point, reported honestly, never hidden behind a chain. (A store that
+reflinks a new branch image's unchanged pages against its parent's at snapshot time is an `OverlayStore`
+refinement, §17, not a restore-path change.)
+
+---
+## 9. The Rust library (`vmcell`)
+
+### 9.1 Workspace layout
+
+A cargo **workspace** (2024 edition); the root is a pure `[workspace]`. Members version independently and
+every public-surface change is `cargo semver-checks`-gated. **The current version is not restated here**:
+it lives in the members' `Cargo.toml`s, each carrying its own comment changelog (the ledger §10.4 requires
+of a contract crate), and a figure copied into this document goes stale silently — as this parenthetical
+did, twice. Read `crates/vmcell/Cargo.toml`. The members:
+
+- **`vmcell`** — the library, one package carrying the host feature stack (§9.7). It keeps **only the
+  primary Cloud Hypervisor backend**, the shared `Vmm`/`VmInstance` traits + `VmmCapabilities`, the
+  jail/seccomp predicates, the spawn/reap/console/eligibility helpers, and the bootstrap artifact producers
+  (the OCI rootfs source, the host-`make` and prebuilt kernel producers); it exposes the shared utilities
+  the extracted builders and backends reuse.
+- **`vmcell-firecracker` / `vmcell-qemu` / `vmcell-crosvm`** — the three **secondary** VMM backends,
+  extracted into their own crates so the core carries only Cloud Hypervisor. Each depends on `vmcell` for
+  the one `Vmm` trait + the shared jail/seccomp/spawn/console/eligibility helpers; `vmcell` has **no
+  production edge back** (only a dev-dep, for the matrix tests), so the graph stays acyclic.
+  `vmcell-crosvm` (crosvm, §2.5) is the v29 addition — boot-first, driven purely as an external binary
+  (`crosvm run` + `crosvm <ctl> <socket>` clients), so it carries no serde/JSON.
+- **`vmcell-bench`** — the cross-backend `bench-vm` harness, the one composition root wiring all four
+  backends (each secondary backend behind an optional `firecracker`/`qemu`/`crosvm` feature; all four
+  are in the default set — `crosvm` graduated in after its live validation, mirroring `qemu`; only its
+  live runtime matrix stays opt-in because the binary is absent on CI). Kept outside `vmcell` so the
+  dependency graph stays acyclic.
+- **`vmcell-artifact-validator`** — the artifact conformance kit (a roster omission in v28/v29,
+  corrected here): `validate(&ArtifactSet { kernel, rootfs }, &ValidationOptions)` boots real micro-VMs
+  and runs the named check battery (`boot.kernel_banner`, `boot.steward_ready`, `steward.exec_roundtrip`, …)
+  at `Core`/`Extended`/`Full` levels against the whole artifact↔system contract (§5.4, §5.6), plus the
+  `harness` module (`get_vmlinux`/`get_rootfs`/`start_vm`, binary resolvers, capability probes) that
+  vmcell's own integration tests and `vmcell-bench` consume. Depends on `vmcell`; `vmcell` dev-depends
+  back on it for the matrix tests (a permitted dev-dep cycle, like the backends). As of v30 it is
+  **downstream contract surface** (§10.4): the battery is how an out-of-repo kernel proves
+  vmcell-compatibility from the consumer position.
+- **`vmcell-rootfs-builder`** — the extracted full-apt in-VM `mmdebstrap` rootfs source (§4.2). A `Stage`
+  impl that depends on `vmcell`, boots a builder micro-VM, and emits the erofs through the shared
+  `pack_erofs_with_injection`.
+- **`vmcell-kernel-builder`** — the extracted in-VM download+configure+compile kernel builder (§5.1).
+- **`vmcell-cli`** — the **composition-root** crate carrying the CLI (`build`, `build-kernels`,
+  `oci2-erofs`, the lifecycle verbs, `bundle`). It depends on `vmcell` + both builder crates and assembles
+  the `Pipeline`, choosing sources via `--rootfs-source oci|mmdebstrap` / `--kernel-source
+  prebuilt|host-make|in-vm`.
+- **`vmcell-protocol`** — the framed postcard wire enum and the `ExecRequest`/`ExecOutcome` types; the
+  *only* code the host and the steward share.
+- **`vmcell-steward`** — the in-guest control-plane process (renamed from `vmcell-guest-agent` by
+  the v33 pass — §18 delta 1). As of v33 it is a **library carrying the whole steward** behind
+  `StewardOptions` (the R5 split, §3.5 — before it, the library held only the `ReaperCoordinator` +
+  the 961-line `netif` module against a 2,867-line binary) plus the thin binary that reads
+  `/proc/cmdline`, installs the subscriber, and calls `run`. Lean:
+  `rustix`/`signal-hook`/`vsock`/`libc`/`tracing`, no host async stack.
+- **`vmcell-test-runner`** — the privileged-test capability runner (§15.5). Lean: `rustix`/`capctl`/`libc`
+  only, never the `vmcell` library.
+- **`vmcell-guest-tools`** — the in-rootfs multicall helper: six applets as of v33,
+  `ip`/`curl`/`kvm-ok`/`echo-server`/`mini-init`/`xattr` (§4.4; the last two are §18 deltas 5 and
+  7). A *guest* binary; needs
+  `reqwest` for real HTTP, so leaner than the host but not as lean as the steward.
+- **`vmcell-privilege`** — a lean library (`rustix`/`capctl`/`libc` only) holding the capability/blessing
+  predicates, extracted so the daemon and the runner share **one** copy of security-critical logic
+  (§11.2). Subject to the same per-member lean-tree assertion as the runner.
+- **`vmcell-daemon`** — the control-plane daemon **library** (§11): the artifact store, the owning VM
+  `Registry` over the `VmLauncher`/`VmHandle` seam, the start-up sweep, the axum router + handlers, the
+  bearer-auth layer, the OpenAPI document, and the DTOs.
+- **`vmcelld`** — the daemon **binary**: a thin blessed wrapper (functionality in the library, binary is
+  the wrapper).
+- **`vmcell-daemon-client`** — a typed `reqwest` client mirroring the entry points, re-exporting the
+  daemon's DTOs (§11.7).
+- **`vmcelld-ctl`** — a `clap` wrapper over the client.
+- **`vmcell-broker`** — the lean privileged spawn helper + `BrokerClient` (§12.4). It holds the three caps
+  on behalf of a cap-dropped `vmcelld` parent, links `vmcell`'s net-privileged/metrics subset +
+  `vmcell-privilege` — never the daemon's web-**server** stack (`axum`/`vmcell-daemon` absent by its
+  lean-tree assertion; `hyper` enters legitimately via the proxy/HTTP-client subset — §15.2). The
+  jailer-equivalent it applies lives in `vmcell::vmm::jail`, not here, so the lean
+  `vmcell-privilege`/`vmcell-test-runner` tier (which never spawns a VMM) stays lean.
+
+**Why a workspace:** a member crate's build fingerprint depends only on its own (tiny) source + deps, so
+the lean-tree assertion (§9.7) becomes a **structural per-member property** — no host module can leak into
+the runner or steward by construction. Extracting `vmcell-protocol` is what lets the steward be a standalone
+member without a dependency edge on the whole library.
+
+**The dependency graph is two acyclic stars on `vmcell`, wired by artifact-path passing.** The two builder
+crates each depend on `vmcell` and reuse its promoted-`pub` utilities — `pack_erofs_with_injection`,
+`resolve_builder_base`, `hash_file`/`hash_output`/`hash_artifacts_sorted`, `ch_binary_path`,
+`HttpClient`/`ReqwestClient` — so there is **one** implementation of each, not a per-builder fork (a
+divergent erofs packer or hash function across builders is exactly the duplication-hides-divergence trap).
+`vmcell` has **no edge back** to either builder, so the graph never cycles; `vmcell-cli` is the
+composition root and the *only* crate that names a builder — which is why the CLI had to leave the
+`vmcell` package (a CLI inside `vmcell` referencing the builders would force `vmcell → builder → vmcell`).
+The daemon members form the second star: the daemon depends on `vmcell` (never the reverse), and the
+client links only the daemon's DTOs (§11.1). Builders pass real data through `StageInputs`/`StageOutputs`
+(§10.2), never via env vars. The vendored vhost patch (`vendor/vhost`, `vendor/vhost-user-backend`) is
+applied via `[patch.crates-io]` path entries at the workspace root (§9.6).
+
+### 9.2 The module map
+
+The `vmcell` library's module tree (`crates/vmcell/src/`), each module's job in one line:
+
+```
+lib.rs           # public re-exports; crate lints (deny missing-docs, unwrap, panic, print, indexing under not(test))
+error.rs         # the crate Error enum + Result<T>
+config.rs        # VmConfig + builder, RootfsSource, NetConfig, Share, ResourceLimits, RestoreMode  (host-common)
+env.rs           # HostEnv: the process-wide injected-seam bundle (allocators, cgroups, clock, overlay) (§9.3)
+vmm/             # Vmm + VmInstance traits, VmmCapabilities, Cid/Vmid types; cloud_hypervisor (the ONE in-lib backend); FakeVmm
+vmm/seccomp.rs   # vmm_seccomp_args: the ONE (backend, VmmSeccomp)→CLI-flag predicate (§12.2)
+vmm/jail.rs      # JailSpec + async-signal-safe apply_jail: the jailer-equivalent, seccompiler deny-list (§12.3)
+vmm/usb.rs       # host-USB claim/release: vid:pid → usbfs node, record displaced drivers, re-bind at teardown (§2.4)
+steward/         # StewardClient (host vsock client, handshake + desync); steward::session multiplexer (§3.2)
+fs.rs            # VirtioFsDaemon: one virtiofsd per share, perms, tags, sockets, socket-wait timeout
+net/             # NetConfig dispatch: tap (netns + /30 via rtnetlink, nft TPROXY) + userspace (smoltcp NAT)
+net_sys.rs       # the unsafe syscall edges net/ can't host (setns_net, TUNSETIFF, TUNSETPERSIST); net/ is #![forbid(unsafe_code)]
+proxy/           # EgressProxy (hudsucker MITM), TLS CA + leaf minting, test doubles + record/replay
+metrics.rs       # CgroupFs trait (real + recording fake), slice mgmt, peak/avg readers (direct sysfs writes)
+hostcaps.rs      # HostCapabilities: the ONE start-up probe of caps/KVM/netns/cgroup delegation (§7.2)
+feature.rs       # Feature/Removal/FeatureSet: the ONE intersection site over backend×host×artifacts (§7.4)
+cpufreq.rs       # benchmark-only CpuFreqSysfs seam: pin governor/turbo, RAII restore-on-drop
+orchestrator.rs  # MicroVm handle; VmidAllocator/CidAllocator; ordered Drop; sweep_orphans
+naming.rs        # one prefix → every per-VM resource name (net/tap/cgroup/scratch) + every sweep filter (§11.4)
+reflink.rs       # the FICLONE-or-copy primitive behind ReflinkOverlayStore (forbid(unsafe))
+overlay.rs       # OverlayStore seam: trait + ReflinkOverlayStore + RecordingOverlayStore (§8.4)
+zygote.rs        # Zygote: suspend once, mint many; the concurrent-fan-out gate (§8.4)
+lineage.rs       # Lineage/LineageId/LineageAllocator: fork/branch over Zygote (§8.5)
+artifact/        # Stage trait, Pipeline, cache, bootstrap kernel/rootfs/snapshot stages, bundle; pub reuse surface
+```
+
+### 9.3 The public API surface
+
+Types are `#[non_exhaustive]` where future fields are likely; builders keep call sites stable.
+
+**`HostEnv` — the process-wide seam bundle.** Every injected seam that is process-global (or that every VM
+shares) lives in one struct, built once per process and passed by reference to every spawn:
+
+```rust
+// ---- env.rs ----
+#[derive(Clone)]
+#[non_exhaustive]                        // documented to GROW BY FIELD — a new process-global seam is
+                                         // a field here, never a new positional argument
+pub struct HostEnv {
+    pub cids:    Arc<CidAllocator>,
+    pub vmids:   VmidAllocator,          // Clone over an internal Arc<Mutex>
+    pub segids:  SegmentIdAllocator,     // v30 (§6.5): segment ids; shares the vmid allocator's
+                                         //   extracted flock claim core, lock dir /tmp/vmcell-segid
+    pub cgroups: Arc<dyn CgroupFs>,
+    pub clock:   Arc<dyn Clock + RefUnwindSafe>,  // the bound the v28 sketch elided (as-built)
+    pub overlay: Arc<dyn OverlayStore>,
+}
+impl HostEnv {
+    /// Production: cross-process VmidAllocator::shared(), RealClock, ReflinkOverlayStore, the real CgroupFs.
+    pub fn shared() -> Result<Self>;
+    /// Hermetic: in-process allocators; tests substitute recording fakes field-by-field.
+    pub fn hermetic() -> Self;
+}
+```
+
+The allocators are process-global by design — under `cargo test`'s in-process parallelism, per-test
+allocators hand concurrent tests identical IDs and collide on temp-dir paths and socket names — and the
+daemon is the natural single home for the productized pair (§11.1). Bundling them with the `CgroupFs`,
+`Clock`, and `OverlayStore` seams gives every spawn one parameter instead of three-to-five positional
+injected arguments that grew by one per feature, removes the per-clone `make_cgroups` closures from the
+fan-out APIs, and lets `steward()` take no *seam* arguments — the clock that drives the post-restore
+resync comes from the env captured at construction; the one retained parameter is the per-call connect
+**budget** (`None` ⇒ the 10 s default; the recorded as-built deviation from the v28 sketch,
+implementation-notes Delta 1 — see the API listing below). Tests
+build a `HostEnv` with recording fakes; per-VM assertions key on the slice/vmid the shared recording fake
+recorded. The bundle arrived with the v28 pass (its deltas 1–2, landed — the one breaking change of the
+0.10 release); v30 grows it by the `segids` field, the documented growth mode.
+
+```rust
+// ---- config.rs ----
+#[non_exhaustive]
+pub struct VmConfig {
+    pub vcpus: u8,               // > 0
+    pub mem_mib: u32,            // >= 64
+    pub kernel: PathBuf,         // vmlinux (direct kernel boot)
+    pub rootfs: RootfsSource,    // Erofs { image } (default) | Block { image, overlay }
+    pub shares: Vec<Share>,      // virtio-fs mounts; need capabilities().virtio_fs_shares
+    pub net: NetConfig,
+    pub nested_virt: bool,       // needs capabilities().nested_virt (not Firecracker)
+    pub limits: ResourceLimits,
+    pub snapshotting: bool,      // build() REJECTS this with ANY vhost-user device (S1) or any
+                                 //   non-Pid1 steward placement (§3.5)
+    pub vsock_transport: VsockTransport, // QEMU only (§2.4): Auto (in-kernel iff snapshotting) | InKernel |
+                                 //   ExternalDaemon; read through the ONE uses_in_kernel_vsock predicate
+    pub vmid: Option<u32>,       // 1..=254; None => allocated
+    pub restore_mode: RestoreMode, // Default | Eager | Lazy  → CH --restore prefault=on|off
+    pub ksm_mergeable: bool,     // CH mergeable=on + shared=off; mutually exclusive with vhost-user (§8.3)
+    pub kernel_verbosity: KernelVerbosity, // Quiet|Balanced(default)|Verbose|Debug → loglevel=3/6/7/8
+    pub timeouts: Timeouts,      // per-VM hot-path timing knobs; default()/low_latency()/throughput()
+    pub console_mode: ConsoleMode, // Uart(ttyS0, default) | VirtioConsole(hvc0); needs capabilities().virtio_console
+    pub extra_disks: Vec<BlockDevice>,  // extra raw virtio-blk → /dev/vd{b,c,…}; snapshot-composing (§4.6)
+    pub extra_kernel_args: Vec<String>, // append-only, is_reserved_cmdline_arg-guarded (§5.3)
+    pub usb_host_devices: Vec<UsbHostDevice>, // host-USB passthrough (v30 §2.4); needs
+                                        //   capabilities().usb_host_passthrough (QEMU only);
+                                        //   build() rejects with snapshotting
+    pub init: Option<PathBuf>,          // init= override: replaces PID 1 — init IDENTITY only (§5.3);
+                                        //   control-plane availability is the placement's fact, below
+    pub steward_placement: StewardPlacement, // Pid1 (default when init is None) | Service{port} | None
+                                        //   (default when init is Some); law C8's TWO methods live
+                                        //   here — steward_port() answers "is a steward expected,
+                                        //   and where", resync_reachable() answers "may this cell
+                                        //   snapshot/clone", and they differ exactly at Service
+                                        //   (§3.5); build() rejects
+                                        //   Pid1 + a custom init, and snapshotting + non-Pid1
+    pub resource_prefix: String,        // names AND sweeps every per-VM host resource; default "vmcell",
+                                        //   validated [A-Za-z0-9]≤6 at build() (§11.4)
+    pub vmm_seccomp: VmmSeccomp,        // the VMM subprocess's OWN seccomp: Enforcing (default) | Log | Disabled
+    pub jail: JailConfig,               // jailer-equivalent pre-exec hardening; default hardened() (§12.3)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct BlockDevice { pub image: PathBuf, pub readonly: bool, pub io_limit: Option<DiskIoLimit> }
+impl BlockDevice {
+    pub fn read_only(image: impl Into<PathBuf>) -> Self;
+    pub fn read_write(image: impl Into<PathBuf>) -> Self;
+    pub fn with_io_limit(self, limit: DiskIoLimit) -> Self;
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DiskIoLimit { pub bandwidth_bytes_per_sec: Option<u64>, pub iops: Option<u64> } // build() rejects all-None / any-0
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]                       // bus/port addressing can arrive later without a break
+pub struct UsbHostDevice { pub vendor_id: u16, pub product_id: u16 }  // v30 (§2.4); duplicates rejected at build()
+
+// ---- orchestrator.rs — the handle most callers hold ----
+pub struct MicroVm<V: Vmm> { /* instance, cgroup, net, virtiofsd, cid, vmid, tmp_dir, env, ... */ }
+impl<V: Vmm> MicroVm<V> {
+    pub async fn start(vmm: &V, cfg: VmConfig, env: &HostEnv) -> Result<Self>;
+    pub async fn restore(vmm: &V, snapshot_dir: &Path, cfg: VmConfig, env: &HostEnv) -> Result<Self>;
+        // SINGLE-USE: rewrites snapshot_dir in place (§8.1)
+    pub async fn restore_cow(vmm: &V, zygote_dir: &Path, cfg: VmConfig, env: &HostEnv) -> Result<(Self, CowSupport)>;
+        // CoW-copies the suspend dir through env.overlay first (§8.4)
+    pub fn vmid(&self) -> u32;
+    pub fn proxy(&self) -> Option<&EgressProxy>;          // the egress-proxy handle, if egress is filtered
+    pub async fn steward(&mut self, timeout: Option<Duration>) -> Result<&mut StewardClient>;
+        // drives the first post-restore resync via env.clock. Takes NO seam arguments (the v28 delta-1 gate);
+        // the one retained parameter is the per-call connect BUDGET (None => the 10 s default) — a
+        // consumer running slow builder-VM boots or restore-under-load legitimately needs 60–180 s
+        // windows, and `Timeouts` deliberately carries no overall steward-connect field (the recorded
+        // as-built deviation from the v28 delta-1 sketch; implementation-notes.md, Delta 1)
+    pub async fn connect_sessions(&self, timeout: Option<Duration>) -> Result<SessionMux>;
+        // a 2nd control-plane connection for interactive sessions; fail-loud when the placement
+        // is None (C8, §3.5); (&self + per-call budget, matching steward() — the as-built shape)
+    pub async fn dial_vsock(&self, port: u32, timeout: Duration) -> Result<VsockDial>;
+        // raw byte stream to a guest vsock listener (v30, §3.2); steward-independent — works under
+        // a custom init=; typed fail-fast on a dead port, never a hang
+    pub async fn usage(&self) -> Result<ResourceUsage>;   // reads the cgroup slice
+    pub async fn pause(&mut self) -> Result<()>;
+    pub async fn resume(&mut self) -> Result<()>;
+    pub async fn snapshot(&mut self, dir: &Path) -> Result<()>; // snapshot-eligible only; Unsupported otherwise
+    pub async fn shutdown(self) -> Result<()>;            // graceful, then verify gone (§9.4)
+}
+impl<V: Vmm> Drop for MicroVm<V> { /* kill VMM proc-group → virtiofsd → tap/netns/cgroup/overlay/tmp_dir */ }
+
+// ---- zygote.rs — suspend once, mint many (§8.4) ----
+pub enum CowSupport { Reflink, FullCopy }
+pub struct Zygote { /* immutable master snapshot dir + the snapshot-eligible clone config (vmid cleared) */ }
+impl Zygote {
+    pub async fn suspend<V: Vmm>(vm: &mut MicroVm<V>, cfg: VmConfig, master_dir: impl Into<PathBuf>) -> Result<Self>;
+    pub async fn from_snapshot_dir(master_dir: impl Into<PathBuf>, cfg: VmConfig) -> Result<Self>;
+    pub async fn spawn_clone<V: Vmm>(&self, vmm: &V, env: &HostEnv) -> Result<MicroVm<V>>;
+    pub async fn spawn_clones<V: Vmm>(&self, vmm: &V, count: usize, env: &HostEnv) -> Result<Vec<MicroVm<V>>>;
+        // concurrent pool, all-or-nothing; Unsupported when count > 1 && !restore_rotates_host_paths
+    pub fn master_dir(&self) -> &Path;
+}
+
+// ---- vmm::seccomp / config — the VMM's own seccomp policy + the jailer config (§12.2–§12.3) ----
+pub enum VmmSeccomp { Enforcing, Log, Disabled }  // default Enforcing; Disabled is a logged, explicit opt-out
+pub fn vmm_seccomp_args(backend: &str, policy: VmmSeccomp) -> Result<Vec<String>>;
+pub struct JailConfig { /* no_new_privs, clear_ambient_caps, non_dumpable, rlimit_core/fsize/nofile, seccomp_deny_list */ }
+impl JailConfig { pub fn hardened() -> Self; } // no_new_privs + RLIMIT_CORE=0 + non_dumpable on; the rest off
+```
+
+Both `Zygote` constructors fail-fast reject an ineligible config (a vhost-user device) at construction,
+before any copy is minted; the config's `vmid` is cleared since every clone is allocated a fresh one. A
+caller wanting an up-front CoW cost signal probes directly: `env.overlay.probe(zygote.master_dir())`. The
+`Lineage` API is §8.5; the session API and `VsockDial` are §3.2; the `NetSegment` API is §6.5;
+`StewardClient`, `ResourceUsage`, `VmmCapabilities`, `Vmm`/`VmInstance`, `NetConfig`, and `Share` are
+shown in §2–§7 where they are used. The v30 additions landed as one breaking pass, `vmcell` 0.12 → 0.13
+(the ledger holds the record); the v33 additions land per the §18 register — deltas 2–7 as one
+breaking release, 8–10 separable.
+
+**Allocator mechanics.** `VmidAllocator` is either hermetic (`new()`, in-process) or cross-process
+(`shared()`, via `/tmp/vmcell-vmid/<vmid>.lock` files with crashed-owner reclaim; `shared_at(dir)` injects
+the lock directory so the fs claim/reclaim path is unit-testable). Each lock file is **created already
+carrying the owner pid** (never a create-then-write two-step that could crash into an empty, unreclaimable
+lock); the whole read→liveness→(re)claim sequence is serialized by an **exclusive `flock` on a per-vmid
+coordination file**, with the claim itself an atomic `hard_link` of a pid-bearing temp file (the H1 fix
+— the code's own comments record why rename-based claiming dual-claims), and liveness is a
+`/proc/<pid>` check. The VMID is mapped to the third IPv4
+octet as **`(vmid % 254) + 1`** (`10.200.<octet>.{1,2}` — a raw counter would exceed 255 and synthesize
+invalid addresses), centralized in one unit-tested `/30` helper, which caps a single host at ≈254
+concurrent VMs on one `/16` (§17). VMID range is `1..=254`; CID space is `3..=254`. The VMID lock dir is
+deliberately *not* prefixed by `resource_prefix` — it is a cross-process rendezvous that must be stable
+regardless of prefix, and it is not swept.
+
+**`resource_prefix` + the `vmcell::naming` module — one string names *and* sweeps every per-VM host
+resource (law F2).** A VM leaks four host resources if it dies ungracefully — a netns, a tap, a cgroup
+slice, and a scratch dir — and the orphan sweep filters for them. Their names were four hard-coded
+`vmcell-*` literals and the sweep filtered by three more — seven copies of one prefix that had to stay in
+lockstep or the sweep would silently miss a leak. `vmcell::naming` collapses them: the single place that
+composes every name from a prefix (`<prefix>-net-<vmid>`, `<prefix>-tap-<vmid>`, `<prefix>-vm-<vmid>`,
+`<prefix>-vm-<pid>-<vmid>`) and every sweep filter (`<prefix>-net-`, `<prefix>-vm-`); a unit test pins
+that each produced name **starts with** its sweep filter for any prefix. The prefix lives on
+`VmConfig::resource_prefix` (validated `[A-Za-z0-9]`≤6 at `build()` so it is safe in an
+interface/netns/cgroup/dir name), and `HostOrphanScanner::new(prefix)` matches by the same value — so two
+daemons with distinct prefixes never sweep each other's resources (§11.4). The default reproduces the
+historical `vmcell-*` names exactly.
+
+All per-VM temporaries (API/vsock sockets, serial log, the unprivileged smoltcp socket) live under one
+`/tmp/<prefix>-vm-<pid>-<vmid>/` owned by a `VmTempDir` RAII guard on `MicroVm`, created *before*
+networking and dropped *last* in `Drop`. (The VMID lock files and the Firecracker T2 capability-probe
+socket are deliberately outside it — they outlive any single VM.)
+
+### 9.4 `Timeouts` and the lifecycle nuances
+
+**`Timeouts` — the per-VM hot-path timing profile.** Seven `Duration` fields gather every tunable hot-path
+wait (defaults in ms; `low_latency()` / `throughput()` in parentheses): `connect_backoff_floor` 20 (5/10)
+and `connect_backoff_cap` 100 (40/75) — the vsock connect backoff, reset to the floor once the UDS
+connects; `connect_ok_read` 150 (100/150); `api_socket_poll` 5 (2/3), which paces **every** VMM
+control-socket / daemon readiness wait (including QEMU's `vhost-device-vsock` daemon wait and
+Firecracker's T2 CPU-template probe wait); `shutdown_grace` 250 (250/50); `guest_accept_poll` 20 (5/10)
+and `guest_rebind_idle` 250 (150/200), the last two emitted as `vmcell_*_ms` cmdline tokens the steward
+parses clamped (§5.3), so a preset tunes the guest with **no rootfs rebuild**. `low_latency()` minimizes
+time-to-first-output (tightens every connect/accept cadence, leaves teardown graceful — ~−28 ms CH cold);
+`throughput()` minimizes whole-lifecycle wall clock (cuts `shutdown_grace` to 50 ms and keeps cadences
+moderate, since tight polls cost idle-CPU wakeups in a dense farm). Every field clamps to a correctness
+floor via `pub(crate) clamped()` (`connect_backoff_floor` ≥1 ms, `cap` ≥ floor, `connect_ok_read` ≥5 ms,
+`api_socket_poll`/`guest_accept_poll` ≥1 ms, `guest_rebind_idle` ≥20 ms; `shutdown_grace` has no floor — 0
+is legal, force-kill remains the fallback), and because the fields are `pub`, the orchestrator
+**re-clamps at `start()`/`restore()`** so post-`build()` mutation can never busy-spin PID 1 or a readiness
+poll; `vmm::wait_for_socket` additionally clamps its interval to ≥1 ms. The deliberately-*not*-in-
+`Timeouts` failure ceilings are correctness-floor constants (the 2 s Ready-frame wait, the 10 s overall
+connect deadline, `DEFAULT_EXEC_TIMEOUT` 10 s, the QMP/join timeouts), not knobs.
+
+**`MicroVm::shutdown()`** (not the backend's `request_shutdown()`, which is only the graceful signal)
+computes the grace deadline **before** issuing `request_shutdown` — the RPC round trip *spends* the grace
+instead of silently extending it (worth ~20 ms on the default profile) — then polls
+`VmInstance::has_exited()` on an **adaptive step** (grace ≤50 ms → 5 ms, ≤150 ms → 10 ms, else 20 ms) and
+returns as soon as the guest powers off, capping at `Timeouts::shutdown_grace` before the SIGKILL
+fallback. Because the shutdown RPC's only bound is the generic 5 s `vmm::unix_api_request` ceiling — far
+longer than the grace, so a slow ack would otherwise spend the whole window — the deadline is clamped
+post-ack to ≥ one poll step, so a stalled RPC still yields at least one `has_exited` check. That
+`unix_api_request` ceiling bounds **every** CH/FC control RPC over the API UDS, returning a typed
+`Error::Timeout`, so a wedged control socket surfaces before any outer readiness timeout can mask it.
+
+**Error-path teardown mirrors success-path teardown through one function.** On a mid-`start()`/`restore()`
+failure *before* resources move into `MicroVm`, the internal `EnvSetup` staging struct releases them via
+an explicit `Drop` impl that calls the **same ordered-teardown helper** `teardown_post_instance` uses —
+one law for the order (proxy and smoltcp NAT before netns; VMM process group first once an instance
+exists), two callers, pinned by a drop-order recording gate. (This replaces relying on struct
+field-declaration order for the error-path drop sequence, which was correct but invisible and
+reshuffle-fragile — the v28 pass's delta 7, landed. The pre-fix bug it guards against: deleting the
+netns before the proxy running inside it.)
+
+### 9.5 The error type
+
+One `Error` enum (`thiserror`) with a variant per subsystem, `Result<T> = std::result::Result<T, Error>`.
+Two deliberate properties: there is **no `Error::Other(String)` catch-all** — the review rubric bans
+exactly that — and the two most caller-relevant conditions are **typed and matchable**:
+`Error::Unsupported { vmm, feature }` (an op a backend doesn't advertise) and
+`Error::CapabilityUnavailable { op, needed }` (a requested op whose OS capability is absent, §7.2). The
+per-subsystem variants (`Vmm`/`Steward`/`Network`/`Cgroup`/`Artifact`/`Config`/…) carry a `String` payload
+rather than a fully-typed source for every case; `#[from]` is used where a concrete upstream type exists
+(`Hyper`, `SerdeJson`, `Io`, `Reqwest`, `Postcard`). This is an accepted trade-off — matchability where it
+matters, strings elsewhere — not the `Error::Other`-everywhere anti-pattern.
+
+### 9.6 Dependency strategy
+
+Implementation avenues are ranked — *best:* our own well-documented Rust; *great:* a permissive crate;
+*good:* a binary with a programmable interface; *okay:* an external tool — and copyleft/restrictive
+licenses are forbidden for anything *linked*. Much that a naive implementation would shell out to is a
+linked, permissive crate under `cargo-deny`'s license gate:
+
+| Capability | Naive OS tool | Crate (linked) |
+|---|---|---|
+| netns / tap / addrs / routes | `iproute2` (`ip`) | `rtnetlink` + `netns-rs` (tap creation is our own `TUNSETIFF`, §9.2) |
+| MITM CA + leaf minting | `openssl` | `rcgen` + `rustls` (via `hudsucker`) |
+| cgroup peak/avg reads | parse `/sys` by hand | `cgroups-rs` + `procfs` (reads only; slice create + limit writes go direct to sysfs) |
+| pull + unpack a Debian base | `skopeo` / `docker` | `oci-client` + `tar` + `flate2`/`zstd` |
+| build the erofs image | `mkfs.erofs` | `am-fs-erofs` (tar→erofs in memory) |
+| vsock control channel | `socat`/`ncat` | `tokio-vsock` (host), `vsock` (steward) |
+| unprivileged guest net | `passt` (rejected, Exp 4) | `smoltcp` + `vhost-user-backend` |
+| verify SHA256 / detached PGP | `sha256sum` / `gpgv` | `sha2` / `pgp` (rPGP) |
+
+Three caveats shaped the choices:
+
+- **nftables has no permissive pure-Rust path.** `rustables` relicensed to GPL-3.0-or-later; the pure-Rust
+  crates don't cover the TPROXY/`socket` expressions. Since the ruleset is small, fixed, and
+  security-critical, it is rendered in Rust and applied via `nft -f -` — correctness over purity.
+- **A carried vendored patch of `vhost-user-backend`+`vhost`** is needed *only* to attach the unprivileged
+  smoltcp NAT to QEMU (not CH), where a strict `PROTOCOL_FEATURES` check rejects `SET_VRING_ENABLE`
+  arriving before `SET_FEATURES`. A live message trace confirms QEMU sends `SET_VRING_ENABLE` first while
+  CH sends features first, and upstream still enforces the guard — a genuine QEMU ordering quirk, not a
+  masked backend bug. The crates.io-packaged sources are vendored **in-tree** (`vendor/vhost` 0.16.0,
+  `vendor/vhost-user-backend` 0.22.0 — content in git, stronger than pinning a git-fork rev), wired via
+  `[patch.crates-io]` path entries with exact `=` pins. The relaxation is **gated on `features_acked`**
+  (accept QEMU's early delivery, re-enforce the spec check after `SET_FEATURES` — narrower than a blanket
+  relaxation), the disabled check carries an at-site rationale comment, and `just ci` asserts via
+  `cargo tree` that both crates resolve from `vendor/` so a version bump cannot silently drop the patch.
+  Permissively licensed (rust-vmm, Apache-2.0); drop it (delete `vendor/` + the `[patch]` entries) if the
+  QEMU-unprivileged tier is dropped. (Because `just ci` sets `RUSTFLAGS=-D warnings` process-wide, the
+  vendored code's unused helpers carry `#[allow(dead_code)]`.)
+- **Trust `cargo-deny`, not hand-written license labels.** An earlier draft mislabeled `rustables`
+  MIT/Apache when it is GPL-3.0 — exactly the class of error the allow-list catches.
+
+`virtiofsd` is `cargo install`'d (a rust-vmm binary, Apache/BSD), so shared-directory support needs no OS
+package. Irreducibly external: `cloud-hypervisor` (pinned release binary), the kernel build toolchain,
+`nftables` (`nft`), `qemu-system-x86` (fallback only), and KVM. **License gate:** `cargo-deny` enforces an
+allow-list (`MIT`/`Apache-2.0`/`BSD-3`/`BSD-2`/`ISC`/`Zlib`/`0BSD`/`Unicode-3.0`/`CDLA-Permissive-2.0`)
+for all *linked* crates on every build. The advisory `ignore` list is **one entry**, with a per-crate
+rationale, and `unused-ignored-advisory = "deny"` makes a dead one red rather than a warning nobody
+reads. It was fifteen: fourteen were the dormant `tokio-0.1` tree, which entered only via
+`tun-tap 0.1.4 → tokio-core → tokio 0.1.22` — a crate carried for a single `TUNSETIFF`, now written
+in `net_sys` (§9.2) against `libc::ifreq`, and banned by name in `deny.toml` so it cannot return
+transitively.
+
+### 9.7 Features and build shapes
+
+The build *shapes* (things you compile and ship) are the host stack (**library + CLI + `bench-vm`**) and
+the lean *binary* members (**steward**, **test-runner**, **guest-tools**, plus the daemon-tier binaries);
+`vmcell-protocol` is a shared library member, never shipped on its own. Within the `vmcell` library the
+per-component features remain (`cloud-hypervisor`, `firecracker`, `qemu`, `net-privileged`,
+`net-unprivileged`, `proxy`, `metrics`, `pipeline`, `cli`), but each pulls in a **`host-common`** umbrella
+that turns on the whole host module set, and `host-common` in turn lists the per-module features — an
+intentional feature cycle cargo accepts and unifies. The effect: **any host feature yields the whole
+coherent stack**, so there are no incoherent partial-host configs. This retired the fine-grained matrix
+that was the direct source of feature-gating build breaks (an un-`cfg`'d `#[from]` variant broke
+`--features agent`; modules gated on the wrong feature made single-feature combos fail to compile). The
+feature powerset is a **blocking** CI gate (all combos compile). The trade-off is deliberate: there is no
+minimal backend-only library build — a `--features qemu` build still pulls the full host stack — which is
+fine, since no real deployment used a partial host build.
+
+The leanness that *does* matter — the privileged-window binaries and the steward must not drag in the
+host async stack — is a **structural per-member property**: each is its own crate, so building the member
+*is* the lean build. A CI `cargo tree -e no-dev` per member asserts `steward`, `test-runner`, and
+`vmcell-privilege` contain no `tokio`/`hyper`/`rtnetlink`; `vmcell-broker`'s distinct web-server-stack
+assertion (no `axum`, no `vmcell-daemon` — it legitimately owns the engine) is §15.2.
+**`guest-tools` is deliberately not under that ban** — it needs `reqwest` for real HTTP and runs
+unprivileged in-guest, so its lean boundary is "not the host *library*," not "no async."
+
+**Toolchain note.** The MSRV is **1.98.0, single-sourced**: `rust-toolchain.toml` pins it and the one
+`[workspace.package] rust-version` equals it, with a CI sync assertion so the two cannot drift. The
+declared MSRV is the *tested floor*, never an aspiration — an **understated** `rust-version` is a live
+vulnerability path, because an MSRV-aware resolver re-resolves older consumers onto dependency versions
+the lockfile pins were bumped past (the `time 0.3.45` / RUSTSEC-2026-0009 class). Build `--locked`; never
+`cargo update` on an older toolchain. (This supersedes — and folds in — the pre-bump "targets 1.85 /
+effective floor 1.88" note that `docs/historical/70` carried as an erratum against this section.)
+
+### 9.8 Testability seams
+
+Four accommodations make the orchestrator unit-testable without KVM or root. **They are load-bearing, not
+optional** — an implementation that skipped them (calling `ip`/`nft` directly, using module-global
+`static AtomicU32` counters) is precisely why a class of correctness bugs was review-only.
+
+1. **The `Vmm`/`VmInstance` trait seam.** `FakeVmm` implements both traits in memory, letting the
+   orchestrator's logic (allocation order, ordered `Drop` cleanup, retry/timeout, snapshot-vs-cold-boot
+   selection) be unit-tested with no KVM, root, or subprocess. `FakeVmm` records calls **and carries a
+   scriptable fault menu** — fail `create`/`boot`/`restore` at a chosen step, delay readiness, report a
+   wedged control socket — so the retry/timeout and mid-`start()` failure paths are exercised at the trait
+   seam itself, not only through the surrounding seams. (The fault menu landed with
+   the v28 pass — its delta 9; before it `FakeVmm` recorded calls only.)
+2. **Pure/imperative split.** The genuinely-testable pure functions are isolated from I/O: nft-rule
+   rendering, `/30` arithmetic, the CH REST payload builder, the vsock handshake state machine,
+   cgroup-path construction, per-VM scratch-dir construction, the artifact `cache_key`, the accept-loop
+   deadline policy (§3.4), and the protocol codec.
+3. **Injectable side-effect traits** — `Netlink`, `NftApplier`, `CgroupFs`, `SerialLog`, `Clock`,
+   `OverlayStore`, `OciPuller` (`RealOciPuller` + a recording/replaying `FakeOciPuller` serving canned
+   manifests/blobs), `GuestResync`, `OrphanScanner`, and `VmidAllocator::shared_at`'s injectable lock
+   directory — each with a real implementation and a recording fake, so `net`/`metrics`/`steward`/`artifact`
+   orchestration can assert "the right rules/limits/handshake/pull were requested" without touching the
+   host.
+4. **Deterministic IDs and clocks** are injected via `HostEnv`, never module-global statics, so tests are
+   reproducible.
+
+The rule that follows: **a subsystem that cannot be unit-tested against a fake is, by this design, not
+done** (§15). One nuance the seams make honest: the zero-netlink-in-PID-1 invariant (law C6) is *not*
+guarded by a `Netlink` fake — the steward has no netlink seam to inject because the manual bring-up
+was *deleted* — so it is guarded structurally by the CI assertion that `vmcell-steward` has no
+`rtnetlink` dependency at all.
+
+---
+## 10. The artifact build pipeline
+
+The pipeline maps onto the artifact-production requirements: staged, pinned, deterministic, cacheable,
+resettable, minimal external access, record/replay, signing-chain verified. It is exposed as the library
+`artifact::Pipeline` and as CLI verbs. The bootstrap pipeline stays in `vmcell` (the `Stage` trait,
+`Pipeline`, the cache, and the bootstrap producers); the in-VM builders are `Stage` impls in their own
+crates; `vmcell-cli` is the composition root that assembles a `Pipeline` from either set (§9.1) and
+implements `build`, `build-kernels` (both accepting `--pins <file>` as of v30 — the overlay, §10.2, and
+the retirement of the CLI's private `pins_path()` near-duplicate of `workspace_root()`),
+`oci2-erofs IMAGE@DIGEST [--inject dest=…,src=…,mode=…]` (§4.2), the live-handle lifecycle verbs
+`run`/`create`/`snapshot`/`stats` (taking `--kernel`/`--rootfs`, plus `--disk`/`--disk-rw`/`--append` as
+thin wrappers over the extra-disk / extra-kernel-arg builder methods), and `bundle`/`verify-bundle` (a
+digest-pinned fetch-and-verify manifest of the built artifacts). The cross-process verbs
+(`exec`/`ls`/`rm`/`destroy`) belong to the daemon, which genuinely owns them (§11); the CLI's former
+fail-loud stubs for them were removed by the v28 pass (its delta 11, landed), each verb redirecting to
+the exact `vmcelld-ctl` subcommand that owns it.
+
+### 10.1 Artifacts produced
+
+1. **`vmlinux`** (per arch, per kernel label): one custom-minimal kernel, direct-boot, drivers built in.
+   Rebuilt only when the config fragment or pinned source changes. Every *compiling* producer also
+   emits the post-`olddefconfig` resolved config beside it as **`vmlinux[-<label>].config`** (v30,
+   §5.6 — the anti-silent-drop artifact; the prebuilt seed has none to emit).
+2. **Root filesystem** (per profile): a single read-only erofs packed in memory from a merged tar, from
+   one of two interchangeable sources sharing the inject+pack tail (§4.2). Kernel-independent.
+3. **Warm snapshot** (per VMM + profile): boot the erofs base to steward-ready, snapshot. This suspend image
+   is directly usable as a **zygote master** (§8.4): `Zygote::from_snapshot_dir` adopts it, so the
+   artifact that speeds a single restore also seeds a warm pool.
+4. **Proxy CA cert**: minted once per artifacts dir and cached (the recorded deviation from per-run CA
+   hygiene, §6.4), baked into the rootfs trust store.
+
+All four live under one artifacts directory — `$VMCELL_ARTIFACTS_DIR` or the default
+`target/vmcell-artifacts` (anchored on the *workspace root*, not the member CWD, so a workspace member's
+tests find it) — from which `kernel_path()`/`rootfs_path()` derive (overridable via `$VMCELL_KERNEL` /
+`$VMCELL_ROOTFS`). There are **no `/tmp/vmlinux`-style fallbacks**: a missing upstream artifact is an
+`Error::Artifact`, never a silent boot from a world-writable path.
+
+### 10.2 The stage model and the five cache-key rules
+
+The pipeline is a sequence of stages behind a small trait; the load-bearing parts are that `cache_key` is
+**pure** (so the cache can decide to skip a stage *before* running it) and that stages pass real data
+through `StageInputs`/`StageOutputs` (not via env vars or empty structs):
+
+```rust
+pub trait Stage {
+    fn name(&self) -> &str;
+    fn cache_key(&self, inputs: &StageInputs) -> CacheKey;                 // PURE (law F4)
+    fn out_path(&self, target_dir: &Path) -> PathBuf;                     // default: target_dir/<name>.bin
+    async fn run(&self, inputs: &StageInputs, out: &Path) -> Result<StageOutputs>;
+}
+pub struct Pipeline { /* Vec<Box<dyn Stage>> */ }
+impl Pipeline {
+    pub async fn build(&self, cache: &Cache) -> Result<Artifacts>;    // skip a stage whose output content matches its key
+    pub fn reset_to(&self, stage: &str, cache: &Cache) -> Result<()>; // remove that stage's + all later outputs;
+                                                                      //   errors on an unknown name
+}
+```
+
+**Stage 0 — the pin lock (the only non-deterministic input, isolated here).** The pin *schema* covers:
+the OCI base-image manifest **digest** (never a tag), the `snapshot.debian.org` **timestamp** (for the
+in-VM source), the kernel source version/SHA (plus the `kernels` registry, §5.5), the `kernel_prebuilt`
+entry (the digest-pinned bootstrap-seed URL + sha256, §5.4), and the CH/virtiofsd release identities.
+The committed `pins.json` currently carries the kernel/`kernels`/`kernel_prebuilt`/rootfs/fragments
+pins; the CH/virtiofsd and snapshot-timestamp pins are **recognized-when-present but not currently
+committed** — so the snapshot stage's CH-build-identity fold arms only once that pin is added (an
+honesty note, not a promise). Pins live in `pins.json`; `ResolvePinsStage` loads it once and propagates the values through `StageOutputs`
+so downstream stages read pins from memory. *Live* tag→digest and timestamp resolution is forward work
+(§17); the committed lock is the honest current state.
+
+**The pins overlay (the landed v30 pass, delta 1 — FR-V6).** A downstream consumer extends the registry without
+forking it: `ResolvePinsStage` gains `overlay_file: Option<PathBuf>`, set from **`VMCELL_PINS`** (env)
+or `--pins` (CLI) or directly (library). Semantics are **key-level overlay over the committed
+baseline**: a flattened key present in the overlay wins; a key absent from the overlay resolves from
+the baseline — that fallback is the vetted default, not a degrade, and it is exactly what retires the
+forked-pins maintenance the overlay exists for. The baseline is vmcell's own committed `pins.json`,
+**embedded at compile time** (`include_str!`) so a git-dep workspace needs no fragile
+filesystem hunt for the checkout; inside the vmcell workspace the embedded copy and the on-disk file
+are the same committed bytes by construction (the one-sentence rationale for what looks like two
+sources). Safety properties, each gated: a fragment or label *referenced* but resolvable nowhere stays the
+existing hard error naming the key; and — because reference-time errors cannot catch a typo'd
+**override** of a key that then silently resolves from the baseline (the accept-then-ignore class the
+fail-loud rule bans, on a surface whose whole purpose is overriding) — the overlay parser is
+**stricter than the baseline's**: every top-level overlay key must match the known pins namespace (the
+fixed pin names, `kernels.*`, `kernel_fragments.*`), and a key matching none is a hard error naming it
+(new entries *within* a namespace stay legal; the baseline file itself keeps its ignore-unknown
+semantics — it is vmcell-committed, not caller input). v33 grows the known-namespace roster by the
+`rootfs` (map shape) and `handlers` registries (§10.5) — added to `KNOWN_PINS_NAMESPACES` **and**
+`flatten_pins_namespace` together, with the legacy-singleton `rootfs` shape rejected naming the
+migration. The stage's `cache_key` folds **both** files'
+content, so an overlay edit re-resolves. What the
+overlay deliberately does **not** do: make `ensure_test_artifacts` a downstream entry point — that
+helper is the vmcell-workspace test bootstrap, and its fingerprint hashes the steward/guest-tools
+*source closures* out of the workspace tree, which no pins seam can conjure in a consumer workspace.
+The downstream build entry points are §5.6's; the downstream artifact story is §10.4's env contract.
+
+**Stages 1..n — deterministic given inputs.** Each stage's output is fully determined by its inputs +
+pins: the kernel producer → `vmlinux`; then the rootfs source (either path; the in-VM `mmdebstrap` path
+boots a builder VM on the compiled/seed `vmlinux`, so the kernel stage is ordered first); both converge on
+the shared inject+pack tail (§4.3) → boot + snapshot.
+
+**Caching — five rules, each its own failure mode (law F4).** Each stage has a pure `cache_key`;
+`Pipeline::build` skips a stage whose **output content** matches that key:
+
+1. **Stable hasher** — `blake3` (or `sha2`), never `DefaultHasher` (not portable across Rust versions).
+2. **Deterministic input order** — hash inputs in a fixed order (sorted keys / `BTreeMap`), never
+   `HashMap` iteration order.
+3. **Content and identity that travel, not local paths** — hash the *content hashes* of upstream
+   artifacts, never absolute `PathBuf`s under `target/`. The rootfs key folds `steward_src_hash` (the
+   steward's full source closure, with a distinct missing-source marker), the guest-tools content, and the
+   baked deployment-CA content, so rebuilding any of them invalidates the rootfs (a stale steward baked into
+   the rootfs was a real handshake-timeout bug); on the `oci2-erofs --steward-musl` path it folds the
+   injected steward binary's **content hash**, never its path string; the `mmdebstrap` key folds the
+   resolved builder-base image+digest. The **snapshot** stage key additionally folds the pinned Cloud
+   Hypervisor build identity: CH guarantees no cross-version snapshot compatibility, so a CH bump
+   invalidates stale snapshots **at build time** rather than failing at first restore — `virtiofsd` is
+   deliberately *not* folded, because a snapshot-eligible VM runs none (law S1).
+4. **Embed a per-stage version constant and the pinned source SHA** — a build-logic change with unchanged
+   pins, or re-pointing a pin at new bytes, must invalidate the key.
+5. **Validity is content-addressed, not existence-based** — a tampered artifact with an intact
+   `.cache_key` sidecar is **rejected**, not silently reused; re-hash on every use (including a cached OCI
+   blob, whose digest is re-verified on the cache-hit path — and the layer list is parsed from the
+   digest-*verified* raw manifest bytes, never a second unverified fetch). The kernel-tarball cache is
+   verify-or-purge; directory-output stages hash via a deterministic sorted walk.
+
+### 10.3 External access, signing, and determinism scope
+
+**Minimize external access + record/replay.** Network-touching stages split into a **record** step
+(populate a cache keyed to the pins) and a **replay** step (build purely from the cache); OCI blobs are
+cached by digest so a later registry deletion doesn't break a rebuild. The OCI pull is behind the
+injectable `OciPuller` trait, so the replay + tamper tests (tag-pull rejected, cache-hit re-verify,
+cached-blob tamper rejected) run with no network.
+
+**Signing-chain verification.** The in-VM `mmdebstrap` source verifies the Debian
+`InRelease`/`Release.gpg` chain *inside the guest* before using any package (refuse-on-mismatch) against
+the builder base image's own archive keyring (§4.2); `[check-valid-until=no]` disables only the freshness
+window, never signature verification, and the snapshot-timestamp pin is unchanged. The OCI digest pin is
+an integrity hard-stop but is *integrity, not authenticity* unless a cosign/sigstore signature is also
+verified. A mismatch is a hard stop, never a warning.
+
+**Byte-determinism, scoped honestly.** The `am-fs-erofs` packer *is* byte-deterministic (fixed mtimes,
+`BTreeMap`-ordered inode/dirent emission — the same tar packs to identical bytes). But the full
+`rootfs.erofs` is *not* byte-identical across independent deployments, because `RootfsStage` bakes a
+freshly-minted per-deployment proxy CA into it (a reproducible shared CA key would be a security defect).
+So "identical pins yield a byte-identical erofs" holds only within a fixed `artifacts_dir`/CA; across
+deployments the CA varies by design while the packer stays deterministic.
+
+### 10.4 The downstream toolkit contract (the landed v30 pass, deltas 2, 5 — FR-V1/FR-V6)
+
+Everything a git-dep consumer stands on is named in **one list**, documented as consumable, and held
+still by gates — retiring "public in the Rust-visibility sense but semi-public in practice." The
+contract surface: the pins schema + overlay semantics (§10.2) — as of v33 including the **rootfs and
+handler registry namespaces** (§10.5); `Stage`, `Pipeline`, `ResolvePinsStage`,
+`StageInputs`/`StageOutputs`, `CacheKey`, and the hash helpers (§10.2); the kernel build entry points
+and the resolved-config sidecar (§5.6) plus, v33, the **labelled rootfs/handler stage constructors** —
+`RootfsStage::labelled(label)` and `GuestToolsStage::labelled(label, source)`, which a consumer
+composes into its own `Pipeline` beside `ResolvePinsStage`, plus the `vmcell build
+--rootfs-label`/`--handler-label` verbs that drive them — and the **feature-manifest sidecar**
+(§7.4/§10.5); the one inject+pack tail `pack_rootfs_with_injection` **and** its erofs-only door
+`pack_erofs_with_injection`, both contract surface, with `ExtraFile`, `PackOptions`, and the
+`XattrPolicy` and `RootfsFormat` parameters, and the rootfs-construction contract (§4.2–§4.3, §4.7);
+the `VMCELL_*` env
+contract (below); the proxy doubles seam's `hudsucker` and `hyper` re-exports (§1.3) — the seam's
+`Matcher`/`Responder` aliases are built from types vmcell does not own, so the re-exports are how a
+consumer names exactly the versions they resolve to, and a bump in either is a ledgered move rather
+than a type mismatch a consumer discovers from the lockfile; and the `vmcell-artifact-validator`
+battery + `KconfigValues` (§5.6, §9.1) — whose `CheckStatus` grows two variants in v33 (§10.6), a
+ledgered validator bump, and whose `ValidationOptions` grows the `run_budget` field that closes §17's
+`validate()` gap. `ValidationOptions` is an exhaustive struct, so that field is a **breaking** addition
+and takes its own ledger entry by the rule below — `semver-checks` reports the edge, but the rule is
+what puts the reason in front of the consumer. Versioning is the convention the
+crates already follow — pre-1.0 breaking-changes-as-minor-bumps, announced in the comment-changelog at
+the top of `crates/vmcell/Cargo.toml` — so a break is a deliberate, findable ledger entry, never
+discovered by compile failure. Gates: `cargo semver-checks` covers **`-p
+vmcell-artifact-validator`** alongside `-p vmcell` (the validator is contract surface — landed with
+the v30 pass), `missing_docs` already denies on every public item, and the out-of-tree example
+workspace (§5.6) is the living consumer that reddens CI when any listed surface drifts — its CI job
+invokes the **exact documented CLI commands** (`vmcell build-kernels --pins …`,
+`vmcell oci2-erofs … --inject …`) so the CLI half of the contract, which `semver-checks` cannot see,
+has a consumer-shaped gate too.
+
+**The `VMCELL_*` environment contract** — the supported override set, with the semantics each one has
+had *specified* rather than discovered:
+
+| Variable | Contract |
+|---|---|
+| `VMCELL_ARTIFACTS_DIR` | Relocates the artifact cache; all freshness/fingerprint logic runs there unchanged. |
+| `VMCELL_KERNEL` | Path redirect only: the harness uses this kernel verbatim and still requires it to exist (fail-loud); it does **not** disable any build. |
+| `VMCELL_ROOTFS` | The externally-managed-artifacts switch: its presence makes `ensure_test_artifacts` a **full no-op** (not a rootfs-only skip — kernel-presence check and steward/tools rebuilds included), and the harness uses the named rootfs verbatim. The switch a downstream harness sets. |
+| `VMCELL_PINS` | The pins overlay (§10.2), read by every pins resolution — the toolkit build entry points (§5.6), the CLI, and (in the vmcell workspace) `ensure_test_artifacts`. |
+| `VMCELL_CH_BIN` / `_FC_BIN` / `_QEMU_BIN` / `_CROSVM_BIN` | Backend binary resolvers (already shipped; now contract). |
+| `VMCELL_SKIP_MANIFEST` | The capability-skip manifest sink (§15.4; already shipped; now contract). |
+
+**The harness getters, downstream — specified, not discovered.** In a consumer workspace,
+`harness::get_vmlinux()`/`get_rootfs()` have exactly two behaviors: with `VMCELL_KERNEL` +
+`VMCELL_ROOTFS` set (the documented downstream configuration — `VMCELL_ROOTFS` no-ops the ensure
+bootstrap), they return the named paths after an existence check; **without** them — including with
+`VMCELL_PINS` alone — they **fail loud** with a message naming the two-step route (build the kernel via
+the §5.6 toolkit, then point `VMCELL_KERNEL`/`VMCELL_ROOTFS` at the outputs), never a silent attempt to
+run the workspace bootstrap against the cargo checkout. This is a **recorded, deliberate deviation from
+FR-V6's letter** ("`get_vmlinux()` builds per the downstream pins file"): the ensure bootstrap
+structurally cannot build downstream (§10.2), so the criterion is met by the documented substitution —
+overlay-driven *build* through the toolkit, getter-driven *consumption* through the env contract — and
+the substitution itself is gated: the example workspace (§5.6) calls the getters under the full
+override set *and* asserts the fail-loud message without it, so the observable downstream behavior is
+pinned from the consumer position.
+
+**Consuming vmcell as a git dependency** — the guidance section (README + rustdoc) a consumer follows,
+each item load-bearing and learned the hard way: (1) pin by `rev`, build `--locked`, toolchain ≥ the
+single-source MSRV (§9.7); (2) **replicate the `[patch.crates-io]` vendored-vhost stanza** into your
+workspace root *if* you use QEMU + `NetConfig::Unprivileged` — cargo honors patch sections only from
+the consuming workspace's root, so a plain git dep silently drops the `SET_VRING_ENABLE` quirk fix and
+regresses that one path to a cryptic vhost-handshake boot failure; the doc gives the exact two-line
+stanza (the `=`-pins make versions match) and states when it is *not* needed (every other
+backend/mode); (3) run the downstream-runnable vendor assertion — `scripts/check-vendored-vhost.sh`,
+path-independent (it greps your own `cargo tree` for the `vendor/` resolution), the same check vmcell's
+CI runs — in your CI when (2) applies; its **positive control** is the example workspace, whose
+manifest replicates the stanza against a vhost-resolving feature set and runs the script green in CI
+(`cargo tree` only — no NAT compile), while the red leg drops the stanza in a temp copy and asserts the
+script fails; (4) artifacts: build the rootfs with a vmcell checkout's
+`vmcell build` / `oci2-erofs --inject` and point your harness at it via `VMCELL_ROOTFS` +
+`VMCELL_ARTIFACTS_DIR`; kernels build downstream through §5.6; (5) privileged runs need a capability
+runner **installed under the consumer's own workspace**, and the route is four explicit steps, not
+`just bless` — that recipe belongs to the vmcell checkout (§15.5) and `vmcell-test-runner` is not a
+member of the consumer's workspace, so there is nothing there for it to bless: build
+`-p vmcell-test-runner` from the pinned vmcell checkout, `install -D -m 0700` that binary into the
+consumer's own `.vmcell-bin/<profile>/` (`release/` for the usual `--release` runs),
+`sudo setcap cap_net_admin,cap_sys_admin,cap_dac_override,cap_setpcap+ep`
+the installed copy, then point `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER` at it — once per
+profile tested under (README § "Consuming vmcell as a dependency (the downstream contract)", step 5,
+carries the runnable form). The copy must live in the
+consumer's workspace because the runner derives its confinement root from its **own** canonicalized
+path (§15.5): one blessed inside the vmcell checkout anchors on *that* `target/` and refuses the
+consumer's test binaries. `0700` before the caps land is the security boundary, and writing a file
+strips its capabilities — so the install+`setcap` pair repeats on every runner rebuild. A
+build-script probe that would auto-detect a missing vhost patch was considered and rejected: the
+failure it prevents is loud (a boot error), just cryptic — a documented stanza + a one-line CI check
+beats autoconf machinery (simplicity is reliability).
+
+### 10.5 The artifact registry: three kinds, one shape (v33 — R2/R7, §18 delta 6)
+
+**The asymmetry this section closes was never a decision.** `docs/requirements.md` item 6 ranks the
+guest *kernel* and vmcell answered it with a registry — labels, fragments, one-law key composers, a
+collision reject, deterministic order, an overlay a consumer extends without forking. Item 5 ranks
+the guest *userland* identically and it has a singleton: `pins.json`'s `rootfs` is one bare
+`{image, digest}` object, a second userland is a fork of the pins file, and the guest handler is not
+an artifact at all — `GuestToolsStage` is workspace-bound in both halves (its `cache_key` hashes
+the workspace source closure; its `run` compiles it, `current_dir(workspace_root())`), with no
+prebuilt escape hatch. v33 extends the
+shape the kernel registry already has to the other two kinds rather than inventing a second one.
+The mental model, in one sentence: **artifacts are registered by digest, selected by label, and
+declared by features** (§7.4).
+
+**The pins schema** (two new namespaces shaped like the one that exists; the overlay's strict
+top-level check (§10.2) learns both, and `flatten_pins_namespace` flattens them the way it flattens
+`kernels.*`):
+
+```jsonc
+// pins.json / the VMCELL_PINS overlay
+"rootfs": {                                   // v32: a bare {image, digest} singleton
+  "default":        { "image": "docker.io/library/debian", "digest": "sha256:a617c1…" },
+  "debian-systemd": { "image": "docker.io/library/debian", "digest": "sha256:…",
+                      "xattrs": "preserve",                 // §4.7 — default "strip"; the
+                      // XattrPreserved feature is DERIVED from this at resolution (one fact,
+                      // one key — an explicit xattr_preserved token here is a hard error naming
+                      // the derivation, so the two can never desync); non-derivable features
+                      "features": { "snapshot_restore": false } } // non-derivable declarations,
+                      // strict-parsed: keys are Feature::name()s or the parse errors (§7.4/F6)
+},
+"handlers": {
+  "default": { "build": "workspace:vmcell-guest-tools" },   // today's in-workspace build, named
+  "acme":    { "digest": "sha256:…",                        // R7: a digest, never a path
+               "source": { "url": "…", "archive_sha256": "…" },
+               "applets": ["acme-probe", "acme-load"] }     // symlink roster for the injection manifest
+}
+```
+
+The **legacy singleton shape is rejected loud, naming the migration** — a `rootfs` object whose
+top-level keys are `image`/`digest` rather than labels gets a hard error pointing at the map form,
+never a silent reinterpretation (two accepted shapes for one namespace is parser ambiguity waiting
+for a third). This is a pins-schema break and rides the pass's ledgered contract bump.
+
+**Naming and keying laws mirror the kernel's exactly, one apiece** — `rootfs_artifact_key`
+(`rootfs-<label>`), a `rootfs-<label>.<format>` filename law over the `rootfs-<label>` stem and its
+inverse (which returns the *pair*, since delta 8 made the extension carry the format and the stem is
+what the `.cache_key` and `.features` sidecars are named after), the sanitized-label
+collision reject, sorted resolution order, and the handler equivalents
+(`handler_artifact_key`/`handler_label_from_artifact_key`) — extracted beside
+`kernel_artifact_key`/`kernel_pin_key` (which the docs/81 pass already exported as one-law
+composers precisely because a builder had byte-duplicated them; the new kinds share the merge /
+collision / sort core rather than copying it — one registry resolution law, three kind
+parameterizations). A stale `rootfs-<label>.erofs` is as detectable as a stale `vmlinux-<label>`,
+by the same code shape; each labelled artifact carries its `.cache_key` sidecar and, when it
+declares features, its feature manifest (§7.4), all content-addressed together.
+
+**The pack tail reads the handler through the key law, and an unmatched pair is a refusal.** The one
+inject+pack tail resolves the handler binary at `handler_artifact_key(handler_label)` — not the bare
+`"guest_tools"` literal — and the `cache_key` consumed-artifact fold reads *that same* key, so the
+identity a build publishes cannot describe a different binary than the bytes it baked. Absence is
+legal for exactly one shape: a pipeline that ran no handler stage at all (`oci2-erofs` without
+`--tools`, an in-VM builder pack), where an image with no `/vmcell-tools` is what the caller asked
+for. Every other absence is a wiring error and is **refused, fail-loud, before any layer is read** —
+a declared label with no artifact under its key, and the mirror case of an *orphaned* labelled
+artifact sitting beside a pack that declared no label (the mmdebstrap-source shape, whose stage takes
+no handler label). The alternative is not a failed build but a *successful* one: an image whose every
+applet path is absent, `mini-init` among them, and that one is an `init=` target, so its absence is a
+guest kernel panic rather than a missing test helper. The reserved `default` spelling normalizes to
+"no label" at the one stage intake, so `--handler-label default` and the omitted spelling compose the
+same key, the same output file and the same cache key — the byte-identity rule below, applied to the
+handler kind.
+
+**Registration is a digest; a path is an override (R7 — the rule that had to be settled before the
+registry existed).** Three registration shapes exist, exhaustively: a **digest** (the consumer
+form — authoritative, verified); the **workspace build** (`"build": "workspace:…"` — legal only in
+vmcell's committed baseline for vmcell-owned defaults, where identity is the source-closure hash
+the cache already folds — a consumer overlay carrying one is rejected naming the digest route); and
+the **dev path-override** (below — `unpinned`, bundle-refused). Nothing else parses. The discipline is already the platform's in four places (`oci2-erofs` refuses
+a tag; `kernel_prebuilt` pins `archive_sha256`+`sha256`; `bundle`/`verify-bundle` re-hash; F4 rule
+5 re-verifies cached blobs) and the registry adopts it as a rule, not a habit: every entry's
+`digest` is authoritative; a `source` is a fetch instruction **verified against it before use**,
+failing loud on mismatch — and the verification is the whole assertion, because a digest stored and
+never checked has passing output identical to its not-running output, so the delta's gate corrupts
+one byte of a cached blob and demands the build fail naming the mismatch. The two env overrides
+keep their documented path-redirect semantics untouched (`VMCELL_KERNEL`/`VMCELL_ROOTFS`, §10.4) —
+an *override* is a deliberate per-run act by an operator who knows what they are pointing at;
+a *registration* is a durable claim that outlives the session that made it, and a registry that
+accepts a path is a registry whose entries mean "whatever is at that location today", un-citable by
+any consumer's provenance discipline. A development registration with a path and no digest exists
+under one explicitly named override key, marks the resulting cell's artifact identity **`unpinned`**
+wherever provenance is reported, and is **refused by `bundle`**.
+
+**Where selection lives — a recorded shift from the requester's sketch.** The R2 sketch put label
+selection on the config builder (`.rootfs_label(…)`, `.handler_label(…)`); v33 keeps `VmConfig`
+**path-based** and puts selection at the **artifact layer** — the labelled stage constructors
+`RootfsStage::labelled(label)` / `GuestToolsStage::labelled(label, source)`, the `vmcell build
+--rootfs-label`/`--handler-label` verbs that drive them, and
+the env overrides — for a reason the sketch conventions anticipate (names advisory, behavior
+binds): registry coupling stays out of the VM layer, a cell consumes whatever artifact path it is
+handed exactly as before, and the declarations still reach a path-consuming cell because they
+travel in the feature-manifest sidecar beside the artifact (§7.4). The shift is recorded here so
+it is a decision, not a drift. A **second** shift rides it, in the same spirit: there is no
+`build_labelled_rootfs`/`…_handler` thin assembler to mirror `build_labelled_kernel`. A kernel build
+is a fixed two-stage assembly with nothing for a caller to vary; a rootfs or handler build composes
+with injections, extra files, a pack format and an xattr policy, so an assembler would either hide
+those or grow a parameter per knob — the shape `PackOptions` exists to avoid. The constructors are
+the entry points; `docs/implementation-notes.md` carries the reasoning.
+
+**Selection is lazy — a registered artifact is not built until something selects it.** This is the
+one place R2 changes the *kernel* registry too: `build-kernels` today builds every label in the
+merged registry with no per-label filter, so registering a `debian-latest` userland (or one more
+kernel) in a shared pins file would tax every build in every workspace that reads it. The verb
+becomes `build-kernels <label>…` / `--all`, and the rootfs/handler kinds are selection-driven from
+birth (`vmcell build` builds the labels the invocation names, defaulting to `default`); the CI
+nightly matrix passes `--all` explicitly — a CLI behavior change, ledgered, with the recipes updated
+in the same commit. The laziness gate is the requester's own: register a second label pointing at
+the **same** digest as `default`, build both, assert byte-identical outputs **and** that `default`'s
+cache key did not move (the empty-change-folds-to-the-same-key property — the only assertion that
+catches a registry change quietly re-keying every existing artifact); then register a
+`debian-latest` label and assert a build that selects nothing **does not build it** — red-on-inverse
+by removing the laziness.
+
+**Handlers are the third kind, and the injection tail is where they land.** A handler artifact is
+the binary injected at the tools path (`/vmcell-tools`, §3.5's `tools_dir`), with its `applets`
+roster emitted as the injection manifest's symlinks. The `default` entry names today's
+workspace build — behavior byte-identical, now stated in data instead of hardcoded — and a
+registered handler is `--steward-musl`'s treatment generalized to tools *as a durable artifact*
+(§4.2's `--tools` flag is the per-run override form). Two laws scope it: the
+`GUEST_TOOLS_APPLETS` const-assert binds the **default** handler only (a consumer handler's roster
+comes from its registry entry, strict-parsed; the manifest pin test grows a labelled-handler arm),
+and `is_reserved_injection_path` is unchanged — registering more artifacts extends nothing about
+what a consumer may shadow (F5). What this retires: the checkout-only CLI (§4.2), the
+16 MiB-frame / non-executable-mode limits of pushing a helper per boot through `PutFile` (recorded
+in v30's dial delta and now answered properly — an artifact has neither problem), and the fork-the-
+pins-file route to a second userland.
+
+**What must not regress**, gated per §18 delta 6: the canonical artifacts stay byte-identical for a
+cell that names no label (`default` resolves to today's inputs and folds to today's cache key); the
+five F4 cache-key rules and the identity folds (every new fold bumps `STAGE_VERSION` — the v20
+precedent); determinism (a label resolves to a digest, never a mutable tag — the `oci2-erofs` rule
+becomes the registry's); and the fetch stays cacheable and offline-friendly (a digest-keyed cache
+hit skips the fetch entirely, as the OCI layer cache already does).
+
+### 10.6 The two-directional conformance kit (v33 — R4, §18 delta 3)
+
+**A declaration is a claim, and an unchecked claim is worse than no claim** — it is a fact a
+consumer will build a fixture on. Once §7.4 lets an artifact declare and §10.5 lets anyone register
+one, the kit is the only thing that can convert declarations into measurements, and it must be the
+platform's because the artifacts are. The shipped kit is a strong base — it boots real VMs, refuses
+to return a green all-skipped report, keeps `Skip` forever distinct from `Pass`, and routes every
+boot/handshake failure through the classifier — but it checks **one direction**: a present feature
+that does not work. Nothing verifies an **absence** at the data plane (the kit never boots a
+`nested_virt: false` cell and asserts the consequence in-guest; the one such leg in the tree,
+`nested_virt_disabled`, lives in vmcell's own matrix, not the kit), and the requester's measurement
+carries a live example of why that matters (recorded from their box; unverifiable on a clean
+checkout, so §18 delta 3 re-measures it before leaning on it): the `usbhost` label's published
+config sidecar is **byte-identical**
+to the unlabelled one — every symbol the fragment names was already in the base defconfig, so the
+fragment is a no-op against this baseline, and a positive survival predicate ("is the symbol `=y`
+in the sidecar?") passes while the fragment contributed nothing. A presence check without a
+differential control certifies everything; so does an absence probe without a positive control.
+
+**The five-state outcome, three of which already ship:**
+
+```rust
+pub enum CheckStatus {
+    Pass,
+    Fail(String),          // a PRESENT feature that does not work — an error
+    Warn(String),          // an ABSENT feature that DOES work — under-claiming: a documentation
+                           //   defect, not a runtime one; reddening it would push declarers toward
+                           //   over-claiming, the exact wrong incentive
+    Unverified(String),    // an absence that cannot be decided, with why — never counted as a pass
+    Skip(String),          // shipped today, unchanged; still never a pass
+}
+pub struct ConformanceOptions {
+    /// Absences whose "works anyway" is known and dispositioned. A Warn NOT in this set is
+    /// promoted to Fail (a NEW under-claim must be triaged); one in it stays a Warn until retired
+    /// — and an entry whose Warn no longer fires is itself reported as an error (the
+    /// unfulfilled-`#[expect]` rule, one level up: a stale expectation outliving its reason is
+    /// the same rot as a stale suppression). Without the two-direction lifecycle, warnings
+    /// accumulate until nobody reads them — the same terminal state as not emitting them.
+    pub expected_warnings: BTreeSet<(Feature, ArtifactId)>,
+    /// v33 also lands the §17-recorded overall wall-clock budget here: per-check deadlines stay,
+    /// and the battery as a whole is bounded, because a kit that doubles its check count doubles
+    /// the visibility of "fails loudly per check, hangs per battery".
+    pub battery_budget: Duration,
+}
+```
+
+`Unverified` is a real state because proving a negative is sometimes impractical: snapshot absence
+is testable by attempting a snapshot; page-sharing absence is not, because no in-guest observation
+distinguishes "the host is not sharing pages" from "it is and nothing diverged yet". An honest kit
+says so per check — the same distinction `KconfigValues::get` already draws between `None`
+(olddefconfig dropped it) and `Some(No)` (the author disabled it).
+
+**"Present" and "absent" are judged against the artifact's declaration — the claim under test —
+never against the computed intersection**: `Fail` is declared-present-but-broken on a substrate
+that can exercise the claim; `Warn` is declared-absent-but-works; and a check whose substrate
+cannot exercise the declaration at all (the backend or host lacks the facility) stays `Skip`,
+exactly as today — the new states never absorb the old one's meaning.
+
+**Every absence probe carries a positive control** — run the same probe against an artifact that
+*declares* the feature and require "works" — because an absence probe without one is a constant
+that silently certifies everything (a probe that always answers "absent" passes every absence check
+ever written). The kit already has this discipline in single instances (the USB refusal test's QEMU
+positive control; the vendor script's example-workspace control); R4 makes it structural: an
+absence check and its positive control are **one paired check id**, so the control cannot be
+deleted without the check's roster gate reddening. The requester's four-leg verification is the
+acceptance shape: declaring artifact on a capable backend → `Pass`; declaring on an incapable →
+`Fail` naming the backend (§7.4 provenance); non-declaring that genuinely cannot → `Pass` (a
+verified absence); non-declaring that in fact can → `Warn`. The fourth leg is the control for the
+third, and deleting it must redden the suite — fail-first applied to the kit's own property.
+
+**The roster gates extend to every level, with the recorded blocker fixed rather than waived.**
+`level_full_rustdoc_names_exactly_the_shipped_checks` pins Full's documented ids to the ids a
+`fail_create` fake run records; Core/Extended stayed ungated for a stated reason — their
+guest-facing ids exist only after a real handshake, so a fake run under-reports them. R4's fix is
+the mechanism, not a waiver: **every check records-or-skips its id on every path, including the
+pre-handshake failure paths** (the shape Full's arms already have), which makes all three rosters
+enumerable KVM-free and the rustdoc gate uniform — the defect the Full gate was filed for
+(doc-promised checks that never ran) was always level-independent. Failure messages keep their
+classifier; a `Warn` gets the same treatment (an under-claim with no explanation is a bare bool
+again). The kit stays **on-demand, never on cell boot** — an absence probe is by construction the
+most expensive kind (it boots to prove a negative), and the split of cost is the caller's via the
+existing levels; nothing in R4 adds a hot-path cost to any cell.
+
+---
+
+## 11. The control-plane daemon (`vmcelld`)
+
+### 11.1 What it adds, and where it sits
+
+`vmcell` (the library) and `vmcell-cli` are a **single-process** model: a `MicroVm<V>` handle owns its VM
+and *is* the lifetime — when the handle drops, ordered teardown destroys the VM. That model is correct and
+stays the default for tests and one-shot CLI verbs, but it structurally cannot offer a VM that **outlives
+the process that created it**: there is nobody to hold the handle.
+
+**The daemon is that missing owner.** `vmcelld` is a single long-lived process that owns the VMs it
+starts: it holds each `MicroVm` handle in an in-process registry, so a VM's lifetime is decoupled from any
+one client request but stays tied to the daemon — and the whole "teardown is ownership, `Drop` releases
+resources" invariant (law L1) carries over unchanged. Clients talk over HTTP and refer to VMs by an opaque
+**id**. The one thing owning-and-`Drop` cannot handle by itself is a *hard* kill of the daemon (SIGKILL,
+power loss), which skips every `Drop`; the daemon closes that with a **start-up orphan sweep** (§11.4), so
+a crash-and-restart self-heals.
+
+```
+  vmcelld-ctl (CLI)  ─┐                         ┌─ artifact store  (<artifacts-dir>/<name>)  [files]
+  your Rust program  ─┤── HTTP/REST (bearer) ──▶ vmcelld ─┤
+  (vmcell-daemon-     ─┘   OpenAPI-described    (owning,   └─ VM registry ── holds ──▶ MicroVm … MicroVm
+   client)                                       blessed)     (Drop releases; start-up sweep reclaims leaks)
+```
+
+The daemon is the natural single home for the process-global pieces: it builds **one `HostEnv`** (§9.3) —
+one `VmidAllocator::shared()`, one `Arc<CidAllocator>`, the production seams — and hands it to every
+launch. The daemon-tier members form an acyclic star on `vmcell` (§9.1); `vmcell` has no edge to any of
+them. The wire schema is single-sourced by keeping the DTOs (and the artifact-name predicate) in
+`vmcell-daemon` compiled **unconditionally**, while the whole server stack — axum router + handlers,
+registry, auth, the `vmcell` host stack — sits behind a default-on `server` feature.
+`vmcell-daemon-client` depends on `vmcell-daemon` with `default-features = false`, so it links **only**
+the wire DTOs + the name predicate (serde + std), never axum or the server stack — the client shares the
+server's exact types, and a required field added to a DTO is a compile error in the client, never a silent
+skew.
+
+Because the daemon **owns** its VM handles rather than detaching them, it needed **no** new vmcell
+primitive — the single-process ownership model is reused in-process, held by a long-lived server instead
+of a one-shot CLI. It forced exactly one client-side divergence: `vmcell`'s entry points take host
+*paths*; over a network boundary a client path is meaningless to the daemon and a client-supplied *server*
+path is a traversal hole — so the daemon's VM APIs take artifact **names** resolved against its own store,
+and the client grows an upload step (§11.3). VMs deliberately do **not** outlive the daemon: a clean exit
+tears them down; a hard kill leaks them and the next boot's sweep reclaims the residue. If daemon-surviving
+VMs are wanted later, that is a detached variant — explicitly not v1.
+
+### 11.2 Privilege and blessing
+
+The daemon needs the same three capabilities as privileged operation (§6.1). Two ways to grant them:
+
+- **Tests and dev — launch `vmcelld` through the blessed `vmcell-test-runner` (the default; no
+  per-rebuild blessing).** The runner is a cap-conferring `exec` wrapper whose confinement accepts **any**
+  binary under the workspace `target/` dir (§15.5) — so `vmcell-test-runner target/debug/vmcelld …` execs
+  the daemon with the three caps in its effective set, and the blessing precondition passes without
+  `vmcelld` itself being blessed. Because only the runner carries file-caps, and the runner rarely
+  changes, `vmcelld` (which changes constantly) rebuilds freely with no `sudo setcap` on every change.
+- **Standalone / production — file-caps or systemd ambient caps.** A long-lived system `vmcelld` is
+  blessed once (`setcap …+ep`) or, better, granted via `systemd`'s `AmbientCapabilities=`.
+
+**The one deliberate difference from the runner: the cap-holder retains the caps; it does not
+drop-and-exec (law P1).** The runner is a *transient* wrapper — file-caps → **drop to the dev uid** →
+raise ambient → `execvp` (that order, not its inverse: §15.5) — so the caps live only across one `exec`. The daemon's cap-holder is a *long-lived
+server* that must itself perform privileged VM operations (netns/tap/nft) for the whole process life. So
+it runs the **blessing precondition** — the three caps present in the **effective** set, unconditionally,
+with **no euid exemption** — and then keeps them: no uid drop, no ambient raise, no bounding-set shrink,
+no `exec`. There used to be an `or euid == 0` short-circuit, and it was a fail-open: default container
+root holds neither `CAP_NET_ADMIN` nor `CAP_SYS_ADMIN`, and a unit with `User=root` plus a
+`CapabilityBoundingSet=` that omits one of the three looks the same, so both came up clean and then
+failed every privileged create — the degraded server law P1 exists to forbid, reached through the one
+function the daemon and the runner share. A genuine full-authority root process still passes, because it
+holds the caps; only the narrowed shapes now refuse. If the precondition
+fails it **refuses to start** and prints the remediation the *shape* needs, which is why the euid is read
+at all: an unblessed non-root binary gets the `setcap …+ep` line (almost always a rebuilt binary), while
+a narrowed root gets told to grant the capabilities where its own set is configured — the container
+runtime's `--cap-add`, or the unit's `AmbientCapabilities=` — because a file capability is masked by the
+process's own bounding set and `setcap` there is advice that cannot work. Which process is the cap-holder
+depends on the broker: by **default** `vmcelld` forks the setup broker — the broker child is the
+cap-holder and owns the VM `Registry`, while the HTTP-serving parent drops all caps (law P2, §12.4);
+`--no-setup-broker` selects the single-process retain-caps fallback.
+
+**`vmcell-privilege` — one predicate, two callers.** The precondition logic is security-critical and was
+private to the runner's `main.rs`; copying it into the daemon is precisely the "duplicate load-bearing
+logic diverges" trap. So it is extracted, with the runner's pure, already-unit-tested seams moved verbatim:
+
+```rust
+// vmcell-privilege — lean: rustix + capctl + libc only.
+pub const PRIVILEGED_CAPS: [Cap; 3] = [Cap::NET_ADMIN, Cap::SYS_ADMIN, Cap::DAC_OVERRIDE];
+
+pub fn compute_missing(effective: &CapSet, need: &[Cap]) -> Vec<Cap>;          // pure
+pub fn shell_single_quote(p: &Path) -> String;                                 // pure
+
+/// Why the precondition refused, and therefore which remediation fixes it. BOTH arms refuse:
+/// the verdict never depends on the euid, only the advice does.
+pub enum BlessingRefusal { Unblessed(Vec<Cap>), NarrowedRoot(Vec<Cap>) }
+
+/// The precondition's decision, over in-memory inputs — PURE, so the euid-0-with-a-narrowed-set
+/// shape is unit-testable on any host at any privilege level (law P1's start-up gate).
+pub fn blessing_verdict(euid: u32, effective: &CapSet, need: &[Cap]) -> Result<(), BlessingRefusal>;
+pub fn blessing_remediation(uid: u32, exe: &Path, refusal: &BlessingRefusal) -> String;  // pure
+
+/// Effective-set precondition shared by the runner and the daemon: the thin live edge over
+/// `blessing_verdict` — it reads the cap state and the euid, and on a refusal resolves
+/// `current_exe()` to build the message. Returns that remediation string on failure. Does NOT
+/// mutate the process, and never re-branches on the euid beside the verdict (a source scan says so).
+pub fn ensure_blessed_or_explain(need: &[Cap]) -> Result<(), String>;
+
+// The runner's transient path stays runner-only (it drops uid + execs) but its PURE plan lives here:
+pub struct PrivilegePlan { /* … */ }
+pub fn plan_privilege_transition(/* … */) -> PrivilegePlan;   // pure, unit-tested against buggy inverses
+pub fn apply_privilege_transition(plan: &PrivilegePlan) -> Result<(), String>;  // thin syscall edge
+```
+
+The daemon uses only `ensure_blessed_or_explain` + `blessing_remediation`; the runner keeps its full path
+but imports it instead of defining it. The runner's red-on-inverse tests moved with the code and keep
+guarding both callers. The runner's exec-target *confinement* stays runner-only (§15.5); the daemon's
+analogous "anchor on trusted data" check is the artifact-name validator (§11.3), which anchors every
+filesystem access on the daemon's own `--artifacts-dir`, never a client-supplied path.
+
+### 11.3 The artifact store
+
+The daemon receives `--artifacts-dir <path>` and manages the files under it with three operations —
+**create, list, delete; no update**. This is deliberately *not* the `vmcell` artifact pipeline (§10): it
+is a flat content store the VM APIs draw their `kernel`/`rootfs` inputs from. A client builds artifacts
+elsewhere and **uploads** them; the daemon never fetches from the network on a client's behalf.
+
+**One name predicate, anchored on trusted data (law P3).** Names map directly to files (`k1` →
+`<artifacts-dir>/k1`), so the name validator is a security boundary of the same class as the runner's
+exec-target confinement — a name that path-traverses or is absolute would read or clobber files outside
+the store. One predicate, pure, unit-tested against its buggy inverses:
+
+```rust
+/// The ONLY function that turns a client-supplied artifact name into a path. Every
+/// store op and every VM-API artifact reference goes through it.
+pub fn resolve_artifact_path(dir: &Path, name: &str) -> Result<PathBuf, ArtifactError>;
+```
+
+Accept rule (allowlist, not denylist — a denylist of "bad" substrings is the divergence trap): a name is
+valid iff it is non-empty, within `MAX_ARTIFACT_NAME_LEN`, every byte in `[A-Za-z0-9._-]`, not `.`/`..`,
+and not leading `-`
+or `.` (a leading `-` would be read as a flag by any tool the name is later handed to; a leading `.` hides
+the file and enables the `.`/`..` family). **The ceiling is `NAME_MAX` minus the digest-sidecar suffix**,
+not `NAME_MAX` itself: an accepted name has to fit *twice*, as `<name>` and as `<name>.sha256`, because
+the store writes the sidecar beside the artifact. At a bare-`NAME_MAX` ceiling a long-but-legal name
+persisted the artifact and *then* failed its sidecar write with `ENAMETOOLONG` — a deterministic 500 on a
+well-formed request, and a burned name in a create-only store. The suffix is the one const both the
+validator and the store read, so the two cannot drift; the atomic upload's temp file carries an
+independent random name, so no temp suffix has to fit in the budget.
+The result is always `dir.join(name)` with `name` a single
+component — no `/` in the accepted set, so no subdirectories and no traversal are representable. Callers
+**never** construct `dir.join(client_string)` themselves (grep-able gate: `dir.join(` on a client string
+outside this function is a review-reject). Red-on-inverse tests: `..`, `a/b`, `/abs`, `-rf`, `.hidden`,
+empty, a NUL byte, and an over-ceiling name all reject — the length leg pins that the longest accepted
+name's sidecar lands exactly **on** `NAME_MAX`, no byte over and none wasted, so it reddens if the
+ceiling is restored to `NAME_MAX`; a positive control (`vmlinux-6.12`, `rootfs.erofs`)
+accepts and joins to exactly `<dir>/<name>`.
+
+**Operations:**
+
+- **Create** — `PUT /v1/artifacts/{name}` with the file bytes as the body. **No update**: create rejects
+  an existing name with a typed `AlreadyExists` (409), never a silent overwrite. Bytes are streamed
+  **through a SHA-256 hasher** to a temp file in the same dir, then atomically renamed into place, so a
+  crashed or truncated upload never leaves a half-written artifact — and the digest is computed once, at
+  upload, and stored in a `<name>.sha256` sidecar (the v28 pass's delta 10, landed). The write is size-capped by
+  `--max-artifact-bytes`, rejected fail-loud past it — an unbounded upload is a trivial disk-fill DoS.
+- **List** — `GET /v1/artifacts` → `[{name, size_bytes, sha256}]`, the digest served from the sidecar so
+  list is O(entries), not O(store bytes); its purpose is client round-trip verification, and the daemon
+  owns the dir, so re-hashing on every list bought nothing. Listing surfaces only direct children that
+  pass `resolve_artifact_path` (a stray subdir or an out-of-band name that fails validation is skipped,
+  never surfaced as a usable artifact); sidecars are internal and not listed.
+- **Snapshot prefix** — a warm snapshot writes into `<artifacts-dir>/<prefix>/`, and that prefix is part
+  of the same create-only namespace: the registry mints it with `create_dir`, **not** `create_dir_all`, so
+  an existing prefix is an `AlreadyExists` (409) naming the delete-then-retry route. The kernel's `EEXIST`
+  *is* the check, so it is atomic against a concurrent snapshot to the same prefix — no check-then-act
+  window. Under `create_dir_all` a second snapshot overwrote an older one file-by-file and a `restore_from`
+  copy racing that write read a torn mix of two lineages. A failed snapshot removes the dir it created
+  when it is empty; a partially-written one is kept for diagnosis.
+- **Delete** — `DELETE /v1/artifacts/{name}` → 204. Refuses to delete an artifact **in use** by a live VM
+  with a typed `InUse` (409). The check and the unlink are **one operation**,
+  `delete_artifact_if_unused`, run under a single hold of the VM-table lock: the pinned-name scan (the
+  `pins` predicate — kernel, rootfs, extra disks, and the snapshot prefix for the duration of its write)
+  and the file delete cannot be interleaved by a concurrent `create`, which re-takes that same lock to
+  insert its pinning slot. The two-step form — ask `is_artifact_in_use`, then delete — is what reopened
+  the TOCTOU it was meant to close, so the HTTP handler crosses to the engine for the *whole* operation
+  and never deletes locally; `is_artifact_in_use` survives only as the read-only query over the same
+  `pins` predicate.
+  **Residual window, accepted (single-tenant), recorded at the call site:** `create` resolves its
+  artifacts and *launches* the VM **before** taking the VM-table lock to insert its slot, so a
+  `create` that has resolved-and-launched but not yet inserted is not yet visible to the scan above,
+  and its on-disk artifact can still be deleted out from under it. Closing it would mean re-checking
+  the resolved set under this lock after launch; it is recorded rather than fixed — see §17.
+
+Every store op is a pure-ish function over `(dir, name, bytes?)` behind the validator, unit-testable
+against a `tempdir` with no HTTP and no KVM — the axum handler is a thin adapter that maps the typed store
+error to a status code.
+
+### 11.4 The VM registry and the start-up sweep
+
+The registry keeps law L1 intact end-to-end: while a handle is held the VMM process and its
+netns/tap/cgroup/scratch stay alive, and when the handle drops the *same* ordered teardown runs. Two seams
+and one recovery hook:
+
+- **`VmLauncher` / `VmHandle`** — the registry drives VMs through these traits, not `MicroVm` directly, so
+  its logic (id minting, the state machine, ordered teardown, artifact pinning) is unit-testable against a
+  recording fake with no KVM or root. The real `MicroVmLauncher` is a thin adapter: `launch` builds a
+  `VmConfig`, calls `MicroVm::start` (bringing the steward up, so a returned VM is genuinely ready — "ready"
+  is derived from the VM, not a hopeful label), and boxes the handle; `exec`/`usage`/`snapshot`/`shutdown`
+  forward to the `MicroVm`.
+- **`Registry`** — a `tokio::sync::Mutex<HashMap<VmId, Arc<VmSlot>>>` where each `VmSlot` holds the boxed
+  handle behind its **own** async mutex. Ops on different VMs run concurrently; ops on one VM serialize on
+  its single vsock control channel (correct — one channel per VM). The VM's immutable identity (id, vmid,
+  the artifact names it pins) is read lock-free for the delete-in-use guard; only the handle + state sit
+  behind the per-VM lock. The **id** is an opaque server-minted token (`vm-<counter>-<splitmix64>` —
+  readable counter + mixed suffix, unguessable, never reused in a process); it is *not* the VMID (the
+  network octet).
+
+**Teardown is ownership, two paths, one helper.** `destroy` removes the slot from the table (so no new op
+finds it), marks it `Destroying`, and runs the graceful `MicroVm::shutdown`; a clean daemon exit calls
+`shutdown_all`; and dropping the table runs each **`MicroVm`'s own** `Drop` — the panic path — with the
+identical ordered cleanup. `Registry` deliberately has **no `Drop` impl**: it owns nothing beyond the
+handles, so the third path is the contained `MicroVm`s dropping, not a registry-level teardown, and
+writing one would be a second copy of the ordered helper. A **hard** kill skips all three and leaks the
+residue.
+
+**The start-up orphan sweep — the crash-recovery counterpart.** Before it owns any VM, the daemon runs
+`sweep_orphans` with **empty** live-vmid and live-segid sets, so every netns/cgroup-slice/scratch dir
+(and segment netns, §6.5) whose trailing id is not currently owned — i.e. every orphan a previously
+hard-killed daemon left — is reclaimed.
+What makes the empty set safe is **prefix ownership, not liveness**: this daemon owns its
+`--resource-prefix` and nothing of its own is live yet. The sweep itself is cross-process
+liveness-**blind** — it consults no claim file, and the scratch-dir stem discards the pid the name
+carries (`<prefix>-vm-<pid>-<vmid>` is matched on `<prefix>-vm-`, and the trailing id is the vmid) — so
+a second process sharing the prefix on the same host *would* have its live resources swept. That is the
+same blindness already recorded for `clean_vmcell_netns`, and it is acceptable for the same reason:
+sharing a prefix between two concurrent owners is outside the model (law F2 is what makes the prefix an
+ownership boundary). It is **not** the stronger claim that nothing can be live at start-up. The sweep
+needs
+`CAP_NET_ADMIN` to delete a netns, which the cap-holder has; per-resource failures are logged, not fatal.
+The `--resource-prefix` flag (default `vmcell`) is threaded to *both* the launcher and the sweep, so its
+VMs are named with it and the sweep reclaims exactly those names — two daemons with distinct prefixes
+never sweep each other's resources (law F2; validated on KVM: a daemon run with `--resource-prefix acme`
+names its VM's netns `acme-net-<vmid>`, reclaims a planted `acme-net-*` orphan, and leaves a
+`vmcell-net-*` orphan from another tool untouched).
+
+### 11.5 The HTTP REST API and its OpenAPI document
+
+```
+Artifacts
+  PUT    /v1/artifacts/{name}      upload (create; 409 if exists)         body: bytes
+  GET    /v1/artifacts             list                                   -> [ArtifactInfo]
+  GET    /v1/artifacts/{name}      metadata (HEAD-like; no body download)
+  DELETE /v1/artifacts/{name}      delete (409 if in use by a live VM)
+
+VMs
+  POST   /v1/vms                   create+boot (== `run`/`create`)        body: CreateVmRequest -> CreateVmResponse
+  GET    /v1/vms                   list the daemon's owned VMs (== `ls`)  -> [VmInfo]
+  GET    /v1/vms/{id}              get one                                -> VmInfo
+  POST   /v1/vms/{id}/exec         run a command over vsock (== `exec`)   body: ExecRequestDto -> ExecOutcomeDto
+  GET    /v1/vms/{id}/stats        resource usage (== `stats`)            -> ResourceUsageDto
+  POST   /v1/vms/{id}/snapshot     write a warm snapshot (== `snapshot`)  body: {artifact_prefix} -> SnapshotInfo
+  DELETE /v1/vms/{id}              destroy + teardown (== `rm`/`destroy`) -> 204
+
+Meta
+  GET    /openapi.json             the served OpenAPI 3.1 document        (unauthenticated)
+  GET    /healthz                  liveness                               (unauthenticated)
+```
+
+`CreateVmRequest` carries `kernel` and `rootfs` (artifact **names**), `vcpus`, `mem_mib`, and — additive,
+`#[serde(default)]` so old clients keep working — the config knobs plus the run/ephemeral pair and the
+extra device fields:
+
+- **`net: NetMode`** (`none` default | `privileged` | `unprivileged`). The cap-holder has the caps, so the
+  privileged tap path is available; `unprivileged` is the smoltcp NAT (not snapshot-eligible).
+- **`snapshotting: bool`** — boot a snapshot-eligible VM. Rejected fail-loud (400) with a non-eligible
+  `net` *before* launch.
+- **`restore_from: Option<String>`** — restore from the snapshot in the store under this prefix instead of
+  a cold boot. The daemon restores via **CoW** (`MicroVm::restore_cow`), so the named snapshot is
+  preserved and re-restorable; `create` then drives the mandatory post-restore resync.
+- **`command: Option<Vec<String>>`** — present ⇒ `run` (exec, capture, keep-or-teardown per
+  `ephemeral: bool`); absent ⇒ `create` (boot to steward-ready and register). A **failed** inline exec
+  tears the VM down **regardless of `ephemeral`**: `create` is one operation, and the error reply
+  carries no `CreateVmResponse`, so a kept VM would be a booted, resource-holding cell whose id the
+  caller never received and cannot destroy. A command that *ran* and exited non-zero is an `Ok`
+  outcome and keeps its VM, as `ephemeral: false` asks — the distinction is whether the caller got an
+  id, not whether the guest process succeeded. A teardown error on that path is logged, never masked
+  over the exec outcome the caller asked for.
+- **`extra_disks: Vec<ExtraDiskSpec>`** and **`extra_kernel_args: Vec<String>`** — an `ExtraDiskSpec` is
+  an artifact **name** (resolved through `resolve_artifact_path`) plus an optional `io_limit`. Two
+  deliberate divergences from the library, both forced by the daemon's model: **daemon extra disks are
+  read-only** (the store is create-only/immutable; a writable disk backed by a shared store artifact would
+  let one VM mutate an artifact another VM reads — a copy-on-attach writable-scratch disk is a follow-up,
+  §17), and **no steward-less cells over REST** (the daemon owns VMs through the control plane). The
+  second rule was "no `init=` over REST" until v33, and its own rationale scopes it: a custom init no
+  longer implies a lost control plane (§3.5), so the request gains additive `init` +
+  `steward_placement` fields (**§18 delta 10**, separable) accepting exactly the placement that keeps
+  the control plane — `Service{port}` with a custom init — while `StewardPlacement::None` stays
+  unexpressible over REST (the rationale's remaining force, unchanged). The new fields are
+  `#[serde(default)]` presence-attribute DTOs and round-trip on the JSON codec they actually ship
+  over (the postcard trap, Appendix A reversal 10 — restated here because this is the next wire
+  surface it would bite). A live VM pins its extra-disk artifacts for the delete-in-use guard. A bad
+  knob (a reserved kernel arg, a `0` io_limit, a `Pid1`+init contradiction) surfaces as the
+  library's `Error::Config`, mapped to 400 — a config-validation failure is a client error, not a 500.
+
+The daemon resolves `kernel`/`rootfs`/`restore_from` and every extra-disk name through
+`resolve_artifact_path` against its own `--artifacts-dir` — a client can only ever name an artifact it
+uploaded, never a host path. Snapshots land **in the artifact store**: `snapshot` writes the snapshot dir
+under `<artifacts-dir>/<artifact_prefix>/…` and returns the names, so a subsequent `create {restore_from}`
+restores by name — the store is the one exchange surface, no out-of-band paths. Validated end-to-end: a
+marker written into a VM's tmpfs before `snapshot` survives a `restore_from` into a fresh VM.
+
+**The OpenAPI document and the mounted router are one table (law P5).** Rather than trust a derive
+macro's output (an untested claim) or hand-maintain a separate file (a divergence trap), `API_ROUTES` is
+the single source: `openapi_document()` generates the document from it, and **`build_router` is a fold
+over it** — each row mounted with its own method and path, into the authenticated or the open subtree as
+the row's flag says. Parity is therefore **structural, not asserted**: a route cannot be added to the
+router alone, because there is no per-route mount site to add it at. That distinction is the finding
+this design text used to paper over — the previous gate compared the served document to the table it
+was generated from, which agree by construction, and would have stayed green through exactly the drift
+it claimed to catch. What the KVM-free gates actually hold, each red on its own inverse:
+
+- the router source contains the fold and **exactly two** `.route(` mount sites (its two subtree arms),
+  so a hand-written route reddens rather than shipping undocumented and possibly unauthenticated;
+- every table row resolves to a handler, and a row that does not is a loud 500 naming itself, never a
+  panic while building the router;
+- the document's path set equals the table's, and every row's `(method, path)` is an operation with the
+  row's `operationId`;
+- every authenticated row carries the bearer requirement and the open set is **exactly**
+  `/healthz` + `/openapi.json` — asserted from both the table and the document;
+- every `$ref` in the document resolves to a schema declared in `components.schemas`, and the document
+  must contain at least one `$ref` — the clause that keeps "every named schema exists" from being the
+  vacuous truth it was when `components` carried `securitySchemes` only.
+
+The document describes paths, auth, and the **error body**; it does not describe request-body schemas,
+so additive `#[serde(default)]` fields do not change it.
+
+**One daemon error type, matchable, mapped to status.** Mirrors §9.5 (no catch-all; caller-relevant
+conditions typed). One `DaemonError` enum, each variant carrying the HTTP status it maps to in one
+`IntoResponse` impl:
+
+```
+NotFound        -> 404   (no such vm/artifact)
+AlreadyExists   -> 409   (create over an existing artifact — the "no update" guard)
+InUse           -> 409   (delete an artifact a live VM pins)
+Conflict        -> 409   (op against a VM in the wrong state)
+InvalidName     -> 400   (resolve_artifact_path rejected the name)
+BadRequest      -> 400   (malformed body / knob; a config-validation Error::Config)
+Unauthorized    -> 401   (missing/blank bearer)  |  Forbidden -> 403 (wrong bearer)
+Unsupported     -> 501   (an op the backend does not advertise — wraps vmcell Error::Unsupported)
+PayloadTooLarge -> 413   (upload past --max-artifact-bytes)
+Internal        -> 500   (a wrapped vmcell::Error with no more specific mapping; body is the Display,
+                          never a Debug struct-dump)
+```
+
+The error body is a small JSON `{error, message}`, and it **is** an OpenAPI component: `ErrorBody` is
+declared in `components.schemas` and `$ref`'d from every operation's `default` response, so a generated
+client decodes a structured error instead of guessing. Its `error` enum is rendered from the real
+`ErrorKind` roster — never a second literal list in the document — so a new kind cannot ship
+undocumented.
+
+### 11.6 Authentication — a bearer API key
+
+The idiomatic, minimal, correct choice is a **pre-shared opaque API key presented as an HTTP Bearer
+token** (`Authorization: Bearer <key>`, the RFC 6750 transport), **not** a full OAuth 2.0
+authorization-server flow. Rationale, stated honestly: a full OAuth flow (an authorization server,
+`/token`, grant types, JWT issuance/rotation) buys delegated third-party authorization the daemon has no
+use for — it is a local, single-tenant control plane for one operator's host. The bearer *transport* is
+the part of OAuth that carries the credential; adopting it (and describing it in OpenAPI as
+`type: http, scheme: bearer`) gives every standard HTTP client first-class auth with zero custom flow. The
+key is an opaque high-entropy secret, not a structured JWT — no signature to verify, no clock-skew window,
+no rotation ceremony in v1. Comparison is **constant-time** so a timing side-channel can't leak the key
+byte-by-byte.
+
+The key is loaded from `--api-key-file` — a path, **perms-checked**: the daemon refuses a key file that is
+group/other-readable (law P4). Passing the key as a CLI arg or env var is rejected in favor of the file so
+it never lands in `ps` or a captured log. If no key file is given the daemon **refuses to start** (a
+control plane with no auth is never an accident), unless `--allow-unauthenticated` is explicitly passed
+for a loopback-only dev bind, which is logged loudly at every request.
+
+The auth check is one tower/axum middleware layer wrapping every route **except** `/healthz` and
+`/openapi.json`, so a new route is authenticated **by default** — you opt out, you don't opt in (law P4);
+the parity gate asserts the opt-outs are exactly those two. The 401-vs-403 split is deliberate: **absent**
+credentials are 401 (per RFC 7235, with a `WWW-Authenticate: Bearer` header); **present but wrong** are
+403. Unit tests (KVM-free): correct key → 200; wrong → 403; absent → 401 with the challenge; a
+world-readable key file refused at start-up; and a timing test that the compare is constant-time in shape
+guards against a future `==` regression. Recorded, not built: JWT bearer tokens and per-key scopes — the
+middleware seam is where they attach (§17).
+
+### 11.7 The client library and CLI
+
+**`vmcell-daemon-client`** offers a typed Rust API matching the `vmcell` entry points as closely as the
+network boundary allows, built on `reqwest` and re-exporting the daemon's DTOs (§11.1):
+
+```rust
+pub struct DaemonClient { /* base_url, bearer key, reqwest::Client */ }
+impl DaemonClient {
+    pub fn new(base_url: Url, api_key: impl Into<String>) -> Result<Self>;
+
+    // Artifact store — the divergence from vmcell entry points is HERE (paths -> upload):
+    pub async fn upload_artifact(&self, name: &str, body: impl Into<UploadBody>) -> Result<ArtifactInfo>;
+    pub async fn list_artifacts(&self) -> Result<Vec<ArtifactInfo>>;
+    pub async fn delete_artifact(&self, name: &str) -> Result<()>;
+
+    // VM lifecycle — one-to-one with the CLI verbs, kernel/rootfs given as artifact NAMES:
+    pub async fn create_vm(&self, req: CreateVmRequest) -> Result<CreateVmResponse>;  // the general POST
+    pub async fn run(&self, kernel: &str, rootfs: &str, cmd: Vec<String>) -> Result<ExecOutcomeDto>;
+    pub async fn create(&self, kernel: &str, rootfs: &str) -> Result<VmInfo>;
+    pub async fn exec(&self, id: &VmId, req: ExecRequestDto) -> Result<ExecOutcomeDto>;
+    pub async fn stats(&self, id: &VmId) -> Result<ResourceUsageDto>;
+    pub async fn snapshot(&self, id: &VmId, artifact_prefix: &str) -> Result<SnapshotInfo>;
+    pub async fn ls(&self) -> Result<Vec<VmInfo>>;
+    pub async fn destroy(&self, id: &VmId) -> Result<()>;               // == rm
+}
+```
+
+The one forced divergence: `vmcell run --kernel <path> --rootfs <path>` becomes
+`upload_artifact("k", …) + upload_artifact("r", …) + run("k", "r", cmd)` — a host path is replaced by an
+upload + name reference. `upload_artifact` accepts raw bytes or a local path (v1 reads the file into
+memory; streaming a large image is a follow-up, §17). The client's error type surfaces the daemon's typed
+`{error, message}` as a matchable enum (a 409 `AlreadyExists` is `ClientError::AlreadyExists`, not an
+opaque status), so callers branch on the same conditions the server names.
+
+**`vmcelld-ctl`** is a thin `clap` wrapper over `DaemonClient`, reading `--daemon-url` and
+`--api-key-file` from flags/env, with subcommands mirroring the client methods (`artifact put|ls|rm`,
+`run|create|exec|ls|stats|snapshot|rm`). `run` streams stdout/stderr and propagates the guest exit code
+exactly as `vmcell run` does. It is a wrapper only — no logic beyond argument marshaling lives here, so
+its tests are argument-parsing shape tests.
+
+---
+## 12. Privilege hardening: confining the VMM
+
+### 12.1 The problem
+
+Everything so far makes vmcell *work*; this section makes it *contain*. The running VMM subprocess (Cloud
+Hypervisor, Firecracker, QEMU, crosvm) is the largest attack surface in the system: it parses guest-controlled I/O
+(virtio rings, the network datapath) in a process that, on the privileged path, sits next to
+`CAP_NET_ADMIN`/`CAP_SYS_ADMIN`. A guest that finds a VMM bug should hit a wall, not the host. Hardening is
+three independent layers, each narrowing what the VMM can do to the host even if the layer above is
+bypassed: (1) the VMM's **own** seccomp policy, (2) a **jailer-equivalent** set of pre-`exec` process
+restrictions, and (3) a **setup broker** so the process that parses network input never holds the caps.
+The layers compose — none of them assumes the others hold — and each is fail-loud and testable.
+
+### 12.2 Layer 1 — the VMM's own seccomp filter
+
+Each backend ships a syscall filter for its *own* process; vmcell's job is to make sure it is **on**, make
+its state a typed choice rather than an accident, and translate that choice to each backend's dialect. The
+choice is `VmConfig::vmm_seccomp: VmmSeccomp` (`Enforcing` default | `Log` | `Disabled`), and one pure
+function per backend renders it:
+
+```rust
+pub fn vmm_seccomp_args(backend: &str, policy: VmmSeccomp) -> Result<Vec<String>>;
+```
+
+- **Cloud Hypervisor** — `--seccomp true` (Enforcing) / `log` (Log) / `false` (Disabled). CH's filter is
+  on by default; vmcell passes the flag **explicitly** so the state is visible at the call site and in the
+  process's argv, never left implicit.
+- **Firecracker** — seccomp is built in and **Enforcing** by default (no flag needed); `Disabled` emits
+  `--no-seccomp`; `Log` has **no Firecracker equivalent**, so it is a typed `Error::Unsupported { vmm:
+  "firecracker", feature: "seccomp_log" }`, never silently downgraded to "off" or "on".
+- **QEMU** — `-sandbox on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny`
+  (Enforcing). This is load-bearing: **QEMU runs with no seccomp at all unless `-sandbox` is passed**, so
+  the earlier QEMU path — which omitted it — left the fallback backend completely unconfined. `spawn=deny`
+  is the important clause (no `fork`/`exec` out of the VMM). Like Firecracker, QEMU has no "log" sandbox
+  mode, so `Log` is a typed `Unsupported`.
+- **crosvm** (v29) — crosvm's own sandbox is a **multiprocess minijail** (per-device jailed subprocesses
+  that `pivot_root` into `/var/empty` and load policy-dir seccomp). The initial design kept it on for
+  `Enforcing` (the Firecracker analogue), but **live validation refuted that**: it fails
+  `"/var/empty" is not a directory, cannot create jail` unless that dir is pre-created, and its
+  device-child forking fights the single-process supervision model (cgroup `add_task`/pgid-reap/
+  `find_host_pid` all assume one leader). So crosvm **always** runs `--disable-sandbox` (a single
+  externally-jailed process). To keep the "never unconfined by default" invariant, its seccomp confinement
+  moves to the **Layer-2 jailer deny-list**: `Crosvm::create` turns `JailConfig::seccomp_deny_list` **on**
+  for `Enforcing` (the default) and **off** for `Disabled` (the loud opt-out). Both emit the same
+  `--disable-sandbox`; the Enforcing/Disabled distinction lives in the jail spec, not the argv. `Log` is a
+  typed `Unsupported`. This is the one backend whose confinement is Layer-2 rather than its own filter, and
+  it is the empirically-forced per-backend enablement the deny-list was designed for (§12.3).
+
+`Disabled` exists only for diagnosing a suspected seccomp-induced failure and is a **loud, explicit**
+opt-out (it widens the attack surface); it is never a silent fallback when a filter fails to apply. The
+per-backend mapping is unit-tested, including that every backend with its *own* filter renders a
+non-empty, sandbox-enabling argument under `Enforcing` (crosvm's `Enforcing` is instead asserted as
+`--disable-sandbox` **plus** the Layer-2 deny-list turned on — its confinement lives there, above) and
+that the three unsupported `Log` cases (Firecracker, QEMU, crosvm) return the typed error rather than
+a wrong flag.
+
+### 12.3 Layer 2 — the jailer-equivalent (`JailSpec` + `apply_jail`)
+
+Firecracker ships a separate `jailer` binary that hardens the process *before* `exec`ing the VMM; CH and
+QEMU ship nothing equivalent. Rather than adopt FC's jailer (FC-only, and it wants to own process
+creation), vmcell applies the same class of restrictions itself, uniformly across all backends (including
+crosvm, §2.5), in the child between `fork` and `execve`:
+
+```rust
+pub struct JailSpec {
+    pub no_new_privs: bool,           // PR_SET_NO_NEW_PRIVS — a set-uid bit can never regain privilege
+    pub clear_ambient_caps: bool,     // drop the ambient set so the VMM cannot inherit caps (DEFAULT FALSE — see below)
+    pub non_dumpable: bool,           // PR_SET_DUMPABLE 0 — no ptrace attach, no core with guest RAM
+    pub rlimit_core: Option<u64>,     // RLIMIT_CORE — Some(0): no core dump (a core would contain guest RAM)
+    pub rlimit_fsize: Option<u64>,    // RLIMIT_FSIZE — None on the snapshot path (a snapshot IS a large write)
+    pub rlimit_nofile: Option<u64>,   // RLIMIT_NOFILE — bound the VMM's fd table
+    pub seccomp: Option<Arc<BpfProgram>>, // an EXTRA vmcell-authored deny-list, ON TOP of the VMM's own filter
+}
+```
+
+`apply_jail` runs in the pre-`exec` child and is written **async-signal-safe** — no allocation, no
+locking, only direct syscalls — because after `fork` in a multi-threaded process the child may run only
+async-signal-safe code until `execve`. Order is load-bearing and fixed: **rlimits → dumpable → ambient-clear
+→ no_new_privs → seccomp → execve**. `no_new_privs` must precede the seccomp filter (installing a filter
+without it requires `CAP_SYS_ADMIN` and defeats the point); the seccomp filter is installed **last** so
+the setup syscalls themselves aren't filtered.
+
+**`clear_ambient_caps` defaults to `false`, and that default is a hard-won correctness fix, not laziness.**
+On the privileged tap path the VMM itself performs privileged network operations at boot — CH issues
+`TapSetMac`/`TapSetOffload` ioctls, Firecracker re-opens its tap fd — which need `CAP_NET_ADMIN` *in the
+VMM process*. That capability arrives via the ambient set the parent raised. Clearing it in the jailer
+child stripped the capability the VMM was about to use, so every restore-with-tap test failed `EPERM` at
+device setup. Because the fix is subtle, the field is explicit and defaulted off with an at-site comment;
+turning it on is a real hardening increment blocked on moving tap-fd creation entirely into the broker so
+the VMM never needs the cap (fd-passing, §17). Cold-boot paths that never touch a tap survived clearing it
+(they don't exercise the ioctl), which is exactly why the regression was restore-with-tap-specific and
+easy to miss.
+
+**The optional extra seccomp deny-list** (`seccomp: Some(...)`) is a **defense-in-depth** filter vmcell
+authors *on top of* the VMM's own (Layer 1), compiled with `seccompiler`, denying a set of syscalls no
+correctly-operating VMM needs and that map to host escape or lateral movement:
+
+```text
+mount, umount2, pivot_root            # filesystem-namespace escape
+kexec_load, kexec_file_load           # boot a new kernel
+init_module, finit_module, delete_module  # load/unload kernel modules
+ptrace, process_vm_readv, process_vm_writev  # attach to / read / write another process
+bpf, perf_event_open                  # load BPF, open perf — broad kernel attack surface
+add_key, keyctl, request_key          # kernel keyring
+setns, unshare                        # enter / create namespaces
+reboot                                # reboot/halt the HOST (a guest reboot is a VMM-internal transition)
+swapon, swapoff                       # reconfigure host swap
+```
+
+`DENIED_SYSCALLS` in `vmm/jail.rs` is the one authoritative copy of that roster; this table is checked
+against it, in both directions — a syscall that belongs is added to *both*, never dropped from the const
+to "match the doc".
+
+Denied syscalls return `EPERM` (not `SIGSYS`-kill), so a VMM that probes one degrades rather than dying.
+The list is **default-allow, opt-in**: it is `None` by default and enabled once validated against a live
+run of each backend, because a VMM that happens to need one of these at an unexercised code path would be
+mysteriously broken by a `SIGSYS`. Turning it on after that validation is the plan (§17). `apply_jail`'s
+pure plan (the ordered list of operations) is unit-tested; the syscall edge is thin.
+
+**Why not chroot / uid-drop in this layer.** Two host-facing things the orchestrator does *after* the VMM
+is up need the VMM reachable and signalable: the host connects to the VMM's API socket and the guest's
+vsock UDS (a chroot would hide those paths), and teardown sends signals via `pidfd_send_signal`, which —
+across a uid boundary — needs `CAP_KILL`. So a naive "chroot + drop to nobody" breaks the control plane
+and teardown. A full jailer increment (chroot/`pivot_root` into a per-VM root, uid-drop with the fd-passing
+that makes it safe) is recorded as forward work (§17); this layer does the process-restriction subset that
+composes with the existing control plane today.
+
+**How the post-apply state is gated.** Three routes, because no single one can read all of it. (a) A
+stand-in child spawned through `build_vmm_cmd` `cat`s its own `/proc/self/status` and `/proc/self/limits`,
+which covers `no_new_privs` (`NoNewPrivs: 1`, with the `VmmSeccomp::Disabled` jail as the inverse that
+reads `0`) and `RLIMIT_CORE` (asserted against a jail that *raises* it to a nonzero value, so a host
+whose ambient soft limit is already 0 cannot make the assertion vacuous). (b) **Dumpable has no
+`/proc/<pid>/status` field** — `prctl(PR_GET_DUMPABLE)` in the jailed child is the only read route — so it
+is gated by a KVM-free forked-child probe, both ways. (c) The **ambient-capability** half is a privileged,
+`#[ignore]`d leg: an unprivileged process's ambient set is already empty, so the assertion would pass
+against an `apply_jail` that did nothing. It runs under the blessed runner in `just test-privileged`,
+where `CAP_NET_ADMIN` *is* in the ambient set (§11.2) — asserted as a precondition, never assumed — and
+its inverse pins the shipped `clear_ambient_caps = false` default (Appendix A reversal 9). All three live
+in `tests/jail_hardening.rs`, which routes every leg through one `fork_probe` helper rather than a second
+copy of the fork dance.
+
+### 12.4 Layer 3 — the setup broker (network surface never holds caps)
+
+The deepest layer addresses a structural fact the first two cannot: on the single-process privileged path,
+the *same* process both parses guest/network input **and** holds `CAP_NET_ADMIN`/`CAP_SYS_ADMIN`. Layers 1
+and 2 confine the *VMM child*, but the parent orchestrator — the axum server, the smoltcp NAT, the proxy —
+is the cap-holder and is also on the network. The broker splits those two roles across a process boundary
+(law P2): **the process on the network never holds the caps, and the process holding the caps never parses
+network input.**
+
+**Why a broker is structurally required, not merely nice.** Per-VM `setns` into a fresh network namespace
+needs `CAP_SYS_ADMIN` *in the user namespace that owns the netns*. A parent that has dropped its caps can
+never `setns` again. Two models can hold the caps in a separate process:
+
+- **fd-passing model** — a privileged helper creates the netns/tap and passes *file descriptors* back to
+  an unprivileged parent that spawns the VMM. Cleaner isolation, but it needs every backend to accept a
+  tap **fd** (CH `--net fd=`, etc.) and a cross-process refactor of `MicroVm`, which currently creates the
+  tap in-process. Recorded as the end-state (§17).
+- **spawner model (chosen)** — a privileged **broker** child forks, `setns`es into the VM's netns, sets up
+  the cgroup, applies the jail (Layers 1–2), and `execve`s the **VMM** inside the netns, returning the
+  VMM's `pidfd` to the parent. The VMM ends up as a child of the broker at the broker's (privileged) uid,
+  so the parent's later `pidfd_send_signal` for teardown works without `CAP_KILL` games. This reuses the
+  in-process tap creation vmcell already has, so it ships first.
+
+**Process topology.** The broker is forked **before the tokio runtime starts** — forking a multi-threaded
+process is unsafe (only async-signal-safe code may run in the child until `exec`), so the split must
+precede any thread spawn. The broker child sets `PR_SET_PDEATHSIG=SIGKILL` so it dies with the parent
+(no orphaned cap-holder) and, in the same few post-fork instructions, sets **SIGINT/SIGTERM to
+`SIG_IGN`**: `fork(2)` leaves it in the parent's process group, so a terminal Ctrl-C reaches the
+cap-holding child too, and at the default disposition that kills it outright — its `Registry` never
+drops and the VMM processes (each in its own group, no `PDEATHSIG`) survive as orphans pinning guest RAM
+and `/dev/kvm`, which the *next* daemon's start-up sweep then de-resources underneath. Ignoring both lets
+the graceful path (parent death, or `ShutdownAll`/EOF on the bridge) win the race. Because an **ignored**
+disposition survives `execve` — unlike a caught one — `build_vmm_cmd`'s `pre_exec` resets both to
+`SIG_DFL` in the VMM child, as its first step, so an operator's `kill` and the teardown's own signals
+still work. The parent drops **all** capabilities via the pure `plan_broker_parent_drop`
+(the bounding-set shrink needs `CAP_SETPCAP`, which `just bless` grants the runner file as a
+transient cap; where it is absent the shrink degrades to a warned no-op and the effective/permitted
+drop — the load-bearing half — still happens). Parent and broker speak a tiny framed enum over a `socketpair`:
+
+```rust
+pub enum BrokerRequest  { SetupNetwork(NetPlan), CreateCgroup(CgroupPlan), SpawnVmm(VmmPlan),
+                          Teardown(VmId), Sweep(SweepPlan), Shutdown }
+pub enum BrokerReply    { NetworkReady(NetHandles), CgroupReady, VmmSpawned { pidfd: RawFd }, Done,
+                          Error(String) }
+```
+
+Frames are length-prefixed and bounded by `MAX_BROKER_FRAME_BYTES` (a broker that trusted an unbounded
+length from its peer would be a trivial DoS/overflow). The broker reuses the exact same seams as the
+in-process path — `Netlink`, `NftApplier`, `CgroupFs`, `OrphanScanner`, and `build_vmm_cmd` + `apply_jail`
+— so there is **one** implementation of network/cgroup/spawn/jail logic, brokered or not; the broker is a
+*location*, not a fork of the logic. The `vmcell` crate's `net-privileged` + `metrics` subset compiles
+into the broker; **`axum` and the `vmcell-daemon` crate never do** (its lean-tree assertion, specified
+at §15.2; `hyper` enters legitimately via the proxy/HTTP-client subset).
+
+**What actually shipped: the "fat", engine-owning broker.** Rather than broker only the privileged
+syscalls and keep VM ownership in the parent, the shipped design puts the whole VM **`Registry` in the
+privileged broker child**, and the HTTP-serving parent forwards every VM operation to it over a
+multiplexed `VmEngine` JSON-RPC channel. This fell out of the constraint that the parent must drop caps
+before it serves HTTP, but VM operations (create/exec/snapshot/teardown) *need* the caps throughout the VM
+lifetime, not just at spawn — so the cap-holder has to be the thing that owns the VMs. Consequences worth
+knowing:
+
+- **JSON, not postcard, on the engine channel.** The forwarded DTOs use `#[serde(skip_serializing_if)]` /
+  `#[serde(default)]`, and postcard's non-self-describing format silently corrupts round-trips of exactly
+  those attributes (it encodes fields positionally, so a skipped field shifts every later field). A
+  self-describing format (JSON) is required for DTOs that use serde's presence/absence attributes; the
+  broker's *own* control enum, which uses neither, stays framed-binary. (This is the same class of finding
+  as the daemon-DTO reversal — presence-dependent serde attributes need a self-describing codec.)
+- **Multiplexing.** Each forwarded request carries a `u64` id and the parent matches replies via a per-id
+  oneshot, so concurrent client requests to different VMs pipeline over the one engine channel without
+  head-of-line blocking between VMs.
+- **`--no-setup-broker` fallback.** The single-process retain-caps path (§11.2) stays for environments
+  where the fork-before-runtime split is unwanted; it holds the caps in the serving process, which is the
+  weaker posture the broker exists to fix. Validated end-to-end: `just test-daemon` boots `vmcelld` under
+  the broker and drives its whole VM-lifecycle suite with the serving parent cap-dropped (the suite's
+  size is what `just test-daemon` reports, not a figure quoted here).
+
+The **thin** broker (broker only `SpawnVmm`+pidfd, keep the `Registry` in the parent) remains the
+cleaner long-term shape and is the fd-passing end-state's companion (§17); it needs the cross-process
+`MicroVm` refactor the fat broker sidestepped.
+
+### 12.5 The licensing constraint on seccomp crates
+
+The seccomp layers pick **`seccompiler`** (the rust-vmm compiler, Apache-2.0 / BSD-3-Clause) — the same
+library Cloud Hypervisor and Firecracker themselves use, so it is proven against this exact workload and
+adds no new license class. This choice is a **hard constraint**, not a preference, and it is the one place
+the license gate needs a name-based rule rather than trusting crate metadata:
+
+| Crate | License (metadata) | Verdict |
+|---|---|---|
+| `seccompiler` | Apache-2.0 / BSD-3 | **chosen** — pure-Rust BPF compiler, no C lib |
+| `libseccomp`, `libseccomp-sys` | metadata varies | **banned** — link the LGPL-2.1 C `libseccomp` |
+| `syscallz`, `seccomp` | permissive metadata | **banned** — wrap `libseccomp-sys` → same LGPL-2.1 C lib |
+| `birdcage` | permissive metadata | **banned** — pulls the same C-lib transitive edge |
+
+The trap: the Rust *wrapper* crates advertise a permissive license in their `Cargo.toml`, but they
+dynamically link the **LGPL-2.1 C `libseccomp`**, and that C dependency is **invisible to `cargo-deny`'s
+license scan** (which sees only the Rust crate graph). So the ban is enforced by an explicit
+`deny.toml [bans]` entry naming each wrapper crate, not left to the license allow-list — the one case in
+the whole dependency strategy (§9.6) where metadata is insufficient and a by-name rule is required.
+
+---
+## 13. Cross-cutting invariants
+
+The invariants each subsystem must uphold, gathered in one place as a checklist. Each is stated once, with
+its owner, the gate that enforces it, and a pointer to the section where the mechanism lives — the
+mechanics are **not** repeated here. A change that trips one of these is a design-level regression, not a
+style nit. They are lettered by family so code and review can cite them (`S3`, `C6`, `P2`).
+
+**S — Snapshot / clone semantics** (§8)
+
+- **S1 — vhost-user ⇒ not snapshottable.** A VM is snapshot-eligible only if **no** vhost-user device
+  (any virtiofsd — including a read-only data share — the unprivileged NAT, or an external vsock daemon)
+  is attached. *Owner:* `config::build` + `orchestrator::restore` + backend self-guard, all through the
+  one shared `config_has_vhost_user_device` predicate. *Gate:* negative build/restore tests per case +
+  the shared-predicate unit test + the "extra virtio-blk does not flip the predicate" test. → §8.1.
+- **S2 — a restored VM is not a fresh VM.** Every restore refreshes four frozen things — CID (live-unique,
+  reuse allowed), MAC **and** IP (rotated at the device layer), entropy (CSPRNG reseed), and clock
+  (host-driven) — in one native `Resync` round-trip on the first post-restore `steward()`. *Owner:*
+  `orchestrator::restore` + the steward's `netif`/resync. *Gate:* `snapshot_restore.rs` asserts a
+  live-valid CID (not `assert_ne`), a rotated MAC *and* IP (little-endian gateway compare via
+  `/proc/net/route`), a pre/post RNG change without a test-issued reseed, and a first-call `FakeClock`. →
+  §8.2.
+- **S3 — the master is immutable; clones restore from private CoW copies.** A single-use `restore`
+  rewrites its snapshot dir in place, so minting many VMs from one image restores each from its own
+  CoW copy, leaving the master byte-for-byte intact and re-cloneable. Extends to every lineage **branch**
+  node. *Owner:* `orchestrator::restore_cow` / `Zygote` / `Lineage`. *Gate:* the fan-out test asserts the
+  master `config.json` is byte-identical afterward. → §8.4.
+- **S4 — every CoW clone goes through `env.overlay`.** Clone materialization is the injected
+  `OverlayStore::clone_tree(master, private_dst)`, never an ad-hoc copy, and `dst` is always a fresh
+  private dir inside the clone's scratch (never the master). *Owner:* `orchestrator`. *Gate:* the
+  `RecordingOverlayStore` fan-out test asserts N distinct private dsts, none equal to the master. → §8.4.
+- **S5 — lineage is immutable, acyclic, cross-family-safe.** A branch node's parent is fixed at creation,
+  generation strictly increases, ancestry is `parent.ancestry ++ [parent.id]`, and `is_ancestor_of` first
+  checks a shared allocator via `Arc::ptr_eq` so ids from distinct allocators never false-positive.
+  *Owner:* `lineage`. *Gate:* the cross-allocator ancestry unit test. → §8.5.
+
+**C — Control-plane discipline** (§3)
+
+- **C1 — under the `Pid1` placement, the steward is PID 1 and behaves like an init.** It mounts
+  `/proc`, `/sys`, `/dev/pts`, sets up the
+  tmpfs overlay, reaps **all** children (not only its own sessions), and **never exits** — any exit panics
+  the guest kernel. In **service mode** the fatality inverts by design: no filesystem assembly, a
+  graceful SIGTERM shutdown, `PR_SET_CHILD_SUBREAPER` on — the placement parameterizes the contract,
+  never forks the code (§3.5). *Owner:* `vmcell-steward`. *Gate:* the never-exit reviews + the reaper
+  unit tests + the mini-init service-mode battery (subreaper double-fork leg, both SIGTERM legs).
+  → §3.4 / §3.5.
+- **C2 — the vsock handshake has exactly three traps, and the host respects them.** Fresh connection per
+  attempt (a refused connect poisons the socket for retries), read the `Ready` frame to completion before
+  writing, uniform bounded timeout on connect/handshake. *Owner:* `steward::StewardClient`. *Gate:* the
+  handshake FSM unit test over all three. → §3.2.
+- **C3 — a connection owns its sessions; loop exit SIGKILLs their process groups.** When a control
+  connection's dispatch loop ends, every process group it spawned is `kill(-pgid, SIGKILL)`'d, so no
+  guest process outlives the connection that created it. *Owner:* `vmcell-steward`. *Gate:* the KVM
+  connection-drop residue test (`sh -c 'echo $$; sleep 600'`, then drop, then assert the pgroup is gone).
+  → §3.4.
+- **C4 — one writer per connection, both ends.** The host multiplexer and the guest dispatcher each have a
+  single task that owns writes to a given vsock connection; frames from concurrent sessions are queued to
+  that writer, never written from multiple tasks. *Owner:* `steward::session` (host) + the guest dispatcher.
+  *Gate:* two window-filling self-identifying streams show zero cross-attribution. → §3.4.
+- **C5 — session I/O is channelized with exactly one terminal `SessionExit`.** Each session's
+  stdout/stderr are tagged frames; a session ends with exactly one `SessionExit` (a spawn failure is
+  `SessionStderr` + `SessionExit(127)`); frames arriving after a session's exit are dropped, never
+  misattributed. *Owner:* `steward::session` + the guest dispatcher. *Gate:* the demux interleave +
+  post-exit-drop unit test over a tokio duplex. → §3.2 / §3.4.
+- **C6 — zero netlink in PID 1.** The guest configures its network via the kernel `ip=` cmdline and
+  device-layer ioctls (`SIOCSIF*`), never a netlink/`rtnetlink` bring-up. *Owner:* `vmcell-steward`.
+  *Gate:* a **structural** `cargo tree -e no-dev` assertion that the steward crate has no `rtnetlink`
+  dependency (there is no seam to fake because the manual bring-up was deleted). → §3.4 / §9.8.
+- **C7 — a PTY session is a controlling terminal with a session leader.** `setsid` + `TIOCSCTTY`,
+  `isatty` true in the guest, and host `Winsize` changes forward as `SIGWINCH`. *Owner:* the guest
+  dispatcher's PTY path. *Gate:* an in-guest `test -t 0 && stty size` + a resize assertion, with a
+  pipe (non-PTY) negative control. → §3.4.
+- **C8 — control-plane facts are the declared placement's two methods, and nothing else's (v33).**
+  `StewardPlacement::steward_port()` is the only spelling of "is a steward expected, and where"
+  (`steward()`, `connect_sessions()`, the control-plane health gate), and
+  `StewardPlacement::resync_reachable()` is the only spelling of "may this cell snapshot/clone"
+  (`snapshot()`'s guard, the eligibility predicate's placement arm) — two methods because the two
+  questions differ exactly at `Service`, which has a port but no measured post-restore resync;
+  neither is ever re-derived from `cfg.init` (which decides init *identity* only, at the cmdline
+  builder plus its two validation sites). The pre-v33 tree spelled availability three
+  accidentally-equivalent ways; a fifth spelling — or an eligibility site reading `steward_port()`
+  — is this law's violation. *Owner:* `config::StewardPlacement` + `orchestrator`. *Gate:* the
+  call-site source scan over both methods (the predicates alone are not the claim) + the placement
+  matrix tests — `Service` must **not** take the fail-loud arm (the first negative case the guard
+  has ever had) and a `Service` cell's `MicroVm::snapshot()` **must** return the typed placement
+  refusal. → §3.5.
+
+**L — Lifecycle / teardown** (§9.4)
+
+- **L1 — teardown is ownership; one ordered helper cleans up, even on panic.** Resource release order is
+  fixed — proxy/smoltcp NAT before the netns, VMM **process group** (`kill -9 -pgid`) first once an
+  instance exists, then virtiofsd, then netns/cgroup/overlay/scratch — and the success path
+  (`teardown_post_instance`), the error path (`EnvSetup::drop`), and every registry teardown variant
+  (`destroy`, `shutdown_all`, and the contained `MicroVm`s' `Drop` when the table goes — the registry
+  itself has no `Drop` impl, §11.4) all call the **same** helper. A hard kill that skips `Drop` is
+  reclaimed by the start-up sweep against an empty live set. *Owner:* `orchestrator` + `vmcell-daemon`'s
+  registry. *Gate:* the drop-order recording gate + the panic-residue-vs-computed-paths lifecycle test. →
+  §9.4 / §11.4.
+
+**F — Fail-loud / naming / cmdline / cache**
+
+- **F1 — a missing capability fails loud, never a silent no-op.** A *requested functional* op whose OS
+  capability is absent returns a typed `CapabilityUnavailable`; only an explicitly-listed best-effort knob
+  (the benchmark levers) degrades to a `warn!`. *Owner:* `metrics` + `net` + `HostCapabilities`. *Gate:*
+  the `CgroupFs`-fake `CapabilityUnavailable` test + the errno-split unit test. → §7.2.
+- **F2 — one prefix names and sweeps every per-VM (and per-segment) resource.** A single
+  `resource_prefix` composes every per-VM *and per-segment* resource name **and** every orphan-sweep
+  filter through `vmcell::naming`, so a produced name can never fall out of lockstep with the filter
+  that reaps it — and each swept class is liveness-checked against **its own id space** (vmids for
+  `-net-`/`-vm-`, segids for `-seg-`, §6.5). *Owner:* `vmcell::naming`. *Gate:* the "every produced
+  name starts-with its sweep filter, for any prefix" unit test, extended per class. → §9.3 / §11.4 /
+  §6.5.
+- **F3 — extra kernel args are append-only.** A caller's `extra_kernel_args` may add a parameter but never
+  clobber a token vmcell owns, enforced by the one `is_reserved_cmdline_arg` predicate (reserved-key set +
+  `vmcell_` prefix guard + single-token guard). *Owner:* `config`. *Gate:* the gate that builds a cmdline
+  exercising every emitted token and asserts the predicate rejects each key. → §5.3.
+- **F4 — cache keys are content-addressed and deterministic.** Five rules: stable hasher, deterministic
+  input order, content/identity-not-paths, per-stage version + source SHA, validity by content not
+  existence. *Owner:* `artifact`. *Gate:* the `cache_key` golden test against a **real** stage + the
+  tamper-rejected test. → §10.2.
+- **F5 — rootfs injection has one reserved-path predicate (v30).** Every downstream `ExtraFile` dest is
+  checked against the single `is_reserved_injection_path` list of vmcell-owned dests (steward, CA trust
+  store, `vmcell-tools/`); a hit — or a duplicate extra dest — is a build-time `Error::Artifact`, and
+  vmcell's own injections stay unconditional and authoritative. Never a second copy of the list, never
+  a silent last-writer-wins among injected entries. *Owner:* `artifact::rootfs`. *Gate:* the
+  reserved-dest + duplicate-dest red-on-inverse tests + the manifest pin test. → §4.2.
+- **F6 — a cell's features are computed in one place, and an unknown feature name is an error (v33).**
+  The `FeatureSet` intersection over backend × host × artifact declarations has exactly one
+  computation site; every removal carries `Removal { feature, by, reason }` provenance; the typed
+  refusal's feature string is `Feature::name()` by construction (never a hand-spelled fragment —
+  the substring-matcher class is retired with it); and a feature token matching no known variant is
+  a hard error naming it at every declaration surface (pins entry, feature-manifest sidecar) —
+  absence is the silent direction, so a typo may never read as "unsupported". *Owner:*
+  `vmcell::feature`. *Gate:* the two-sided provenance test (same artifact, two backends — the
+  removal names the rootfs on one and the backend on the other, which is what proves the
+  intersection is an intersection and not a rename of the backend flags) + the
+  misspelled-token hard error red-on-inverse + the computation-site source scan. → §7.4.
+- **F7 — a registration is a digest; a path is an override, never a registration (v33).** Every
+  registry entry's `digest` is authoritative; a `source` is a fetch instruction verified against it
+  before use, failing loud on mismatch; the development path-registration override marks the cell's
+  artifact identity `unpinned` and is refused by `bundle`. `VMCELL_KERNEL`/`VMCELL_ROOTFS` keep
+  their per-run override semantics — F7 governs registrations, not overrides. *Owner:*
+  `artifact` (the registry resolvers). *Gate:* the corrupt-one-byte-of-the-cached-blob test (the
+  build must fail naming the digest mismatch — a stored-but-never-checked digest has passing output
+  identical to its not-running output) + the bundle-refuses-unpinned test. → §10.5.
+
+**P — Privilege / daemon** (§11–§12)
+
+- **P1 — the cap-holder retains caps; it never drops-and-execs to serve.** A long-lived privileged process
+  runs the effective-set precondition and keeps its caps (no uid drop / ambient raise / bounding shrink /
+  exec) for the whole lifetime, and **refuses to start** if the precondition fails — never a degraded
+  server that fails privileged ops at first use. (The *transient* runner is the opposite by design: it
+  drops and execs.) *Owner:* `vmcell-daemon` + `vmcell-privilege`. *Gate:* the daemon start-up
+  precondition test + the runner's transition tests. → §11.2.
+- **P2 — the broker model: the network surface never holds caps, the cap-holder never parses network
+  input.** By default `vmcelld` forks a privileged broker that owns the caps (and, as shipped, the VM
+  `Registry`) while the HTTP-serving parent drops all caps; the two speak a bounded framed protocol.
+  *Owner:* `vmcell-broker` + `vmcelld`. *Gate:* `just test-daemon` drives the whole VM-op suite with
+  the serving parent cap-dropped. → §12.4.
+- **P3 — every client-named artifact goes through `resolve_artifact_path`.** One allowlist validator turns
+  a client string into `dir.join(name)` with `name` a single safe component; no caller constructs
+  `dir.join(client_string)` itself. *Owner:* `vmcell-daemon`. *Gate:* the red-on-inverse validator tests +
+  a grep gate on `dir.join(` outside the validator. → §11.3.
+- **P4 — authenticated by default; secrets never sit in process-visible surfaces.** The auth layer wraps
+  every route except exactly `/healthz` + `/openapi.json` (opt-out, not opt-in); the key is loaded from a
+  perms-checked file (never a CLI arg or env var), compared constant-time; `RLIMIT_CORE=0` keeps a VMM
+  core from dumping guest RAM. *Owner:* `vmcell-daemon` + `vmm::jail`. *Gate:* the auth 200/403/401 tests +
+  the world-readable-key-file-refused test + the opt-out-set parity assertion. → §11.6 / §12.3.
+- **P5 — the served OpenAPI and the mounted routes are one table.** `API_ROUTES` generates the document
+  *and* is folded into the router, so the two agree by construction; the gates hold what construction
+  cannot: the router mounts nothing outside the fold, every row has a handler, every row is an operation
+  with its auth requirement, the open set is exactly the two named routes, and every `$ref` resolves to
+  a declared schema in a document required to contain at least one. *Owner:* `vmcell-daemon`. *Gate:* the
+  KVM-free `openapi`/`server` unit tests. → §11.5.
+
+**G — Keep the primitive general**
+
+- **G1 — no domain policy in the core.** `vmm`/`steward`/`orchestrator`/`metrics` (and the guest
+  steward binary) hold
+  **no** workload-, tenant-, or product-specific policy; the core is a workload-agnostic capability and a
+  consumer crate supplies domain policy. Share tags, egress rules, and resource limits are all
+  caller-supplied, never built-in. *Owner:* every core crate. *Gate:* review against the out-of-scope
+  boundary list (§17) — naming the consumer layers is itself the guard. → §1.3.
+
+Two invariants live with their subsystems rather than here, and are cited from it: the **cgroup edges**
+that make a memory cap actually bind (sibling placement, non-threaded `domain` scope,
+`swap.max=0`+`oom.group=1`) are §7.3, and the **NAT's six silent-wedge invariants** (source-MAC
+collision, RX-only-when-queued, TX notification, socket-pool sizing, bounded host reads, contiguous-span
+guest reads) are §6.2. They
+are subsystem-local because nothing outside their module can violate them, but they are the same *class* of
+load-bearing rule as the lettered set above.
+
+---
+
+## 14. Hard-won lessons
+
+Five conclusions from building this that are cheap to state and expensive to re-learn. They are the
+*why* behind the testing discipline (§15) and the benchmark discipline (§16); each is a rule, not an
+anecdote.
+
+1. **A path with no test that can fail has never run.** The single most expensive class of bug here was
+   code that looked exercised but was not — a "leaked-VM" test that spawned a VM, never asserted teardown,
+   and passed for weeks while hanging the suite for 30 minutes on a real run. The rule that falls out:
+   every test must be able to **fail on the inverse** of what it claims (§15). A green test that cannot go
+   red proves nothing.
+2. **Only interleaved, same-session benchmark deltas are trustworthy.** Absolute latency numbers wander
+   with host load, thermal state, and background noise; a number measured in one session and compared to a
+   number from another session is measuring the sessions, not the change. Every performance claim here is
+   an A/B delta measured **back-to-back in one run** (§16). A cross-session "~2× slower" scare turned out
+   to be host-load noise, and cost real time before it was re-measured interleaved and vanished.
+3. **Measuring disproves wrong beliefs — plural.** At least three confidently-held hypotheses inverted
+   under measurement: the guest kernel version was assumed a hot-path lever (it is not, within ~2% on the
+   warm path); CH's lazy-restore was assumed strictly faster (it front-loads, and the cost reappears as
+   first-touch page faults); a fashionable set of microVM cmdline trims was assumed to help (a
+   `printk`-timestamp probe showed they target probes that never run here). The discipline: a plausible
+   mechanism is a hypothesis to **measure**, never a fact to ship on.
+4. **"Environmental" flake is a hypothesis, not a diagnosis.** A recurring test failure was papered over
+   with `nextest` retries for weeks under the label "environmental," until it was root-caused to a real
+   guest-reaper epoch race (the AGENT-2 finding). Retries are a **backstop for genuinely residual**
+   host-level noise, never a substitute for root-causing a reproducible failure — and the way to tell them
+   apart is to **control against a known-good baseline**: the flake was isolated by re-running the exact
+   suite against a git-stashed baseline until it was clear the failure tracked a code change, not the host
+   (a specific `kvm_intel` EPT symptom clustered on one machine, which is what "environmental" is *supposed*
+   to mean).
+5. **The dev host is the KVM host — "forward work" is legitimate only when preflight says NOT READY.** The
+   integration suites need KVM, and the machine running them has it. So a preflight check that prints
+   **READY** means the right next step is to *run the suites now*, not to defer them; deferring real
+   validation with the suites available is how review-only correctness bugs accumulate. "Forward work" is
+   an honest label **only** when a preflight check prints **NOT READY** and names the specific failed
+   capability (no `/dev/kvm`, no nested virt, a missing `nft`) — at which point the deferred item is
+   recorded with its blocking check, not hand-waved.
+
+---
+## 15. Testing strategy
+
+### 15.1 Philosophy: green is necessary, not sufficient
+
+The organizing principle is a direct consequence of §14 lesson 1: **a passing test suite proves nothing
+unless each test can fail on the inverse of what it claims.** This project has concrete evidence for why —
+the suite passed green while *four* distinct implementations were broken, because the tests asserted that
+code *ran*, not that it was *correct*. So the bar for every test is: **negate the behavior under test and
+the test must go red.** A test that stays green when the thing it checks is broken is deleted or fixed, not
+kept for coverage. The rest of this section is the machinery that makes that bar enforceable.
+
+### 15.2 Lint and structural gates (compile-time, always on)
+
+These run on every build and fail it, so a whole class of defect never reaches a test:
+
+- **Deny-by-default lints under `not(test)`:** `unwrap`/`expect`/`panic`/`unreachable`/`todo`, arithmetic
+  that can silently wrap, direct slice indexing (`clippy::indexing_slicing` — use `get`), and
+  `print`/`eprint` (the library emits `tracing`, never stdout). Plus `missing_docs` (every public item is
+  documented) and a lint requiring every `unsafe` block to carry a `// SAFETY:` justification.
+- **`#![forbid(unsafe_code)]` on every I/O-free / logic module** — `net/` (its one irreducible ioctl is
+  quarantined in `net_sys.rs`), `config`, `naming`, `artifact`'s pure core, the protocol codec — so unsafe
+  can physically only live in the few modules that have a documented reason for it. **This roster is
+  itself the gate's input.** `naming`'s `design_forbid_unsafe_roster` parses the list out of the newest
+  `docs/*.md` §15.2 heading at run time (never `include_str!`, so a reissue is picked up the moment it
+  lands) and asserts each named module carries the attribute, failing loud in both directions: a named
+  module without it, and a roster entry the gate cannot map to a file — because a design that grows a
+  module must not silently grow an unchecked one. An unparseable bullet is a `gate misconfigured`, never
+  a green empty roster. It held only by memory before, and the entry it was false for was `naming`
+  itself — law F2's sole home, and the module whose output the orphan sweep uses to decide what to
+  delete.
+- **`RUSTFLAGS=-D warnings`** applied process-wide in `just ci`, over `clippy --all-targets
+  --all-features` and `cargo fmt --check`.
+- **The feature powerset compiles** — a blocking gate that builds every feature combination (§9.7), the
+  fix for the feature-gating build breaks the fine-grained matrix used to cause.
+- **Per-member lean-tree assertions** — `cargo tree -e no-dev` proves `vmcell-steward`,
+  `vmcell-test-runner`, and `vmcell-privilege` pull no `tokio`/`hyper`/`rtnetlink` (`guest-tools` is
+  exempt, §9.7). **`vmcell-broker`'s boundary is different and narrower**: it legitimately *owns* the
+  engine (`tokio`, `rtnetlink`, and — transitively via the proxy/HTTP-client subset — `hyper`), so its
+  assertion is that the HTTP-**server** stack is absent: no `axum` and no `vmcell-daemon` (the P2
+  boundary; `vmcelld`, which legitimately links both, is the gate's positive control). Both
+  `vendor/vhost*` crates are asserted to resolve from `vendor/` (§9.6). (This folds in the second
+  `docs/historical/70` erratum — the earlier phrasing lumped the broker into the `tokio`/`rtnetlink`
+  ban it never had.)
+- **`cargo-deny`** enforces the license allow-list + the seccomp-crate by-name bans (§12.5) + the
+  advisory-ignore set (§9.6), and **`cargo semver-checks`** gates every public-surface change.
+
+### 15.3 Unit tests (no KVM, no root) — the pure cores and the seams
+
+Everything that can be tested without a VM is, against the injectable seams (§9.8) and the pure functions
+(§9.8 item 2). The point of each is a *named invariant with a red-on-inverse assertion*, not line
+coverage. By category, with the load-bearing ones named:
+
+- **Pure arithmetic / codecs:** the `/30` address math (octet `= (vmid % 254) + 1`, no address > 255); the
+  protocol codec **round-trips** every `Message` variant (an encode-only test would miss a decode bug);
+  `mac_math` collision-freedom against the NAT's reserved MAC; `cache_key` **golden** vs a **real** stage
+  (rules of §10.2); `KernelVerbosity`/`ConsoleMode` → cmdline token; `Timeouts::clamped()` at each floor;
+  `parse_ms` clamp (garbage/overflow → default); the `ifreq`/`Winsize` struct layouts; `winsize_from`
+  rows/cols; `child_path`/scratch-dir construction.
+- **State machines / parsers:** the vsock handshake FSM over its three traps (§3.2); the CH REST restore
+  config parser/rewriter; the `nft` ruleset renderer (**golden** output); the accept-loop deadline helpers
+  and the reaper's "reserve after drain" ordering; the discriminant-stability check pinning the wire
+  variants to `8..=15` (§3.1).
+- **Seam behaviors (recording fakes):** the `CgroupFs` fake returns `CapabilityUnavailable` for an
+  undelegated controller and the errno-split maps `EINVAL`→`Cgroup` / `EACCES`→`CapabilityUnavailable`
+  (§7.2); the shared cmdline builder emits `loglevel=` on **all** backends (the QEMU-regression pin,
+  §5.3); the `is_reserved_cmdline_arg` all-tokens gate (§5.3); path injectivity — the artifact-name
+  validator's red-on-inverse battery (§11.3, a property test over the accepted byte-class); the
+  drop-order recording gate (§9.4); the `demux` interleave + **post-exit-drop** over a tokio duplex (§3.2).
+
+### 15.4 Integration tests (KVM required) — split by mode, honest about capability
+
+VM-touching tests are `#[ignore]`d (so `cargo test` stays hermetic) and run explicitly with `--ignored`
+under the capability runner (§15.5). `nextest` places them in a **serial host group** that positively
+selects `package(~vmcell) & kind(test) & !binary(proptests)` — a *positive* selector, so a newly-added
+integration binary is included by default rather than silently left out of the serial group (a negative
+"everything but X" selector is the divergence trap). The `~` is a **substring** match over package
+names, which is what makes it a workspace glob: the exact-name form needed one override per member
+(`package(vmcell)` plus a separate `package(vmcelld)`) and each silently denied every member added
+later, so a new VM-booting binary in `vmcelld` or `vmcell-daemon` ran unserialized and raced on
+netns/cgroups/nft. The cost — serializing a few cheap KVM-free daemon integration tests — buys that
+auto-inclusion; `proptests` is excluded because it is pure in-memory property testing and keeps its
+parallelism. The suite splits along the two operating modes (§6.1):
+a privileged-mode suite (netns+tap+snapshot) and an unprivileged-mode suite (smoltcp NAT, no snapshot).
+
+**Where it runs: a GitHub-hosted runner, established by probing.** `ci.yml`'s `test-integration` job
+is `runs-on: ubuntu-24.04` — one job carrying every live suite (unprivileged, privileged, daemon, the
+validator battery, and the downstream example's live leg), plus `just bless` in the middle of it. Its
+predecessor named a `[self-hosted, linux, kvm]` runner that was never registered, so the whole live
+matrix was queued-then-cancelled and **CI-invisible for the repo's entire history** — the reason
+AGENTS.md rule 3 says CI must execute what it claims. Two hosted-runner facts are load-bearing and
+carry their rationale in the job: `/dev/kvm`, `/dev/vhost-vsock` and `/dev/vhost-net` are widened by a
+udev rule whose roster is parsed back out of the file it just wrote (so a widened device nobody asserts
+is unrepresentable), and **every** live suite is wrapped in a delegated scope, because a hosted
+runner's own cgroup is not delegated and `MicroVm::start` needs a writable one even with no limit
+requested.
+
+**Capability honesty is enforced, not documented.** On the **primary** backend (Cloud Hypervisor) a
+missing capability is a hard `require_cap!` **panic** — CH is the reference and a silent skip there would
+hide a real regression. On the secondary backends (Firecracker, QEMU, crosvm) a missing capability records
+a **SKIP** to a `VMCELL_SKIP_MANIFEST` manifest instead, so the run surfaces exactly what did not execute
+rather than passing by omission — and each such `false` capability additionally carries a KVM-free honesty
+pin so a silently-flipped flag reddens even without the live leg (this is how crosvm's honest-`false`
+capabilities, §2.5, stay auditable — each honest `false` shows up as a `require_cap!` skip in the
+opt-in `just test-crosvm` run's skip manifest, which is the roster to read). A per-flag
+capability-honesty test pins every `VmmCapabilities` field — all nine (`snapshot_restore`, `lazy_restore`, `virtio_fs_shares`,
+`unprivileged_vhost_user_net`, `nested_virt`, `virtio_console`, `restore_rotates_host_paths`,
+`disk_io_throttle`, `usb_host_passthrough`) — to the backend that actually supports it, plus the three
+seccomp-`Log` unsupporteds (FC/QEMU/crosvm, §12.2) as separate non-descriptor pins, so a flag that lies
+(advertising a capability the backend lacks, or vice versa) goes red. **Zero selected tests
+is a CI failure**
+(`nextest`'s `--no-tests=fail`), so a mis-scoped filter that silently selects nothing fails loudly instead
+of passing. `nextest` **retries** (exponential, count 3, 5 s→20 s) are configured as a backstop for
+genuinely residual host noise only (§14 lesson 4) — never a substitute for root-causing a reproducible
+failure.
+
+The exemplar suites, each written so its assertions **fail on the inverse**:
+
+- **`snapshot_restore.rs`** (the S2 battery, §8.2): reconnect across the **severed** vsock (the restore
+  re-creates the vhost-vsock device, so a test that reused the old connection would hang); assert the
+  **transport-real** restored identity per backend inside a `restore_rotates_host_paths` branch — CH's
+  rotated AF_UNIX vsock path (embedding the new vmid), QEMU's rotated guest **CID** (`assert_ne!` vs the
+  source CID, made non-vacuous by reserving that CID up front), and FC's verbatim baked vsock path; assert
+  the MAC **and** IP both rotated (the IP check compares the little-endian default-gateway from
+  `/proc/net/route`, since a "MAC-only" assertion passed while every clone sat on a dead `/30`); assert the
+  CSPRNG changed across restore **without** a test-issued reseed; and assert `FakeClock` was read on the
+  **first** post-restore `steward()`.
+- **`zygote.rs`** (the S3/S4 fan-out, §8.4): N concurrent clones each get a **distinct** vmid, a MAC equal
+  to `mac_math(vmid)`, distinct vsock paths, and — for QEMU (the Vsock endpoint) — a distinct guest **CID**
+  (the host-global resource it rotates); concurrent fan-out on the rotating backends (CH **and** QEMU) and a
+  single-clone-only Unsupported path on FC; the master `config.json` is **byte-identical** after the
+  fan-out; a non-rotating backend returns `Unsupported` for `count > 1` while a single clone succeeds; and
+  the `RecordingOverlayStore` shows the fan-out targeted N distinct private dirs, none the master.
+- **One-liners that each pin one past bug:** `egress_proxy` (a double matches on the label **boundary**,
+  and a `CONNECT` falls through rather than being matched, §6.4); `metrics_limits` (a bound guest shows
+  `memory.events oom_kill > 0`, **not** an exit-137 heuristic, §7.3); `lifecycle` (after a forced panic the
+  computed netns/tap/cgroup/scratch paths are **gone**, §9.4); `put_file` round-trips a payload through the
+  steward.
+- **Pipeline tests:** a tamper test **corrupts the artifact bytes while keeping the `.cache_key` sidecar**
+  and asserts rejection (§10.2 rule 5); a warm-cache run does **zero** upstream fetches; `reset_to` removes
+  exactly the named stage's and later outputs; an steward-source change **re-bakes** the rootfs (the
+  stale-steward handshake-bug pin).
+- **Daemon + `vmcelld`:** the KVM-free daemon gates (auth 200/403/401, OpenAPI parity, artifact-name
+  red-on-inverse, delete-in-use) run always; the KVM `vmcelld` integration suite **inverts the runner** —
+  the test binary itself holds the caps and spawns `vmcelld` directly in a systemd-delegated scope, then
+  drives the data plane (create → exec → snapshot → `restore_from` → destroy) and asserts a tmpfs marker
+  survives a restore into a fresh VM — the cap-dropped operation set of §12.4.
+- **The v30 downstream batteries (landed):** the **segment** set (two-VM bidirectional TCP, off-segment
+  negative with on-segment positive control, host `dial_tcp`, a `netem` delay that measurably shifts the
+  guest↔guest round-trip, last-holder netns residue, orphan-`seg` sweep with foreign-prefix isolation —
+  §6.5); the **dial** set (echo round-trip + EOF both ways per backend/endpoint arm, dead-port typed
+  error not a hang — §3.2); the **injection** set (in-guest `cat` + `stat` of an injected file before
+  first exec, reserved/duplicate-dest rejects, cache-key invalidation — §4.2); the **toolkit** set (pins
+  overlay wins/falls-back/fails-loud, resolved-config sidecar present and assertable, the serial-log
+  classifier red-on-inverse on canned logs, and the **out-of-tree example workspace** built and run by
+  CI — its KVM leg, a step of the integration job, boots the fragment-built kernel and proves
+  `/proc/config.gz` on the data plane — §5.6/§10.4); and the **opt-in USB recipe**
+  (`just test-usb-passthrough`, env-gated on a designated `VMCELL_TEST_USB_DEVICE=<vid>:<pid>`, staged
+  exactly like `just test-crosvm` because CI has no designated device — §2.4; its KVM-free honesty pins
+  and argv golden tests always run).
+- **The v33 batteries (§18):** the **placement** set (the `Service{5000}`+`init: None` composition
+  leg — `steward()` returns a client, `connect_sessions()` works, the health gate *ran* for a
+  `Service` placement; the discriminating `Service`+custom-`init` refusal-identity leg — the
+  transport timeout, never the placement refusal — which is the arm that reddens on the
+  `cfg.init` re-key; the `Service`-cell `snapshot()` typed-refusal leg (`resync_reachable()`); the
+  `None` fail-loud leg; the byte-identical-default cmdline pin; the C8 two-method call-site scan —
+  §3.5);
+  the **service-steward** set (under `mini-init`: a double-forking payload's `exec` returns its exit
+  code — red-on-inverse by removing the `PR_SET_CHILD_SUBREAPER` call, which hangs it; SIGTERM to
+  the service steward sweeps its live sessions **and** its in-flight one-shot `exec` children per C3
+  — both pgroup residues gone — exits cleanly,
+  and **mini-init restarts it**, so the guest stays up and a later `exec` works (satisfiable only
+  because mini-init restarts on exit — §3.5); the `Pid1` twin
+  asserting SIGTERM *does* power off — a SIGTERM policy that never powers off is the same
+  assertion-free shape one placement over; and the rapid-failure-cap leg, a steward that cannot
+  start powering the guest off fail-loud rather than crash-looping — §3.5); the **feature** set (the two-sided provenance
+  pair, the misspelled-token hard error, `require()` refusing pre-boot with the removal named —
+  §7.4); the **conformance** set (the four-leg present/absent × capable/incapable matrix per
+  decidable feature, the paired positive-control ids, the `Warn` lifecycle, the roster gates on all
+  three levels, the battery budget — §10.6); the **registry** set (same-digest-two-labels
+  byte-identity + unmoved default key, the laziness leg red on eager, the corrupt-blob digest
+  mismatch, bundle-refuses-unpinned, the legacy-singleton-shape reject — §10.5); the **xattr** set
+  (the `pax_xattrs_are_stripped_under_the_default_policy` / `…_preserved_under_the_preserve_policy`
+  unit pair, plus the live in-guest `xattr get` readback
+  with the `Strip` negative control — §4.7); the **ext4** set (pack from the merged tar, boot as
+  `RootfsSource::Block`, in-guest tree/xattr/device-node diff against the tar manifest; the
+  tool-version probe's typed refusal — §4.7); and the opt-in **systemd proof cell**
+  (`just test-systemd`, §18 delta 9: the registered `debian-systemd` artifact boots real systemd as
+  PID 1, the steward runs as a unit under `Service` placement, `exec`/sessions work, and the
+  §10.6 kit runs green over the R1+R2+R5+R6+R7 composition — staged like `test-crosvm` because it
+  pulls a full-Debian image).
+
+### 15.5 The capability test runner (`vmcell-test-runner`)
+
+Privileged integration tests get their caps from a **`nextest` target-runner**, not `sudo -E cargo test`
+(which runs the *whole* suite as root and pollutes `target/` ownership). The runner is a lean
+(`rustix`/`capctl`/`libc`, never the `vmcell` library) cap-conferring `exec` wrapper, so **only** the
+test process — at the dev uid — runs privileged, and `target/` stays dev-owned. It confers `+ep` on the
+*runner* (`vmcell-test-runner`), not `+p` on every test binary.
+
+**The transition is an ordered plan, and the order is the security property.** `PrivilegePlan::steps`
+is the one place it is written, and `apply_privilege_transition` executes exactly that sequence:
+
+```
+1. drop uid   — gid → supplementary groups → uid, under PR_SET_KEEPCAPS   (setuid-root form only)
+2. inheritable — add the needed caps, so the ambient set is allowed to hold them
+3. bounding    — drop everything supported-but-not-needed (this is what CAP_SETPCAP is for)
+4. ambient     — raise the needed caps, into an already-narrowed set, at the already-dropped uid
+5. trim        — permitted/effective down to exactly the needed set, then `execvp`
+```
+
+The **uid drop precedes the ambient raise**, never the reverse: a root process must not reach `exec`
+holding ambient caps, and the bounding shrink precedes the raise so ambient lands inside the narrowed
+set. Earlier revisions of this document stated the order backwards in this section and in §11.2 — the
+code was right and the text was wrong. Emitting the transition as a **step list** is what makes the
+order data rather than statement order: a struct has no sequence, so while the plan was only a struct
+the promised "pure transition test that asserts the uid change happens before the ambient raise" had
+nothing to assert against. Both the step order and the executor's fidelity to it are now unit-gated.
+
+Two further subtleties are load-bearing:
+
+- **Confinement anchors on the runner's own path, not the argument's.** The runner refuses to exec
+  anything whose canonicalized path is not under the workspace `target/` — but it derives that `target/`
+  from **its own** `current_exe()` (walking up from the blessed `.vmcell-bin/<profile>/vmcell-test-runner`
+  to `<workspace>/target`), **not** from the target argument. Anchoring on the argument's own `target/`
+  ancestor is inert (a malicious argument would validate itself); anchoring on the *runner's* location is
+  the real boundary. Because the OS strips file-caps on any binary rewrite, a tampered runner simply loses
+  its caps — the blessing is self-invalidating, which is a feature.
+- **`just bless` installs to a gitignored, mode-checked location.** It copies the runner to
+  `./.vmcell-bin/<profile>/`, `chmod 0700`s it, `setcap`s it, and records a content-hash `.blessed` stamp
+  **keyed on the runner binary only** (so a rebuild of the runner re-blesses, but a rebuild of an ordinary
+  test binary does not). the granted set is `BLESSED_FILE_CAPS` — the three `PRIVILEGED_CAPS` the mode
+  uses plus a **transient `CAP_SETPCAP`**, whose only purpose is `PR_CAPBSET_DROP`: the transition
+  drops it out of the bounding set (it is in `supported` but not in `need`) and out of
+  permitted/effective (step 5 trims to exactly `need`), so no test or VMM ever holds it. Without it
+  the bounding-set shrink is a **warned no-op** and the bounding set stays at the kernel's full
+  width; with it the exec'd test's bounding set is exactly the three delivered caps, gated live by
+  `the_bounding_set_is_shrunk_to_exactly_the_delivered_caps`. `vmcell-privilege::setcap_arg` is the
+  one composer of the `setcap` argument, and a unit gate **walks the tree** for copies of the command
+  — every Markdown, shell, Rust, TOML, YAML file and the `justfile`, minus `target/`, `.git/`, and the
+  frozen `docs/historical/` — asserting each names exactly that set, and pinning **which** files carry
+  a copy and how many each carries so a scan that matched nothing reddens instead of passing
+  vacuously. The current copies are the `bless` recipe, the README's three, and the **current design
+  document's** §10.4 downstream route; that last one is located the same way `vmm::jail` locates §12.3
+  — by reading `docs/` and finding the file that carries the section — so reissuing this document
+  under a new number moves the copy without breaking the gate, while deleting it reddens. The
+  preflight probe's `NEEDED_CAPS` array is checked separately against the same constant. The gate
+  earns the tree walk: the design's own copy had drifted to the three delivered caps for a whole
+  release while the gate read a hand-listed pair of files and claimed to read "every copy". The
+  `setuid` fallback (for hosts without file-cap support) is verified by a pure transition test that
+  asserts the uid change happens **before** the ambient raise. This whole mechanism is
+  **dev-workstation only** — production `vmcelld` uses file-caps or systemd ambient caps (§11.2),
+  never this runner.
+
+---
+## 16. Performance
+
+**Framing (§14 lessons 2–3).** These numbers are **tracked metrics, not gates** — a benchmark number is
+meaningless without the substrate it was measured on, and only same-session interleaved A/B deltas graduate
+to guards (the last subsection). Every macro number below is a central tendency (median or trimmed mean)
+over repeated runs on one substrate, quoted as a representative figure, not a spec.
+
+**Substrate.** *(The 2026-08-21 A/B pass below ran on a different host — a 13th Gen i7-1370P, 20 threads — which is exactly why it is reported as an A/B and not as a new table: absolute milliseconds do not cross a substrate change, relative same-session deltas do.)* Intel Core Ultra 7 258V (8 cores / 8 threads, Lunar Lake), 30 GiB RAM, ext4-on-NVMe with
+`/tmp` a tmpfs; Cloud Hypervisor v52.0.0, Firecracker v1.16.0, QEMU 10.2.1, virtiofsd 1.13.3, guest kernel
+6.12.94, CPU frequency pinned to 2.2 GHz for measurement stability. "**Cold**" throughout means
+**warm-cache** (artifacts already built) cold *boot*, not a from-scratch pipeline build.
+
+**A measurement-methodology fix that moved every historical p95.** The percentile helper used
+`floor(n·q)`, which for small `n` returned an index at or past the last element, so effectively **every
+p95/p99 collapsed to the max** — making tail numbers look worse and noisier than reality. The corrected
+estimator is nearest-rank `ceil(q·n) − 1` on the sorted sample. Any tail figure recorded before 2026-07-03
+is on the old estimator and is **not comparable** to a current p95; the medians are unaffected.
+
+**Micro-benchmarks** (representative): protocol frame **encode ≈54.8 ns**, **decode ≈86.2 ns**;
+`cache_key` ≈260 ns; IP/`/30` parse ≈23.2 ns; the in-memory `tar→erofs` inner step ≈1.26 µs. These are
+far below the millisecond floor of any VM operation and never dominate.
+
+**Macro — cold boot to steward-ready** (warm-cache; p50 / p95 ms; the 2026-07-17 canonical matrix —
+`docs/benchmark-results.md` holds every prior matrix and the per-phase evidence; the end-to-end and
+phase-budget figures further below quote their own recorded measurement rounds):
+
+| Backend | p50 | p95 | notes |
+|---|---:|---:|---|
+| Cloud Hypervisor | 305 | 322 | ≈290 on the `low_latency` profile |
+| Firecracker | 775 | 785 | |
+| QEMU (q35) | 991 | 1132 | after the shared-cmdline fix (was ≈1400); one recovered ~5 s p99 vsock-daemon flake tail |
+| crosvm | 1413 | 1420 | slowest but the most consistent — in-kernel vsock, no flake tail; the cost is guest bring-up (≈79 % `connect`) |
+
+**Macro — warm restore to steward-ready** (p50 / p95 ms):
+
+| Backend | p50 | p95 | notes |
+|---|---:|---:|---|
+| Firecracker | 27 | 29 | the fastest restore |
+| Cloud Hypervisor | 53 | 62 | ≈5.8× faster than its cold boot |
+| crosvm | 76 | 86 | sparse ~58 MiB snapshot via `run --restore`, baked CID |
+| QEMU | 475 | 487 | shipped v29 (§2.4); slowest by construction — `migrate-incoming` streams the full memory image |
+
+**End-to-end throughput** (full lifecycle, ms): CH cold create→exec→teardown ≈361, CH **restore path
+≈120**; Firecracker **restore ≈64** (create ≈13 + connect ≈13 + exec ≈10 + teardown ≈31), FC cold ≈848;
+QEMU cold ≈1080. Standalone graceful teardown alone: CH ≈56, FC ≈78, QEMU ≈92.
+
+**The optimization narrative, condensed** — each item is an interleaved A/B delta, and several inverted a
+prior belief (don't re-derive these):
+
+- **Console verbosity was the single biggest cold-boot lever.** Dropping to `loglevel=6` removed ≈231 ms
+  of synchronous byte-at-a-time UART writes; a console A/B showed **558 ms verbose vs 316 ms** on CH. On a
+  virtio-console the same verbosity delta nearly vanished (299 vs 291) — confirming the cost was the UART
+  device, not the logging.
+- **Accept-loop cadence, then event-driven accept.** The guest accept poll went 100 → 20 ms, then
+  (experiment EXP-C) to a genuinely **event-driven `poll(2)`**, cutting restore-connect from **16.6 → 4.6
+  ms**.
+- **Deadline-before-RPC + adaptive teardown step** (EXP-D) cut standalone teardown **95 → 56 ms** (§9.4).
+- **cmdline trims** removed the crypto self-test (≈9.7 ms) and RAID autodetect (≈2 ms) — a real but small
+  CH −6 / FC −4 ms, and the *only* trims a `printk`-timestamp probe justified (§5.3).
+- **The shared cmdline builder** (fixing QEMU's dropped `loglevel=`) took QEMU cold **≈1400 → ≈996 ms**.
+- **Native in-steward resync** replaced three subprocess `exec`s on the restore hot path (§8.2).
+- **CH lazy vs eager restore inverted the intuition:** lazy restore is ≈176 ms vs eager ≈258 ms *to
+  resume*, but the deferred cost **reappears as first-touch page faults** during execution — faster to
+  resume, not faster overall. It is a `RestoreMode` knob, not a default win.
+- **Cold boot is dominated by the guest itself:** ≈79–89 % of cold-boot time is the guest kernel+userspace
+  coming up; the CH REST config round-trip is ≈1 ms. Optimizing the host orchestration further has little
+  headroom on cold boot — the restore path is where the wins are.
+
+**Density** (from §8.3, measured): a CH guest demand-pages ≈58 MiB of a 256 MiB allocation; marginal RAM
+per added idle guest ≈58 MiB, giving ≈**230 idle** guests (≈52 if each faults its full 256 MiB) in ≈13 GiB
+free on the 30 GiB substrate; the steward PID 1 is ≈2.4 MiB. KSM merges **0** by default on CH (shared
+memfd) and ≈**394 MiB / ≈84 %** across 8 identical guests when explicitly enabled (`shared=off`,
+mutually exclusive with vhost-user). A suspend image is ≈268.5 MB for a 256 MiB guest — it **tracks guest
+RAM, flat in rootfs size**. An OCI-sourced rootfs is ≈79 MB vs ≈120–129 MB for `mmdebstrap` (the size
+inversion, §4.2); a static-musl steward adds ≈6.2 %.
+
+**A per-phase budget** (representative, ms) — where the time actually goes:
+
+| Phase | Cold (CH) | Restore |
+|---|---:|---:|
+| connect | 266 | 4.6 |
+| create / restore+resume | 44 (create) | 54 |
+| exec (one command) | 4 | 1 |
+| teardown (Drop) | 27 | 27 |
+
+Graceful teardown's ceiling is ≈265 ms (the full `shutdown_grace`) vs ≈27 ms for a `Drop` hard kill —
+which is why `throughput()` cuts the grace. Exec round-trip alone is ≈0.7 ms p50 / ≈852 µs … ≈1013 µs
+across p95/p99.
+
+**The two-arm A/B harness (`bench-ab`) — how this project answers "did we regress".** The framing at
+the top of this section says only same-session interleaved A/B deltas are evidence. Until v34 that rule
+had no implementation: a comparison was assembled by hand each time, from shell, against the recorded
+table. A 2026-08-21 pass showed what that costs, and `bench-ab` is the rule made executable.
+
+*The model.* An **arm** is a whole vmcell tree as measured: a built `bench-vm` (plus its `vmcelld`), an
+artifacts directory, and the guest `rootfs.erofs` that tree bakes — because guest-side code ships inside
+the image, so "the version under test" is never just the host library. `bench-ab prepare --git-ref <ref>
+--label <name>` builds an arm from any ref; `bench-ab run --arm a --arm b` compares two on one host in
+one session. There is deliberately **no** mode that compares against a stored result from another
+machine: that is the mistake the harness exists to prevent, and it is absent rather than merely
+unimplemented.
+
+*Controls are verified, never asserted.* Every arm carries an `arm.json` manifest of sha256 digests, and
+the guards run **before** any measurement and **refuse** rather than warn — a violated control produces
+confident wrong numbers, which is worse than no numbers.
+
+- `guard_same_kernel` — every arm's `vmlinux` must be byte-identical. The rule exists because the
+  natural way to state this control does not work: exporting `$VMCELL_KERNEL` binds only arms new
+  enough to read it, and an older `bench-vm` composes `<artifacts_dir>/vmlinux` itself. A whole matrix
+  pass ran with the arms on 6.12.94 and 6.12.104 while the driver reported one kernel. The fix is a file
+  copy into each arm's artifacts dir, and the guard is what proves it happened.
+- `guard_binaries_unchanged` — re-digest each arm's binaries against its manifest. A concurrent
+  experiment once overwrote `target/release/bench-vm` with a patched build while `git status` stayed
+  clean, so a run measured the fixed arm and would have reported it as stock.
+- `guard_vmm_binaries` — after the run, every arm must report the **same** resolved VMM binary. Only the
+  emitted report can prove this: an arm predating the `$VMCELL_*_BIN` resolvers falls back to `PATH`,
+  which is the same class as the kernel above, one crate over.
+- `guard_distinct_rootfs` — warns (does not fail) when two arms bake the same image, which is legitimate
+  when only host code moved but is usually a staging mistake.
+
+*Numbers travel as data.* `bench-vm --report json` emits a versioned `BenchReport` — backend, mode, the
+knobs actually used, the resolved VMM binary **and how it was resolved**, and typed `Metric` rows. The
+text output remains the default and is unchanged. This replaces stdout scraping, which had already
+broken on crosvm's log volume, on a parenthetical inside a metric line, and on phase-budget rows whose
+COLD and RESTORE paths print identical names — so a naive collector silently kept only the first.
+
+*Statistics, because one run is not a measurement.* `bench-ab` alternates which arm leads on each
+(spec, repeat) so a monotonic host drift cannot favour one, then reports each arm's median over repeats
+with a tie-corrected **Mann-Whitney** two-sided p and the common-language effect size. The verdict keys
+off the **Holm-Bonferroni adjusted** p over the family of rows that can receive one, with the family
+size printed and the raw p kept beside it: the default matrix is ~20 rows, and twenty uncorrected tests
+at 0.05 produce a phantom verdict 64 % of the time under a true null — for a tool whose whole purpose is
+not reporting phantoms, that was the wrong default. A metric with fewer than four repeats per arm prints
+`insufficient repeats` — never a verdict. This is not fastidiousness: in the pass that motivated the
+tool, of six single-pass deltas ≥10 % **five did not survive repeats and one reversed sign**, and a
+mechanism investigation ran to completion against a finding that did not exist.
+
+*Three more things that are not verdicts.* **Sample loss:** a `Metric` carries `n`/`dropped`/`warmup_failed`
+beside its percentiles because a p50 over three surviving samples out of ten is a different claim from a
+p50 over ten — and the survivors of a failing run are the *fast* ones, so the broken arm wins. A row
+where either arm dropped a measurement iteration is marked and gets no verdict; a failed *warmup* is
+surfaced but does not disqualify, since it never entered the percentile. **No direction:** every metric
+name carries an explicit `LowerIsBetter`/`HigherIsBetter`/`Neutral` entry in one roster
+(`vmcell_bench::metrics`), which `bench-vm` emits its names through and refuses to emit outside of. A
+default of "everything is a cost" printed IMPROVEMENT when a benefit (guest memory kept, pages deduped)
+got worse, and gave a direction to compositional shares, where halving one phase raises every other
+phase's share. A metric the *other* arm's ref emits and this build does not know is `Neutral` and loud
+rather than a refusal — comparing two refs is the point. **Notes:** each arm's own `BenchReport::notes`
+are surfaced per arm, and a note one arm reported and the other did not (`cpufreq: NOT pinned`) is a
+warning: two noise floors are not one comparison.
+
+*What it does not claim.* It compares two arms on one host under one set of controls. It says nothing
+about another machine, and a green A/B is not a statement that absolute latency is acceptable — that is
+what the tracked tables above are for, with their substrate stated.
+
+**The guards rule (§14 lesson 2).** Only **relative invariants** graduate from tracked-metric to
+CI guard, because they survive substrate changes: the OCI-vs-`mmdebstrap` size relationship, the working
+set staying flat in rootfs size, a suspend image staying flat in rootfs size, and the per-phase *shares*
+(connect-dominated cold boot, resume-dominated restore). **Absolute latencies are never gated** — they
+would red on any slower CI box.
+
+**Deferred optimization opportunities (don't re-derive — mechanically refuted in `docs/historical/45`).** Parallel
+`virtiofsd` startup is a real latency win but `try_join_all` is cancellation-unsafe (a failed spawn would
+leak the others' half-started daemons) and, worse, it is **invisible on the tracked benchmarks** (which
+run zero data shares), so it stays deferred. NAT pump-cadence tuning is deferred. A ≈22 ms
+`fs_initcall`-region gap and a ≈5.7 ms `cfg80211` `regulatory.db` load are observed-but-unattributed and
+not chased. A 12-item opportunity-reject table in `docs/historical/45` records each rejected micro-optimization with
+its refutation — consult it before proposing one. Full experiment logs live in `docs/benchmark-results.md`,
+`docs/historical/44-claude-perf-experiments.md`, and `docs/historical/45-claude-perf-investigation.md`.
+
+**The v33 pass's performance envelope — stated up front, measured at landing.** Every §18 delta is
+pay-for-what-you-use by construction, and the register names the budget each must not regress: the
+default cell's hot path is untouched (a `Pid1`/`init: None` cell emits a **byte-identical cmdline**
+and takes the identical code path — the delta-4 pin; the §7.4 intersection is microseconds of set
+arithmetic at `start` over sidecars already resolved; no new frame rides the wire; no boot cost
+changes for a cell that names no placement, label, policy, or feature). Two deltas are wall-clock
+*improvements* on cold paths: registry laziness stops a shared pins file taxing every build with
+unselected labels (§10.5), and a registered handler removes the per-boot `put_file` push pattern the
+image-is-the-artifact rule always intended to retire. The costs land only where opted into: an
+absence probe boots a VM (kit-invocation time, §10.6), a `Preserve` artifact pays the size of the
+xattrs it asked to keep, the ext4 producer and the systemd proof cell are opt-in recipes. The
+interleaved A/B checks at landing: CH cold-boot and warm-restore p50 within noise of the §16 matrix
+on the same substrate (the placement re-key adds one enum read to `start`), and the default rootfs
+build's cache key unmoved (the empty-change gate, §10.5).
+
+---
+
+## 17. Open gaps and future capabilities
+
+The honest current state, organized by subsystem. Everything here is either wired-but-unvalidated,
+validated-but-unwired, or deliberately deferred with a known blocker (§14 lesson 5: "forward work" is
+legitimate only when a preflight check names what is missing). Nothing here is load-bearing for the
+shipped design.
+
+**Observed, unattributed (2026-08-21).** Every *graceful* Firecracker teardown on the A/B host prints `Missing ENDBR` → `kernel BUG at arch/x86/kernel/cet.c:132!` → `Oops: invalid opcode` after `SendCtrlAltDel`, in the `reboot: Restarting system` path. A *live* FC guest's console is clean (captured mid-run: 62 lines, zero fault signatures), so this is a shutdown-path fault, not a boot one, and it does not affect a connect-time classification. Whether the pre-bump 6.12.94 guest kernel also does it is unresolved — the per-VM directory is reclaimed at teardown and the capture lost the race three times. Recorded rather than chased.
+
+**Backends & boot.** Firecracker UFFD lazy-restore is unwired (single-lineage verbatim-vsock only, §8.4).
+QEMU snapshot/restore over the in-kernel `vhost-vsock` transport is shipped, and **concurrent** QEMU zygote
+fan-out (`restore_rotates_host_paths: true`) is now shipped too — `restore()` rotates the host-global guest
+CID to a fresh `res.guest_cid`, making QEMU the first backend to rotate a *host-global* resource (unlike
+CH's per-scratch-dir paths); the migrate-incoming-at-a-new-CID viability was proven live before enabling it
+(§2.4). The dedicated `VmConfig::vsock_transport` selector (`Auto | InKernel | ExternalDaemon`) — decoupling
+in-kernel vhost-vsock from `snapshotting` so a privileged non-snapshot QEMU can opt into the more-reliable
+in-kernel path and shed the ~11% external-daemon bring-up flake — is also shipped, behind the one
+`uses_in_kernel_vsock` predicate. Remaining QEMU gaps: QEMU UFFD lazy-restore (`lazy_restore: false`, no
+backend wired) and wiring the unprivileged smoltcp NAT (needs the vendored `vhost` patch, §9.6). `mkfs.erofs`
+shell fallback is designed but unimplemented — a missing packer input is fail-loud today (§4.2).
+Cross-version snapshot pinning: **CLOSED** (2026-08-20 dependency pass). The snapshot stage folds the
+`cloud_hypervisor` pin into its cache key, and `pins.json` now commits that pin (`"v53.0"`, the latest
+release and the one `ci.yml` installs), so the fold hashes a real value and a CH bump invalidates stale
+snapshots at build time. The README's `cargo install --git` instruction — which installed an unreleased
+`main` build and was the reason the pin could not be trusted even if committed — was replaced with the
+checksum-verified pinned release. The *runtime* "restore under the CH it was taken on" advice remains
+advice either way.
+
+**crosvm (v29).** Boot, lifecycle, vsock/steward, tap networking, sessions, and cgroup limits are **validated
+live** (§2.5, the `just test-crosvm` matrix); the CLI flag spellings and the seccomp/jail posture were
+confirmed against a source-built crosvm and pinned in arg-builder unit tests. **Snapshot/restore is now
+shipped** (§2.5, FC-pattern): `snapshot take`/`run --restore` round-trips the block/net/vsock/serial device
+set (USB is the one non-`Suspendable` device, dropped via `--no-usb`), validated by the
+`snapshot_restore` + `extra_block_survives_snapshot` + `fork_branch_lineage` matrix legs. What remains open:
+(1) **concurrent zygote fan-out** — crosvm bakes+requires the vsock CID on restore, so
+`restore_rotates_host_paths` is `false` and only *sequential* lineage works (concurrent restores from one
+snapshot collide on the baked CID — exactly FC's single-lineage constraint, §8.4). Lifting it needs a
+future crosvm that accepts a rotated `--vsock cid=` on restore. (2) **vsock privilege** — in-kernel
+vhost-vsock is validated in the **privileged** mode; whether `/dev/vhost-vsock` is reachable in the
+**unprivileged** KVM-group mode (or needs a vhost-user-vsock AF_UNIX alternative) is untested. (3)
+**virtio-fs** — validate crosvm's in-process `--shared-dir type=fs` and reconcile its
+(non-external-vhost-user) framing with the `config_has_vhost_user_device` eligibility law before flipping
+`virtio_fs_shares`. (4) **unprivileged vhost-user-net** for the smoltcp NAT. (5) **disk I/O throttling** —
+crosvm's `--block` has no bandwidth/iops key, so `disk_io_throttle` is a hard `false` (§2.6); a future
+`blkdebug`-style shim is the only path. (6) **control transport** — the shipped choice re-invokes the crosvm
+binary as a client; linking `libcrosvm_control` (lower latency, a build/link step) is the recorded
+alternative. (7) **the baked guest CID across a restore: CLOSED** (2026-08-20 loose-end pass) — the
+CID-axis sibling of the vmid hazard the docs/90 pass closed on Firecracker's vsock path. `restore()`
+reads the snapshot's baked CID from its sidecar and programs `--vsock cid=<baked>`, because crosvm
+refuses a rotated one, while the orchestrator allocated a *fresh* CID whose `CidGuard` held only that
+one; nothing kept the baked CID out of the pool, and crosvm's vsock is **in-kernel** AF_VSOCK — the
+CID is a host-global identity, not a per-scratch-dir path — so once the ancestor was torn down a
+later VM drew it and collided with the live restored VM. The FC fix could not cover this by
+construction: it keys on the host *path* a backend adopted (`adopted_scratch_vmid`), and crosvm
+spawns into its own scratch dir, so its non-rotating resource is the CID. `CidGuard` now carries a
+private `baked: Option<u32>` — the CID twin of `VmidGuard::lineage` — and `CidGuard::adopt_baked_cid`
+is the one predicate: `baked == self.cid` is the no-op arm every rotating backend takes, an exhausted
+claim warns and does **not** take ownership of somebody else's reservation, and an out-of-range baked
+CID is fail-loud `Error::Vmm`. `restore_inner` calls it beside the vmid `adopt_lineage` and **before**
+`instance.resume()`, keyed on `instance.guest_cid()` — what the backend says it answers on — so no
+backend needs a branch, and `Drop` releases the claim only when it was ours. The guard's fields are
+private, so a second reservation path is a compile error and the law earns no grep-ban. *Gates:* the
+`just test-crosvm` / `just test-privileged` `snapshot_restore` leg asserts `CidAllocator::reserve` on
+the CID the restored VM answers on **fails** while that VM is live (the leg now releases the source
+VM's CID before restoring, so the claim under test is the guard's own and not the harness's, and
+holds a distinct low CID so the crosvm branch is non-vacuous with two CIDs out of the pool) — proven
+red by deleting the call, with a real crosvm, at baked 4 / fresh 3. Three KVM-free twins in
+`orchestrator.rs` carry it where CI has no crosvm binary: the reservation and its release, the
+out-of-range refusal *before* the resume (red when the call is moved after it), and the conflict arm
+that must not release a claim it never took.
+**Resolved during v29 validation**: (a) crosvm's own multiprocess sandbox is incompatible with
+the single-process supervision model (`/var/empty` jail failure), so it runs `--disable-sandbox` + the
+Layer-2 jailer deny-list (on for `Enforcing`) — validated to boot, exec, and do tap/netns networking under
+the deny-list (§12.2); (b) snapshot/restore over the virtio device set works (baked-CID reuse). crosvm still
+runs its KVM-free gates in `just ci`; `just test-crosvm` is the opt-in live suite (kept out of
+`test-privileged` because the binary is absent on CI).
+
+**Storage & shares.** A per-share service-uid allocator for `virtiofsd` (§4.5). `fuse-backend-rs` as an
+in-process share backend is gated behind `experiment-fuse` but must enforce read-only before it can
+graduate (today a RO share on it is a typed `Unsupported`, §4.5). A writable-scratch extra disk copied-on-attach from a store artifact is
+**CLOSED** (2026-08-21): `OverlayStore::clone_file` is the file-level door on the S4 seam (a default
+body that refuses as `CapabilityUnavailable`, so an injected store cannot have a host copy improvised
+behind it), and `ExtraDiskSpec.writable` attaches a private per-VM clone that dies with the VM. The
+store artifact is never attached writable whatever the flag says. Recorded limitation: the copies live
+under `<artifacts-dir>/.vmcell-scratch/` (reflink is filesystem-local, so anywhere else forces a byte
+copy) and are **excluded** from the store's usage accounting, so `--max-store-bytes` bounds uploads
+only — an operator provisions quota *plus* concurrent writable disks, and a per-VM ceiling is the
+obvious next knob and is not shipped.
+
+**Networking.** `Egress::Open` provides no *arbitrary* outbound egress in either mode — closing it needs
+real destination re-origination (or a typed `Unsupported`), §6.2. Per-VM network byte counters need a new
+netns-scoped usage type reading `/sys/class/net/<if>/statistics` (§7.1). Privileged-path `host_services`
+wiring (a TPROXY accept rule + a host binding) would re-add the `host_services_port` field on the
+privileged variant (§6.2). The per-host VM ceiling is **CLOSED** (2026-08-21 loose-end pass): it moved
+252 → **9999**. The binding limit was never the address map — `CidAllocator` was `3..=254`, a notch
+*below* the map's own 254, and `MicroVm::start` allocates a guest CID unconditionally, so widening the
+`/16` first would have raised the concurrent count by exactly zero. The CID space moved first
+(`vmm::MAX_GUEST_CID` is now **derived** from `net::MAX_VMID`), then `ip_math` gained a second
+dimension (`sub = (vmid-1)/254`, host `4·sub+1`, guest `4·sub+2`, third octet unchanged) — a strict
+**superset** that agrees byte-for-byte with the old map on `1..=254`, so this section's own statement
+and every pinned golden stay true. 9999 is the `IFNAMSIZ` ceiling, not a round number:
+`<prefix>-tap-<vmid>` at `MAX_RESOURCE_PREFIX_LEN = 6` is exactly 15 bytes at four digits, and two
+`const` asserts hold both that and the codomain bound. The roster found a **sixth** home the analysis
+had missed — `VmConfigBuilder::build`'s own `vmid > 254`, which refused loudly rather than wrapping,
+which is precisely why five review passes walked past it. A
+fully-automatic periodic orphan sweeper (the daemon already closes its own crash-restart case, §11.4).
+The **smoltcp NAT bring-up flake** (recorded 2026-07-15): ~10% of networked boots, the VMM's wait for
+the vhost-user-net UDS does not succeed within its 2 s ceiling. **The flake is real; its mechanism is
+open.** The mechanism this register used to name — "`VhostUserDaemon::start` binds lazily from a
+background thread", with "make `SmoltcpProcess::start` block until the socket is bound" as the fix —
+is **false against the tree and withdrawn**: `Listener::new` *is* the bind (`UnixListener::bind`), it
+is called synchronously on the caller's thread, and `SmoltcpProcess::start` does it before spawning
+either worker and returns only after. The named fix would retire nothing because the code already does
+it. No replacement mechanism is asserted here; AGENTS.md's rule governs — *"environmental" is a
+hypothesis, not a diagnosis* — and a flake explanation without a mechanism stays open. What a real
+diagnosis has to explain is why a socket that is bound before `start` returns is nonetheless not
+connectable within 2 s. This joins the family of shipped-fact premises this project has recorded and then
+falsified (two in the v28 register, five in the v30 register — §18 keeps the running argument); the
+register convention (verify a premise's anchors before cutting) is why it was caught here
+rather than by an implementer who "fixed" it.
+**Segment refinements** (v30 ships §6.5 without them, each a deliberate cut): `Egress::Filtered` on a
+segment (a per-segment proxy + nft posture — the variant shape keeps it unrepresentable until designed);
+a typed netem/impairment API (blocked on hand-assembled `TcMessage`s — the rtnetlink stack types no
+netem options; the shipped mechanism is stable names + the harness's own `tc`); `snapshotting` +
+`Segment` (restore-time slot/addressing semantics undefined in v30); the **NAT `host_forwards`
+TCP port-forward** (FR-V3's other shape — host listener dialing into the guest over the smoltcp NAT;
+not taken in v30 because the vsock dial + segment `dial_tcp` cover the requesting topology without
+touching the NAT's six-invariant datapath or its open bring-up flake); and daemon/REST exposure of
+segments and the raw dial (new wire surface — the presence-attribute codec rule applies, Appendix A
+reversal 10).
+
+**Downstream toolkit (v30 residuals).** The prebuilt bootstrap seed ships no resolved-config sidecar
+(there is none to copy — recorded on §5.6; the seed is not a fragment consumer). No loadable-modules
+kernel pipeline (fragments build `=y`; explicitly not requested — a modules + rootfs-module-tree item
+would be its own design). `vmcell_artifact_validator::validate()` hardcodes the Cloud Hypervisor
+backend even though every check is generic over `Vmm` — a backend knob on `ValidationOptions` is the
+natural extension when a consumer needs it. **`validate()`'s missing overall wall-clock budget is
+closed** — and by its own field, not by delta 3's. Delta 3 gave the *conformance battery*
+`ConformanceOptions.battery_budget` (§10.6) and this register read as though the older,
+documented downstream route had been fixed with it; it had not — `run_battery` and `validate()` are
+parallel entry points, so a `Level::Full` run kept booting several VMs sequentially bounded only by
+the sum of its per-check deadlines. `ValidationOptions` now carries `run_budget:
+Option<Duration>`, defaulting to `Some(DEFAULT_RUN_BUDGET)`, which bounds the **whole** run — every
+level, every boot, end to end. Per-check deadlines are unchanged and each one still fails loud; this
+bounds their sum. Exceeded is `Error::Timeout` naming the budget, the level that outran it and the
+checks that completed first — never a hang, and never a green report with its tail missing; `None`
+opts out **explicitly**, for a caller that bounds the run itself (a nextest timeout, a CI job
+budget). It is deliberately its own constant rather than a reuse of `DEFAULT_BATTERY_BUDGET`: the two
+bound different rosters, and one const for both would silently re-budget one when the other's roster
+grew. USB-passthrough guest-side coverage
+beyond enumeration + one class smoke (per designated device class) is consumer territory.
+
+**The v33 pass's own residuals, recorded at specification time** (each a deliberate cut the §18
+deltas name rather than quietly narrow): **`Service` + `snapshotting` stays rejected until
+measured** — whether the guest's init restarts the steward after a restore re-creates the
+vhost-vsock device, or the idle re-bind covers it, is an empirical question with a named experiment
+(snapshot a `Service` cell under mini-init, restore, measure reconnect), and un-rejecting it is
+blocked on that measurement plus the S2 resync reaching a service steward. The **systemd proof
+cell is opt-in**, like `test-crosvm`, because it pulls a full-Debian image — its KVM-free halves
+(placement matrix, registry laws, xattr policy) run everywhere; a consumer wanting it `required`
+follows the measure-then-demand order its own discipline prescribes. The **`Feature` roster is
+deliberately narrow** (one variant per `VmmCapabilities` field + three validated artifact
+properties) — candidates like `PosixAcl` join when a §10.6 check exists behind them, never before
+(the narrow-name doctrine at vocabulary scale). The **ext4 producer's crate-vs-tool choice** is
+resolved at cut time in the crate's favor if a permissive pure-Rust writer passes the mount-and-diff
+gate (§4.7; the `mkfs.ext4 -d tarball` fallback is validated on this host at e2fsprogs 1.47.2 —
+Appendix B's substitution pattern runs in reverse until the crate route matures). **Placement
+`None` stays unexpressible over REST** (§11.5 — the daemon owns VMs through the control plane;
+delta 10 exposes `Service` only). And the **steward rename's ban is identifier-scoped** — the
+legacy-terms gate learns `vmcell-guest-agent`/`AgentClient`/`Error::Agent`-class identifiers, never
+the bare word "agent", which legitimately survives in the agentic-execution domain text, `AGENTS.md`
+(repo tooling convention), historical finding IDs (`AGENT-2`), and external names (`agent-ctl`).
+
+**One law, one predicate — the consolidations still open.** Each is a second copy of a rule that has one
+designated home, kept on the register rather than in a comment because every duplicate so far has
+diverged. **One remains:** `bench-vm` hand-rolls the library's `pub(crate)` workspace-root ascent (the
+`crates/vmcell-protocol/Cargo.toml` marker). Collapsing it needs a `vmcell`-side `pub` export and so
+cannot be done from that crate; the coupling to watch is the marker string.
+**Closed since v31:** the integration harness's `computed_cgroup_name` — it now calls the one law
+(`vmcell::naming::vm_slice_name`, made `pub` when the same duplication was found in the artifact
+validator), so there is nothing left to copy. **Closed in the docs/90 pass:** the Cloud Hypervisor
+binary resolver, which this register had inventoried at two copies when there were three —
+`harness::ch_bin()` *and* `vmcell-cli`'s, the one every VM-lifecycle verb went through. Both now
+delegate to `vmcell::artifact::ch_binary_path()` in one line, and the class is gated repo-wide rather
+than remembered: `scripts/ban-ch-binary-resolver-copies.sh` scans every Rust source under `crates/`
+for the quoted `"VMCELL_CH_BIN"` (line comments stripped, so prose naming the variable is not a hit)
+and pins exact counts **in both directions** — the law's own home, plus a commented roster of the
+files that may still name it, each with its count and the reason it earned the exemption: `vmcelld`'s
+flag-then-env precedence (a different law, an operator flag outranking the variable), its integration
+suite's PATH-searching variant, `bench-vm`'s parity-asserted four-backend table, and the CLI's own
+call-site scan, which has to name what it forbids. A read added inside a rostered file is a second
+resolver wearing that entry's exemption; a count that fell to zero is a stale entry, i.e. a widened
+blind spot. A parity assertion could not have replaced the scan: with the variable unset both
+spellings answer `cloud-hypervisor`, so `ch_bin() == ch_binary_path()` cannot fail.
+
+**Daemon.** Capping the guest **exec capture host-side**: an `exec` reply carries the command's whole
+captured output, so a large enough capture overflows the bridge frame cap. That is now a typed 500
+instead of a request wedged forever on a dropped reply, but the reply still has no size ceiling of its
+own. A UDS transport under `XDG_RUNTIME_DIR` (alongside the HTTP bind). A warm-pool manager
+(`POST /v1/pools`) — because the registry already owns handles, a pool is a **hand-out policy** over the
+existing fan-out capability, not a new primitive (§11.4). JWT bearer tokens + per-key scopes at the
+existing auth-middleware seam (§11.6). Pause/resume routes. Artifact GC / quota. Streaming upload (v1
+reads the file into memory, §11.7). **The delete-in-use residual (§11.3):** `create` resolves its
+artifacts and launches the VM before taking the VM-table lock to insert its pinning slot, so an
+artifact can still be deleted out from under a `create` that has launched but not yet inserted.
+Closing it means re-checking the resolved set under that lock after launch; it is accepted under the
+single-tenant model and recorded at the call site rather than fixed.
+
+**Sessions.** Daemon-side streaming (WebSocket or chunked transfer with a `SessionId` sub-protocol, over
+streaming `VmEngine` ops). A raw-mode interactive CLI with `SIGWINCH` forwarding. Per-session backpressure
+(a credit/window scheme; today the host queue is trusted-unbounded — a recorded trade). PTY `StdinEof`
+half-close. `Session::write_stdin`/`close_stdin`/`resize`/`close` can still return `Ok(())` for a short
+window after the reader has closed the registry — they observe only the writer channel, which dies one
+transport failure later. It is a no-op write, not a hang (the session's `recv()` is already terminal), but
+their docs promise `Error::Steward` "if the connection has closed"; closing it properly means a shared
+closed-flag on `Session`.
+
+**Hardening (the increments Layers 1–3 are built to grow into).** The **thin** broker (broker
+`SpawnVmm`+pidfd only, keep the `Registry` in the parent) needs the cross-process `MicroVm` refactor the
+fat broker sidestepped (§12.4). Turning the seccomp deny-list **default-on** after a live per-backend
+validation (§12.3). Turning `clear_ambient_caps` **default-on**, blocked on fd-passing tap creation so the
+VMM never needs `CAP_NET_ADMIN` (§12.3). A jailer chroot/`pivot_root`/uid-drop increment (§12.3). A CH
+`--net fd=` fd-passing variant (the fd-passing broker model, §12.4). `clone3(CLONE_INTO_CGROUP)` to place
+the VMM in its cgroup atomically at spawn.
+
+**Lineage.** A sparse-snapshot `SEEK_HOLE` density lever. A non-reflink `OverlayStore` (a content-addressed
+pool for ext4/tmpfs hosts). Daemon fork/branch verbs exposing `Lineage` over REST. A lineage-aware sweep.
+A branch-image store that reflinks a new branch's unchanged pages against its parent at snapshot time
+(§8.6).
+
+**Future capability catalogue** (each keeps the primitive general — these are consumer-layer or
+opt-in-feature ideas, not core changes): record/replay cassettes; a declarative egress policy (a DNS-label
+allowlist); a deterministic guest clock API; a structured serial-console fault classifier (v30 ships
+its first scoped consumer — the kernel-validation battery's missing-symbol classifier, §5.6; the
+general typed-fault surface remains); `netem` network fault injection (v30 ships the segment-side
+mechanism — stable names a harness drives `tc` against, §6.5 — the typed API remains); virtio-blk error
+injection (QEMU `blkdebug`, the piece `DiskIoLimit` throttling doesn't cover, §4.6); a generic
+vsock↔TCP bridge (v30's `dial_vsock` covers host→guest raw dial, §3.2; the persistent port-forward
+bridge remains); OTLP tracing export; overlay checkpoint/rollback; `kcov`/`gcov` extraction from the
+guest; **multi-host** L2 clusters (the single-host case is §6.5's segments as of v30); a `gdbstub`
+debug stub; a CPUID / aarch64 capability matrix; scale-to-zero.
+
+**Explicitly out of scope (naming the boundary is the G1 guard, §13).** These are *consumer* layers built
+**on** vmcell, never in it: an MCP frontend, a KUnit/LTP kernel-test runner, `rr`-as-payload
+record/replay, run bundles, and billing. The core stays a workload-agnostic micro-VM primitive; domain
+policy lives in the crate that consumes it.
+
+---
+## 18. Delta register: the serial-nexus consumer-platform pass, as directed by v33
+
+This section is the exact boundary between "as built and validated" (`vmcell` 0.14 / validator 0.2 —
+read the crates' `Cargo.toml` ledgers, never a figure quoted here) and "directed by this revision."
+The register before this one — the nine-delta v30 downstream-platform pass — is **landed and
+reconciled**; its per-delta as-built record is `docs/implementation-notes.md` ("v30 delta 1" … "v30
+delta 9"), its directed shape is frozen in `docs/historical/` with the v30/v31/v32 revisions, and the
+code no longer legitimately differs from it. Until an item below lands, the code legitimately
+matches the validated 0.14 state — a delta-item divergence is a finding **only** in the change that
+claims to implement that delta; a change implementing one lands **with the delta's named gate** and
+reconciles the as-built result in `docs/implementation-notes.md`.
+
+**Bundling and order.** Delta 1 (the steward rename) lands **first and alone** — a pure mechanical
+pass with its ban gate, so every later delta writes new API in the new vocabulary instead of minting
+`Agent*` names that immediately rename. Deltas 2–3 land next, **against today's artifact set** — the
+requester's build-order argument is adopted as this register's: R3/R4 need no new artifact, they
+establish the vocabulary everything else declares in, and a kit built *after* the features it
+validates has, as its first job, certifying code written without it (the guard-pins-the-fix trap);
+building them first also means they can go red on facts already in the tree, which is the only proof
+they can go red at all. Then 4 (the unlock, smallest), 5 (the largest), 6, 7 — deltas 2–7 as **one
+breaking release** with one ledger entry per contract crate (the breaking edges: the rename's API
+sweep, `CheckStatus`'s two new variants, `VmConfig`'s `steward_placement` field, the pins `rootfs`
+namespace shape, `pack_erofs_with_injection`'s `XattrPolicy` parameter, `build-kernels`' default).
+Deltas 8–10 are **separable**: 8 (ext4) and 10 (daemon placement) ride the pass only if ready; 9
+(the systemd proof cell) is the capstone gate over 4+5+6+7 and necessarily lands last. Internal
+dependencies: 3 consumes 2's vocabulary (the kit reports removals in it); 5 needs 4 (a service
+steward with no placement to declare has nothing to be); 8 needs 7 (the `XattrPolicy`-aware merged
+tail is what the ext4 producer consumes); 9 needs 2–7 (its gate asserts delta-2 provenance and
+runs delta-3's kit); 10 needs 4.
+
+**Register conventions — the standing rules the v24–v30 passes taught** (kept verbatim in force;
+the implementation-notes records cited per rule are the evidence):
+
+- **Sketched names and signatures are advisory; the behavior and its gate bind.** A name or
+  signature may shift for a recorded reason, reconciled in the implementation notes — never
+  silently. (`clone_into`→`clone_tree`; `steward()`'s retained timeout; delta 4's own §5.6-vs-§9.1
+  acyclicity shift.)
+- **Premises are verified anchors, not memory.** Every register so far has carried at least one
+  shipped-fact premise that was empirically false (v28: two; v30: five — the count is the argument).
+  Every current-state premise below was **re-verified against HEAD `77a3868` on 2026-08-15 by
+  independent per-cluster verification agents**, not quoted from the requirements document — and
+  three of the requester's premises were corrected in the process (the steward *library* is
+  1,604 lines with `netif`, not 643; the fatal core-mount set is four mounts, not the code comment's
+  three; one data-plane absence leg already exists outside the kit). If the tree has moved when you
+  implement, re-verify the anchor before cutting, and treat a stale premise as a stop-and-check.
+- **Filesystem- and process-touching deltas name their live gate up front.** The fakes are
+  fs-blind and process-blind; deltas 4–9 each name the live leg that is not optional.
+- **Any new wire surface carrying serde presence attributes round-trips on the codec it ships
+  over** (the postcard trap). Delta 10 is the one new cross-process surface here, and its gate says
+  so explicitly.
+- **A gate binds the call sites, not just the extracted predicate** (the completeness-audit lesson,
+  promoted to a register convention by this pass: two of six audited fixes were invisible precisely
+  because a green unit test stood beside an unchanged call site). Every one-law delta below names
+  its call-site scan alongside its predicate tests.
+
+Each item: the verified **premise**, **what** changes, **why**, the **migration** for a caller, and
+the **gate** that pins it.
+
+1. **The steward rename** *(vocabulary; every later delta writes in it)*. *Premise:* the in-guest
+   control-plane process is `vmcell-guest-agent` (crate, binary, `DEFAULT_INIT =
+   "/usr/sbin/vmcell-guest-agent"` at `config.rs:446`); the host client is `AgentClient`
+   (`agent/mod.rs`), the handle method `MicroVm::agent()`, the error variant `Error::Agent`, the
+   port mirror `AGENT_VSOCK_PORT` (`vmm/mod.rs:1193`) against the guest's private `VSOCK_PORT`
+   (`main.rs:523`); the validator check ids include `boot.agent_ready`/`agent.exec_roundtrip`
+   (contract surface); the CLI flag is `--agent-musl`; `ban-legacy-terms.sh` exists with a
+   self-test and deliberately excludes `docs/` and would ban nothing agent-shaped today. *What:*
+   rename the process and its whole identifier family to **steward** — crate `vmcell-steward`,
+   binary `/usr/sbin/vmcell-steward`, `StewardClient`, `MicroVm::steward()`, `Error::Steward`,
+   `steward::session`, `boot.steward_ready`/`steward.exec_roundtrip`, `--steward-musl`,
+   `StewardStage`, `steward_src_hash` — and extend the legacy-terms ban with the retired
+   **identifiers** (never the bare word "agent": the agentic-execution domain text, `AGENTS.md`,
+   historical finding IDs like `AGENT-2`, and external names like Kata's `agent-ctl` legitimately
+   keep it — §17 records the scoping). *Why:* vmcell explicitly serves **agentic execution** as a
+   domain, so "the agent" was about to mean two different things in every consumer's prose — the
+   naming collision is concrete, not connotational — and the window closes as consumers accumulate.
+   The name: "cell" is deliberately dual — a small living organism (the biology register: zygote,
+   lineage, fork/branch) and a secured enclosure (jail, the broker) — and **steward** is the
+   caretaker reading of the first without fighting the second ("warden" played only the enclosure
+   half); recorded so future names are tested against both registers. *Migration:* mechanical
+   renames, one ledgered breaking entry per contract crate; check-id renames noted in the
+   validator's ledger; consumers `sed` the identifier list the ledger entry carries. *Gate:* the
+   extended `ban-legacy-terms.sh` with MUST-flag fixtures per retired identifier (meta-rule: one
+   fixture per rule, so deleting a scanner branch reddens) and MUST-PASS fixtures for the kept
+   words (`AGENTS.md`, "agentic"); the existing suites re-run green under the new names.
+
+2. **The feature vocabulary and the intersection** *(R3; §7.4, F6)*. *Premise:* three descriptors
+   exist and none meet — `VmmCapabilities` (nine bools, exhaustive, `vmm/mod.rs:1066-1121`),
+   `HostCapabilities` (`hostcaps.rs:42-59`), and nothing for an artifact (nearest analogues: the
+   validator's clause→symbol map, `classify.rs:134-204`, and steward console-text self-checks
+   parsed back out of the serial log, `classify.rs:103`); `Error::Unsupported { vmm, feature }`
+   carries no provenance while `CapabilityUnavailable { op, needed }` does and is host-axis-only
+   (`error.rs:82-107`); the N-VMM-1 norm is asserted in comments (`vmm/mod.rs:837` + sites) and
+   violated by prose feature strings at ≥10 sites ("snapshot with a vhost-user device" ×4 backends,
+   "boot after restore…" ×2, zygote fan-out prose, and siblings) with substring matchers in tests
+   (`feature.contains("vhost-user")` ×3, `.contains("custom init")` ×4, `.contains("segment")`,
+   `.contains("USB")`, `.contains("read-only")`, `.contains("boot after restore")` ×3,
+   `.contains("in-kernel vsock")` ×2 — all verified at HEAD); `VmConfigBuilder::build()` takes no
+   backend and every refusal lands at `create()`/`restore()`; `clone_ineligible_feature`
+   (`orchestrator.rs:2214`) is the one reason-returning predicate. One requester premise was
+   corrected at verification: `require_snapshot_restore_capable` is **production** (QEMU's
+   self-guard, `vmcell-qemu/src/lib.rs:619`), and production also carries `require_state` and
+   `require_vsock_daemon` — so no delta text may claim "every `require_*` is harness-only". *What:*
+   `vmcell::feature` — the `Feature` enum (one variant per `VmmCapabilities` field, name-for-name,
+   plus `ControlPlane`/`XattrPreserved`/`ProcConfigGz`), `Source`/`Removal`/`FeatureSet`, the one
+   intersection site resolved at `MicroVm::start`, `require(Feature)` on the builder, the
+   feature-manifest sidecar with strict parsing, the baseline declaration for sidecar-less
+   artifacts, and the `Error::Unsupported`-from-`Removal` constructor that makes the feature string
+   `Feature::name()` by construction — retiring the prose strings and converting every substring
+   matcher to typed matching (§7.4). *Why:* the intersection is the only honest answer once
+   artifacts are selectable, and the un-centralized form has already diverged once
+   (`config_has_vhost_user_device`'s history); the enum turns the silent-absence typo class into
+   compile/parse errors. *Migration:* additive API; refusal *messages* change spelling (ledgered;
+   any consumer matching message substrings was already in the banned class). *Gate:* the F6 gates
+   (§13) — the two-sided provenance pair, the misspelled-token hard error, `require()` pre-boot
+   refusal, the computation-site scan — plus a sweep test asserting no production refusal site
+   composes a feature string by hand (red on re-introducing one).
+
+3. **The two-directional conformance kit** *(R4; §10.6)*. *Premise:* `CheckStatus` is exactly
+   `{Pass, Fail(String), Skip(String)}` (`lib.rs:155-164`, no Warn/Unverified anywhere);
+   `validate()` refuses green-all-skipped (`lib.rs:269-288`), hardcodes CH (`lib.rs:290`), and has
+   no overall budget (`ValidationOptions` carries only `level`, `lib.rs:134-138`); the roster is ~16
+   checks in Core ⊂ Extended ⊂ Full with `boot.config` error-only; the Full rustdoc gate exists
+   (`lib.rs:392-412`) and Core/Extended are deliberately ungated because their guest-facing ids
+   exist only after a real handshake (`lib.rs:390-391`); **no kit check verifies an absence at the
+   data plane** (the one absence leg in the tree, `nested_virt_disabled`, is vmcell's own matrix —
+   `crates/vmcell/tests/nested_virt.rs:123-196` — which deliberately asserts the module parameter,
+   not `/dev/kvm`, because `-cpu host` exposes VMX unconditionally: reuse that lesson); the
+   `usbhost` sidecar byte-identity (the fragment-no-op live example) is recorded from the
+   requester's measurement — **unverifiable on a clean checkout** (no `target/`), so the delta
+   re-measures it before leaning on it. *What:* §10.6 — `Warn` + `Unverified`, paired
+   absence-probe/positive-control check ids, `ConformanceOptions { expected_warnings,
+   battery_budget }`, the every-check-records-or-skips-on-every-path refactor that makes all three
+   rosters enumerable against a `fail_create` fake and extends the rustdoc gate to Core/Extended
+   (fixing the recorded blocker rather than waiving it), and `Warn`s routed through the classifier.
+   *Why:* a declaration without a two-direction check is a fact a consumer will build a fixture on;
+   the fragment-no-op example shows the present direction alone certifies a build the fragment
+   never touched. *Migration:* `CheckStatus` gains variants — a ledgered validator breaking bump;
+   `into_result()`'s Fail-only contract is unchanged; consumers matching exhaustively add two arms.
+   *Gate:* the four-leg matrix per decidable feature (§15.4's conformance set), the
+   delete-the-positive-control-reddens leg, the budget's wall-clock test (a stalled fake check
+   trips `battery_budget` typed, not a hang), and the roster gates on all three levels red-on-
+   inverse.
+
+4. **Steward placement** *(R1 — the unlock; §3.5, C8)*. *Premise:* `control_plane_disabled:
+   cfg.init.is_some()` at both construction sites (`orchestrator.rs:1527`, `:1721`; field `:662`);
+   the health-gate skip keys on raw `cfg.init` (`:1480`); `steward()`/`connect_sessions()`/
+   `snapshot()`/`clone_ineligible_feature` key on the retained field or `cfg.init`
+   (`:1750`/`:1866`/`:2036`/`:2237`) — **three spellings of one predicate, all currently
+   accidentally equivalent** (the verification agents' finding); the cmdline `init=` site
+   (`config.rs:392-395`, `DEFAULT_INIT` `:446`) is the one genuine init-identity site, plus three
+   further keying sites: `build()`'s init+snapshotting reject (`config.rs:1555-1559` — re-keys to
+   placement with the rest), and two that must survive re-keying untouched, `validate_init_path`
+   (`config.rs:546`) and `init`'s membership in `RESERVED_CMDLINE_KEYS` (`:478`); `dial_vsock`
+   bypasses the guard with its wire-driving pin (`:5610-5684`); the fail-loud law is pinned with a
+   `"custom init"` message assertion (`:5561-5598`); the port is duplicated
+   (`vmm/mod.rs:1193` ↔ `main.rs:523`, both 5000); no backend reads `cfg.init` (grep-verified);
+   `VmConfig::init` is library-only (no CLI flag; the daemon launcher hardcodes `Erofs` and never
+   calls `.init()`, `launcher.rs:208-228`); the connect budget defaults 10 s with 20/100 ms backoff
+   under `Timeouts::default()` (presets differ — 5/40 and 10/75). *What:* §3.5's
+   `StewardPlacement` + C8's **two** predicates on it — `steward_port()` for availability and
+   `resync_reachable()` for snapshot/clone eligibility, two methods because the two answers differ
+   exactly at `Service` — the derived default, the
+   `Pid1`+init reject, the seven-site re-key (health gate included — the site most likely to be
+   missed), `snapshotting` ⇒ `Pid1`, `STEWARD_VSOCK_PORT` moved to `vmcell-protocol` with both
+   sides re-exporting, and the `vmcell_steward_port=` token. *Why:* seven sites ask "can I reach a
+   steward?" and answer "did the caller set `init=`?" — the predicate split is what makes systemd,
+   init-system testing, and distro-as-shipped images expressible at all, and the platform already
+   made this exact call once (`dial_vsock`). *Migration:* none for existing callers (derived
+   default preserves semantics; byte-identical cmdline pinned); the fail-loud message re-words
+   (the test's `"custom init"` assertion moves with it, recorded). *Gate:* the placement battery
+   (§15.4): the `Service{5000}`+`init: None` composition leg (placement end-to-end, `Service` not
+   taking the fail-loud arm, the health gate ran); the **discriminating** `Service`+custom-`init`
+   refusal-identity leg — re-key any guard site back onto `cfg.init.is_some()` and this leg goes
+   **red on the wrong error, not merely slow** (with `init: None` the buggy and correct predicates
+   agree everywhere, so that leg alone is not the fail-first — the near-trap this gate text exists
+   to record); a `Service` cell's `snapshot()` returning the typed placement refusal
+   (`resync_reachable()`, the C8 second method); the `None` typed-refusal-before-transport leg; the
+   byte-identical default cmdline pin; the C8 two-method call-site scan; `dial_vsock`'s gate green
+   verbatim.
+
+5. **The steward as a library; service mode** *(R5 — the largest; §3.5, C1)*. *Premise:* the crate
+   is a 1,604-line library (643-line `lib.rs` reaper/coordinator + 961-line `netif`) against a
+   2,867-line `main.rs` carrying mounts/serving/exec/sessions/power-off; `main()` takes no args,
+   `tracing_subscriber::fmt::init()` first statement, sole env read `PATH` (`main.rs:1195`), **no
+   getpid/pid==1 check and no prctl of any kind in the crate** (grep-verified — no
+   `PR_SET_CHILD_SUBREAPER`); `VSOCK_PORT` private (`:523`); `child_path` hardcodes
+   `/vmcell-tools` (`:1193-1202`), applied unconditionally via `build_command` (`:1224`); one
+   `/proc/cmdline` read (`:312`) with `vmcell_accept_poll_ms`/`vmcell_rebind_idle_ms` clamped
+   (`:416-429`); the PID-1 assembly runs unconditionally with the **four-mount** fatal set (tmpfs
+   `/mnt` `:186-198`, overlay `:203-213`, `/proc` `:253-263`, `/dev` `:264-274` — the in-code
+   "EXACTLY {overlay, /proc, /dev}" comment understates its own code and is corrected by this
+   delta); signals are exactly `[SIGCHLD, SIGTERM]` with an unconditional SIGTERM→
+   `power_off_never_returns()` (`:438-459`, `:493-519`); the exec paths never `child.wait()` (the
+   false-127 machinery: epoch before spawn `:1259/:1738/:1874`, reserve after `:1316/:1758/:1887`,
+   `wait_for` post-epoch-only, `DEFAULT_MAX_REAPED_STATUSES = 1024` with the PID-1-orphans doc);
+   the lean ban is `tokio|hyper|rtnetlink` (`check-lean-tree.sh:58`); no credential syscalls; the
+   `login_tty` pre_exec is exactly setsid + `TIOCSCTTY` + 3×dup2. *What:* §3.5's `StewardOptions`
+   + `run()`; mode by `getpid() == 1`; `PR_SET_CHILD_SUBREAPER` under `Service`; per-mode SIGTERM
+   policy; the `Pid1`-scoped assembly; the tracing/tools-dir/port/tuning seams; `main.rs` shrinks
+   to the thin wrapper; the **`mini-init`** guest-tools applet (its G1 defense recorded in §3.5) —
+   an applet addition, so `GUEST_TOOLS_APPLETS` + the manifest + their pins move together and the
+   rootfs rebuild trap is restated in the delta. *Why:* R1's `Service` placement is a predicate
+   change; this is what makes it a capability — and it is vmcell's own source-code rule
+   ("all functionality in library crates") applied to the one crate where it held for a component
+   rather than the crate. *Migration:* none for hosts (wire protocol placement-blind); the crate's
+   internal reorganization rides delta 1's ledger entry. *Gate:* the service-steward battery
+   (§15.4): the double-fork exec leg **red-on-inverse by removing the subreaper call** (the test
+   hangs — bounded by its harness timeout — instead of returning the exit code); both SIGTERM
+   legs (service: C3 residue gone for a live session **and** for a live one-shot `exec` child — the
+   second leg drives the real `exec` handler and asserts the swept child's terminal frame carries the
+   128+9 only a SIGKILL produces, red on the inverse by dropping the one-shot registration; clean
+   exit, mini-init restarts it, guest stays up, next exec
+   works; Pid1 twin: powers off) plus the rapid-failure-cap leg; the lean-tree gate
+   surviving the split; the thin-`main.rs` source-scan pin (red on a planted stray `fn` — the
+   split-drift hazard's structural gate, §3.5); the reservation/epoch unit suite green unmoved
+   (pid-reuse correctness is placement-independent and must carry over intact); the
+   `GUEST_TOOLS_APPLETS`/manifest pins growing `mini-init` together with the rootfs-rebuild trap
+   restated at the site.
+
+6. **The artifact registry: rootfs + handler kinds, lazy, digest-only** *(R2+R7; §10.5, F7)*.
+   *Premise:* the kernel registry is real and one-law (`KernelRegistryEntry` with the
+   label-determines-build invariant, `resolve_kernel_registry` over the baseline+overlay merge,
+   the eight key/name composers — `kernel_pin_key`/`kernel_artifact_key` exported as one-law since
+   the docs/81 pass, with `vmcell-kernel-builder` calling them rather than byte-duplicating —
+   `reject_sanitized_label_collision`, `sort_kernel_registry`); `pins.json` carries labels
+   `6.6.152`/`6.12.104`/`usbhost`, five fragments, a **singleton** `rootfs {image, digest}`
+   (flattened to `rootfs_image`/`rootfs_digest`; no `rootfs_artifact_key`, no
+   `resolve_rootfs_registry` anywhere), and `kernel_prebuilt {url, archive_sha256, sha256,
+   archive_member}` — four keys, not the three the requester listed; `KNOWN_PINS_NAMESPACES` is
+   exactly nine entries (`artifact/mod.rs:683-693`) and any new namespace must be added there and
+   in `flatten_pins_namespace`; `GuestToolsStage` builds from the workspace unconditionally in
+   `cache_key` **and** `run` (`guest_tools.rs:39`, `:59-75`) with no skip; `build-kernels` takes no
+   label filter and errors on an empty registry (`main.rs:83-94`, `:631-636`);
+   `build_labelled_kernel(label, target_dir, overlay_file)` is library-only; `oci2-erofs` demands
+   `IMAGE@sha256:<64 hex>`; **`bundle` digests are blake3** via `hash_file`, not sha256 (a
+   requester phrasing corrected at verification — the registry's `source.archive_sha256` stays
+   sha256 like `kernel_prebuilt`'s, the two hash roles stay distinct and named); the sanitized
+   filename law (`vmlinux-6-12-94`) keeps dotted labels in keys. *What:* §10.5 — the `rootfs`/
+   `handlers` map namespaces (legacy singleton rejected naming the migration), the mirrored
+   key/name laws sharing the merge/collision/sort core, digest-authoritative registration with
+   verified fetch (F7), the `unpinned` dev override refused by `bundle`, lazy selection
+   (`build-kernels <label>…`/`--all`, rootfs/handlers selection-driven from birth, CI passes
+   `--all`), handler injection at the tools path with per-entry `applets` rosters, and registry
+   entries carrying `xattrs` (§4.7) + `features` (§7.4) declarations. **The handler kind's consumer
+   half is part of *What*, not an implementation detail** (it was the delta's one hole): the pack tail
+   and `cache_key`'s consumed-artifact fold both resolve the handler through
+   `handler_artifact_key(handler_label)`, never the bare `"guest_tools"` literal, and an unmatched
+   pair refuses fail-loud before a layer is read — a declared label with nothing under its key, or an
+   orphaned labelled artifact beside a pack that declared none. The literal made the labelled artifact
+   reach nothing and the build *succeed* anyway, packing an image with no applet symlinks at all,
+   `mini-init` — an `init=` target — among them. The reserved `default` spelling normalizes to "no
+   label" at the one stage intake, so `--handler-label default` is the same request as omitting it,
+   with the same key, output file and cache key (§10.5's byte-identity rule). *Why:* item 6's shape applied
+   to item 5's axis — the asymmetry was never a decision; and R7 had to be settled before the
+   registry existed, not retrofitted. *Migration:* pins-schema break, ledgered; existing overlays
+   carrying `rootfs` keys get the loud migration error; `build-kernels` callers add `--all` (CI
+   recipes updated in the same commit). *Gate:* the registry battery (§15.4): same-digest-two-
+   labels byte-identity + unmoved default key; the laziness leg red on eager; the corrupt-blob
+   digest-mismatch loud failure; bundle-refuses-unpinned; the legacy-shape reject; the handler-
+   roster manifest pin gaining a labelled arm; **live leg** (fs-blind fakes): a registered handler
+   boots and its applet answers in-guest.
+
+7. **External repacking + per-artifact xattr policy** *(R6 first half; §4.2, §4.7)*. *Premise:*
+   `pack_erofs_with_injection` is public contract surface with a typed non-feature arm;
+   `ExtraFile`/`RootfsStage.extra` public; `--inject` only on `Oci2Erofs`; `GuestToolsStage`
+   unconditional in `oci2erofs` (`main.rs:1044`) and `--agent-musl` skips only the steward stage
+   (`:1040-1042`); the strip rationale comment sits at the Regular-entry arm covering all six
+   tar-derived `xattrs: vec![]` sites (ten total); `test_pax_xattrs_are_not_preserved` at
+   `tar2erofs.rs:817` with the recorded-limitation doc and retire-me message (this delta renames it
+   `pax_xattrs_are_stripped_under_the_default_policy` and drops the retire-me: it now pins the
+   default policy, which must stay green forever, and gains the
+   `…_preserved_under_the_preserve_policy` twin — the shift, recorded); **no ext4 producer
+   exists anywhere** (grep across crates/scripts/fuzz/examples/justfile: zero `mkfs.ext4`/`mke2fs`/
+   `e2fsprogs`/`debugfs` hits); virtiofsd spawns with no xattr flags; the packer buffers wholly in
+   memory (recorded on `ExtraFile`'s doc); the example workspace has **never packed a rootfs from
+   the consumer position** (its legs are fail-fast boundaries, honestly labeled); injected/
+   synthesized nodes are uid/gid 0 mtime 0 but tar-derived nodes keep tar mtimes, and **no
+   pack-twice byte-identity gate exists in-tree** — this delta adds one, since its own claims lean
+   on it. *What:* `--tools` + `--work-dir` (§4.2); `XattrPolicy` on the one pack tail, declared
+   per-artifact, default `Strip` (§4.7); the `xattr` guest-tools applet; the `Preserve` twin
+   test; the pack-twice determinism gate. *Why:* the strip's premise is scoped to the base it was
+   written for; the checkout dependency was one severable edge; both are properties of the
+   artifact, which is where §10.5 puts properties. *Migration:* none by default (`Strip` +
+   flag-absent behavior byte-identical, cache key unmoved — gated). *Gate:* the xattr battery
+   (§15.4) both directions with the in-guest readback; the from-outside-a-checkout pack green
+   with `--tools`, red-loud without; the cache-key invalidation on policy change; the pack-twice
+   gate.
+
+8. **The ext4 producer** *(R6 second half — separable; §4.7)*. *Premise:* `RootfsSource::Block` is
+   consumable by all four backends (`config.rs:372-379` emits `rootfstype`+`rootflags=noload`;
+   per-backend arms verified) and nothing produces it; the merged-tar tail exists and synthesizes
+   parents; **empirically validated on this host while specifying** (e2fsprogs 1.47.2):
+   `mkfs.ext4 -d <tarball>` run unprivileged populates an image preserving root ownership,
+   `security.capability` PAX xattrs byte-exact, and device nodes, and **errors loud when a parent
+   directory is absent from the tar** — re-verify on the implementing host; if the tool route is
+   taken the version gate is e2fsprogs ≥ 1.47.1 with libarchive. *What:* §4.7's producer behind
+   the same Stage — **crate route first** (a permissive pure-Rust ext4 writer, vetted by the
+   mount-and-diff conformance gate), external `mkfs.ext4 -d <tarball>` as the validated fallback
+   (probed fail-loud, recorded as the external-tool exception; either route swaps later without a
+   contract change). The format has to be honored **through the registry**, not only by calling the
+   producer directly: the OCI rootfs source packs through the general
+   `pack_rootfs_with_injection` tail, so a `format: ext4` entry built by `vmcell build
+   --rootfs-label <label>` reaches the producer. Routed through the erofs-only door instead, the stage
+   pulled every layer and then refused by name — `format` was an accepted input that could not be
+   honored, the F1 shape, and no vmcell-built ext4 rootfs was producible through the registry at all.
+   *Why:* `Block` has been a consumable with no producer since v22; the ext4
+   *artifact* serves **POSIX-completeness** workloads without touching the erofs default — an
+   artifact, not a switch. (The cut's "writable-root" wording was the contradiction §4.7 now
+   resolves: read-only wins, on *Migration: additive*'s own terms, and the four backends' drifted
+   read-write attach was deleted in this delta — see §4.7 and `root_device_read_only`.)
+   *Migration:* additive. *Gate:* the ext4 battery (§15.4): pack → boot as `Block`
+   → in-guest tree/xattr/device diff against the tar manifest (the mount-and-diff gate doubles as
+   the crate-route qualifier); the version-probe typed refusal; the parent-dirs-present pin; and
+   the delta-7 from-outside-a-checkout leg repeated for this producer (R6's capability sentence
+   covers both packers).
+
+9. **The systemd proof cell** *(the capstone; §15.4 — opt-in)*. *Premise:* the pinned base carries
+   no systemd (no `usr/lib/systemd/systemd`, no `systemctl`, no `usr/sbin/init` — only unit files,
+   `libsystemd.so.0`, and dpkg shims; verified against the cached layer by the requester and
+   adopted); a full-Debian image must be pulled to get one, so the leg cannot ride default CI; the
+   consumer's own four `unverified` packaging rows want exactly "a live systemd to start a unit
+   on"; serial-nexus's probe mechanism additionally needs `/proc/1/comm == systemd`, uid 0, and
+   `systemd-run` on PATH, with scratch under `/run` because `PrivateTmp=yes` hides `/tmp` —
+   consumer-side facts recorded here so the cell's shape serves them without shipping them (G1:
+   the proof cell validates *vmcell's* composition; the consumer's suites are its own lane).
+   *What:* `just test-systemd` — register `debian-systemd` by digest (delta 6) with
+   `xattrs: preserve` (delta 7) and a no-snapshot feature declaration (delta 2); boot it with
+   `init=/usr/lib/systemd/systemd` (or the image's `/sbin/init`) under `Service` placement
+   (delta 4) with the steward installed as a unit baked in via `ExtraFile`; assert the control
+   plane end-to-end (`exec`, sessions, `put_file`) with real systemd as PID 1; run the §10.6 kit
+   over the composition and assert the declared-feature legs: `why_absent(SnapshotRestore)` on the
+   composed `FeatureSet` carries `Source::Rootfs("debian-systemd")` (the intersection's only
+   remover — the `Service` placement is a per-op eligibility arm, not an intersection axis), an
+   attempted `snapshot()` returns the C8 placement refusal (per-op authoritative, §8.1 — the pair
+   is the honest picture of a doubly-unavailable op), and the xattr readback passes. *Why:* this is
+   "what landed looks like" —
+   the one configuration in which every request composes, and the gate that catches a cross-delta
+   interaction no per-delta gate can (the fakes and the per-delta legs are all blind to
+   systemd's actual boot behavior). *Migration:* n/a (new opt-in recipe; staged like
+   `test-crosvm`). *Gate:* itself — deliberately reddened once during landing (drop the unit file
+   and the steward must be unreachable; the fail-loud message names the placement).
+
+10. **Daemon placement exposure** *(separable, last; §11.5)*. *Premise:* the daemon launcher never
+    calls `.init()` and hardcodes `RootfsSource::Erofs` (`launcher.rs:208-228`); the "no `init=`
+    over REST" rule is recorded with the rationale "the daemon owns VMs through the control
+    plane"; `CreateVmRequest` grows additively with `#[serde(default)]` and the engine channel is
+    JSON for exactly the presence-attribute reason (Appendix A reversal 10). *What:*
+    `CreateVmRequest` gains `init` + `steward_placement` accepting `Service{port}` with a custom
+    init only; `StewardPlacement::None` is rejected 400 naming the rule's surviving half; the
+    typed client mirrors it. *Why:* the old rule's own rationale now permits exactly the
+    placement that keeps the control plane — a systemd cell becomes reachable on the platform's
+    third entry surface. *Migration:* additive DTO fields; old clients unchanged. *Gate:*
+    KVM-free: the JSON round-trip with `Some`/`None` populated asymmetrically (the codec rule's
+    named test), the `None`-rejected-400 arm with the `Service` positive control; live: a daemon-
+    suite `Service` cell driven end-to-end through REST.
+
+---
+
+## Appendices
+
+The per-finding records that the v27 body carried inline (the `M-*`, `H-*`, `EXP-*`, `AGENT-*` IDs)
+resolve to the project's working documents and are **not** reproduced here: performance experiments in
+`docs/historical/44-claude-perf-experiments.md`, the performance investigation log in
+`docs/historical/45-claude-perf-investigation.md`, the code-review findings in
+`docs/historical/46-claude-code-review.md` (and the later passes through
+`docs/historical/72-claude-code-review.md`), and
+the as-built reconciliation in `docs/implementation-notes.md`. This document cites the *conclusions*; those
+files hold the evidence.
+
+### Appendix A — Load-bearing reversals
+
+Each of these is a case where the obvious choice was wrong and measurement or a live trace forced the
+opposite. They are here because the *reasoning* justifies a current design decision that would otherwise
+look arbitrary.
+
+1. **Firecracker: PCI → MMIO.** An early assumption that PCI snapshotting was required inverted — FC's
+   maturity and snapshot support are on the **MMIO** transport, so the guest kernel builds *both*
+   virtio-pci (for CH) and virtio-mmio (for FC), and FC runs in MMIO mode (§2.3, §5.2).
+2. **Guest networking: `ip=`/device-layer, not netlink.** A manual `rtnetlink` bring-up in PID 1 caused
+   wrong-attribution failures and dragged netlink into the steward; it was **deleted** in favor of the
+   kernel `ip=` cmdline plus device-layer `SIOCSIF*` ioctls, and the net-unprivileged manual path was
+   compiled out. This is *why* C6 is a structural (dependency-absence) gate, not a fake (§3.4, §9.8).
+3. **FPU/XSAVE: `T2` template + `noxsave`, not a base downgrade.** A guest FPU/XSAVE mismatch on restore
+   tempted a bookworm kernel downgrade; the correct fix was a Firecracker **`T2` CPU template** (a stable
+   cross-host feature set) with a `noxsave` cmdline fallback gated on `template.is_none()`, keeping the
+   modern base (§2.3, §5.3).
+4. **Egress steering: `REDIRECT` → `TPROXY` — right choice, wrong first reason.** The transparent-proxy
+   redirect moved from `REDIRECT` to `TPROXY`; the *stated* reason (needing `SO_ORIGINAL_DST`) was wrong,
+   but TPROXY is still correct because it carries the original destination in the socket and preserves the
+   source without conntrack (§6.4).
+5. **QEMU unprivileged vsock = a stateless vhost-user mirror of the eligibility law.** The QEMU
+   unprivileged-vsock path is a stateless vhost-user device, so it obeys S1 exactly as the NAT and
+   virtio-fs shares do — no special case (§8.1).
+6. **The rootfs size argument inverted.** The OCI slim base was assumed larger than an `mmdebstrap` build
+   and turned out ≈34–39 % **smaller** (dpkg path-excludes), so the in-VM source earns its place on
+   **provenance**, not size (§4.2).
+7. **microVM early-boot `#DE` had ~24 candidate causes; the real one was found by live trace.** A triple
+   fault / `#DE` on early microVM boot was narrowed from two dozen plausible causes to a confirmed **vhost
+   fork** interaction by an actual message trace — and, separately, the `passt` incompatibility was traced
+   to a host **AppArmor `af_unix`** rule, not `passt`'s seccomp and not CH-specific (feeding reversal in
+   §6.2).
+8. **Firecracker warm-restore was four stacked bugs, not one.** FC warm restore failed for four
+   independent reasons at once — a cached client reused across the severed vsock, a baked vsock path whose
+   parent dir was wrong, no entropy device to reseed, and the AGENT-2 guest-reaper epoch race — and only
+   fixing **all four** made it work; the guest-side fix was the *generic* re-bind, no FC-specific guest
+   change (§8.2).
+9. **`clear_ambient_caps` must default off.** Clearing the ambient set in the jailer child stripped the
+   `CAP_NET_ADMIN` the VMM itself needs for `TapSetMac` (CH) / tap-reopen (FC) at boot, reddening every
+   restore-with-tap test while cold boot survived — so the field defaults **false** with an at-site
+   rationale, and turning it on is blocked on fd-passing (§12.3).
+10. **The engine channel is JSON, not postcard.** The broker's forwarded DTOs use serde
+    `skip_serializing_if`/`default`, which postcard's non-self-describing format silently corrupts, so the
+    engine channel uses JSON while the broker's own attribute-free control enum stays framed-binary — the
+    same class of finding as the daemon-DTO reversal (§12.4).
+11. **`branch`/`fork_from_vm` needed a `create_dir_all` the fake couldn't reveal.** A missing
+    directory-creation on the lineage snapshot path was **invisible to `FakeVmm`** (which never touches the
+    filesystem) and was caught only by the live KVM suite — a concrete instance of §14 lesson 1 and lesson
+    5 (§8.5).
+
+### Appendix B — Substitution experiments
+
+Deliberate "replace X with a better-licensed or in-process Y" attempts, and where each landed:
+
+| # | Substitution | Status |
+|---|---|---|
+| 1 | shell `mkfs.erofs` → in-process `am-fs-erofs` (tar→erofs) | **graduated** — the only wired erofs writer (§4.2) |
+| 2 | `iproute2`/`skopeo` → OCI-in-Rust (`oci-client` + whiteout apply) | **graduated** — the default rootfs source (§4.2) |
+| 3 | `mmdebstrap`-only rootfs → OCI slim base as the default | **graduated + wired**, `mmdebstrap` kept for provenance (§4.2) |
+| 4 | `passt` → in-process `smoltcp` + `vhost-user-backend` | **graduated** — no external dep, no LSM entanglement (§6.2) |
+| 5 | `rustables` (GPL) for nftables | **rejected** — no permissive pure-Rust TPROXY path; render + `nft -f -` (§9.6) |
+| 6 | `virtiofsd` → in-process `fuse-backend-rs` | **underway**, blocked on read-only enforcement before it can graduate (§4.5) |
+
+### Appendix C — Contested facts, per pin
+
+Facts that were surprising, version-specific, or initially gotten wrong — each pinned to the version it was
+verified against, because the next version may differ:
+
+- **Cloud Hypervisor DAX is gone as of v52.** The virtio-fs DAX window was removed, so shared-directory
+  density rests on `cache=never` + the shared erofs base, not DAX (§8.3).
+- **CH snapshot + virtio-fs is unreachable through the API**, which is *why* S1 is enforceable at all — the
+  combination can't be constructed, so rejecting it at `build()` matches the backend's own limit (§8.1).
+- **CH UFFD "prefault" is confirmed lazy.** Eager restore front-loads and is ≈1.5× the resume cost of
+  lazy, with the difference reappearing as first-touch faults; sparse-`SEEK_HOLE` handling is still open
+  (§16, §17).
+- **Vendor-published boot numbers are workload-dependent** and were not reproduced verbatim; the §16
+  figures are this substrate's, measured interleaved.
+- **Nested virt is host-configured, not a CH flag.** It needs host `kvm_intel nested=1` plus the guest
+  `kvm-intel.nested=` cmdline token; there is no CH nested-virt flag, and AMD L1-with-L2 does not migrate
+  (so a nested guest is not snapshot-portable) (§5.3).
+- **There is no `herolib-virt` crate** — an early dependency assumption that did not exist; the VMM
+  integration is direct against each backend's process/API.
+- **CVE-2026-45782 is fixed in CH v52.0.0**, and as of the 2026-08-20 dependency pass that is a
+  **fact rather than an assumption**: `pins.json` now carries `cloud_hypervisor: "v53.0"` and the
+  README installs that pinned release (checksum-verified, the same one `ci.yml` installs) instead of
+  `cargo install --git`. The old git-HEAD instruction was how the gap persisted — it installs an
+  *unreleased* build of `main` reporting the next version number (`v54.0.0`, which is why the earlier
+  live matrix ran on a "54.0.0" that no release tag ever carried), so nobody could say which CH a
+  green suite had actually validated. The snapshot cache key's fold of the `cloud_hypervisor` pin
+  (§10.2) now hashes a real value, so a CH bump invalidates stale snapshots at build time.
+
+### Appendix D — Prior art
+
+Projects consulted while designing this, and the one idea taken from each: **cocoonstack / cocoon** (a
+micro-VM sandbox shape); **tinylabscom / mvm** (a minimal Rust VMM-driver approach); the **microvm.nix**
+write-up (declarative micro-VM composition); **agentkernel / vmexec** (agent-workload VM execution);
+**smoltcp + vhost-user-backend** (the in-process userspace-net datapath, §6.2); and the **Kata
+`agent-ctl`** tooling (the steward control-protocol shape, §3). None is a dependency; each informed a
+boundary or a protocol choice.
+
+### Appendix E — Section map, v27 → v28
+
+The code comments and `docs/` cross-references written against v27's section numbers still point at v27
+numbering; when updating them (a delta-register follow-up, §18), use this map. v29–v33 renumbered
+nothing — v29 inserted §2.5 (shifting only the capability matrix to §2.6), v30's new subsections
+(§5.6, §6.5, §10.4) append inside their sections, and v33's (§3.5, §4.7, §7.4, §10.5, §10.6) do the
+same — so this map remains the only translation needed. The rewrite merged the
+Parts VI–IX appendix subsystems into the main sequence and folded the three "future work" sections
+together.
+
+| v27 section | v28 location |
+|---|---|
+| Front matter (changelog v19–v27) | **removed** (per-item history → `docs/implementation-notes.md`) |
+| §1 Overview / §2 Goals | §1 Overview (§1.3 non-goals) |
+| §3 VMM backends & the `Vmm` trait | §2 |
+| §4 Control plane (vsock) + §22 Sessions | §3 |
+| §5 Storage/rootfs + §19.1/§19.5 (virtio-fs, extra disks) | §4 |
+| §8 Guest kernel + §19.2 (kernel knobs) | §5 |
+| §6 Networking & egress | §6 |
+| §7 Resource monitoring & limits | §7 |
+| §9 Snapshot/restore + §21 (OverlayStore / Lineage) | §8 |
+| §10 The Rust library | §9 |
+| §11 The artifact pipeline | §10 |
+| §18 The control-plane daemon | §11 |
+| §20 Privilege hardening | §12 |
+| §12 Cross-cutting invariants | §13 (re-lettered S/C/L/F/P/G) |
+| §13 Hard-won lessons | §14 |
+| §14 Testing strategy | §15 |
+| §15 Performance | §16 |
+| §16 + §17 + §18.9/§20.9/§21.8/§22.7 (open gaps, per subsystem) | §17 (merged, deduped) |
+| Appendix E (build roadmap) | **removed** (pure history) |
+| — (new) | §18 Delta register |
+| Appendices A–D (reversals, substitutions, contested facts, prior art) | Appendices A–D |

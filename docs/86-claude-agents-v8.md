@@ -1,8 +1,8 @@
 # AGENTS.md — vmcell
 
 Deploy at the repository root as `AGENTS.md`. Terse by design; the reasoning lives in
-`docs/84-claude-fable-code-review-rubric-v7.md` (rubric v7) and `docs/83-claude-fable-design-v33.md`
-(design v33; v32 is now `docs/historical/82-claude-opus-design-v32.md`).
+`docs/84-claude-fable-code-review-rubric-v7.md` (rubric v7) and `docs/93-claude-opus-design-v34.md`
+(design v34, the regression-harness pass; v33 is now `docs/historical/83-claude-fable-design-v33.md`).
 
 ## What this is
 
@@ -43,7 +43,7 @@ contract-surface bump must extend (see "The downstream toolkit contract").
 - `docs/99-claude-fable-code-review-rubric-v9.md` — every rule below is expanded there with its
   defect history. Its **Retired & qualified rules** section lists former demands the design
   supersedes or scopes (incl. the exhaustive-contract-types qualification) — don't re-open them.
-  (`9` represents an arbitrary digit, use the newest version you find.)
+  (`9` represents an arbitrary digit and `*` the authoring model — both vary across revisions; use the newest version you find.)
 - `docs/historical/85-claude-fable-automated-quality-v5.md` — the gate specifications (lint
   preambles, ban scripts, recipes, the delta-gate table, the coverage map). **Retired**: there is no
   non-historical copy, so read it for rationale, never for a roster. The live roster is the `gates`
@@ -52,7 +52,7 @@ contract-surface bump must extend (see "The downstream toolkit contract").
   the standing code review; a finding it records is not a fresh discovery. Earlier passes are
   retired under `docs/historical/`.
 - `docs/benchmark-results.md` — measured perf levers; the 2026-07-17 matrix is canonical.
-- `docs/99-claude-fable-design-v99.md` — architecture; **§13** lists the cross-cutting invariants,
+- `docs/99-claude-*-design-v99.md` — architecture; **§13** lists the cross-cutting invariants,
   lettered S/C/L/F/P/G, each with an owner and a gate; **Appendix A** records the load-bearing
   reversals (cite them, don't re-argue); **§17** is the open-gaps register. **No standing errata**:
   a correction is folded into the body when the design is reissued.
@@ -577,6 +577,25 @@ fragment is the one defended exception shape and never carries a consumer's usbi
 ## Performance claims
 
 - Benchmarks are tracked metrics, not gates; only relative invariants graduate to guards.
+- **"Did this regress?" is `just bench-ab`, never a diff against a recorded table.** Two prepared
+  arms (`just bench-ab-prepare <ref> <label>`), interleaved on one host in one session, rank-tested
+  over repeats — design §16. The recorded tables are absolute numbers *with their substrate*, and a
+  substrate change voids the comparison in both directions: the 2026-08-21 pass ran on a different
+  machine than every table in `docs/benchmark-results.md`. `bench-ab` verifies its controls by
+  **digest** rather than by exported variable (an arm older than a `VMCELL_*` var silently ignores
+  it — that is how two arms once booted two kernels for a whole matrix) and refuses rather than
+  warns when one is violated.
+- **A single p50 is not evidence.** Of six single-pass deltas ≥10% in that pass, five did not
+  survive repeats and one reversed sign — after a mechanism hunt had run to completion against one
+  of the phantoms. Below four repeats per arm `bench-ab` prints no verdict at all, and the verdict
+  it does print keys off the **Holm-Bonferroni adjusted** p over the rows that can receive one
+  (twenty uncorrected tests at 0.05 print a phantom 64% of the time), with the family size and the
+  raw p both shown. Three more outcomes are deliberately not verdicts: `sample loss` (an arm whose
+  percentiles are over a shrunken sample set — the surviving boots are the fast ones), and
+  `no direction` for a compositional share or a metric outside the `vmcell_bench::metrics` roster.
+  That roster is the one place a metric's direction lives, `bench-vm` refuses to emit a name it does
+  not carry, and each arm's notes are surfaced with an asymmetry (one arm `cpufreq: NOT pinned`,
+  the other not) called out loud.
 - Check the `docs/historical/45` refuted-lever table before proposing a lever; only interleaved
   same-session deltas are evidence; name the budget a change must not regress.
 - "Environmental" is a hypothesis, not a diagnosis: a flake explanation without a mechanism stays

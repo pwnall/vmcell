@@ -24,7 +24,7 @@ trap 'rm -rf "$work"' EXIT
 mk_clean_tree() {
   root="$1"
   mkdir -p "$root/vmcell/src/artifact" "$root/vmcelld/src" "$root/vmcelld/tests" \
-           "$root/vmcell-bench/src/bin" "$root/vmcell-cli/src" \
+           "$root/vmcell-bench/src/bin" "$root/vmcell-bench/src" "$root/vmcell-cli/src" \
            "$root/vmcell-artifact-validator/src" "$root/vmcell-daemon/src"
   # THE HOME: the one resolver, plus the rustdoc that NAMES the variable in prose (which must be
   # stripped, or the home's count is 2 and the law looks like its own violation).
@@ -64,6 +64,34 @@ mk_clean_tree() {
     printf '        assert_eq!(code.matches("VMCELL_CH_BIN").count(), 0);\n'
     printf '    }\n}\n'
   } > "$root/vmcell-cli/src/main.rs"
+  # ROSTERED 5 — the bench report's PROVENANCE VALUE (3): the recorded answer to "which variable did
+  # this run read", never a read of its own.
+  {
+    printf 'pub enum BinSource { EnvVar { name: String }, Path }\n'
+    printf '#[cfg(test)]\nmod tests {\n'
+    printf '    fn fixture() -> BinSource { BinSource::EnvVar { name: "VMCELL_CH_BIN".to_string() } }\n'
+    printf '    fn other() -> BinSource { BinSource::EnvVar { name: "VMCELL_CH_BIN".to_string() } }\n'
+    printf '    fn third() -> BinSource { BinSource::EnvVar { name: "VMCELL_CH_BIN".to_string() } }\n'
+    printf '}\n'
+  } > "$root/vmcell-bench/src/report.rs"
+  # ROSTERED 6 — the same recorded value in the A/B guard's fixtures (2).
+  {
+    printf 'pub fn guard_vmm_binaries() {}\n'
+    printf '#[cfg(test)]\nmod tests {\n'
+    printf '    fn a() -> BinSource { BinSource::EnvVar { name: "VMCELL_CH_BIN".to_string() } }\n'
+    printf '    fn b() -> BinSource { BinSource::EnvVar { name: "VMCELL_CH_BIN".to_string() } }\n'
+    printf '}\n'
+  } > "$root/vmcell-bench/src/ab.rs"
+  # ROSTERED 7 — `bench-ab`'s deliberate NON-seal (2): the A/B driver strips the artifact overrides
+  # from every child and must not strip this one, so both hits are that decision written down.
+  {
+    printf 'const SEALED_CHILD_VARS: [&str; 3] = ["VMCELL_KERNEL", "VMCELL_ROOTFS", "VMCELL_PINS"];\n'
+    printf 'const UNSEALED_BY_DESIGN: [(&str, &str); 1] = [("VMCELL_CH_BIN", "the documented shim")];\n'
+    printf '#[cfg(test)]\nmod tests {\n'
+    printf '    #[test]\n    fn the_child_environment_is_sealed_and_named() {\n'
+    printf '        assert!(!envs.iter().any(|(k, _)| k == "VMCELL_CH_BIN"));\n'
+    printf '    }\n}\n'
+  } > "$root/vmcell-bench/src/bin/bench-ab.rs"
   # MUST NOT be flagged: a consumer calling the one resolver, and one naming a DIFFERENT backend's
   # variable (which has no `vmcell`-side law and is out of this gate's scope by construction).
   printf 'fn boot() { let bin = vmcell::artifact::ch_binary_path(); }\n' \
@@ -94,6 +122,7 @@ if ! grep -q '^ok: ' <<<"$out"; then echo "FAIL: expected an 'ok:' verdict on th
 expect_clean 'vmcelld/src/main.rs'
 expect_clean 'integration.rs'
 expect_clean 'bench-vm.rs'
+expect_clean 'bench-ab.rs'
 expect_clean 'vmcell-cli'
 expect_clean 'snapshot.rs'
 expect_clean 'launcher.rs'
