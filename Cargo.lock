@@ -1161,7 +1161,7 @@ dependencies = [
  "radix_trie",
  "vhost 0.15.0",
  "virtio-queue",
- "vm-memory",
+ "vm-memory 0.17.1",
  "vmm-sys-util",
 ]
 
@@ -3869,7 +3869,7 @@ dependencies = [
  "bitflags 2.13.1",
  "libc",
  "uuid",
- "vm-memory",
+ "vm-memory 0.17.1",
  "vmm-sys-util",
 ]
 
@@ -3880,7 +3880,7 @@ dependencies = [
  "bitflags 2.13.1",
  "libc",
  "uuid",
- "vm-memory",
+ "vm-memory 0.17.1",
  "vmm-sys-util",
 ]
 
@@ -3893,7 +3893,7 @@ dependencies = [
  "vhost 0.16.0",
  "virtio-bindings",
  "virtio-queue",
- "vm-memory",
+ "vm-memory 0.17.1",
  "vmm-sys-util",
 ]
 
@@ -3912,7 +3912,7 @@ dependencies = [
  "libc",
  "log",
  "virtio-bindings",
- "vm-memory",
+ "vm-memory 0.17.1",
  "vmm-sys-util",
 ]
 
@@ -3926,6 +3926,18 @@ dependencies = [
  "libc",
  "thiserror 2.0.20",
  "winapi",
+]
+
+[[package]]
+name = "vm-memory"
+version = "0.18.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9b55e753c7725603745cb32b2287ef7ef3da05c03c7702cda3fa8abe25ae0465"
+dependencies = [
+ "arc-swap",
+ "libc",
+ "thiserror 2.0.18",
+ "winapi 0.3.9",
 ]
 
 [[package]]
@@ -3982,7 +3994,7 @@ dependencies = [
  "vhost-user-backend",
  "virtio-bindings",
  "virtio-queue",
- "vm-memory",
+ "vm-memory 0.18.0",
  "vmcell-artifact-validator",
  "vmcell-crosvm",
  "vmcell-firecracker",
