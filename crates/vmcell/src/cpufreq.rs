@@ -260,6 +260,23 @@ pub struct CpuFreqPin<S: CpuFreqSysfs> {
     restore_governors: Vec<(u32, String)>,
     /// `Some(original_enabled)` iff this guard changed the turbo setting.
     restore_turbo: Option<bool>,
+    /// Online CPUs observed on `performance` when [`Self::engage`] finished — whether this guard
+    /// switched them or found them already there.
+    ///
+    /// Separate from `restore_governors` because the two answer different questions, and conflating
+    /// them made the harness lie: `restore_*` is "what must I put back" (the correct basis for
+    /// `Drop`), while this is "is the noise floor actually pinned" (the correct basis for what the
+    /// run reports). A host left on `performance` by a previous run — an interrupted benchmark does
+    /// exactly that, since a killed process runs no `Drop` — has nothing to restore, and the old
+    /// `is_pinned()` therefore announced "frequency NOT pinned … run through the privileged test
+    /// runner", on a machine that was pinned, through a runner that was already delivering
+    /// CAP_DAC_OVERRIDE. That note now travels into `bench-ab`'s comparison artifact, where it
+    /// would discredit a good run or manufacture an arm-asymmetric "different noise floors".
+    observed_performance: usize,
+    /// CPUs that could not be read, written, or that offer no `performance` governor.
+    skipped: usize,
+    /// Whether turbo is off (by this guard or already), or absent on this host.
+    turbo_quiet: bool,
 }
 
 impl<S: CpuFreqSysfs> CpuFreqPin<S> {
@@ -296,11 +313,15 @@ impl<S: CpuFreqSysfs> CpuFreqPin<S> {
                     sysfs,
                     restore_governors: Vec::new(),
                     restore_turbo: None,
+                    observed_performance: 0,
+                    skipped: 0,
+                    turbo_quiet: false,
                 });
             }
         };
         let mut restore_governors = Vec::new();
         let mut skipped = 0usize;
+        let mut observed_performance = 0usize;
 
         for cpu in online.iter().copied() {
             // Per-CPU read/availability failures are non-fatal: warn and skip.
@@ -326,12 +347,17 @@ impl<S: CpuFreqSysfs> CpuFreqPin<S> {
                 }
             };
             if current == PERFORMANCE {
-                // Already pinned by someone else — do not record, so we do not
-                // "restore" a setting we never changed.
+                // Already pinned by someone else — do not record, so we do not "restore" a setting
+                // we never changed. It still COUNTS as pinned: the question the report answers is
+                // what the CPU is doing, not who set it.
+                observed_performance += 1;
                 continue;
             }
             match sysfs.write_governor(cpu, PERFORMANCE) {
-                Ok(()) => restore_governors.push((cpu, current)),
+                Ok(()) => {
+                    observed_performance += 1;
+                    restore_governors.push((cpu, current));
+                }
                 Err(e) => {
                     warn!("cpufreq: cpu{cpu}: cannot set `{PERFORMANCE}` governor: {e}");
                     skipped += 1;
@@ -342,21 +368,28 @@ impl<S: CpuFreqSysfs> CpuFreqPin<S> {
         // Turbo is a single global knob; disabling it removes thermal-dependent
         // boost variance. Only record (and later restore) if we actually flip it.
         let mut restore_turbo = None;
+        let mut turbo_quiet = false;
         match sysfs.read_turbo() {
             Ok(Some(true)) => match sysfs.write_turbo(false) {
-                Ok(()) => restore_turbo = Some(true),
+                Ok(()) => {
+                    restore_turbo = Some(true);
+                    turbo_quiet = true;
+                }
                 Err(e) => warn!("cpufreq: cannot disable turbo: {e}"),
             },
-            Ok(Some(false)) => { /* already disabled — nothing to restore */ }
-            Ok(None) => { /* host exposes no turbo control */ }
+            Ok(Some(false)) => turbo_quiet = true, // already disabled — nothing to restore
+            Ok(None) => turbo_quiet = true,        // host exposes no turbo control to vary
             Err(e) => warn!("cpufreq: cannot read turbo state: {e}"),
         }
 
-        if restore_governors.is_empty() && restore_turbo.is_none() {
+        // Keyed off the OBSERVED state, not off what this guard changed: "I changed nothing" and
+        // "nothing is pinned" are different facts, and only the second one is worth warning about.
+        if observed_performance == 0 || skipped > 0 || !turbo_quiet {
             warn!(
-                "cpufreq: frequency NOT pinned ({} CPU(s) skipped); benchmark numbers will carry \
-                 scaling noise — run through the privileged test runner (CAP_DAC_OVERRIDE) to pin",
-                skipped
+                "cpufreq: frequency NOT fully pinned ({observed_performance} CPU(s) on \
+                 `performance`, {skipped} skipped, turbo quiet: {turbo_quiet}); benchmark numbers \
+                 will carry scaling noise — run through the privileged test runner \
+                 (CAP_DAC_OVERRIDE) to pin"
             );
         } else {
             info!(
@@ -374,19 +407,27 @@ impl<S: CpuFreqSysfs> CpuFreqPin<S> {
             sysfs,
             restore_governors,
             restore_turbo,
+            observed_performance,
+            skipped,
+            turbo_quiet,
         })
     }
 
     /// The number of CPUs this guard pinned (and will restore on drop).
     #[must_use]
     pub fn pinned_cpus(&self) -> usize {
-        self.restore_governors.len()
+        self.observed_performance
     }
 
-    /// Whether this guard changed any setting (governor or turbo).
+    /// Whether the CPU frequency is actually pinned for this run — every online CPU on
+    /// `performance` with turbo quiet — regardless of whether *this* guard is what put it there.
+    ///
+    /// Deliberately NOT "did I change something". A benchmark host that a previous (or interrupted)
+    /// run left on `performance` is pinned, and reporting otherwise sends the operator to fix a
+    /// runner that was already working while stamping a false caveat onto the results.
     #[must_use]
     pub fn is_pinned(&self) -> bool {
-        !self.restore_governors.is_empty() || self.restore_turbo.is_some()
+        self.observed_performance > 0 && self.skipped == 0 && self.turbo_quiet
     }
 }
 
@@ -565,6 +606,53 @@ mod tests {
         assert_eq!(parse_cpu_list("\n").unwrap(), Vec::<u32>::new());
         assert!(parse_cpu_list("3-1").is_err());
         assert!(parse_cpu_list("x").is_err());
+    }
+
+    // THE HOST THAT WAS ALREADY PINNED. An interrupted benchmark leaves `performance` + turbo off
+    // behind, because a killed process runs no `Drop` — so this is the ordinary state of a machine
+    // someone has been benchmarking on, not a corner case. `is_pinned()` used to mean "did I change
+    // anything", so it answered FALSE here and the harness printed "frequency NOT pinned … run
+    // through the privileged test runner (CAP_DAC_OVERRIDE) to pin" — on a pinned machine, through
+    // a runner that was already delivering that capability (verified: CapEff carried it). The note
+    // is now recorded into `bench-ab`'s comparison artifact, so a false one either discredits a good
+    // run or, if it lands on one arm only, invents a "different noise floors" warning.
+    //
+    // RED on the old `!self.restore_governors.is_empty() || self.restore_turbo.is_some()`.
+    #[test]
+    fn a_host_someone_else_already_pinned_reports_pinned_and_restores_nothing() {
+        let fake = RecordingCpuFreq::new(&[0, 1, 2, 3], "performance");
+        fake.set_turbo(Some(false));
+        let pin = CpuFreqPin::engage(fake.clone()).expect("engage is infallible");
+        assert!(
+            pin.is_pinned(),
+            "the CPUs ARE on performance with turbo off; who set them is not the question"
+        );
+        assert_eq!(pin.pinned_cpus(), 4, "all four are pinned, not zero");
+        drop(pin);
+        for cpu in 0..=3 {
+            assert_eq!(
+                fake.governor(cpu),
+                "performance",
+                "cpu{cpu}: restoring a setting we never changed is the other half of the law"
+            );
+        }
+        assert_eq!(
+            fake.turbo(),
+            Some(false),
+            "turbo must be left as we found it"
+        );
+    }
+
+    // The inverse of the above, so the accessor cannot be "always true": a host we could not pin
+    // at all must still say so.
+    #[test]
+    fn a_host_that_could_not_be_pinned_still_says_so() {
+        let fake = RecordingCpuFreq::new(&[0, 1], "powersave");
+        fake.deny_write(0);
+        fake.deny_write(1);
+        let pin = CpuFreqPin::engage(fake.clone()).expect("engage is infallible");
+        assert!(!pin.is_pinned(), "no CPU reached performance");
+        assert_eq!(pin.pinned_cpus(), 0);
     }
 
     #[test]

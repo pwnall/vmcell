@@ -1562,7 +1562,51 @@ fn run_preflight(arms: &[ArmManifest]) -> anyhow::Result<Vec<String>> {
     for w in &warnings {
         progress!("WARNING: {w}");
     }
+    warm_arm_artifacts(arms)?;
     Ok(warnings)
+}
+
+/// Reads every arm's kernel and rootfs so the host page cache holds all of them before the first
+/// measurement — the arms must start the run equally warm.
+///
+/// **This is a control, not an optimization, and it was bought with a wrong answer.** Each arm boots
+/// its OWN ~98 MB `rootfs.erofs` out of its own directory, and a guest page-faults those pages in
+/// through virtio-blk. Whichever arm runs first is therefore measured against a warm image while the
+/// other's is cold, and the asymmetry lands squarely on the metric that measures bringing a
+/// connection up. On 2026-08-21 this produced a *fully significant* phantom: with the code held
+/// byte-identical and two file copies of the SAME artifact bytes, the arms differed by 13 µs median,
+/// and swapping which copy the head arm read collapsed a "+22 µs, p=0.021 regression" to
+/// "+7 µs, p=0.45". A syscall census over the same pair showed the per-connect syscall counts are
+/// identical between the arms — there was no code to find.
+///
+/// Note what this means for the A/A null control: two labels pointed at ONE artifacts directory hold
+/// constant exactly the variable that carries this signal, so such an A/A reads clean while the A/B
+/// beside it does not. A real null control gives each label its own copy.
+///
+/// # Errors
+/// Returns an error when an arm's kernel or rootfs cannot be read — the same files the manifest
+/// digested, so an unreadable one means the arm is not what `prepare` recorded.
+fn warm_arm_artifacts(arms: &[ArmManifest]) -> anyhow::Result<()> {
+    for arm in arms {
+        for path in [&arm.kernel.path, &arm.rootfs.path] {
+            let bytes = std::fs::File::open(path)
+                .and_then(|mut f| std::io::copy(&mut f, &mut std::io::sink()))
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "arm `{}`: cannot read {} to warm the page cache: {e}",
+                        arm.label,
+                        path.display()
+                    )
+                })?;
+            progress!(
+                "warmed {} ({:.1} MiB) for arm `{}`",
+                path.display(),
+                bytes as f64 / (1024.0 * 1024.0),
+                arm.label
+            );
+        }
+    }
+    Ok(())
 }
 
 /// The interleaved run loop, with the child spawn INJECTED.
@@ -3519,6 +3563,53 @@ EOF
         .expect_err("a violated control must refuse the run");
         assert!(err.to_string().contains("same guest kernel"), "{err}");
         assert_eq!(spawned, 0, "the controls must run before any VM boots");
+    }
+
+    // The page-cache control's call site. `warm_arm_artifacts` reads every arm's kernel and rootfs
+    // BEFORE the first boot, because whichever arm runs first would otherwise be measured against a
+    // warm image while the other's is cold — an asymmetry that produced a fully significant PHANTOM
+    // on 2026-08-21 (byte-identical artifacts in two file copies: 13 us median apart, and swapping
+    // which copy an arm read turned "+22us, p=0.021" into "+7us, p=0.45").
+    //
+    // Asserting on the SPAWN ORDER, not on the page cache: what the tool controls is that every
+    // arm's bytes have been read before any measurement, and an unreadable artifact must refuse the
+    // run rather than measure half-warm. RED on the inverse (`warm_arm_artifacts(arms)?` deleted
+    // from `run_preflight`): the missing-artifact leg stops refusing and `spawned` becomes non-zero.
+    #[test]
+    fn run_comparison_warms_every_arm_before_it_spawns_anything() {
+        let dir = TempDir::new().expect("tempdir");
+        let arms = vec![
+            arm_fixture(dir.path(), "base", b"vmlinux", b"rootfs-A"),
+            arm_fixture(dir.path(), "head", b"vmlinux", b"rootfs-B"),
+        ];
+        // The happy path first, so this test cannot pass by everything being broken.
+        let specs = vec![Spec::new("cloud-hypervisor", "latency")];
+        let mut spawned = 0_usize;
+        run_comparison(&arms, &specs, 4, &mut |arm, _spec, _repeat| {
+            spawned += 1;
+            Ok(report_for(arm, 40.0))
+        })
+        .expect("two warm arms with one kernel must run");
+        assert!(spawned > 0, "the happy path must actually spawn");
+
+        // Now make ONE arm's rootfs unreadable after its digest was recorded: the warm pass is the
+        // only thing that opens it before a boot, so this is the leg that proves it ran.
+        std::fs::remove_file(&arms[1].rootfs.path).expect("remove rootfs");
+        let mut spawned_after = 0_usize;
+        let err = run_comparison(&arms, &specs, 4, &mut |arm, _spec, _repeat| {
+            spawned_after += 1;
+            Ok(report_for(arm, 40.0))
+        })
+        .expect_err("an arm whose artifacts cannot be read must refuse the run");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("head") || msg.contains("rootfs"),
+            "the refusal must name the arm or the file: {msg}"
+        );
+        assert_eq!(
+            spawned_after, 0,
+            "nothing may boot before every arm is warm"
+        );
     }
 
     // The rootfs guard's call site: a shared image is a WARNING, and a warning nobody carries out

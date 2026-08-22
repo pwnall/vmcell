@@ -42,7 +42,7 @@ at), each with its own host lib *and its own guest rootfs*, because guest-side c
 intent**: the guest kernel (one `vmlinux`, 6.12.104, byte-identical in both arms' artifact dirs),
 the VMM binaries (Cloud Hypervisor **v53.0**, the pinned release — `PATH` on that host carried an
 unreleased v54.0.0 `main` build; Firecracker v1.16.0; QEMU 10.2.1; crosvm), the blessed runner, a
-delegated cgroup scope, and the CPU-frequency pin. 184 wrapped runs, zero failures, plus repeat
+delegated cgroup scope, and the CPU-frequency pin. *(Those runs' logs say `cpufreq: NOT pinned`; they were wrong and the substrate was fine — all 20 CPUs were on `performance` with turbo off throughout. `CpuFreqPin::is_pinned` answered "did I change anything", so a host an interrupted run had already left pinned reported itself unpinned. Fixed to report the observed state.)* 184 wrapped runs, zero failures, plus repeat
 rounds of n=10 per arm with a Mann-Whitney two-sided rank test. Reproduce with `just bench-ab`.
 
 **Verdict: no core metric regressed. One narrow path did.**
@@ -77,22 +77,31 @@ with only that scan reverted: −35 µs default, −577 µs verbose). `6a8315d` 
 whole-buffer prefilter, and the classifier now carries its own tracked micro-benchmark, which is why
 the cost was invisible for a release.
 
-**But the fix does not close the regression, and the re-measurement says so.** With the prefilter in,
-the same interleaved A/B (n=10 per arm) still reports `session-connect` +35.8 % CH (187 → 254 µs,
-p=0.0004), +35.7 % QEMU (p=0.0045), +20.8 % FC (p=0.0065) and `session-open` +14.9 % CH (p=0.0002).
-The dose-response says exactly what the fix did and did not do:
+**Then the re-measurement said the fix had not closed it — and a third pass showed most of what
+remained was the measurement, not the code.** With the prefilter in, the same A/B still reported
+`session-connect` +35.8 % CH (p=0.0004). The dose-response shows what the fix genuinely did: over
+`--kernel-verbosity` the head arm went 315/299/**972** µs (quiet/balanced/debug) before the prefilter
+to 234/226/**320** µs after, against a base of 186/179/198 — so the console-size **slope** was the
+classifier and is largely gone. The apparently-constant remainder did **not** survive scrutiny:
 
-| `--kernel-verbosity` | base | head, before the prefilter | head, after |
-| --- | --- | --- | --- |
-| quiet | 186 µs | 315 µs | 234 µs |
-| balanced | 179 µs | 299 µs | 226 µs |
-| debug | 198 µs | 972 µs | 320 µs |
+- **A syscall census** (`--iterations 30` vs `130`, `strace -f -c`) shows the two arms issue the
+  *same* syscalls in the *same* counts per connect — `openat`, `socket`, `connect`, `read`,
+  `recvfrom`, `epoll_ctl` all identical, and `statx` at exactly 1.00/op in **both** arms (the console
+  `exists()` check, cancelling). The real code delta on that path totals ≈3 µs.
+- **The artifact-copy experiment** identifies the confound. Holding the binary and the artifact
+  *bytes* identical and varying only which of two file copies an arm reads: the copies differ by
+  13 µs median, and swapping which one the head arm reads collapses "+22 µs, p=0.021" to
+  "+7 µs, p=0.45". Each arm boots its own ~98 MB `rootfs.erofs` from its own directory, so whichever
+  arm runs first is measured warm and the other cold.
+- **The A/A null control was not a control.** Both labels read one shared artifacts directory, which
+  holds constant exactly the variable carrying the signal — it reads clean (18/18) while the A/B
+  beside it does not. A real null gives each label its own copy.
 
-Most of the console-size **slope** is gone (debug 972 → 320 µs), which is the classifier. What remains
-is a **constant ≈47 µs per connect at every verbosity, including `quiet`** — plus a small residual
-slope — and the classifier cannot explain it: it now costs ≈4.3 µs on a 24-line console. **Open, with
-the mechanism unidentified.** Recorded rather than attributed, because the first attribution was made
-before the re-measurement and was wrong to claim closure.
+`bench-ab` now reads every arm's kernel and rootfs before the first boot (`warm_arm_artifacts`), so
+the arms start equally warm. **What is left after that is `session-open`**, which carries a
+consistently-signed residual across every battery (+26 µs at n=3000 quiet, +45 µs pooled, +64 µs at
+balanced) and is **open, mechanism unidentified**. `session-connect` is not established as a
+regression once the page-cache asymmetry is controlled.
 
 **Micro-benchmarks** (`criterion`, in-process, two rounds each arm — same host, so comparable to
 each other but not to the 2026-07-01 table below):

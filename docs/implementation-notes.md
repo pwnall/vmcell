@@ -7002,6 +7002,20 @@ term is O(console bytes) with no bound on the console.
 Everything else is flat: cold boot, warm restore, snapshot bytes, host RSS per guest, zygote
 fan-out, net-egress in all three modes, and every `daemon-api` verb, on all four backends.
 
+**Third pass: most of the "remainder" was the measurement.** A syscall census (`strace -f -c` over
+`--iterations 30` vs `130`) shows both arms issue the same syscalls in the same counts per connect —
+`statx` at exactly 1.00/op on **both** sides, i.e. the console `exists()` check cancelling — with a
+total real code delta of ≈3 µs. The confound is arm-asymmetric page-cache state: each arm boots its
+own ~98 MB `rootfs.erofs` from its own directory, so the arm that runs first is measured warm. Proven
+by holding the binary and the artifact *bytes* identical and varying only which of two file copies an
+arm reads: 13 µs median between copies, and swapping which copy the head arm read turned
+"+22 µs, p=0.021" into "+7 µs, p=0.45". `bench-ab` now warms every arm's kernel and rootfs before the
+first boot. **And the A/A null control was not a control**: both labels read one shared artifacts
+directory, holding constant precisely the variable that carries the signal — it reads 18/18 clean
+while the A/B beside it reads 26/10. A real null control gives each label its own copy; the
+shared-artifact A/A proves only that the timer is unbiased. `session-open`'s residual survives all of
+this and stays open.
+
 **The fix is partial, and the correction matters more than the fix.** Re-measuring after `6a8315d`
 landed — same controls, n=10 per arm — `session-connect` is *still* +35.8 % on CH (187 → 254 µs,
 p=0.0004), +35.7 % QEMU, +20.8 % FC. The dose-response separates what was fixed from what was not:
