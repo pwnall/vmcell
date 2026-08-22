@@ -72,6 +72,34 @@ fn bench_math_30(c: &mut Criterion) {
     });
 }
 
+fn bench_serial_fault_classify(c: &mut Criterion) {
+    // The HEALTHY console is the case that needs a tracked number: it is the one where nothing
+    // short-circuits, and `StewardClient::connect_framed` re-runs this on every connect attempt
+    // against a console that is still growing during boot. A 2026-08-21 A/B against the previous
+    // release found this call ~17x more expensive than the boolean check it replaced — 3.4 us to
+    // 56 us on a 10 KB console — and nothing in the tree could see it, because the classifier had
+    // no benchmark and the cost hides inside a hundreds-of-milliseconds boot.
+    //
+    // Two sizes on purpose: the cost is O(console bytes) with no bound on the console, so the pair
+    // is what makes a future constant-factor regression legible as a slope, not just a number.
+    let line = "[    0.012861] Kernel command line: console=ttyS0 loglevel=6 root=/dev/vda \
+                rootfstype=erofs ro panic=1 init=/usr/sbin/vmcell-steward vmcell_vmid=1\n";
+    let small: String = line.repeat(24); // a real CH console at the default `loglevel=6`
+    let large: String = line.repeat(2400); // a chatty or long-lived guest
+
+    for (name, log) in [
+        ("serial_fault_classify_healthy_small", &small),
+        ("serial_fault_classify_healthy_large", &large),
+    ] {
+        c.bench_function(name, |b| {
+            b.iter(|| {
+                let verdict = vmcell::vmm::fault::classify_serial_fault(black_box(log));
+                black_box(verdict);
+            })
+        });
+    }
+}
+
 #[cfg(feature = "am-fs-erofs")]
 fn bench_tar_to_erofs(c: &mut Criterion) {
     // Create a dummy empty tar in memory
@@ -112,6 +140,7 @@ criterion_group!(
     bench_protocol_codec,
     bench_cache_key,
     bench_math_30,
+    bench_serial_fault_classify,
     bench_tar_to_erofs
 );
 

@@ -376,6 +376,71 @@ fn halted_is_orthogonal_to_the_fault_class() {
     );
 }
 
+/// Ordinary boot chatter carrying **none** of the words a lazy prefilter might key on — no
+/// `panic`, no `BUG`, no `Oops`, no `error`. The control body for the prefilter gate below, which
+/// is only able to fail while its fixture is this clean.
+const NEUTRAL_CONSOLE: &str = "[    0.000000] Linux version 6.12.104 (pwnall@pwnlet13)\n\
+     [    0.006469] ACPI: x2apic entry ignored\n\
+     [    0.032209] SCSI subsystem initialized\n\
+     [    0.073545] VFS: Disk quotas dquot_6.6.0\n";
+
+// `classify_serial_fault` opens with a whole-buffer prefilter so a HEALTHY console costs one
+// `memmem`-class pass instead of five line-by-line ones (it runs inside `connect_framed`'s retry
+// loop, against a console still growing during boot). The prefilter is only sound while its needle
+// union is the WHOLE union: a needle it forgets becomes a fault the classifier can no longer see,
+// which is silent — the classifier just answers `None`, exactly as it does for a healthy boot.
+//
+// RED on any prefilter narrowed by hand, including the tempting single `"panic"` needle (which
+// matches the `panic=1` cmdline token on every healthy console and so is a no-op, and would let
+// this test's KASAN and lockdep cases through as `None`).
+#[test]
+fn every_known_signature_survives_the_prefilter() {
+    for kind in [
+        GuestFault::Kasan,
+        GuestFault::Oops,
+        GuestFault::Panic,
+        GuestFault::Lockdep,
+    ] {
+        for needle in kind.signatures() {
+            // The surrounding console is deliberately NEUTRAL rather than `REAL_HEALTHY_BOOT`:
+            // that fixture carries the `panic=1` cmdline token, which makes a prefilter narrowed
+            // to a single `"panic"` needle pass every case here and turns this gate into theater.
+            // Verified by construction below, and by narrowing the prefilter by hand: this test
+            // must be the one that reddens.
+            assert_eq!(
+                classify_serial_fault(NEUTRAL_CONSOLE),
+                None,
+                "the control body must carry no fault of its own"
+            );
+            let log = format!("{NEUTRAL_CONSOLE}[    9.9] {needle}something\n");
+            let fault = classify_serial_fault(&log).unwrap_or_else(|| {
+                panic!(
+                    "the prefilter swallowed {kind}'s signature {needle:?}: \
+                     classify_serial_fault answered None on a console that carries it"
+                )
+            });
+            assert_eq!(
+                fault.kind(),
+                kind,
+                "{needle:?} is a {kind} signature but classified as {}",
+                fault.kind()
+            );
+        }
+    }
+}
+
+// The other half of the prefilter's contract, and the one that keeps it worth having: it must not
+// fire on the console it exists to make cheap. RED on a prefilter widened to something a healthy
+// boot contains (`BUG`, `error`, `failed` and `panic` all appear in REAL_HEALTHY_BOOT).
+#[test]
+fn the_prefilter_does_not_fire_on_a_real_healthy_boot() {
+    assert_eq!(classify_serial_fault(REAL_HEALTHY_BOOT), None);
+    // Scaled up the way a long-running or verbose guest scales it — still nothing to classify.
+    let long = REAL_HEALTHY_BOOT.repeat(200);
+    assert!(long.len() > 100_000, "the scaled console must be large");
+    assert_eq!(classify_serial_fault(&long), None);
+}
+
 // The growth obligation, enforced by the compiler: a new `GuestFault` variant must be spliced into
 // `FAULT_PRECEDENCE` (or `classify_serial_fault` can never return it) and given signatures. The
 // exhaustive `match` below fails to compile until the new variant is named here, and the
